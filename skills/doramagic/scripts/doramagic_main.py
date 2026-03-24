@@ -26,37 +26,76 @@ from pathlib import Path
 
 
 def setup_packages_path() -> None:
-    """Add packages/ to sys.path so controller and contracts are importable.
+    """Add packages/ subdirs to sys.path and configure env vars.
 
-    Search order:
-    1. {baseDir}/packages/ — self-contained skill (OpenClaw/Claude Code install)
-    2. {project_root}/packages/ — developer layout (running from project root)
-    3. DORAMAGIC_ROOT env var — explicit override
+    Resolution order for runtime_root:
+    1. DORAMAGIC_ROOT env var (explicit override)
+    2. skill_root (parent of scripts/) if packages/ exists there
+    3. project_root (3 levels up from scripts/) if packages/ exists there
+
+    Side effects:
+    - Sets DORAMAGIC_ROOT env var
+    - Adds all packages/<pkg>/ subdirs to sys.path
+    - Sets DORAMAGIC_BRICKS_DIR if bricks/ exists under runtime_root
+    - Sets DORAMAGIC_SCRIPTS_DIR if scripts/ exists under runtime_root
+    - Auto-resolves platform_rules.json from runtime_root if not already set
     """
     script_dir = Path(__file__).resolve().parent
-    skill_root = script_dir.parent  # skills/doramagic/ or installed skill root
+    skill_root = script_dir.parent          # skills/doramagic/ (or installed skill root)
+    project_root = script_dir.parents[3]    # dev layout: project_root/skills/doramagic/scripts/
 
-    candidates = [
-        skill_root / "packages",                          # self-contained skill (primary)
-        script_dir.parent.parent.parent / "packages",     # dev layout: project_root/skills/doramagic/scripts/
-    ]
-
-    # Allow explicit override via env var
+    # Determine runtime_root
     env_root = os.environ.get("DORAMAGIC_ROOT")
     if env_root:
-        candidates.insert(0, Path(env_root) / "packages")
+        runtime_root = Path(env_root).expanduser().resolve()
+    elif (skill_root / "packages").exists():
+        runtime_root = skill_root           # self-contained skill install
+    elif (project_root / "packages").exists():
+        runtime_root = project_root         # developer layout
+    else:
+        # Last resort: skill_root (so env vars still get set)
+        runtime_root = skill_root
 
-    for candidate in candidates:
-        if candidate.exists():
-            for pkg_dir in candidate.iterdir():
-                if pkg_dir.is_dir() and not pkg_dir.name.startswith((".", "_")):
-                    if str(pkg_dir) not in sys.path:
-                        sys.path.insert(0, str(pkg_dir))
-            # Also set bricks path for brick_injection
-            bricks_dir = candidate.parent / "bricks"
-            if bricks_dir.exists():
-                os.environ.setdefault("DORAMAGIC_BRICKS_DIR", str(bricks_dir))
-            break
+    # Set DORAMAGIC_ROOT so sub-modules can find their resources
+    os.environ.setdefault("DORAMAGIC_ROOT", str(runtime_root))
+
+    # Add all packages/<pkg>/ subdirs to sys.path
+    packages_dir = runtime_root / "packages"
+    if packages_dir.exists():
+        for pkg_dir in packages_dir.iterdir():
+            if pkg_dir.is_dir() and not pkg_dir.name.startswith((".", "_")):
+                if str(pkg_dir) not in sys.path:
+                    sys.path.insert(0, str(pkg_dir))
+
+    # Set DORAMAGIC_BRICKS_DIR if bricks/ exists
+    bricks_dir = runtime_root / "bricks"
+    if bricks_dir.exists():
+        os.environ.setdefault("DORAMAGIC_BRICKS_DIR", str(bricks_dir))
+
+    # Set DORAMAGIC_SCRIPTS_DIR if scripts/ exists
+    scripts_dir = runtime_root / "scripts"
+    if scripts_dir.exists():
+        os.environ.setdefault("DORAMAGIC_SCRIPTS_DIR", str(scripts_dir))
+
+    # Try to import runtime_paths for any additional path configuration (graceful fallback)
+    try:
+        import runtime_paths  # noqa: F401
+    except ImportError:
+        pass  # Optional module — work without it
+
+
+def _auto_resolve_platform_rules(args) -> None:
+    """Auto-resolve platform_rules.json from DORAMAGIC_ROOT if not passed via CLI."""
+    if args.platform_rules:
+        return  # Already specified via CLI
+
+    runtime_root = os.environ.get("DORAMAGIC_ROOT")
+    if not runtime_root:
+        return
+
+    candidate = Path(runtime_root) / "platform_rules.json"
+    if candidate.exists():
+        args.platform_rules = str(candidate)
 
 
 def main() -> None:
@@ -73,6 +112,9 @@ def main() -> None:
     args = parser.parse_args()
 
     setup_packages_path()
+
+    # Auto-resolve platform_rules.json if not provided via CLI
+    _auto_resolve_platform_rules(args)
 
     # Import after path setup
     from doramagic_controller.flow_controller import FlowController

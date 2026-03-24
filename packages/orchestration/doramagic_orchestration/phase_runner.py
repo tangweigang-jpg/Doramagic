@@ -1,7 +1,7 @@
 """Phase Runner — Doramagic 单项目提取管线编排核心 (Race G / S1-Sonnet)
 
 编排逻辑：
-  Stage 0  → extract_repo_facts (CLI subprocess)
+  Stage 0  → extract_repo_facts (package call)
   Brick    → load_and_inject_bricks (optional)
   Stage 1.5 → run_stage15_agentic (optional, adapter 存在时)
   Stage 3.5 → validate_all + run_evidence_tagging + run_dsd_checks
@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -33,33 +32,6 @@ from typing import Optional
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# sys.path bootstrap — make shared packages importable from any working dir
-# ---------------------------------------------------------------------------
-
-_THIS_DIR = Path(__file__).resolve().parent
-# Possible repo roots: worktree layout or direct checkout
-for _candidate_root in [
-    _THIS_DIR.parent.parent.parent.parent,  # races/r06/runner/s1-sonnet/../../..
-    _THIS_DIR.parent.parent.parent.parent.parent,
-]:
-    _contracts_dir = _candidate_root / "packages" / "contracts"
-    _shared_dir = _candidate_root / "packages" / "shared_utils"
-    _extraction_dir = _candidate_root / "packages" / "extraction"
-    if _contracts_dir.exists():
-        for _p in [str(_contracts_dir), str(_shared_dir), str(_extraction_dir)]:
-            if _p not in sys.path:
-                sys.path.insert(0, _p)
-        _REPO_ROOT = _candidate_root
-        break
-else:
-    _REPO_ROOT = _THIS_DIR.parent.parent.parent.parent
-
-# Brick injector lives in races/r06/injection/s1-sonnet/
-_INJECTION_DIR = _REPO_ROOT / "races" / "r06" / "injection" / "s1-sonnet"
-if str(_INJECTION_DIR) not in sys.path:
-    sys.path.insert(0, str(_INJECTION_DIR))
 
 # ---------------------------------------------------------------------------
 # Lazy imports (soft-fail if packages not installed)
@@ -81,48 +53,46 @@ def _import_extraction_modules():
 
 def _import_validate():
     try:
-        from validate_extraction import validate_all, write_report  # type: ignore[import]
+        from doramagic_orchestration.validate_extraction import validate_all, write_report
         return validate_all, write_report
-    except ImportError:
-        # Try path from skills/soul-extractor/scripts/
-        for candidate in [
-            _REPO_ROOT / "skills" / "soul-extractor" / "scripts",
-        ]:
-            if candidate.exists() and str(candidate) not in sys.path:
-                sys.path.insert(0, str(candidate))
-        try:
-            from validate_extraction import validate_all, write_report  # type: ignore[import]
-            return validate_all, write_report
-        except ImportError as exc:
-            logger.warning("Could not import validate_extraction: %s", exc)
-            return None, None
+    except ImportError as exc:
+        logger.warning("Could not import validate_extraction: %s", exc)
+        return None, None
 
 
 def _import_assemble():
     try:
-        from assemble_output import assemble  # type: ignore[import]
+        from doramagic_orchestration.assemble_output import assemble
         return assemble
-    except ImportError:
-        for candidate in [
-            _REPO_ROOT / "skills" / "soul-extractor" / "scripts",
-        ]:
-            if candidate.exists() and str(candidate) not in sys.path:
-                sys.path.insert(0, str(candidate))
-        try:
-            from assemble_output import assemble  # type: ignore[import]
-            return assemble
-        except ImportError as exc:
-            logger.warning("Could not import assemble_output: %s", exc)
-            return None
+    except ImportError as exc:
+        logger.warning("Could not import assemble_output: %s", exc)
+        return None
 
 
 def _import_brick_injector():
     try:
-        from brick_injection import load_and_inject_bricks  # type: ignore[import]
+        from doramagic_extraction.brick_injection import load_and_inject_bricks
         return load_and_inject_bricks
     except ImportError as exc:
         logger.warning("Could not import brick_injection: %s", exc)
         return None
+
+
+def _import_stage0():
+    try:
+        from doramagic_extraction.stage0 import extract_repo_facts
+        return extract_repo_facts
+    except ImportError as exc:
+        logger.warning("Could not import extract_repo_facts: %s", exc)
+        return None
+
+
+def _resolve_bricks_dir(config: "PipelineConfig") -> Optional[str]:
+    """Resolve bricks dir without relying on CWD."""
+    candidate = config.bricks_dir or os.environ.get("DORAMAGIC_BRICKS_DIR")
+    if not candidate:
+        return None
+    return str(Path(candidate).expanduser().resolve())
 
 
 # ---------------------------------------------------------------------------
@@ -142,8 +112,8 @@ class PipelineConfig(BaseModel):
     enable_dsd: bool = True
     """是否运行 DSD 检查（Deceptive Source Detection）。"""
 
-    bricks_dir: str = "bricks/"
-    """积木 JSONL 文件目录，相对于 CWD 或绝对路径。"""
+    bricks_dir: Optional[str] = None
+    """积木 JSONL 文件目录。优先显式值，其次 DORAMAGIC_BRICKS_DIR，否则跳过。"""
 
     knowledge_budget: int = 1800
     """Knowledge Compiler token 预算。"""
@@ -152,7 +122,7 @@ class PipelineConfig(BaseModel):
     """是否跳过 Stage 5（assemble）；主要用于测试。"""
 
     extract_repo_facts_script: Optional[str] = None
-    """extract_repo_facts.py 的绝对路径；None = 自动探测。"""
+    """Deprecated compatibility field; Stage 0 now imports package code directly."""
 
 
 class PipelineResult(BaseModel):
@@ -171,19 +141,6 @@ class PipelineResult(BaseModel):
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
-
-
-def _find_extract_script(config: PipelineConfig) -> Optional[str]:
-    """查找 extract_repo_facts.py 脚本路径。"""
-    if config.extract_repo_facts_script:
-        return config.extract_repo_facts_script
-    candidates = [
-        _REPO_ROOT / "skills" / "soul-extractor" / "scripts" / "extract_repo_facts.py",
-    ]
-    for c in candidates:
-        if c.exists():
-            return str(c)
-    return None
 
 
 def _load_cards_as_dicts(output_dir: str) -> list[dict]:
@@ -289,38 +246,38 @@ def _run_stage0(
     stages_skipped: list[str],
     stages_failed: list[str],
 ) -> bool:
-    """Stage 0: 确定性提取 — extract_repo_facts.py CLI。"""
-    script = _find_extract_script(config)
-    if script is None:
-        logger.warning("Stage 0: extract_repo_facts.py not found — skipping")
+    """Stage 0: 确定性提取 — directly call package stage0 code."""
+    extract_repo_facts = _import_stage0()
+    if extract_repo_facts is None:
+        logger.warning("Stage 0: extract_repo_facts not importable — skipping")
         stages_skipped.append("stage0")
         return False
 
     # Check if repo_facts.json already exists (idempotent re-run)
-    facts_path = os.path.join(output_dir, "artifacts", "repo_facts.json")
-    if os.path.exists(facts_path):
+    facts_path = Path(output_dir) / "artifacts" / "repo_facts.json"
+    if facts_path.exists():
         logger.info("Stage 0: repo_facts.json already exists, skipping re-extraction")
         stages_completed.append("stage0")
         return True
 
     try:
-        result = subprocess.run(
-            [sys.executable, script, "--repo-path", repo_path, "--output-dir", output_dir],
-            capture_output=True,
-            text=True,
-            timeout=120,
+        repo_facts = extract_repo_facts(repo_path)
+        payload = repo_facts.model_dump() if hasattr(repo_facts, "model_dump") else repo_facts.dict()
+        payload.setdefault("repo_path", repo_path)
+        payload.setdefault("skills", [])
+        payload.setdefault("files", [])
+        payload.setdefault("config_keys", [])
+        if not payload.get("project_narrative"):
+            payload["project_narrative"] = payload.get("repo_summary", "")
+
+        facts_path.parent.mkdir(parents=True, exist_ok=True)
+        facts_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
-        if result.returncode != 0:
-            logger.error("Stage 0 failed:\n%s", result.stderr)
-            stages_failed.append("stage0")
-            return False
-        logger.info("Stage 0 complete:\n%s", result.stdout.strip())
+        logger.info("Stage 0 complete: repo_facts=%s", facts_path)
         stages_completed.append("stage0")
         return True
-    except subprocess.TimeoutExpired:
-        logger.error("Stage 0: extract_repo_facts.py timed out")
-        stages_failed.append("stage0")
-        return False
     except Exception as exc:
         logger.error("Stage 0 unexpected error: %s", exc)
         stages_failed.append("stage0")
@@ -343,7 +300,11 @@ def _run_brick_injection(
         stages_skipped.append("brick_injection")
         return 0
 
-    bricks_dir = config.bricks_dir
+    bricks_dir = _resolve_bricks_dir(config)
+    if not bricks_dir:
+        logger.info("Brick injection: no explicit bricks dir and DORAMAGIC_BRICKS_DIR unset — skipping")
+        stages_skipped.append("brick_injection")
+        return 0
     if not os.path.isdir(bricks_dir):
         logger.info("Brick injection: bricks_dir '%s' not found — skipping", bricks_dir)
         stages_skipped.append("brick_injection")
@@ -811,7 +772,9 @@ def _cli():
         "--output-dir", required=True, help="Output directory (soul/, artifacts/ etc.)"
     )
     parser.add_argument(
-        "--bricks-dir", default="bricks/", help="Domain bricks directory (default: bricks/)"
+        "--bricks-dir",
+        default=None,
+        help="Domain bricks directory (default: explicit path or DORAMAGIC_BRICKS_DIR)",
     )
     parser.add_argument(
         "--knowledge-budget",

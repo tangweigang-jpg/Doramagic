@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -335,20 +336,40 @@ def _write_merged_bricks(
 
 def load_and_inject_bricks(
     frameworks: list[str],
-    bricks_dir: str = "bricks/",
+    bricks_dir: Optional[str] = None,
     output_dir: Optional[str] = None,
 ) -> BrickInjectionResult:
     """匹配框架 → 加载积木 → 写入 artifacts → 返回注入文本。
 
     Args:
         frameworks: 来自 repo_facts.frameworks 的框架名称列表，如 ["Django", "React"]。
-        bricks_dir: 积木 JSONL 文件所在目录，默认为 "bricks/"（相对路径相对 CWD）。
+        bricks_dir: 积木 JSONL 文件所在目录。若为 None，按以下顺序自动解析：
+                    1. DORAMAGIC_BRICKS_DIR 环境变量
+                    2. DORAMAGIC_ROOT/bricks/
+                    3. CWD/bricks/（开发模式兜底）
+                    若均不存在，返回空结果。
         output_dir: 若提供，将合并积木写入 <output_dir>/artifacts/domain_bricks.jsonl。
                     若为 None，则不写文件。
 
     Returns:
         BrickInjectionResult 实例，包含加载统计、注入文本和文件路径。
     """
+    if bricks_dir is None:
+        bricks_dir = os.environ.get("DORAMAGIC_BRICKS_DIR")
+    if bricks_dir is None:
+        # Try runtime_root/bricks
+        root = os.environ.get("DORAMAGIC_ROOT")
+        if root:
+            candidate = Path(root) / "bricks"
+            if candidate.exists():
+                bricks_dir = str(candidate)
+    if bricks_dir is None:
+        # Last resort: relative to CWD (dev mode)
+        if Path("bricks").exists():
+            bricks_dir = "bricks"
+        else:
+            return BrickInjectionResult(0, [], list(frameworks), "", None, [])
+
     bricks_path_obj = Path(bricks_dir).resolve()
 
     all_bricks: list[dict] = []
@@ -412,8 +433,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--bricks-dir",
-        default="bricks/",
-        help="积木目录路径（默认: bricks/）",
+        default=None,
+        help="积木目录路径（默认: 自动解析）",
     )
     parser.add_argument(
         "--output-dir",

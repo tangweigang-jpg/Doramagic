@@ -12,29 +12,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
 
+from doramagic_community.github_search import download_repo
+from doramagic_community.community_signals import collect_community_signals
 from doramagic_contracts.envelope import ErrorCodes, ModuleResultEnvelope, RunMetrics, WarningItem
 from doramagic_contracts.executor import ExecutorConfig
 
 logger = logging.getLogger("doramagic.executor.soul_batch")
-
-
-def _ensure_scripts_importable() -> None:
-    candidates = [
-        Path(__file__).resolve().parent.parent.parent.parent / "skills" / "doramagic" / "scripts",
-        Path.home() / "Documents" / "vibecoding" / "Doramagic" / "skills" / "doramagic" / "scripts",
-        Path.home() / ".openclaw" / "skills" / "soul-extractor" / "scripts",
-    ]
-    for p in candidates:
-        if (p / "github_search.py").exists() and str(p) not in sys.path:
-            sys.path.insert(0, str(p))
-            return
 
 
 class _RepoResult:
@@ -60,7 +49,6 @@ class SoulExtractorBatch:
         self, input: BaseModel, adapter: object, config: ExecutorConfig,
     ) -> ModuleResultEnvelope:
         start = time.monotonic()
-        _ensure_scripts_importable()
 
         repos = self._get_repos(input)
         if not repos:
@@ -161,7 +149,6 @@ class SoulExtractorBatch:
             return _RepoResult(repo_id=repo_id, success=False, error="No repo name for download")
 
         try:
-            from github_search import download_repo
             branch = repo.get("default_branch", "main")
             local_path = download_repo(full_name, branch, str(repos_dir / repo_id))
             if local_path:
@@ -266,7 +253,6 @@ class SoulExtractorBatch:
                 results[repo_id] = {"skipped": True, "skip_reason": "not a GitHub URL"}
                 continue
             try:
-                from community_signals import collect_community_signals
                 signals = await asyncio.to_thread(collect_community_signals, url, None)
                 results[repo_id] = signals
             except Exception as e:

@@ -6,12 +6,12 @@ Also searches ClawHub and scans local OpenClaw skills.
 
 from __future__ import annotations
 
-import sys
 import time
 from pathlib import Path
 
 from pydantic import BaseModel
 
+from doramagic_community.github_search import search_github
 from doramagic_contracts.base import NeedProfile
 from doramagic_contracts.cross_project import (
     DiscoveryCandidate,
@@ -28,19 +28,6 @@ from doramagic_contracts.envelope import (
 from doramagic_contracts.executor import ExecutorConfig
 
 MIN_STARS = 30
-
-
-def _ensure_github_search_importable() -> None:
-    """Add the scripts directory to sys.path so github_search is importable."""
-    candidates = [
-        Path(__file__).resolve().parent.parent.parent.parent / "skills" / "doramagic" / "scripts",
-        Path.home() / "Documents" / "vibecoding" / "Doramagic" / "skills" / "doramagic" / "scripts",
-        Path.home() / ".openclaw" / "skills" / "soul-extractor" / "scripts",
-    ]
-    for p in candidates:
-        if (p / "github_search.py").exists() and str(p) not in sys.path:
-            sys.path.insert(0, str(p))
-            return
 
 
 class DiscoveryRunner:
@@ -117,11 +104,8 @@ class DiscoveryRunner:
         )
 
     def _search_github(self, keywords: list[str]) -> list[DiscoveryCandidate]:
-        """Real GitHub API search via github_search.py."""
+        """Real GitHub API search via doramagic_community.github_search."""
         try:
-            _ensure_github_search_importable()
-            from github_search import search_github
-
             raw = search_github(keywords, top_k=6)
             candidates = []
             for i, r in enumerate(raw):

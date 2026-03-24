@@ -203,14 +203,6 @@ def output_with_soul_and_validation(output_with_cards):
 # ---------------------------------------------------------------------------
 
 
-def _make_mock_subprocess_result(returncode: int = 0, stdout: str = "", stderr: str = ""):
-    r = MagicMock()
-    r.returncode = returncode
-    r.stdout = stdout
-    r.stderr = stderr
-    return r
-
-
 def _make_mock_validation_report(overall_pass: bool = True):
     return {
         "output_dir": "/fake",
@@ -262,6 +254,29 @@ class MockDSDReport:
         return self._dict
 
 
+def _make_mock_stage0_fn(repo_path: str, output_dir: str):
+    """Return a mock extract_repo_facts function that writes repo_facts.json."""
+    def _stage0_fn(rp):
+        facts = {
+            "repo_path": rp,
+            "commands": [],
+            "skills": [],
+            "files": [],
+            "config_keys": [],
+            "frameworks": [],
+            "languages": [],
+            "dependencies": [],
+            "storage_paths": [],
+            "project_narrative": "Mocked extraction.",
+        }
+        # The real _run_stage0 writes the file itself after calling extract_repo_facts,
+        # so this mock just needs to return a dict-like object with model_dump/dict.
+        mock_result = MagicMock()
+        mock_result.model_dump.return_value = facts
+        return mock_result
+    return _stage0_fn
+
+
 # ---------------------------------------------------------------------------
 # Unit tests
 # ---------------------------------------------------------------------------
@@ -299,7 +314,7 @@ class TestPipelineConfig:
         assert cfg.enable_stage15 is True
         assert cfg.enable_bricks is True
         assert cfg.enable_dsd is True
-        assert cfg.bricks_dir == "bricks/"
+        assert cfg.bricks_dir is None
         assert cfg.knowledge_budget == 1800
         assert cfg.skip_assembly is False
 
@@ -333,11 +348,26 @@ class TestPipelineResultModel:
 
 
 class TestStage0:
-    """Test Stage 0 extraction subprocess behavior."""
+    """Test Stage 0 extraction via direct Python function call."""
 
     def test_stage0_success(self, tmp_repo, tmp_output):
-        """Stage 0 runs subprocess and marks completed."""
-        mock_result = _make_mock_subprocess_result(returncode=0, stdout="repo_facts=/tmp/x\n")
+        """Stage 0 calls extract_repo_facts function and marks completed."""
+        mock_stage0_fn = MagicMock()
+        mock_facts = MagicMock()
+        mock_facts.model_dump.return_value = {
+            "repo_path": str(tmp_repo),
+            "commands": [],
+            "skills": [],
+            "files": [],
+            "config_keys": [],
+            "frameworks": [],
+            "languages": [],
+            "dependencies": [],
+            "storage_paths": [],
+            "project_narrative": "Mocked.",
+        }
+        mock_stage0_fn.return_value = mock_facts
+
         config = PipelineConfig(
             enable_bricks=False,
             enable_stage15=False,
@@ -345,8 +375,7 @@ class TestStage0:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value="/fake/extract_repo_facts.py"),
-            patch("subprocess.run", return_value=mock_result) as mock_run,
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=mock_stage0_fn),
             patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
             patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
         ):
@@ -357,9 +386,10 @@ class TestStage0:
             )
         assert "stage0" in result.stages_completed
         assert "stage0" not in result.stages_failed
+        mock_stage0_fn.assert_called_once()
 
     def test_stage0_script_not_found(self, tmp_repo, tmp_output):
-        """Stage 0 is skipped gracefully when script is missing."""
+        """Stage 0 is skipped gracefully when _import_stage0 returns None."""
         config = PipelineConfig(
             enable_bricks=False,
             enable_stage15=False,
@@ -367,7 +397,7 @@ class TestStage0:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
             patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
         ):
@@ -379,9 +409,10 @@ class TestStage0:
         assert "stage0" in result.stages_skipped
         assert "stage0" not in result.stages_failed
 
-    def test_stage0_subprocess_failure(self, tmp_repo, tmp_output):
+    def test_stage0_function_raises(self, tmp_repo, tmp_output):
         """Stage 0 failure is recorded without crashing."""
-        mock_result = _make_mock_subprocess_result(returncode=1, stderr="ERROR: repo not found")
+        mock_stage0_fn = MagicMock(side_effect=RuntimeError("extraction failed"))
+
         config = PipelineConfig(
             enable_bricks=False,
             enable_stage15=False,
@@ -389,8 +420,7 @@ class TestStage0:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value="/fake/script.py"),
-            patch("subprocess.run", return_value=mock_result),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=mock_stage0_fn),
             patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
             patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
         ):
@@ -403,7 +433,9 @@ class TestStage0:
         assert "stage0" not in result.stages_completed
 
     def test_stage0_idempotent_when_facts_exist(self, tmp_repo, output_with_facts):
-        """Stage 0 skips subprocess if repo_facts.json already exists."""
+        """Stage 0 skips the function call if repo_facts.json already exists."""
+        mock_stage0_fn = MagicMock()
+
         config = PipelineConfig(
             enable_bricks=False,
             enable_stage15=False,
@@ -411,8 +443,7 @@ class TestStage0:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value="/fake/script.py"),
-            patch("subprocess.run") as mock_run,
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=mock_stage0_fn),
             patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
             patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
         ):
@@ -421,7 +452,7 @@ class TestStage0:
                 output_dir=str(output_with_facts),
                 config=config,
             )
-        mock_run.assert_not_called()
+        mock_stage0_fn.assert_not_called()
         assert "stage0" in result.stages_completed
 
 
@@ -436,7 +467,7 @@ class TestBrickInjection:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
             patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
         ):
@@ -458,7 +489,7 @@ class TestBrickInjection:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
             patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
         ):
@@ -490,7 +521,7 @@ class TestBrickInjection:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
             patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
             patch("doramagic_orchestration.phase_runner._import_brick_injector", return_value=mock_injector),
@@ -516,7 +547,7 @@ class TestStage15:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
             patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
         ):
@@ -538,7 +569,7 @@ class TestStage15:
         )
         mock_adapter = MagicMock()
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
             patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
         ):
@@ -579,7 +610,7 @@ class TestStage15:
         mock_contracts.extraction.Stage1Coverage = MagicMock(return_value=MagicMock())
 
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch(
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(MagicMock(), MagicMock(), None, mock_run_stage15),
@@ -614,7 +645,7 @@ class TestStage15:
         mock_run_stage15 = MagicMock(side_effect=RuntimeError("LLM timeout"))
 
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch(
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(MagicMock(), MagicMock(), None, mock_run_stage15),
@@ -650,7 +681,7 @@ class TestStage35:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch(
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, mock_dsd, mock_compile, None),
@@ -682,7 +713,7 @@ class TestStage35:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch(
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, mock_dsd, mock_compile, None),
@@ -714,7 +745,7 @@ class TestStage35:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch(
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, mock_dsd, mock_compile, None),
@@ -750,7 +781,7 @@ class TestStage35:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch(
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, mock_dsd, mock_compile, None),
@@ -784,7 +815,7 @@ class TestStage45:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch(
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, None, mock_compile, None),
@@ -814,7 +845,7 @@ class TestStage45:
             knowledge_budget=1200,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch(
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, None, mock_compile, None),
@@ -842,7 +873,7 @@ class TestStage45:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch(
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, None, mock_compile, None),
@@ -882,7 +913,7 @@ class TestStage5:
             skip_assembly=False,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch(
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, None, mock_compile, None),
@@ -914,7 +945,7 @@ class TestStage5:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch(
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, None, mock_compile, None),
@@ -946,7 +977,7 @@ class TestStage5:
             skip_assembly=False,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch(
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, None, mock_compile, None),
@@ -970,12 +1001,28 @@ class TestFullHappyPath:
 
     def test_full_pipeline_happy_path(self, tmp_repo, output_with_soul_and_validation, tmp_path):
         """All stages complete successfully (everything mocked)."""
-        mock_subprocess = _make_mock_subprocess_result(0, "repo_facts=/tmp/x\n")
         mock_validate_all = MagicMock(return_value=_make_mock_validation_report(overall_pass=True))
         mock_write_report = MagicMock()
         mock_compile = MagicMock(return_value=True)
         mock_run_evidence_tagging = MagicMock(side_effect=lambda cards: cards)
         mock_dsd = MagicMock(return_value=MockDSDReport("CLEAN"))
+
+        # Mock stage0 function that writes repo_facts.json
+        def fake_stage0_fn(repo_path):
+            mock_facts = MagicMock()
+            mock_facts.model_dump.return_value = {
+                "repo_path": repo_path,
+                "commands": [],
+                "skills": [],
+                "files": [],
+                "config_keys": [],
+                "frameworks": [],
+                "languages": [],
+                "dependencies": [],
+                "storage_paths": [],
+                "project_narrative": "Mocked extraction.",
+            }
+            return mock_facts
 
         def fake_assemble(output_dir):
             inject = Path(output_dir) / "inject"
@@ -983,7 +1030,7 @@ class TestFullHappyPath:
             (inject / "CLAUDE.md").write_text("# Knowledge", encoding="utf-8")
             return True
 
-        # Remove existing repo_facts.json to force Stage 0 subprocess
+        # Remove existing repo_facts.json to force Stage 0 execution
         facts_path = output_with_soul_and_validation / "artifacts" / "repo_facts.json"
         if facts_path.exists():
             facts_path.unlink()
@@ -996,8 +1043,7 @@ class TestFullHappyPath:
         )
 
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value="/fake/script.py"),
-            patch("subprocess.run", return_value=mock_subprocess),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=fake_stage0_fn),
             patch(
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, mock_dsd, mock_compile, None),
@@ -1035,7 +1081,7 @@ class TestGracefulDegradation:
             skip_assembly=False,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
             patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
             patch("doramagic_orchestration.phase_runner._import_assemble", return_value=None),
@@ -1065,7 +1111,7 @@ class TestGracefulDegradation:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._find_extract_script", return_value=None),
+            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
             patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
             patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
         ):

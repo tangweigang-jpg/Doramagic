@@ -11,9 +11,34 @@ import sys
 from pathlib import Path
 from typing import Iterable
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+# ---------------------------------------------------------------------------
+# DORAMAGIC_ROOT resolution — no hardcoded personal paths
+# ---------------------------------------------------------------------------
+
+def _resolve_doramagic_root() -> Path:
+    """Resolve DORAMAGIC_ROOT: env var first, then auto-detect from file layout."""
+    env_root = os.environ.get("DORAMAGIC_ROOT")
+    if env_root:
+        return Path(env_root).expanduser().resolve()
+
+    # Auto-detect: walk up from this file looking for packages/
+    script_dir = Path(__file__).resolve().parent
+    # Common layouts:
+    #   dev layout:       project_root/skills/doramagic/scripts/extract_facts.py  → parents[3]
+    #   installed skill:  skill_root/scripts/extract_facts.py                      → parents[1]
+    for depth in (3, 2, 1):
+        candidate = script_dir.parents[depth - 1]
+        if (candidate / "packages").exists():
+            return candidate
+
+    # Last resort: 3 levels up (original behaviour)
+    return script_dir.parents[2]
+
+
+DORAMAGIC_ROOT = _resolve_doramagic_root()
+
 for _pkg in ("contracts", "shared_utils", "extraction", "orchestration"):
-    _p = str(PROJECT_ROOT / "packages" / _pkg)
+    _p = str(DORAMAGIC_ROOT / "packages" / _pkg)
     if _p not in sys.path:
         sys.path.insert(0, _p)
 

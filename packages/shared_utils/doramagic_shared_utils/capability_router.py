@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Sequence
@@ -154,8 +155,23 @@ class CapabilityRouter:
 
     @classmethod
     def from_config(cls, config_path: str | Path) -> CapabilityRouter:
-        """从 models.json 配置文件加载。"""
-        path = Path(config_path).expanduser().resolve()
+        """从 models.json 配置文件加载。
+
+        Resolution order for config_path:
+        1. Use config_path as-is if it is absolute or exists as-is.
+        2. If relative and not found, try DORAMAGIC_ROOT/models.json.
+        """
+        path = Path(config_path).expanduser()
+
+        # Resolve relative paths: try DORAMAGIC_ROOT fallback if the path doesn't exist
+        if not path.is_absolute() and not path.exists():
+            root = os.environ.get("DORAMAGIC_ROOT")
+            if root:
+                candidate = Path(root) / "models.json"
+                if candidate.exists():
+                    path = candidate
+
+        path = path.resolve()
         if not path.exists():
             raise FileNotFoundError(f"models.json not found: {path}")
         data = json.loads(path.read_text(encoding="utf-8"))
