@@ -172,6 +172,7 @@ class CapabilityRouter:
             return self._forced_adapter
         # 映射 task → capabilities → route → 构建简易 adapter
         caps = _TASK_TO_CAPABILITIES.get(task, [CAPABILITY_STRUCTURED_EXTRACTION])
+        self._current_stage = f"task:{task}"
         result = self.route(caps)
         # 返回一个带 _default_model 的标记对象
         from doramagic_shared_utils.llm_adapter import LLMAdapter
@@ -181,6 +182,8 @@ class CapabilityRouter:
 
     def route(self, required_capabilities: Sequence[str]) -> RoutingResult:
         """选择满足能力需求的最合适模型。"""
+        if not hasattr(self, "_current_stage"):
+            self._current_stage = "unknown"
         # 找完美匹配
         perfect = [m for m in self.models if m.has_capabilities(required_capabilities)]
 

@@ -109,12 +109,15 @@ skills/soul-extractor/  # OpenClaw skill definition (SKILL.md + stages)
 
 ```python
 # From packages/extraction/doramagic_extraction/confidence_system.py
-def assign_verdict(claim: KnowledgeClaim) -> ConfidenceVerdict:
+def compute_verdict(tags: list[EvidenceTag]) -> tuple[Verdict, PolicyAction]:
     """
-    SUPPORTED  = CODE evidence + DOC corroboration  → inject confidently
-    CONTESTED  = COMMUNITY-only evidence            → annotate source
-    WEAK       = INFERENCE + some corroboration      → mark speculative
-    REJECTED   = INFERENCE-only, no corroboration    → quarantine
+    Deterministic Boolean-algebra verdict from evidence tags:
+
+    CODE + DOC                → SUPPORTED / ALLOW_CORE
+    CODE + COMMUNITY          → SUPPORTED / ALLOW_CORE
+    COMMUNITY only (no CODE)  → CONTESTED / ALLOW_STORY
+    INFERENCE + corroboration → WEAK / ALLOW_STORY
+    INFERENCE only            → REJECTED / QUARANTINE
     """
 ```
 
@@ -122,33 +125,31 @@ def assign_verdict(claim: KnowledgeClaim) -> ConfidenceVerdict:
 
 ```python
 # From packages/extraction/doramagic_extraction/brick_injection.py
-injection_prompt = """
-You already know this baseline knowledge (from Doramagic bricks):
-[Django] MTV pattern, not MVC. Fat models, thin views.
-[React] Hooks rules: no conditional calls, cleanup prevents leaks.
-
-Your task: find what THIS project does DIFFERENTLY from the baseline.
-Do NOT repeat the above knowledge.
-"""
+def _generate_injection_text(bricks, frameworks_matched):
+    # Output format:
+    # 你已经知道以下框架基线知识（来自 Doramagic 积木库）：
+    # [Django] MTV pattern, not MVC. Fat models, thin views.
+    # [React] Hooks rules: no conditional calls, cleanup prevents leaks.
+    # 你的任务是发现这个具体项目在基线之上的独特做法。不要重复以上知识。
 ```
 
 **Deceptive Source Detection** — 8 automated checks catch misleading knowledge:
 
 ```python
 # From packages/extraction/doramagic_extraction/deceptive_source_detection.py
-DSD_CHECKS = [
-    "support_desk_share > 70%",      # Project is mostly "how do I?" questions
-    "exception_dominance_ratio > 60%", # Mostly edge cases, sparse core knowledge
-    "maintainer_boundary_statements",  # Won't-fix = design philosophy gold
-    # ... 5 more checks
-]
+def run_dsd_checks(cards, repo_facts, community_signals) -> DSDReport:
+    """Run all 8 DSD checks: rationale_support_ratio, temporal_conflict,
+    exception_dominance, support_desk_share, public_context_completeness,
+    persona_divergence, dependency_dominance, narrative_evidence_tension.
+
+    Result: CLEAN (0 triggered) / WARNING (1-3) / SUSPICIOUS (4+)"""
 ```
 
 ## Quick Start
 
 ```bash
 # Clone
-git clone https://github.com/user/doramagic.git
+git clone https://github.com/tangweigang-jpg/Doramagic.git
 cd doramagic
 
 # Install dependencies

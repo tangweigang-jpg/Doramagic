@@ -33,6 +33,12 @@ from doramagic_contracts.executor import ExecutorConfig, PhaseExecutor
 
 from .budget_manager import BudgetManager
 from .lease_manager import LeaseManager
+
+try:
+    from doramagic_shared_utils.capability_router import reset_routing_log, get_routing_summary
+    _HAS_ROUTING_LOG = True
+except ImportError:
+    _HAS_ROUTING_LOG = False
 from .state_definitions import MAX_REVISE_LOOPS, PHASE_EXECUTOR_MAP, TRANSITIONS, Phase
 
 logger = logging.getLogger("doramagic.controller")

@@ -204,7 +204,7 @@ fi
 
 cd "$CLEAN_DIR"
 git remote add github "$GITHUB_URL"
-git push github main --force
+git push github HEAD:main --force
 git push github "$VERSION"
 
 echo ""
