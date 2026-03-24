@@ -253,7 +253,7 @@ class SoulExtractorBatch:
                 results[repo_id] = {"skipped": True, "skip_reason": "not a GitHub URL"}
                 continue
             try:
-                signals = await asyncio.to_thread(collect_community_signals, url, None)
+                signals = await asyncio.to_thread(collect_community_signals, url, None, os.environ.get("GITHUB_TOKEN"))
                 results[repo_id] = signals
             except Exception as e:
                 logger.warning(f"Community harvest failed for {repo_id}: {e}")

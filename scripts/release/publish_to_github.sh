@@ -109,6 +109,7 @@ INTERNAL_DIRS=(
     ".claire"
     ".claude"
     "openclaw-test"
+    "packages/doramagic_product"
     "apps"
 )
 

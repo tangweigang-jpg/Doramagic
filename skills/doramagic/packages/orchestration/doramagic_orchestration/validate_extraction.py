@@ -316,6 +316,7 @@ def build_repo_file_index(output_dir):
 def validate_all(output_dir):
     """Run all validations and produce report."""
     soul_dir = os.path.join(output_dir, "soul")
+    os.makedirs(soul_dir, exist_ok=True)
     cards_dir = os.path.join(soul_dir, "cards")
 
     # Load cross-reference data
@@ -487,6 +488,7 @@ def validate_all(output_dir):
 def write_report(report, output_dir):
     """Write validation report as JSON and human-readable summary."""
     soul_dir = os.path.join(output_dir, "soul")
+    os.makedirs(soul_dir, exist_ok=True)
 
     # JSON report
     json_path = os.path.join(soul_dir, "validation_report.json")

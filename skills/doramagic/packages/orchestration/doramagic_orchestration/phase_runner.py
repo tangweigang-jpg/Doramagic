@@ -262,7 +262,7 @@ def _run_stage0(
 
     try:
         repo_facts = extract_repo_facts(repo_path)
-        payload = repo_facts.model_dump() if hasattr(repo_facts, "model_dump") else repo_facts.dict()
+        payload = repo_facts.model_dump(mode="json") if hasattr(repo_facts, "model_dump") else repo_facts.dict()
         payload.setdefault("repo_path", repo_path)
         payload.setdefault("skills", [])
         payload.setdefault("files", [])

@@ -77,11 +77,7 @@ def setup_packages_path() -> None:
     if scripts_dir.exists():
         os.environ.setdefault("DORAMAGIC_SCRIPTS_DIR", str(scripts_dir))
 
-    # Try to import runtime_paths for any additional path configuration (graceful fallback)
-    try:
-        import runtime_paths  # noqa: F401
-    except ImportError:
-        pass  # Optional module — work without it
+  # Optional module — work without it
 
 
 def _auto_resolve_platform_rules(args) -> None:

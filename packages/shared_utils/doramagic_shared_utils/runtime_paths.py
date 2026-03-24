@@ -248,13 +248,13 @@ def resolve_scripts_dir(root: Optional[Path] = None) -> Optional[Path]:
     if root is None:
         return None
 
-    # 自包含布局优先
+    # 自包含布局：root/scripts/ contains doramagic_main.py
     self_contained = root / "scripts"
-    if self_contained.is_dir():
+    if self_contained.is_dir() and (self_contained / "doramagic_main.py").exists():
         logger.debug("scripts_dir resolved (self-contained): %s", self_contained)
         return self_contained
 
-    # 开发布局
+    # 开发布局：root/skills/doramagic/scripts/
     dev_layout = root / "skills" / "doramagic" / "scripts"
     if dev_layout.is_dir():
         logger.debug("scripts_dir resolved (dev layout): %s", dev_layout)

@@ -364,11 +364,7 @@ def load_and_inject_bricks(
             if candidate.exists():
                 bricks_dir = str(candidate)
     if bricks_dir is None:
-        # Last resort: relative to CWD (dev mode)
-        if Path("bricks").exists():
-            bricks_dir = "bricks"
-        else:
-            return BrickInjectionResult(0, [], list(frameworks), "", None, [])
+        return BrickInjectionResult(0, [], list(frameworks), "", None, [])
 
     bricks_path_obj = Path(bricks_dir).resolve()
 
