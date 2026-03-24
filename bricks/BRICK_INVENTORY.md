@@ -1,125 +1,113 @@
-# BRICK_INVENTORY.md — S1-Sonnet Brick Forge (Race B)
+# BRICK_INVENTORY.md
 
-Generated: 2026-03-20
+Updated: 2026-03-24
 
 ## Summary Statistics
 
 | Metric | Value |
 |--------|-------|
-| Total bricks | 89 |
-| L1 (framework-level) bricks | 15 |
-| L2 (pattern-level) bricks | 74 |
-| Failure/anti-pattern bricks | 17 |
-| Failure ratio | 19.1% (≥15% ✓) |
-| Frameworks/domains covered | 12 |
+| Total bricks | 278 |
+| L1 (framework-level) bricks | 52 |
+| L2 (pattern-level) bricks | 182 |
+| Failure/anti-pattern bricks | 58 |
+| Failure ratio | 25.5% (≥15% ✓) |
+| Frameworks/domains covered | 34 |
 | Evidence refs per brick | 1 (all with documentation URLs) |
 
 ---
 
-## Domain × Knowledge_Type Count Table
+## Brick Files
 
-| Domain | capability | rationale | constraint | interface | failure | assembly_pattern | TOTAL |
-|--------|-----------|-----------|------------|-----------|---------|-----------------|-------|
-| python-general | 5 | 3 | 1 | 1 | 3 | 3 | 16 |
-| fastapi-flask | 3 | 2 | 0 | 0 | 2 | 2 | 9 |
-| home-assistant | 1 | 1 | 1 | 2 | 1 | 2 | 8 |
-| obsidian-logseq | 1 | 2 | 0 | 1 | 1 | 1 | 6 |
-| go-general | 2 | 2 | 0 | 1 | 1 | 1 | 7 |
-| django | 1 | 2 | 0 | 0 | 2 | 2 | 7 |
-| react | 1 | 1 | 1 | 0 | 2 | 1 | 6 |
-| domain-finance | 0 | 1 | 3 | 0 | 1 | 1 | 6 |
-| domain-pkm | 0 | 2 | 1 | 0 | 1 | 2 | 6 |
-| domain-private-cloud | 0 | 0 | 1 | 0 | 2 | 3 | 6 |
-| domain-health | 1 | 0 | 3 | 1 | 1 | 0 | 6 |
-| domain-info-ingestion | 1 | 0 | 1 | 0 | 1 | 3 | 6 |
-| **TOTAL** | **16** | **16** | **12** | **7** | **17** | **21** | **89** |
+### AI Frameworks (13 targets, 87 bricks) — NEW 2026-03-24
 
-> Note: Per-cell counts are derived from the Failure bricks list above (authoritative) + approximate type distribution from JSONL files. Some cells may vary by ±1. Authoritative truth is in the JSONL files.
+| File | Domain | Bricks | L1 | Failure |
+|------|--------|-------:|---:|--------:|
+| langchain.jsonl | LangChain | 10 | 2 | 5 |
+| huggingface_transformers.jsonl | HF Transformers | 10 | 2 | 3 |
+| llamaindex.jsonl | LlamaIndex | 8 | 2 | 2 |
+| vllm.jsonl | vLLM | 8 | 2 | 2 |
+| crewai.jsonl | CrewAI | 7 | 2 | 2 |
+| litellm.jsonl | LiteLLM | 7 | 2 | 2 |
+| ollama.jsonl | Ollama | 7 | 2 | 2 |
+| langgraph.jsonl | LangGraph | 7 | 2 | 3 |
+| llama_cpp.jsonl | llama.cpp | 7 | 2 | 2 |
+| diffusers.jsonl | Diffusers | 7 | 2 | 2 |
+| openai_sdk.jsonl | OpenAI SDK | 7 | 2 | 2 |
+| langfuse.jsonl | Langfuse | 7 | 2 | 2 |
+| dspy.jsonl | DSPy | 7 | 2 | 2 |
 
----
+### Web Frameworks — Non-AI First Tier (4 targets, 46 bricks) — NEW 2026-03-24
 
-## Failure (Anti-Pattern) Bricks — Full List
+| File | Domain | Bricks | L1 | Failure |
+|------|--------|-------:|---:|--------:|
+| typescript_nodejs.jsonl | TypeScript/Node.js | 14 | 3 | 3 |
+| nextjs.jsonl | Next.js | 10 | 2 | 2 |
+| vuejs.jsonl | Vue.js | 10 | 3 | 2 |
+| java_spring_boot.jsonl | Java/Spring Boot | 12 | 3 | 3 |
 
-Bricks with `knowledge_type="failure"`:
+### Original Bricks (12 targets, 89 bricks)
 
-| Brick ID | Domain | Description |
-|----------|--------|-------------|
-| py-l2-import-side-effects | python-general | Module-level code runs on import — DB connections at module scope break test environments |
-| py-l2-mutable-defaults | python-general | `def f(items=[])` shares one list across all calls — classic Python gotcha |
-| py-l2-asyncio-pitfalls | python-general | Blocking calls in asyncio event loop freeze all concurrent tasks |
-| flask-l2-request-context | fastapi-flask | Flask context proxies don't work outside request context — background thread trap |
-| fastapi-l2-middleware-order | fastapi-flask | CORS middleware ordering — last added runs first, auth before CORS causes preflight failures |
-| obsidian-l2-plugin-lifecycle | obsidian-logseq | addEventListener without registerEvent() leaks after plugin reload |
-| go-l2-failure-init | go-general | init() hides initialization errors, makes code untestable |
-| django-l2-n-plus-1 | django | N+1 query problem without select_related/prefetch_related |
-| django-l2-signals | django | post_save fires before transaction commit — signal handlers see rolled-back data |
-| react-l2-use-effect-cleanup | react | Missing cleanup causes memory leaks; StrictMode double-invocation exposes them |
-| react-l2-key-prop | react | Array index as key causes state corruption on reorder/delete |
-| finance-l2-decimal-precision | domain-finance | Float arithmetic for money — 0.1 + 0.2 ≠ 0.3 causes audit failures |
-| pkm-l2-sync | domain-pkm | Vault state files in git cause constant merge conflicts |
-| selfhosted-l2-data-persistence | domain-private-cloud | SQLite inside container (not volume-mounted) loses data on update |
-| selfhosted-l2-secrets-management | domain-private-cloud | .env in git = credential leak; docker inspect exposes env vars |
-| health-l2-unit-safety | domain-health | Storing weight/dosage without unit — kg vs lbs confusion is a patient safety risk |
-| info-l2-queue-design | domain-info-ingestion | Celery without retry config and expires= loses tasks and fills Redis |
-
-**Total failure bricks: 17 out of 89 = 19.1%** (requirement: ≥15% ✓)
-
----
-
-## Coverage vs. Requirements
-
-| Requirement | Required | Actual | Status |
-|-------------|----------|--------|--------|
-| Python general (L1+L2) | ≥15 | 16 | ✓ |
-| FastAPI/Flask | ≥8 | 9 | ✓ |
-| Home Assistant | ≥8 | 8 | ✓ |
-| Obsidian/Logseq | ≥6 | 6 | ✓ |
-| Go general | ≥6 | 7 | ✓ |
-| Django | ≥6 | 7 | ✓ |
-| React | ≥5 | 6 | ✓ |
-| domain-finance | ≥5 | 6 | ✓ |
-| domain-pkm | ≥5 | 6 | ✓ |
-| domain-private-cloud | ≥5 | 6 | ✓ |
-| domain-health | ≥5 | 6 | ✓ |
-| domain-info-ingestion | ≥5 | 6 | ✓ |
-| Failure bricks ≥15% | ≥15% | 19.1% | ✓ |
-| Evidence refs | all | all | ✓ |
-| Works with adapter=None | yes | yes | ✓ |
+| File | Domain | Bricks | L1 | Failure |
+|------|--------|-------:|---:|--------:|
+| python_general.jsonl | Python general | 16 | 5 | 3 |
+| fastapi_flask.jsonl | FastAPI/Flask | 9 | 2 | 2 |
+| django.jsonl | Django | 7 | 2 | 2 |
+| react.jsonl | React | 6 | 1 | 2 |
+| go_general.jsonl | Go general | 7 | 1 | 1 |
+| home_assistant.jsonl | Home Assistant | 8 | 2 | 0 |
+| obsidian_logseq.jsonl | Obsidian/Logseq | 6 | 2 | 1 |
+| domain_finance.jsonl | Finance | 6 | 0 | 1 |
+| domain_health.jsonl | Health | 6 | 0 | 1 |
+| domain_pkm.jsonl | PKM | 6 | 0 | 1 |
+| domain_private_cloud.jsonl | Private Cloud | 6 | 0 | 2 |
+| domain_info_ingestion.jsonl | Info Ingestion | 6 | 0 | 1 |
 
 ---
 
 ## Brick Level Distribution
 
-| Level | Count | Fraction | Token Budget |
-|-------|-------|----------|--------------|
-| L1 (framework philosophy) | 15 | 16.9% | ≤400 tokens |
-| L2 (patterns / UNSAID) | 74 | 83.1% | ≤800 tokens |
-
-L1 bricks are framework-level anchors — WHY a framework is designed the way it is.
-L2 bricks are specific patterns, anti-patterns, and UNSAID knowledge.
+| Level | Count | Fraction |
+|-------|-------|----------|
+| L1 (framework philosophy) | 52 | 22.2% |
+| L2 (patterns / UNSAID) | 182 | 77.8% |
 
 ---
 
-## Files Produced
+## Scene Coverage
 
+### AI Application Stack
 ```
-races/r06/bricks/s1-sonnet/
-├── brick_forge.py              # Main script (works with adapter=None)
-├── DECISIONS.md                # Design decisions
-├── BRICK_INVENTORY.md          # This file
-├── bricks/
-│   ├── python_general.jsonl    # 16 bricks
-│   ├── fastapi_flask.jsonl     # 9 bricks
-│   ├── home_assistant.jsonl    # 8 bricks
-│   ├── obsidian_logseq.jsonl   # 6 bricks
-│   ├── go_general.jsonl        # 7 bricks
-│   ├── django.jsonl            # 7 bricks
-│   ├── react.jsonl             # 6 bricks
-│   ├── domain_finance.jsonl    # 6 bricks
-│   ├── domain_pkm.jsonl        # 6 bricks
-│   ├── domain_private_cloud.jsonl  # 6 bricks
-│   ├── domain_health.jsonl     # 6 bricks
-│   └── domain_info_ingestion.jsonl # 6 bricks
-└── tests/
-    └── test_brick_forge.py     # Comprehensive test suite
+LLM Orchestration:      LangChain + LangGraph
+RAG:                    LlamaIndex
+Provider Abstraction:   LiteLLM + OpenAI SDK
+Model Foundation:       HF Transformers
+Inference Serving:      vLLM (prod) + Ollama (local) + llama.cpp (edge)
+Agent:                  CrewAI
+Multimodal Generation:  Diffusers
+Observability:          Langfuse
+Prompt Programming:     DSPy
 ```
+
+### Web / General Stack
+```
+Python:       Python general + Django + FastAPI/Flask
+JavaScript:   TypeScript/Node.js + Next.js + React + Vue.js
+Java:         Java/Spring Boot
+Go:           Go general
+```
+
+### Vertical Domains
+```
+Finance, Health, PKM, Private Cloud, Info Ingestion
+Home Assistant, Obsidian/Logseq
+```
+
+### Non-AI Second Tier (5 targets, 44 bricks) — NEW 2026-03-24 (Codex)
+
+| File | Domain | Bricks | L1 | Failure |
+|------|--------|-------:|---:|--------:|
+| ruby_rails.jsonl | Ruby/Rails | 10 | 2 | 4 |
+| rust.jsonl | Rust | 10 | 2 | 2 |
+| php_laravel.jsonl | PHP/Laravel | 8 | 2 | 2 |
+| swift_ios.jsonl | Swift/iOS | 8 | 2 | 2 |
+| kotlin_android.jsonl | Kotlin/Android | 8 | 2 | 3 |
