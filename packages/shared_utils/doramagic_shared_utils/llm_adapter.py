@@ -108,7 +108,8 @@ class LLMAdapter:
         else:
             self._provider_override = provider_override
         self._clients: dict[str, Any] = {}
-        self._default_model: str = ""  # set by router or config
+        self._default_model: str = ""
+        self._base_url: Optional[str] = None  # For OpenAI-compatible APIs (GLM/Qwen/Kimi/DeepSeek/...)  # set by router or config
 
     def chat(
         self,
@@ -267,7 +268,13 @@ class LLMAdapter:
 
     async def _call_openai(self, model_id: str, messages: Sequence[LLMMessage], **kwargs) -> LLMResponse:
         import openai
-        client = self._get_or_create_client("openai", lambda: openai.AsyncOpenAI())
+        def _make_openai_client():
+            kw = {}
+            if self._base_url:
+                kw["base_url"] = self._base_url
+            return openai.AsyncOpenAI(**kw)
+        client_key = f"openai:{self._base_url or default}"
+        client = self._get_or_create_client(client_key, _make_openai_client)
         api_messages = [{"role": m.role, "content": m.content} for m in messages]
         resp = await client.chat.completions.create(
             model=model_id,
@@ -289,7 +296,13 @@ class LLMAdapter:
         tools: Sequence[LLMToolDefinition], **kwargs
     ) -> LLMResponse:
         import openai
-        client = self._get_or_create_client("openai", lambda: openai.AsyncOpenAI())
+        def _make_openai_client():
+            kw = {}
+            if self._base_url:
+                kw["base_url"] = self._base_url
+            return openai.AsyncOpenAI(**kw)
+        client_key = f"openai:{self._base_url or default}"
+        client = self._get_or_create_client(client_key, _make_openai_client)
         api_messages = [{"role": m.role, "content": m.content} for m in messages]
         api_tools = [
             {"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.parameters}}

@@ -107,6 +107,7 @@ class ModelDeclaration:
     capabilities: list[str]
     cost_tier: str = "medium"  # low, medium, high
     api_key_env: str = ""  # 环境变量名
+    base_url: str = ""  # OpenAI-compatible endpoint (GLM/Qwen/Kimi/DeepSeek/...)
     max_context_tokens: int = 128000
     supports_tool_use: bool = True
 
@@ -194,6 +195,10 @@ class CapabilityRouter:
         from doramagic_shared_utils.llm_adapter import LLMAdapter
         adapter = LLMAdapter(provider_override=result.provider)
         adapter._default_model = result.model_id
+        # Pass base_url for OpenAI-compatible providers (GLM/Qwen/Kimi/DeepSeek/...)
+        matched_model = next((m for m in self.models if m.model_id == result.model_id), None)
+        if matched_model and matched_model.base_url:
+            adapter._base_url = matched_model.base_url
         return adapter
 
     def route(self, required_capabilities: Sequence[str]) -> RoutingResult:
@@ -284,6 +289,19 @@ class CapabilityRouter:
             return RoutingResult(model_id="deterministic", provider="none")
         self._current_stage = stage_name
         return self.route(caps)
+
+    def build_adapter_for_stage(self, stage_name: str) -> "LLMAdapter":
+        """Route a stage and return a configured LLMAdapter ready to call."""
+        result = self.route_for_stage(stage_name)
+        if result.provider == "none":
+            return None  # deterministic stage, no LLM needed
+        from doramagic_shared_utils.llm_adapter import LLMAdapter
+        adapter = LLMAdapter(provider_override=result.provider)
+        adapter._default_model = result.model_id
+        matched = next((m for m in self.models if m.model_id == result.model_id), None)
+        if matched and matched.base_url:
+            adapter._base_url = matched.base_url
+        return adapter
 
     def _select_by_preference(self, candidates: list[ModelDeclaration]) -> ModelDeclaration:
         if self.preference == "lowest_sufficient":

@@ -189,6 +189,19 @@ class SoulExtractorBatch:
             )
             elapsed = int((time.monotonic() - start) * 1000)
 
+            # Run LLM stages (1-3) for knowledge extraction
+            try:
+                from doramagic_extraction.llm_stage_runner import run_llm_stages
+                router = self._get_or_build_router()
+                if router:
+                    llm_result = run_llm_stages(repo.local_path, output_dir, router)
+                    logger.info(
+                        "LLM stages for %s: completed=%s failed=%s",
+                        repo.repo_id, llm_result.stages_completed, llm_result.stages_failed,
+                    )
+            except Exception as e:
+                logger.warning("LLM stages skipped for %s: %s", repo.repo_id, e)
+
             # Read soul data from output
             soul = self._read_soul(output_dir)
 
@@ -218,6 +231,21 @@ class SoulExtractorBatch:
                     prompt_tokens=0, completion_tokens=0, estimated_cost_usd=0.0,
                 ),
             )
+
+    _router_cache = None
+
+    def _get_or_build_router(self):
+        """Build CapabilityRouter from models.json (cached)."""
+        if SoulExtractorBatch._router_cache is not None:
+            return SoulExtractorBatch._router_cache
+        try:
+            from doramagic_shared_utils.capability_router import CapabilityRouter
+            router = CapabilityRouter.from_config("models.json")
+            SoulExtractorBatch._router_cache = router
+            return router
+        except Exception as e:
+            logger.info("No models.json available, LLM stages disabled: %s", e)
+            return None
 
     def _read_soul(self, output_dir: str) -> dict:
         """Read extracted soul from output directory."""
