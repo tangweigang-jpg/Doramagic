@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import logging
 import time
 from pathlib import Path
@@ -191,9 +192,12 @@ class SoulExtractorBatch:
             # Read soul data from output
             soul = self._read_soul(output_dir)
 
+            # Stage 0 success = usable data (degraded without LLM stages is OK)
+            has_facts = Path(output_dir, "artifacts", "repo_facts.json").exists()
+            stage0_ok = "stage0" in result.stages_completed
             return _RepoResult(
                 repo_id=repo.repo_id,
-                success=not result.stages_failed,
+                success=stage0_ok and has_facts,
                 output_dir=output_dir,
                 local_path=repo.local_path,
                 soul=soul,

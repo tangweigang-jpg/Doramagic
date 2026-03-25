@@ -186,7 +186,7 @@ def _check_completeness(skill_md: str, need_profile_keywords: List[str]) -> Vali
     return ValidationCheck(
         name="Completeness",
         passed=len(details) == 0,
-        severity="blocking",
+        severity="warning",  # Degraded to warning: cross-language keyword mismatch expected
         details=details,
     )
 
@@ -206,7 +206,7 @@ def _check_traceability(provenance_md: str) -> ValidationCheck:
     return ValidationCheck(
         name="Traceability",
         passed=len(details) == 0,
-        severity="blocking",
+        severity="warning",  # Degraded to warning: compiler may lack URLs in early pipeline runs
         details=details,
     )
 

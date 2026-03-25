@@ -131,13 +131,13 @@ def _all_decisions(input_data: SkillCompilerInput) -> List[SynthesisDecision]:
     return decisions
 
 
-def _unresolved_items(input_data: SkillCompilerInput) -> List[str]:
+def _outstanding_items(input_data: SkillCompilerInput) -> List[str]:
     issues = []
     for conflict in input_data.synthesis_report.conflicts:
         issues.append("{0}: {1}".format(conflict.conflict_id, conflict.title))
     for decision in _all_decisions(input_data):
         if decision.decision == "option":
-            issues.append("{0}: unresolved option".format(decision.decision_id))
+            issues.append("{0}: outstanding option".format(decision.decision_id))
     return issues
 
 
@@ -309,7 +309,7 @@ def _limitations_markdown(
 ) -> str:
     lines = ["# Limitations", ""]
     if not excluded and not conflicts:
-        lines.append("No explicit exclusions or unresolved conflicts were supplied.")
+        lines.append("No explicit exclusions or outstanding conflicts were supplied.")
         return "\n".join(lines).strip() + "\n"
 
     if excluded:
@@ -383,9 +383,9 @@ def run_skill_compiler(
     if getattr(input_data, "platform_rules", None) is None:
         return _blocked_envelope(ErrorCodes.UPSTREAM_MISSING)
 
-    unresolved_items = _unresolved_items(input_data)
-    if unresolved_items:
-        return _blocked_envelope(ErrorCodes.UNRESOLVED_CONFLICT)
+    outstanding_items = _outstanding_items(input_data)
+    if outstanding_items:
+        return _blocked_envelope(ErrorCodes.OUTSTANDING_CONFLICT)
 
     skill_name = _skill_name(input_data)
     output_dir = _output_dir(skill_name)

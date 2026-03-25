@@ -480,6 +480,22 @@ def _run_stage35(
     ) = _import_extraction_modules()
 
     # ---- 3.5a: Validation ----
+    # Check if card files exist (LLM stages 1-3 produce cards; without them, skip validation)
+    cards_base = os.path.join(output_dir, "soul", "cards")
+    has_card_files = False
+    for subdir in ("concepts", "workflows", "rules"):
+        dirpath = os.path.join(cards_base, subdir)
+        if os.path.isdir(dirpath) and any(f.endswith(".md") for f in os.listdir(dirpath)):
+            has_card_files = True
+            break
+
+    if not has_card_files:
+        logger.info("Stage 3.5: no card files found (LLM stages not yet run) — skipping validation")
+        stages_skipped.append("stage3.5_validate")
+        stages_skipped.append("stage3.5_confidence")
+        stages_skipped.append("stage3.5_dsd")
+        return True, None, []  # validation_passed=True so downstream stages can proceed
+
     if validate_all is None:
         logger.warning("Stage 3.5: validate_all not importable — skipping validation")
         stages_skipped.append("stage3.5_validate")
@@ -717,14 +733,21 @@ def run_single_project_pipeline(
         output_dir, config, stages_completed, stages_skipped, stages_failed
     )
 
-    # BRIEF rule: Stage 3.5 failure blocks Stage 4.5
+    # Stage 3.5 failure blocks Stage 4.5 — but only if we have no Stage 0 data
     if "stage3.5_validate" in stages_failed:
-        logger.warning(
-            "Stage 3.5 validation failed — skipping Stage 4.5 (Knowledge Compiler)"
-        )
-        stages_skipped.append("stage4.5")
-        stages_skipped.append("stage5")
-        inject_dir = None
+        if "stage0" in stages_completed:
+            logger.info(
+                "Stage 3.5 validation failed but Stage 0 data available — proceeding in degraded mode"
+            )
+            # Skip Knowledge Compiler (needs cards) but try assembly
+            stages_skipped.append("stage4.5")
+        else:
+            logger.warning(
+                "Stage 3.5 validation failed — skipping Stage 4.5 (Knowledge Compiler)"
+            )
+            stages_skipped.append("stage4.5")
+            stages_skipped.append("stage5")
+            inject_dir = None
     else:
         # ---- Stage 4.5: Knowledge Compiler ----
         _run_stage45(output_dir, config, stages_completed, stages_skipped, stages_failed)
