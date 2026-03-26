@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Doramagic Single-Shot v11.0 — brick-enriched + fast path + Socratic gate.
+"""Doramagic Single-Shot v12.0 — Skill Architect + reference-driven + self-repair.
 
 v11.0 changes:
   - Domain brick integration: 278 bricks (34 domains) injected into SKILL.md and extraction prompts
@@ -206,7 +206,7 @@ class DebugLogger:
         self._current_stage: str = ""
         self._stage_start: float = 0.0
         self._write("=" * 72)
-        self._write("Doramagic Single-Shot v11.0 — Debug Log")
+        self._write("Doramagic Single-Shot v12.0 — Debug Log")
         self._write("Run ID: %s" % run_id)
         self._write("Started: %s" % datetime.now().isoformat())
         self._write("=" * 72)
@@ -327,7 +327,7 @@ class DebugLogger:
 
 # ── LLM API ──
 
-def call_llm(system_prompt, user_prompt, max_tokens=4096, stage_name=None):
+def call_llm(system_prompt, user_prompt, max_tokens=4096, stage_name=None, timeout=60):
     """Call LLM API directly via requests. Returns response text."""
     import requests
 
@@ -347,7 +347,7 @@ def call_llm(system_prompt, user_prompt, max_tokens=4096, stage_name=None):
             "max_tokens": max_tokens,
             "temperature": 0.3,
         },
-        timeout=120,
+        timeout=timeout,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -891,19 +891,294 @@ def synthesize(souls, intent):
         return None
 
 
+# ── Reference Skill Loading ──
+
+_REFERENCE_LEVELS = {
+    "simple": "simple.md",      # code-review-expert, 156 lines — tool skills
+    "medium": "medium.md",      # script-writer, 570 lines — platform/integration skills
+    "complex": "complex.md",    # n8n (truncated 300 lines) — high-risk/complex domains
+}
+
+_HIGH_RISK_DOMAINS = [
+    "health", "medical", "fitness", "wellness", "diagnosis", "symptom",
+    "finance", "accounting", "investment", "trading", "tax",
+    "security", "auth", "encryption", "credential",
+    "legal", "compliance", "regulation",
+]
+
+
+def _select_reference_level(domain, user_type):
+    """Select reference skill complexity based on domain risk and user type."""
+    domain_lower = (domain or "").lower()
+    if any(k in domain_lower for k in _HIGH_RISK_DOMAINS):
+        return "complex"
+    if user_type == "developer":
+        return "medium"
+    return "simple"
+
+
+def _load_reference_skill(level):
+    """Load reference SKILL.md content. Returns first 80 lines to keep prompt compact."""
+    filename = _REFERENCE_LEVELS.get(level, "simple.md")
+    candidates = [
+        SCRIPT_DIR.parent / "references" / filename,
+        SCRIPT_DIR.parent.parent / "references" / filename,
+    ]
+    for path in candidates:
+        if path.exists():
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+                return "\n".join(lines[:80])
+            except Exception:
+                pass
+    return ""
+
+
+# ── Skill Architect (LLM-powered compile) ──
+
+SKILL_ARCHITECT_SYSTEM = """You are a Skill Architect. Your job is to compile raw materials into a high-quality SKILL.md — an AI agent instruction set that makes an AI assistant genuinely smarter in a specific domain.
+
+## What you receive
+
+1. A REFERENCE SKILL — a gold-standard example of what a good SKILL.md looks like. Your output MUST match its structural depth and quality.
+2. RAW MATERIALS — synthesis results, soul extractions from real projects, and domain baseline knowledge (bricks).
+3. USER CONTEXT — domain, intent, user type.
+
+## Output format
+
+Output ONLY the SKILL.md content as raw markdown. No code fences, no explanations, no preamble.
+
+## Required sections (all mandatory)
+
+1. **YAML Frontmatter** — name (concise, max 40 chars), description (1-2 sentences, trigger-oriented: "Use when...")
+2. **# Title** — the skill's display name
+3. **## Role** — who the AI becomes, specific to this domain
+4. **## When to Use** — concrete trigger phrases and scenarios (3-5 bullets)
+5. **## Domain Knowledge** — design principles with source attribution. Only use knowledge from the provided materials. Never invent.
+6. **## Decision Framework** — at least 2 trade-off pairs with "When to choose A vs B" guidance
+7. **## Recommended Workflow** — at least 5 actionable steps the user should follow
+8. **## Anti-patterns & UNSAID Warnings** — at least 3 pitfalls. Bricks with [RISK] or [CONSTRAINT] tags are highest priority — include their UNSAID content COMPLETELY, never truncate.
+9. **## Safety Boundaries** — what this skill does NOT do, when to escalate/refuse
+10. **## Capabilities** — concrete things the AI can help with (5-8 bullets)
+11. **## Source Projects** — list of projects/skills that contributed knowledge, with what each contributed
+
+## Domain safety rules (MANDATORY for high-risk domains)
+
+- Health/Medical: MUST include "This is not medical advice. For serious symptoms, consult a healthcare professional." in Safety Boundaries. MUST include emergency triage guidance.
+- Finance/Investment: MUST include "This does not constitute financial or investment advice." in Safety Boundaries.
+- Security: MUST include "Never handle real credentials or secrets in this context." in Safety Boundaries.
+- Legal: MUST include "This is not legal advice. Consult a qualified attorney." in Safety Boundaries.
+
+## Quality standards
+
+- Total length: 80-250 lines
+- Workflow: ≥ 5 steps with clear actions
+- Decision Framework: ≥ 2 trade-off analyses
+- Anti-patterns: ≥ 3 items with severity labels [HIGH/MEDIUM/LOW]
+- Every knowledge claim must cite its source (project name or brick ID)
+
+## Critical rules
+
+- NEVER invent knowledge. Only compile from the provided materials.
+- Bricks are expert-curated domain facts — treat them as highest-confidence knowledge.
+- ClawHub skills in the "Reference Tools" section are market context, NOT knowledge sources. List them in Source Projects but don't extract design principles from their summaries.
+- If materials are sparse, produce a shorter but accurate skill. Do NOT pad with generic advice.
+- Output in the same language as the user's original intent (Chinese intent → Chinese skill, English → English)."""
+
+
+def _build_compile_prompt(synthesis, souls, profile, bricks, reference_content,
+                          max_chars=16000):
+    """Assemble the compile prompt with all raw materials for the Skill Architect.
+
+    max_chars: hard cap on total prompt size to avoid context window overflow.
+    """
+    parts = []
+
+    # Section 1: User context
+    parts.append("## User Context")
+    parts.append("- Domain: %s" % profile.get("domain", "general"))
+    parts.append("- Intent: %s" % profile.get("intent", ""))
+    parts.append("- Intent (English): %s" % profile.get("intent_en", ""))
+    parts.append("- User type: %s" % profile.get("user_type", "unknown"))
+    parts.append("")
+
+    # Section 2: Reference skill (few-shot example)
+    if reference_content:
+        parts.append("## Reference Skill (gold standard — match this quality)")
+        parts.append(reference_content)
+        parts.append("")
+
+    # Section 3: Synthesis results
+    if synthesis:
+        parts.append("## Synthesis Results")
+        consensus = synthesis.get("consensus_whys", [])
+        if consensus:
+            parts.append("### Consensus Design Principles")
+            for c in consensus:
+                sources = ", ".join(c.get("sources", []))
+                parts.append("- %s (from: %s)" % (c.get("statement", ""), sources))
+
+        divergent = synthesis.get("divergent_whys", [])
+        if divergent:
+            parts.append("### Divergent Approaches (trade-offs)")
+            for d in divergent:
+                parts.append("- %s" % json.dumps(d, ensure_ascii=False))
+
+        traps = synthesis.get("combined_traps", [])
+        if traps:
+            parts.append("### Known Traps")
+            for t in traps:
+                parts.append("- [%s] %s (source: %s)" % (
+                    t.get("severity", "medium").upper(), t.get("trap", ""), t.get("source", "")))
+
+        contract = synthesis.get("skill_contract", {})
+        if contract:
+            parts.append("### Skill Contract")
+            parts.append("- Purpose: %s" % contract.get("purpose", ""))
+            caps = contract.get("capabilities", [])
+            if caps:
+                parts.append("- Capabilities: %s" % ", ".join(caps))
+            rec = synthesis.get("recommendation", "")
+            if rec:
+                parts.append("- Key Insight: %s" % rec)
+        parts.append("")
+
+    # Section 4: Soul details (from GitHub repos — real extractions)
+    repo_souls = [s for s in souls if s.get("source") not in ("clawhub", "local", "clawhub_ref")]
+    if repo_souls:
+        parts.append("## Soul Extractions (from real project source code)")
+        for soul in repo_souls:
+            parts.append("### %s" % soul.get("project_name", "unknown"))
+            parts.append("- Philosophy: %s" % soul.get("design_philosophy", ""))
+            parts.append("- Mental Model: %s" % soul.get("mental_model", ""))
+            for d in soul.get("why_decisions", []):
+                parts.append("- WHY: %s (evidence: %s, confidence: %s)" % (
+                    d.get("decision", ""), d.get("evidence", ""), d.get("confidence", "")))
+            for t in soul.get("unsaid_traps", []):
+                parts.append("- UNSAID: [%s] %s" % (t.get("severity", "medium"), t.get("trap", "")))
+            parts.append("")
+
+    # Section 5: Domain bricks (FULL content, never truncated)
+    if bricks:
+        parts.append("## Domain Baseline Knowledge (expert-curated bricks)")
+        parts.append("These are verified domain facts. Include them COMPLETELY in the output, especially UNSAID content.")
+        parts.append("")
+        for brick in bricks[:20]:  # Cap at 20 bricks
+            stmt = brick.get("statement", "")
+            ktype = brick.get("knowledge_type", "fact")
+            brick_id = brick.get("brick_id", "")
+            confidence = brick.get("confidence", "medium")
+            label = {"failure": "RISK", "constraint": "CONSTRAINT", "capability": "CAPABILITY"}.get(ktype, "FACT")
+            parts.append("- [%s] (id: %s, confidence: %s) %s" % (label, brick_id, confidence, stmt))
+        parts.append("")
+
+    # Section 6: Reference tools (ClawHub/Local — market context only)
+    clawhub_souls = [s for s in souls if s.get("source") in ("clawhub", "clawhub_ref")]
+    local_souls = [s for s in souls if s.get("source") == "local"]
+    if clawhub_souls or local_souls:
+        parts.append("## Reference Tools (market context, NOT knowledge sources)")
+        for s in clawhub_souls:
+            name = s.get("project_name", "").replace("clawhub:", "")
+            desc = s.get("design_philosophy", "")
+            parts.append("- ClawHub: %s — %s" % (name, desc))
+        for s in local_souls[:3]:
+            name = s.get("project_name", "").replace("local:", "")
+            desc = s.get("design_philosophy", "")
+            if desc:
+                parts.append("- Local: %s — %s" % (name, desc))
+        parts.append("")
+
+    prompt = "\n".join(parts)
+    if len(prompt) > max_chars:
+        prompt = prompt[:max_chars] + "\n\n...[prompt truncated to %d chars]" % max_chars
+        if _debug_logger is not None:
+            _debug_logger.detail("compile prompt TRUNCATED to %d chars" % max_chars)
+    return prompt
+
+
+def _strip_code_fences(text):
+    """Remove markdown code fence wrappers if LLM wraps entire output in ```markdown...```.
+
+    Only strips if the FIRST line is a code fence opener AND the LAST line is ```.
+    This avoids accidentally removing code blocks that are part of the SKILL.md content.
+    """
+    text = text.strip()
+    lines = text.split("\n")
+    if len(lines) >= 3 and lines[0].startswith("```") and lines[-1].strip() == "```":
+        text = "\n".join(lines[1:-1])
+    return text
+
+
+def _validate_skill_md(skill_md, domain):
+    """Validate generated SKILL.md. Returns list of issues (empty = pass).
+
+    Checks structure (sections), content (safety boundaries per domain),
+    and minimum quality (line count).
+    """
+    issues = []
+    lines = skill_md.strip().splitlines()
+    lower = skill_md.lower()
+
+    # Frontmatter check
+    if not skill_md.strip().startswith("---"):
+        issues.append("Missing YAML frontmatter")
+
+    # Must have ## Safety Boundaries section
+    if "## Safety Boundaries" not in skill_md and "## Safety" not in skill_md:
+        issues.append("Missing ## Safety Boundaries section")
+
+    # Section count
+    h2_count = sum(1 for line in lines if line.startswith("## "))
+    if h2_count < 5:
+        issues.append("Only %d sections (need >= 5)" % h2_count)
+
+    # Length check
+    if len(lines) < 50:
+        issues.append("Only %d lines (need >= 50)" % len(lines))
+
+    # Domain-specific safety checks (strict per-domain rules)
+    domain_lower = (domain or "").lower()
+
+    # Health/Medical — requires BOTH disclaimer AND emergency triage
+    if any(k in domain_lower for k in ("health", "medical", "diagnosis", "symptom")):
+        if not ("not medical advice" in lower or "非医疗建议" in lower
+                or "consult a healthcare professional" in lower or "请咨询医疗专业人员" in lower):
+            issues.append("Health domain missing required medical disclaimer")
+        if not any(t in lower for t in ("emergency", "急诊", "chest pain", "胸痛",
+                                         "difficulty breathing", "呼吸困难", "请立即就医",
+                                         "call emergency", "seek immediate")):
+            issues.append("Health domain missing emergency triage guidance")
+
+    # Finance — requires disclaimer
+    if any(k in domain_lower for k in ("finance", "investment", "trading", "tax")):
+        if not ("not financial advice" in lower or "不构成投资建议" in lower
+                or "not investment advice" in lower or "非投资建议" in lower):
+            issues.append("Finance domain missing financial disclaimer")
+
+    # Legal — requires disclaimer
+    if any(k in domain_lower for k in ("legal", "compliance", "regulation")):
+        if not ("not legal advice" in lower or "非法律建议" in lower):
+            issues.append("Legal domain missing legal disclaimer")
+
+    return issues
+
+
 # ── Fast Path Synthesis (Python-only, no LLM) ──
 
 
 def _synthesize_fast(souls, profile):
-    """Synthesize from ClawHub/Local souls without LLM call.
+    """Synthesize from souls without LLM call.
 
-    When fast path skips GitHub, ClawHub skills already have structured
-    descriptions. We compile directly instead of asking LLM to synthesize.
+    Only REAL repo souls contribute to consensus knowledge.
+    ClawHub/Local are reference tools only — NOT knowledge sources.
     """
-    # Collect design philosophies as consensus
+    # Only repo souls contribute knowledge (not ClawHub marketing copy)
+    repo_souls = [s for s in souls if s.get("source") not in ("clawhub", "local", "clawhub_ref")]
+
+    # Collect design philosophies as consensus — ONLY from real repos
     consensus = []
     seen_statements = set()
-    for soul in souls:
+    for soul in repo_souls:
         phil = soul.get("design_philosophy", "").strip()
         if phil and phil not in seen_statements:
             consensus.append({
@@ -912,9 +1187,9 @@ def _synthesize_fast(souls, profile):
             })
             seen_statements.add(phil)
 
-    # Collect traps
+    # Collect traps — ONLY from real repos
     traps = []
-    for soul in souls:
+    for soul in repo_souls:
         for trap in soul.get("unsaid_traps", []):
             trap_text = trap.get("trap", "")
             if trap_text:
@@ -924,9 +1199,9 @@ def _synthesize_fast(souls, profile):
                     "source": soul["project_name"],
                 })
 
-    # Collect capabilities from why_decisions
+    # Collect capabilities — ONLY from real repos
     capabilities = []
-    for soul in souls:
+    for soul in repo_souls:
         for d in soul.get("why_decisions", []):
             decision = d.get("decision", "")
             if decision:
@@ -949,26 +1224,99 @@ def _synthesize_fast(souls, profile):
 
 
 def compile_skill(synthesis, souls, profile, bricks=None):
-    """Compile into an actionable SKILL.md — an AI agent instruction set, not a report.
+    """LLM-powered Skill Architect: compile raw materials into ClawHub-quality SKILL.md.
 
-    Doramagic 产品之魂：不教用户做事，给他工具。
-    SKILL.md 是注入 AI 助手的指令集，让助手在特定领域变聪明。
-    bricks: optional list of domain brick dicts to inject as baseline knowledge.
+    v12.0: Uses LLM with reference skill + validation + self-repair loop.
+    Falls back to template if LLM fails completely.
     """
+    domain = profile.get("domain", "general")
+    user_type = profile.get("user_type", "unknown")
+
+    # 1. Select and load reference skill
+    ref_level = _select_reference_level(domain, user_type)
+    ref_content = _load_reference_skill(ref_level)
+    if _debug_logger is not None:
+        _debug_logger.detail("reference skill: level=%s, loaded=%d chars" % (ref_level, len(ref_content)))
+
+    # 2. Build compile prompt
+    prompt = _build_compile_prompt(synthesis, souls, profile, bricks, ref_content)
+
+    # 3. Round 1: LLM compile
+    try:
+        skill_md = call_llm(
+            SKILL_ARCHITECT_SYSTEM, prompt,
+            max_tokens=6000, stage_name="compile_skill",
+        )
+        skill_md = _strip_code_fences(skill_md)
+    except Exception as e:
+        _log("Skill Architect LLM failed: %s — falling back to template" % e)
+        if _debug_logger is not None:
+            _debug_logger.detail("compile LLM FAILED: %s — using template fallback" % e)
+        return _compile_skill_template(synthesis, souls, profile, bricks)
+
+    # 4. Validate
+    issues = _validate_skill_md(skill_md, domain)
+    if _debug_logger is not None:
+        if issues:
+            _debug_logger.detail("validation issues: %s" % issues)
+        else:
+            _debug_logger.detail("validation PASSED")
+
+    # 5. Round 2: Fix if issues found
+    if issues:
+        _log("Skill validation found %d issues, requesting LLM fix..." % len(issues))
+        try:
+            fix_prompt = (
+                "The following SKILL.md has these quality issues that must be fixed:\n\n"
+                + "\n".join("- %s" % i for i in issues)
+                + "\n\nFix ALL issues and return the complete corrected SKILL.md. "
+                + "Do not explain, just output the fixed markdown.\n\n"
+                + skill_md
+            )
+            skill_md_fixed = call_llm(
+                SKILL_ARCHITECT_SYSTEM, fix_prompt,
+                max_tokens=6000, stage_name="compile_skill_fix",
+            )
+            skill_md_fixed = _strip_code_fences(skill_md_fixed)
+
+            # Re-validate
+            remaining = _validate_skill_md(skill_md_fixed, domain)
+            if _debug_logger is not None:
+                _debug_logger.detail("post-fix validation: %d remaining issues" % len(remaining))
+
+            # Check if high-risk domain still missing safety — hard block
+            is_high_risk = any(k in domain.lower() for k in _HIGH_RISK_DOMAINS)
+            safety_missing = any("safety boundary" in i.lower() or "missing safety" in i.lower() for i in remaining)
+            if is_high_risk and safety_missing:
+                _log("HIGH-RISK domain '%s' still missing safety boundary after fix — blocking output" % domain)
+                if _debug_logger is not None:
+                    _debug_logger.detail("BLOCKED: high-risk domain missing safety after 2 LLM rounds")
+                return _compile_skill_template(synthesis, souls, profile, bricks)
+
+            skill_md = skill_md_fixed
+        except Exception as e:
+            _log("Skill fix LLM failed: %s — using round 1 output" % e)
+            if _debug_logger is not None:
+                _debug_logger.detail("fix LLM FAILED: %s — keeping round 1" % e)
+
+    # Append generation footer
+    if "*Generated by Doramagic" not in skill_md:
+        skill_md += "\n\n---\n*Generated by Doramagic v12.0 — 不教用户做事，给他工具。*"
+
+    return skill_md
+
+
+def _compile_skill_template(synthesis, souls, profile, bricks=None):
+    """Fallback: Python template compilation (v11.0 style). Used when LLM fails."""
     contract = synthesis.get("skill_contract", {})
     purpose = contract.get("purpose", profile.get("intent", ""))
     capabilities = contract.get("capabilities", [])
-    workflow = contract.get("workflow_steps", [])
     consensus = synthesis.get("consensus_whys", [])
-    divergent = synthesis.get("divergent_whys", [])
     traps = synthesis.get("combined_traps", [])
-    recommendation = synthesis.get("recommendation", "")
     domain = profile.get("domain", "general")
     intent_en = profile.get("intent_en", purpose)
-
-    # Sanitize topic for skill name
     topic = profile.get("topic", "custom-skill")
-    skill_name = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff_-]", "-", topic)[:30].strip("-")
+    skill_name = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff_-]", "-", topic)[:40].strip("-")
 
     lines = [
         "---",
@@ -979,94 +1327,40 @@ def compile_skill(synthesis, souls, profile, bricks=None):
         "domain: %s" % domain,
         "tags: [doramagic-generated]",
         "---\n",
+        "# %s\n" % topic,
+        "## Role\n",
+        "You are a domain expert in **%s**.\n" % domain,
     ]
 
-    # ── Section 1: Role & Mission (the agent's identity) ──
-    lines.append("# %s\n" % topic)
-    lines.append("## Role\n")
-    lines.append("You are a domain expert in **%s**. " % domain)
-    lines.append("When the user asks about %s, " % topic)
-    lines.append("apply the knowledge below to give informed, practical advice.\n")
-
-    # ── Section 2: Domain Knowledge (the WHY — what makes you an expert) ──
     if consensus:
-        lines.append("## Domain Knowledge — Design Principles\n")
-        lines.append("These principles are extracted from real-world open-source projects in this domain.\n")
+        lines.append("## Domain Knowledge\n")
         for w in consensus:
             src = ", ".join(w.get("sources", []))
-            lines.append("- **%s** — learned from: %s" % (w["statement"], src))
+            lines.append("- %s (from: %s)" % (w.get("statement", ""), src))
         lines.append("")
 
-    # ── Section 2b: Domain Baseline Knowledge (from bricks) ──
     if bricks:
         lines.append("## Domain Baseline Knowledge\n")
-        lines.append("These are verified facts about this domain, independent of any specific project.\n")
-        for brick in bricks[:10]:  # Cap at 10 bricks to avoid bloat
+        for brick in bricks[:10]:
             stmt = brick.get("statement", "")
-            ktype = brick.get("knowledge_type", "")
             if stmt:
-                label = {"failure": "RISK", "constraint": "CONSTRAINT", "capability": "CAPABILITY"}.get(
-                    ktype, "FACT"
-                )
-                lines.append("- **[%s]** %s" % (label, stmt[:300]))
+                lines.append("- %s" % stmt)  # No truncation in fallback either
         lines.append("")
 
-    # ── Section 3: Decision Framework (when approaches conflict) ──
-    if divergent:
-        lines.append("## Decision Framework — Trade-offs\n")
-        lines.append("When advising on architecture choices, consider these known trade-offs:\n")
-        for d in divergent:
-            lines.append("- **%s**" % d.get("statement", ""))
-            lines.append("  - Approach A (%s): %s" % (d.get("side_a", "?"), d.get("side_a", "")))
-            lines.append("  - Approach B (%s): %s" % (d.get("side_b", "?"), d.get("side_b", "")))
-        lines.append("")
-
-    # ── Section 4: Anti-patterns (the UNSAID — protect the user) ──
     if traps:
-        lines.append("## Anti-patterns — UNSAID Warnings\n")
-        lines.append("These are pitfalls that documentation doesn't warn about. "
-                     "Proactively warn the user when they're heading toward one.\n")
+        lines.append("## Warnings\n")
         for t in traps:
-            sev = t.get("severity", "medium").upper()
-            lines.append("- **[%s]** %s" % (sev, t["trap"]))
+            lines.append("- [%s] %s" % (t.get("severity", "medium").upper(), t.get("trap", "")))
         lines.append("")
 
-    # ── Section 5: Capabilities (what you can help with) ──
     if capabilities:
         lines.append("## Capabilities\n")
-        lines.append("You can help the user with:\n")
         for c in capabilities:
             lines.append("- %s" % c)
         lines.append("")
 
-    # ── Section 6: Workflow (how to approach tasks) ──
-    if workflow:
-        lines.append("## Recommended Workflow\n")
-        lines.append("When the user starts a new task in this domain, follow these steps:\n")
-        for i, step in enumerate(workflow, 1):
-            lines.append("%d. %s" % (i, step))
-        lines.append("")
-
-    # ── Section 7: Key Insight ──
-    if recommendation:
-        lines.append("## Key Insight\n")
-        lines.append("> %s\n" % recommendation)
-
-    # ── Section 8: Mental Models (quick reference) ──
-    repo_souls = [s for s in souls if s.get("source") not in ("clawhub", "local")]
-    if repo_souls:
-        lines.append("## Source Projects — Mental Models\n")
-        for soul in repo_souls:
-            name = soul.get("project_name", "?")
-            model = soul.get("mental_model", "")
-            if model:
-                lines.append("- **%s**: %s" % (name, model))
-        lines.append("")
-
     lines.append("---")
-    lines.append(
-        "*Generated by Doramagic v11.0 — 不教用户做事，给他工具。*"
-    )
+    lines.append("*Generated by Doramagic v12.0 (template fallback) — 不教用户做事，给他工具。*")
     return "\n".join(lines)
 
 
@@ -1074,7 +1368,7 @@ def compile_skill(synthesis, souls, profile, bricks=None):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Doramagic Single-Shot v11.0")
+    parser = argparse.ArgumentParser(description="Doramagic Single-Shot v12.0")
     parser.add_argument("--input", required=True, help="User input text")
     parser.add_argument("--run-dir", required=True, help="Base run directory")
     parser.add_argument(
