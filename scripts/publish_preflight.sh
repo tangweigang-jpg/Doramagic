@@ -141,7 +141,18 @@ else
     pass "TODOS.md not tracked"
 fi
 
-# ── 6. Version consistency ──
+# ── 6. Stranger test — list non-code files for human review ──
+echo -e "\n${BOLD}[6/9] Stranger test (manual review required)${NC}"
+NON_CODE=$(git ls-files '*.md' '*.txt' '*.rst' '*.html' '*.pdf' '*.py' | grep -v '^packages/\|^tests/\|^scripts/\|^skills/doramagic/\|^bricks/\|^data/fixtures/' | grep -v '^README\|^LICENSE\|^CHANGELOG\|^CONTRIBUTING\|^SECURITY\|^INSTALL\|^Makefile\|^pyproject\|^\.env\|^\.git\|^models\.json' || true)
+if [[ -z "$NON_CODE" ]]; then
+    pass "No unexpected non-code files"
+else
+    warn "Non-standard files tracked — does a stranger need each of these?"
+    echo "$NON_CODE" | sed 's/^/         /'
+    echo -e "         ${YELLOW}^ Review each file above. Remove if it fails the stranger test.${NC}"
+fi
+
+# ── 7. Version consistency ──
 echo -e "\n${BOLD}[6/8] Version consistency${NC}"
 
 # Extract version from pyproject.toml
@@ -162,7 +173,7 @@ else
 fi
 
 # ── 7. README freshness ──
-echo -e "\n${BOLD}[7/8] README freshness${NC}"
+echo -e "\n${BOLD}[8/9] README freshness${NC}"
 README_VER=$(grep -oP 'v\d+\.\d+\.\d+' README.md 2>/dev/null | head -1 || echo "none")
 echo "         README mentions: $README_VER"
 if [[ "$README_VER" == "v${SKILL_VER}" ]] || [[ "$README_VER" == "${SKILL_VER}" ]]; then
@@ -172,7 +183,7 @@ else
 fi
 
 # ── 8. Lockfile tracked ──
-echo -e "\n${BOLD}[8/8] Dependency lockfile${NC}"
+echo -e "\n${BOLD}[9/9] Dependency lockfile${NC}"
 if [[ -f "uv.lock" ]]; then
     if git ls-files uv.lock 2>/dev/null | grep -q .; then
         pass "uv.lock exists and is tracked"
