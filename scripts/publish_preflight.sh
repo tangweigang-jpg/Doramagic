@@ -41,11 +41,16 @@ for f in README.md LICENSE CHANGELOG.md CONTRIBUTING.md SECURITY.md .env.example
     fi
 done
 
+# Helper: grep only git-tracked files
+grep_tracked() {
+    # $1 = pattern, rest = grep flags
+    local pattern="$1"; shift
+    git ls-files -z "$@" | xargs -0 grep -n "$pattern" 2>/dev/null || true
+}
+
 # ── 2. No hardcoded internal IPs ──
 echo -e "\n${BOLD}[2/8] No hardcoded internal IPs${NC}"
-IP_HITS=$(grep -rn '192\.168\.[0-9]\+\.[0-9]\+' --include='*.py' --include='*.sh' --include='*.md' --include='*.yml' --include='*.yaml' --include='*.json' \
-    --exclude-dir=.git --exclude-dir=.gstack --exclude-dir=runs --exclude-dir=__pycache__ \
-    --exclude='publish_preflight.sh' . 2>/dev/null || true)
+IP_HITS=$(grep_tracked '192\.168\.[0-9]\+\.[0-9]\+' -- '*.py' '*.sh' '*.md' '*.yml' '*.yaml' '*.json' | grep -v 'publish_preflight.sh' || true)
 if [[ -z "$IP_HITS" ]]; then
     pass "No internal IPs found"
 else
@@ -55,10 +60,7 @@ fi
 
 # ── 3. No credentials or secrets ──
 echo -e "\n${BOLD}[3/8] No credentials or secrets${NC}"
-SECRET_HITS=$(grep -rn 'sk-ant\|sk-[a-zA-Z0-9]\{20,\}\|ghp_\|gho_\|github_pat_\|password\s*=\s*["\x27][A-Za-z0-9]' \
-    --include='*.py' --include='*.ts' --include='*.js' --include='*.json' --include='*.md' \
-    --exclude-dir=.git --exclude-dir=.gstack --exclude-dir=__pycache__ \
-    --exclude='.env.example' --exclude='models.json.example' --exclude='publish_preflight.sh' . 2>/dev/null || true)
+SECRET_HITS=$(grep_tracked 'sk-ant\|sk-[a-zA-Z0-9]\{20,\}\|ghp_\|gho_\|github_pat_\|password\s*=\s*["\x27][A-Za-z0-9]' -- '*.py' '*.ts' '*.js' '*.json' '*.md' | grep -v '.env.example\|models.json.example\|publish_preflight.sh' || true)
 if [[ -z "$SECRET_HITS" ]]; then
     pass "No secrets found"
 else
@@ -68,10 +70,7 @@ fi
 
 # ── 4. No hardcoded paths ──
 echo -e "\n${BOLD}[4/8] No hardcoded user paths${NC}"
-PATH_HITS=$(grep -rn '/Users/\|/home/tangsir\|/home/admin\|vibecoding\|Doramagic-racer' \
-    --include='*.py' --include='*.sh' --include='*.md' --include='*.yml' \
-    --exclude-dir=.git --exclude-dir=.gstack --exclude-dir=__pycache__ \
-    --exclude='publish_preflight.sh' . 2>/dev/null || true)
+PATH_HITS=$(grep_tracked '/Users/\|/home/tangsir\|/home/admin\|vibecoding\|Doramagic-racer' -- '*.py' '*.sh' '*.md' '*.yml' | grep -v 'publish_preflight.sh' || true)
 if [[ -z "$PATH_HITS" ]]; then
     pass "No hardcoded user paths"
 else
@@ -89,7 +88,7 @@ INTERNAL_PATTERNS=(
 )
 INTERNAL_HITS=""
 for pattern in "${INTERNAL_PATTERNS[@]}"; do
-    hits=$(find . -name "*${pattern}*" -not -path './.git/*' -not -path './.gstack/*' -not -path './runs/*' 2>/dev/null || true)
+    hits=$(git ls-files "*${pattern}*" 2>/dev/null || true)
     [[ -n "$hits" ]] && INTERNAL_HITS="${INTERNAL_HITS}${hits}\n"
 done
 if [[ -z "$INTERNAL_HITS" ]]; then
@@ -100,7 +99,7 @@ else
 fi
 
 # Date-stamped files (AI session artifacts)
-DATE_HITS=$(find . -name "2026[0-9]*_*.md" -not -path './.git/*' -not -path './.gstack/*' -not -path './runs/*' 2>/dev/null || true)
+DATE_HITS=$(git ls-files '2026[0-9]*_*.md' '**/2026[0-9]*_*.md' 2>/dev/null || true)
 if [[ -z "$DATE_HITS" ]]; then
     pass "No date-stamped files"
 else
@@ -109,8 +108,7 @@ else
 fi
 
 # Binary files
-BINARY_HITS=$(find . \( -name '*.pdf' -o -name '*.png' -o -name '*.jpg' -o -name '*.xlsx' -o -name '*.zip' -o -name '*.tar.gz' \) \
-    -not -path './.git/*' -not -path './.gstack/*' 2>/dev/null || true)
+BINARY_HITS=$(git ls-files '*.pdf' '*.png' '*.jpg' '*.jpeg' '*.xlsx' '*.zip' '*.tar.gz' 2>/dev/null || true)
 if [[ -z "$BINARY_HITS" ]]; then
     pass "No binary files"
 else
@@ -119,8 +117,7 @@ else
 fi
 
 # Backup files
-BACKUP_HITS=$(find . \( -name '*.bak' -o -name '*.old' -o -name '*.backup' -o -name '*-backup*' \) \
-    -not -path './.git/*' 2>/dev/null || true)
+BACKUP_HITS=$(git ls-files '*.bak' '*.old' '*.backup' '*-backup*' 2>/dev/null || true)
 if [[ -z "$BACKUP_HITS" ]]; then
     pass "No backup files"
 else
