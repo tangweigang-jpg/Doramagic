@@ -63,3 +63,39 @@ Generated from CEO Review + Eng Review on 2026-03-23.
 - **Context**: Not started. Current system assumes Chinese user input + English code.
 - **Effort**: M
 - **Depends on**: Stable product with proven extraction quality
+
+## Security — MEDIUM findings from CSO audit (2026-03-26)
+
+### Indirect prompt injection via repo content
+- **What**: Add delimiter-based isolation (`<repo_content>...\</repo_content>`) in LLM prompts, instruct system prompt to ignore directives inside delimiters
+- **Why**: Malicious GitHub repos can embed instructions in README that manipulate extraction output
+- **Files**: `scripts/doramagic_singleshot.py`, `packages/extraction/doramagic_extraction/llm_stage_runner.py`
+- **Effort**: S (CC: ~15min)
+
+### LLM call budget in singleshot.py
+- **What**: Add per-session call counter with cap + total token logging
+- **Why**: Unbounded LLM API calls = unbounded Aliyun/Bailian cost per /dora invocation
+- **File**: `scripts/doramagic_singleshot.py`
+- **Effort**: S (CC: ~15min)
+
+### ReDoS via LLM-controlled regex in stage15 fallback
+- **What**: Add pattern length limit (max 200 chars) before `re.compile()` in Python grep fallback
+- **File**: `packages/extraction/doramagic_extraction/stage15_agentic.py:340`
+- **Effort**: S (CC: ~5min)
+
+### Security tests skipped in CI
+- **What**: Re-enable `test_dsd.py` and `test_confidence_system.py` in CI (mock LLM layer if needed)
+- **Why**: DSD (deceptive source detection) regression would go undetected
+- **File**: `.github/workflows/ci.yml:34-38`
+- **Effort**: M (CC: ~30min)
+
+### Over-permissive allowed-tools in legacy skills
+- **What**: Scope `allowed-tools` to minimum required in doramagic-s{1-4} SKILL.md
+- **Why**: `[exec, read, write]` maximizes blast radius for prompt injection attacks
+- **Files**: `skills/doramagic-s{1-4}/SKILL.md`
+- **Effort**: S (CC: ~10min)
+
+### races/ cleanup
+- **What**: `git rm -r --cached races/` to remove internal experiments from tracking (already gitignored in this commit)
+- **Why**: Internal experiments should not be in public repo
+- **Effort**: S (CC: ~5min)
