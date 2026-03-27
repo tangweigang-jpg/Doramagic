@@ -1335,6 +1335,152 @@ def _validate_skill_md(skill_md, domain):
     return issues
 
 
+# ── YAML name slugify ──
+
+
+def _slugify(value, max_len=40):
+    """Semantic slug: handles CJK, truncates at word boundaries, max 40 chars.
+
+    Examples:
+      "WiFi password manager" → "wifi-password-manager"
+      "记账app" → "记账app"
+      "A very long title that exceeds forty characters limit" → "a-very-long-title-that-exceeds-forty"
+    """
+    import unicodedata
+    normalized = unicodedata.normalize("NFKC", str(value)).strip()
+    # Replace separators with space
+    normalized = re.sub(r"[\s_/|]+", " ", normalized)
+
+    # Split into semantic tokens (CJK runs stay together, Latin words separate)
+    tokens = []
+    buf = []
+    cjk_buf = []
+    for ch in normalized:
+        cp = ord(ch)
+        is_cjk = (0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF
+                   or 0x3040 <= cp <= 0x30FF or 0xAC00 <= cp <= 0xD7AF)
+        if is_cjk:
+            if buf:
+                tokens.extend(re.findall(r"[A-Za-z0-9]+", "".join(buf)))
+                buf = []
+            cjk_buf.append(ch)
+        else:
+            if cjk_buf:
+                tokens.append("".join(cjk_buf))
+                cjk_buf = []
+            buf.append(ch)
+    if cjk_buf:
+        tokens.append("".join(cjk_buf))
+    if buf:
+        tokens.extend(re.findall(r"[A-Za-z0-9]+", "".join(buf)))
+
+    if not tokens:
+        return "compiled-skill"
+
+    # Build slug by adding tokens until max_len
+    parts = []
+    for token in tokens:
+        lower = token.lower() if re.search(r"[A-Za-z0-9]", token) else token
+        candidate = lower if not parts else "-".join(parts) + "-" + lower
+        if len(candidate) > max_len:
+            break
+        parts.append(lower)
+
+    if not parts:
+        return tokens[0][:max_len].lower() if re.search(r"[A-Za-z]", tokens[0]) else tokens[0][:max_len]
+
+    return "-".join(parts).strip("-") or "compiled-skill"
+
+
+# ── Quality Gate (60-point scoring) ──
+
+_REQUIRED_HEADINGS = ["Role", "Domain Knowledge", "Decision Framework",
+                      "Recommended Workflow", "Anti-Patterns"]
+_WHY_RE = re.compile(r"\b(because|why|rather than|instead of|trade[- ]?off|constraint|rationale)\b", re.I)
+_GENERIC_RE = re.compile(r"\b(best practice|industry standard|scalable solution|robust system)\b", re.I)
+
+
+def _score_quality(skill_md):
+    """Score SKILL.md on 5 dimensions (100-point scale). Returns dict with total + breakdown.
+
+    Dimensions: Coverage (30%), Evidence (25%), DSD Health (20%), WHY Density (15%), Substance (10%).
+    """
+    lines = skill_md.strip().splitlines()
+    lower = skill_md.lower()
+    blockers = []
+
+    # Extract H2 sections
+    sections = {}
+    h2_lines = [(i, line[3:].strip()) for i, line in enumerate(lines) if line.startswith("## ")]
+    for idx, (line_no, heading) in enumerate(h2_lines):
+        end = h2_lines[idx + 1][0] if idx + 1 < len(h2_lines) else len(lines)
+        sections[heading] = "\n".join(lines[line_no + 1:end])
+
+    # --- Coverage (30%) ---
+    present = sum(1 for h in _REQUIRED_HEADINGS if any(h.lower() in sh.lower() for sh in sections))
+    cov_raw = (present / len(_REQUIRED_HEADINGS)) * 100.0
+    if not skill_md.strip().startswith("---"):
+        cov_raw -= 12
+        blockers.append("missing_yaml_frontmatter")
+    workflow_text = next((v for k, v in sections.items() if "workflow" in k.lower()), "")
+    anti_text = next((v for k, v in sections.items() if "anti-pattern" in k.lower()), "")
+    wf_bullets = sum(1 for l in workflow_text.splitlines() if l.strip().startswith(("-", "*", "1", "2", "3", "4", "5")))
+    ap_bullets = sum(1 for l in anti_text.splitlines() if l.strip().startswith(("-", "*")))
+    if wf_bullets < 4:
+        cov_raw -= 10
+    if ap_bullets < 2:
+        cov_raw -= 8
+    cov_raw = max(0, min(100, cov_raw))
+
+    # --- Evidence Quality (25%) ---
+    knowledge_text = next((v for k, v in sections.items() if "knowledge" in k.lower()), "")
+    evidence_hits = len(re.findall(r"\[(CODE|CATALOG|BASELINE)\]|github\.com|source:|README", knowledge_text, re.I))
+    kb_bullets = max(1, sum(1 for l in knowledge_text.splitlines() if l.strip().startswith(("-", "*"))))
+    ev_raw = min(100, (evidence_hits / kb_bullets) * 100)
+    if evidence_hits == 0:
+        ev_raw -= 25
+    ev_raw = max(0, min(100, ev_raw))
+
+    # --- DSD Health (20%) — Design-Soul Differentiation ---
+    combined = " ".join(sections.get(k, "") for k in sections if any(
+        w in k.lower() for w in ("knowledge", "framework", "anti-pattern", "safety")))
+    specific = len(re.findall(r"\b(prefer|avoid|unless|except|trade[- ]?off|failure|trap|constraint)\b", combined, re.I))
+    generic = len(_GENERIC_RE.findall(combined))
+    dsd_raw = min(100, specific * 9.0) - min(25, generic * 5.0)
+    dsd_raw = max(0, dsd_raw)
+
+    # --- WHY Density (15%) ---
+    sentences = [s.strip() for s in re.split(r"[.!?\n]+", skill_md) if s.strip()]
+    why_hits = sum(1 for s in sentences if _WHY_RE.search(s))
+    why_ratio = why_hits / max(1, len(sentences))
+    why_raw = min(100, why_ratio * 220)
+
+    # --- Substance (10%) ---
+    tokens = re.findall(r"[A-Za-z0-9_\-\u4e00-\u9fff]+", skill_md)
+    unique_ratio = len(set(tokens)) / max(1, len(tokens))
+    sub_raw = min(100, len(tokens) / 12.0) + min(25, unique_ratio * 40)
+    if len(tokens) < 220:
+        sub_raw -= 20
+    sub_raw = max(0, min(100, sub_raw))
+
+    # --- Total ---
+    total = round(cov_raw * 0.30 + ev_raw * 0.25 + dsd_raw * 0.20 + why_raw * 0.15 + sub_raw * 0.10, 1)
+
+    if present < 3:
+        blockers.append("fewer_than_3_required_sections")
+
+    return {
+        "total": total,
+        "passed": total >= 60.0 and not blockers,
+        "blockers": blockers,
+        "coverage": round(cov_raw, 1),
+        "evidence": round(ev_raw, 1),
+        "dsd_health": round(dsd_raw, 1),
+        "why_density": round(why_raw, 1),
+        "substance": round(sub_raw, 1),
+    }
+
+
 # ── Fast Path Synthesis (Python-only, no LLM) ──
 
 
@@ -1560,7 +1706,7 @@ def compile_skill(synthesis, souls, profile, bricks=None):
     # 4. Assemble
     intent = profile.get("intent_en", profile.get("intent", "compiled skill"))
     title = re.sub(r"\s+", " ", str(intent)).strip()[:80]
-    slug = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]+", "-", title).strip("-")[:40] or "compiled-skill"
+    slug = _slugify(title)
 
     when_to_use = (
         "## When to Use\n"
@@ -1649,7 +1795,7 @@ def _compile_skill_template(synthesis, souls, profile, bricks=None):
     domain = profile.get("domain", "general")
     intent_en = profile.get("intent_en", purpose)
     topic = profile.get("topic", "custom-skill")
-    skill_name = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff_-]", "-", topic)[:40].strip("-")
+    skill_name = _slugify(topic)
 
     lines = [
         "---",
@@ -1713,6 +1859,27 @@ def _sanitize_input(raw: str) -> str:
     return sanitized.strip()
 
 
+def _save_checkpoint(rd, step, data):
+    """Atomic checkpoint write (POSIX write-then-rename)."""
+    cp_dir = rd / "checkpoints"
+    cp_dir.mkdir(parents=True, exist_ok=True)
+    tmp = cp_dir / ("%s.tmp" % step)
+    final = cp_dir / ("%s.json" % step)
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.rename(final)
+
+
+def _load_checkpoint(rd, step):
+    """Load checkpoint if it exists. Returns data dict or None."""
+    cp_file = rd / "checkpoints" / ("%s.json" % step)
+    if cp_file.exists():
+        try:
+            return json.loads(cp_file.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(description="Doramagic Single-Shot v12.1.0")
     parser.add_argument("--input", required=True, help="User input text")
@@ -1723,14 +1890,27 @@ def main():
         default=False,
         help="Enable debug logging: writes debug.log and LLM traces to run directory",
     )
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Resume from a previous run directory (e.g. 20260327_143000). Skips completed steps.",
+    )
     args = parser.parse_args()
 
     args.input = _sanitize_input(args.input)
 
     run_dir = Path(os.path.expanduser(args.run_dir))
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    rd = run_dir / run_id
-    rd.mkdir(parents=True, exist_ok=True)
+    if args.resume:
+        run_id = args.resume
+        rd = run_dir / run_id
+        if not rd.exists():
+            _log("Resume directory not found: %s" % rd)
+            sys.exit(1)
+        _log("Resuming run %s" % run_id)
+    else:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        rd = run_dir / run_id
+        rd.mkdir(parents=True, exist_ok=True)
 
     # Initialize debug logger if requested
     global _debug_logger
@@ -1743,18 +1923,22 @@ def main():
         _debug_logger.detail("input=%r" % args.input)
 
     # ── Step 1: Build profile ──
-    if _debug_logger is not None:
-        _debug_logger.stage("Step 1: build_need_profile")
-
-    t0 = time.time()
-    profile = build_need_profile(args.input)
-    with open(rd / "need_profile.json", "w") as f:
-        json.dump(profile, f, ensure_ascii=False, indent=2)
-    _log("Profile: keywords=%s" % profile["keywords"])
-
-    if _debug_logger is not None:
-        _debug_logger.timing("build_need_profile", (time.time() - t0) * 1000)
-        _debug_logger.detail("profile saved to need_profile.json")
+    cached_profile = _load_checkpoint(rd, "step1_profile")
+    if cached_profile:
+        profile = cached_profile
+        _log("Resumed Step 1 from checkpoint")
+    else:
+        if _debug_logger is not None:
+            _debug_logger.stage("Step 1: build_need_profile")
+        t0 = time.time()
+        profile = build_need_profile(args.input)
+        with open(rd / "need_profile.json", "w") as f:
+            json.dump(profile, f, ensure_ascii=False, indent=2)
+        _save_checkpoint(rd, "step1_profile", profile)
+        _log("Profile: keywords=%s" % profile["keywords"])
+        if _debug_logger is not None:
+            _debug_logger.timing("build_need_profile", (time.time() - t0) * 1000)
+            _debug_logger.detail("profile saved to need_profile.json")
 
     # ── Step 1.5: Socratic gate ──
     confidence = profile.get("confidence", 1.0)
@@ -2085,6 +2269,9 @@ def main():
         len(clawhub_skills), len(local_skills)
     ))
 
+    # Checkpoint after soul extraction (most expensive step)
+    _save_checkpoint(rd, "step3_souls", {"souls": souls, "repos_count": len(repos)})
+
     # ── Step 4: Community signals ──
     if _debug_logger is not None:
         _debug_logger.stage("Step 4: community signals")
@@ -2190,17 +2377,39 @@ def main():
     t0 = time.time()
     skill_md = compile_skill(syn, souls, profile, bricks=domain_bricks)
 
-    delivery = rd / "delivery"
-    delivery.mkdir(parents=True, exist_ok=True)
-    with open(delivery / "SKILL.md", "w") as f:
-        f.write(skill_md)
-
     if _debug_logger is not None:
         _debug_logger.timing("compile_skill", (time.time() - t0) * 1000)
         _debug_logger.detail("SKILL.md compiled: %d bytes, %d lines" % (
             len(skill_md), skill_md.count("\n")))
 
-    # ── Step 7: Output ──
+    # ── Step 6.5: Quality gate (60-point minimum) ──
+    quality_score = _score_quality(skill_md)
+    quality_passed = quality_score["total"] >= 60.0 and not quality_score["blockers"]
+
+    if _debug_logger is not None:
+        _debug_logger.detail("quality gate: %.1f/100, passed=%s, blockers=%s" % (
+            quality_score["total"], quality_passed, quality_score["blockers"]))
+
+    # Save quality report
+    (rd / "quality_gate.json").write_text(
+        json.dumps(quality_score, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    if not quality_passed:
+        _log("Quality gate FAILED (%.1f/100) — falling back to template" % quality_score["total"])
+        skill_md = _compile_skill_template(syn, souls, profile, bricks=domain_bricks)
+        # Re-score template output (for logging)
+        template_score = _score_quality(skill_md)
+        if _debug_logger is not None:
+            _debug_logger.detail("template fallback score: %.1f/100" % template_score["total"])
+    else:
+        _log("Quality gate PASSED (%.1f/100)" % quality_score["total"])
+
+    delivery = rd / "delivery"
+    delivery.mkdir(parents=True, exist_ok=True)
+    with open(delivery / "SKILL.md", "w") as f:
+        f.write(skill_md)
+
+    # ── Step 7: Output with completeness tier ──
     if _debug_logger is not None:
         _debug_logger.stage("Step 7: output")
 
@@ -2216,8 +2425,30 @@ def main():
     ch_souls = [s for s in souls if s.get("source") == "clawhub"]
     local_souls = [s for s in souls if s.get("source") == "local"]
 
+    # Determine completeness tier
+    if repo_souls and quality_passed:
+        completeness_tier = "FULL"
+        completeness_pct = 100
+    elif repo_souls and not quality_passed:
+        completeness_tier = "PARTIAL_SOULS"
+        completeness_pct = 70
+    elif not repo_souls and (ch_souls or local_souls):
+        completeness_tier = "FAST_PATH"
+        completeness_pct = 55
+    else:
+        completeness_tier = "TEMPLATE"
+        completeness_pct = 20
+
+    if _debug_logger is not None:
+        _debug_logger.detail("completeness: %s (%d%%)" % (completeness_tier, completeness_pct))
+
     msg = []
-    msg.append("**Doramagic 道具锻造完成！**\n")
+    if completeness_pct == 100:
+        msg.append("**Doramagic 道具锻造完成！**\n")
+    elif completeness_pct >= 55:
+        msg.append("**Doramagic 道具锻造完成！**（完整度 %d%%）\n" % completeness_pct)
+    else:
+        msg.append("**Doramagic 道具（基础版）**（完整度 %d%%）\n" % completeness_pct)
     msg.append("**主题**: %s" % profile.get("topic", ""))
 
     source_parts = []
@@ -2266,6 +2497,9 @@ def main():
             "delivery_path": str(delivery),
             "run_id": run_id,
             "repos_analyzed": len(souls),
+            "completeness_tier": completeness_tier,
+            "completeness_pct": completeness_pct,
+            "quality_score": quality_score["total"],
         }
     )
 
