@@ -306,4 +306,17 @@ def _latest_run_dir(run_base: Path) -> Path | None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise  # let sys.exit() propagate
+    except KeyboardInterrupt:
+        print(json.dumps({"error": True, "message": "Interrupted by user"}))
+        sys.exit(1)
+    except Exception as _exc:
+        import traceback as _tb
+        # Write traceback to stderr (never stdout — stdout is for structured output)
+        print(_tb.format_exc(), file=sys.stderr)
+        # Structured error on stdout for the caller
+        print(json.dumps({"error": True, "message": f"Unhandled error: {_exc}"}))
+        sys.exit(1)

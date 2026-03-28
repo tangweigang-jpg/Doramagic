@@ -402,8 +402,13 @@ def _run_stage15(
     # Stage 1 output is not a structured JSON in the default pipeline —
     # we build a minimal Stage1ScanOutput from what we know.
     try:
+        _repo_basename = os.path.basename(repo_path.rstrip("/"))
         repo_ref = RepoRef(
-            repo_id=os.path.basename(repo_path.rstrip("/")),
+            repo_id=_repo_basename,
+            full_name=repo_facts_raw.get("full_name", _repo_basename),
+            url=repo_facts_raw.get("repo_url", repo_facts_raw.get("url", f"https://github.com/unknown/{_repo_basename}")),
+            default_branch=repo_facts_raw.get("default_branch", "main"),
+            commit_sha=repo_facts_raw.get("commit_sha", "unknown"),
             local_path=repo_path,
         )
         repo_facts_obj = RepoFacts(

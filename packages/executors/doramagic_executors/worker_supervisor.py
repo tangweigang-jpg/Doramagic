@@ -136,6 +136,11 @@ class WorkerSupervisor:
                 raise RuntimeError(f"Cannot parse repo name from {context.repo_url}")
 
             local_path = download_repo(full_name, "main", str(context.work_dir / "repo"))
+            if not local_path or Path(local_path).resolve() == Path.cwd().resolve():
+                raise RuntimeError(
+                    f"download_repo returned empty/CWD path for {full_name}; "
+                    f"refusing to analyze current working directory"
+                )
             output_dir = context.work_dir / "output"
             from doramagic_orchestration.phase_runner import run_single_project_pipeline
 

@@ -66,6 +66,11 @@ class RepoWorker:
         try:
             # Step 1: Clone/download
             local_path = self._clone_repo()
+            if not local_path or Path(local_path).resolve() == Path.cwd().resolve():
+                raise RuntimeError(
+                    f"Clone returned empty/CWD path for {self.ctx.repo_name}; "
+                    f"refusing to analyze current working directory"
+                )
 
             # Step 2: Extract facts (deterministic, no LLM)
             facts = self._extract_facts(local_path)
