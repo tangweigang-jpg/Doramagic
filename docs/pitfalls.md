@@ -16,11 +16,15 @@
 - 不要用 Python 脚本批量替换文件内容后直接 git add 而不验证文件完整性（因为可能意外清空文件并提交空文件到 git，发现于 2026-03-29）
 - 不要让 Codex 和 Claude Code 在同一个 git 工作目录赛马（因为 Codex sandbox 无法操作 .git/，两边改动会互相覆盖；必须用独立 git clone 隔离，发现于 2026-03-29）
 - 不要在 pyproject.toml 的 extend-per-file-ignores 中重复同一个文件键（因为 TOML 不允许 duplicate key，会导致 ruff 解析失败，发现于 2026-03-29）
+- 不要在 Sonnet 子代理并行修改文件后切换 git 分支（因为未提交的改动会丢失，应先 commit 或 stash 所有代理产出，发现于 2026-03-29）
+- 不要让 sys.path.insert 清理工具删除 `if` 守卫而不删除整个代码块（因为会留下空 `if` 导致 SyntaxError，发现于 2026-03-29）
 
 ## 发布
 
 - 不要在 GitHub 发布版本中包含 research/、experiments/、races/ 等内部目录（因为会泄露内部信息，必须通过 publish_to_github.sh 清理，发现于 2026-03-25）
 - 不要跳过发布预检直接 push（因为可能遗漏社区标准文件或包含内部文件，发现于 2026-03-25）
+- 不要只推 git tag 而不创建 GitHub Release（因为用户在 Releases 页面看不到版本信息，发现于 2026-03-29）
+- 不要用中文写 GitHub 上的 commit message 和文档（因为 GitHub 是面向国际社区的正式发布仓库，规范要求英文，发现于 2026-03-29）
 
 ## 安全
 

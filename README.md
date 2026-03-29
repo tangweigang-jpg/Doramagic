@@ -24,6 +24,18 @@ export ANTHROPIC_API_KEY="your-key"
 /dora https://github.com/owner/repo
 ```
 
+### Direct Stitch (no project needed)
+
+Doramagic v12.3.0 can generate skills directly from its 1076-brick knowledge library:
+
+```bash
+/dora Build a Telegram bot that monitors crypto prices with alerts
+/dora Create an email automation skill for inbox triage and auto-reply
+/dora 帮我做一个每日信息聚合推送的 skill
+```
+
+This "brick stitch" path matches your intent against 49 knowledge categories and composes a skill in seconds (2 LLM calls), without needing a specific GitHub project.
+
 ### Other install methods
 
 **OpenClaw (ClawHub):**
@@ -165,6 +177,10 @@ Doramagic supports 4 input types, each routed deterministically:
 - **4-Tier Degraded Delivery** -- Users always receive output
 - **EventBus + Structured Logging** -- `run_events.jsonl` for observability
 - **Model-Agnostic** -- Works with any LLM (Claude, Gemini, GPT, Ollama)
+- **Knowledge Brick Direct Stitch** -- generate skills from 1076 pre-built knowledge bricks in seconds
+- **1076 Knowledge Bricks** across 49 domains aligned to ClawHub marketplace demand
+- **Causal Reasoning** -- synthesis produces "X because Y" insights, not just fact lists
+- **Fine-grained Progress** -- sub_progress events every 3-5 seconds during extraction
 
 ## Architecture Overview
 
