@@ -2,6 +2,48 @@
 
 All notable changes to Doramagic are documented in this file.
 
+## [12.3.0] - 2026-03-29
+
+### Architecture — Knowledge Brick Direct Stitch ("知识积木直缝")
+- New dual-path architecture: brick stitch (seconds, 2 LLM calls) vs project extraction (minutes, 10+ LLM calls)
+- BrickMatcher: semantic category matching via LLM with keyword fallback
+- BrickSelector: quality-weighted scoring (failure > rationale > constraint, L1 bonus, relevance weighting)
+- BrickStitcher: composites 30-50 bricks into complete skill pack (SKILL.md + README + PROVENANCE + LIMITATIONS)
+- FlowController: BRICK_STITCH phase integrated into DAG, auto-routes when brick coverage ≥ 3 categories
+- Degraded fallback: deterministic template when LLM stitching fails
+
+### Knowledge — Brick Library 278 → 1076 (+287%)
+- 15 new scene categories aligned to ClawHub market demand (skill_architecture, agent_evolution, info_aggregation, email_automation, web_browsing, content_creation, multi_agent, messaging_integration, financial_trading, crm_sales, cicd_devops, meeting_tasks, data_pipeline, security_auth, api_integration)
+- 34 existing frameworks deepened (AI frameworks +8 each, web frameworks +10, domain verticals +12)
+- All bricks validated: 0 JSON parse errors, ≥15% failure type per file
+
+### Quality — Synthesis Causal Reasoning
+- design_philosophy + mental_model merged into "X — Y" causal statements
+- why_hypotheses: "because" clause parsing preserves causal chains
+- anti_patterns: risk reasoning extracted from "because" clauses
+- Iron Law gate: compile_ready=False when no substantive causal chains found
+- compile_brief workflow: real "Why:" lines replace hardcoded text
+
+### UX — Fine-grained Progress Feedback
+- sub_progress event type added to EventBus
+- 5 executors emit progress: Discovery, WorkerSupervisor, Synthesis, SkillCompiler, Validator
+- OpenClaw adapter converts sub_progress events to user-visible print output
+
+### Refactoring
+- stage15_agentic_gemini.py merged into strategy pattern (provider-based routing)
+- 40+ files cleaned: sys.path.insert hacks removed
+- brick_injection.py: 76 new framework mappings for 15 new categories
+
+### Security
+- Codex cross-review: 7 fixes (Iron Law gate, prompt injection isolation, LLM fail-safe, type weight completeness)
+- Legacy skill allowed-tools scoped to [read, write] (exec removed)
+- LLM quality filter: missing score IDs default to 0 (fail-safe vs fail-open)
+
+### Design Documents
+- Cross-project GCD (knowledge brick auto-growth)
+- Phase B-H crash resume
+- Brick coverage validation methodology
+
 ## [12.2.0] - 2026-03-29
 
 ### Infrastructure — Build system fully operational
