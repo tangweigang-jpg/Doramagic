@@ -10,13 +10,17 @@ Includes:
 Run with:  pytest tests/test_dsd.py -v
 """
 
-import sys
 import os
+import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+sys.path.insert(0, os.path.join(_REPO_ROOT, "packages", "extraction"))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "packages", "contracts"))
 
 import pytest
-from deceptive_source_detection import (
+from doramagic_extraction.deceptive_source_detection import (
     DSDCheck,
     DSDReport,
     check_dsd1_rationale_support_ratio,
@@ -30,7 +34,6 @@ from deceptive_source_detection import (
     compute_overall_status,
     run_dsd_checks,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures — Good Project (wger-style: open source, well-documented)
@@ -292,12 +295,14 @@ class TestDSD1RationaleSupport:
         # 1 out of 5 rationale cards has evidence → ratio=0.2 < 0.3
         cards = []
         for i in range(5):
-            cards.append({
-                "card_id": f"R{i}",
-                "question_key": "Q2",
-                "knowledge_type": "rationale",
-                "evidence_tags": ["CODE"] if i == 0 else ["INFERENCE"],
-            })
+            cards.append(
+                {
+                    "card_id": f"R{i}",
+                    "question_key": "Q2",
+                    "knowledge_type": "rationale",
+                    "evidence_tags": ["CODE"] if i == 0 else ["INFERENCE"],
+                }
+            )
         result = check_dsd1_rationale_support_ratio(cards)
         assert result.triggered is True
 
@@ -309,7 +314,9 @@ class TestDSD1RationaleSupport:
 
 class TestDSD2TemporalConflict:
     def test_no_version_refs_no_trigger(self):
-        cards = [{"subject": "auth", "evidence_refs": [{"path": "src/auth.py", "kind": "file_line"}]}]
+        cards = [
+            {"subject": "auth", "evidence_refs": [{"path": "src/auth.py", "kind": "file_line"}]}
+        ]
         result = check_dsd2_temporal_conflict(cards)
         assert result.triggered is False
 
@@ -508,9 +515,7 @@ class TestDSD6PersonaDivergence:
         assert result.triggered is True
 
     def test_no_env_patterns_no_trigger(self):
-        cards = [
-            {"title": "X", "subject": "api", "statement": "Uses REST API with JSON"}
-        ]
+        cards = [{"title": "X", "subject": "api", "statement": "Uses REST API with JSON"}]
         result = check_dsd6_persona_divergence(cards)
         assert result.triggered is False
 
@@ -526,9 +531,7 @@ class TestDSD7DependencyDominance:
         assert result.triggered is False
 
     def test_open_source_deps_no_trigger(self):
-        repo_facts = {
-            "dependencies": ["Django", "djangorestframework", "Pillow", "celery"]
-        }
+        repo_facts = {"dependencies": ["Django", "djangorestframework", "Pillow", "celery"]}
         result = check_dsd7_dependency_dominance([], repo_facts)
         assert result.triggered is False
 
@@ -760,9 +763,7 @@ class TestRunDsdChecksContract:
     def test_scores_in_0_1_range(self):
         report = run_dsd_checks(DARK_TRAP_CARDS, DARK_TRAP_REPO_FACTS, DARK_TRAP_COMMUNITY_SIGNALS)
         for check in report.checks:
-            assert 0.0 <= check.score <= 1.0, (
-                f"{check.check_id} score {check.score} out of [0, 1]"
-            )
+            assert 0.0 <= check.score <= 1.0, f"{check.check_id} score {check.score} out of [0, 1]"
 
     def test_none_args_handled_gracefully(self):
         # Should not raise even with None inputs
@@ -774,6 +775,6 @@ class TestRunDsdChecksContract:
         report = run_dsd_checks([], {}, "")
         # Empty inputs: all checks should either be skipped or not triggered
         for check in report.checks:
-            assert check.triggered is False, (
-                f"{check.check_id} triggered on empty input: {check.detail}"
-            )
+            assert (
+                check.triggered is False
+            ), f"{check.check_id} triggered on empty input: {check.detail}"

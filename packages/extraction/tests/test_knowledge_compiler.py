@@ -8,21 +8,19 @@ external files or LLM calls are needed.
 from __future__ import annotations
 
 import json
-import os
-import textwrap
-from pathlib import Path
-
-import pytest
 
 # ---------------------------------------------------------------------------
 # Import the module under test
 # ---------------------------------------------------------------------------
-
 import sys
+import textwrap
+from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "packages" / "extraction"))
+sys.path.insert(0, str(_REPO_ROOT / "packages" / "contracts"))
 
-from knowledge_compiler import (
+from doramagic_extraction.knowledge_compiler import (
     DEFAULT_BUDGET,
     build_concepts,
     build_critical_rules,
@@ -41,10 +39,10 @@ from knowledge_compiler import (
     parse_frontmatter,
 )
 
-
 # ---------------------------------------------------------------------------
 # Fixtures helpers
 # ---------------------------------------------------------------------------
+
 
 def _write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -194,6 +192,7 @@ def make_repo_facts(tmp_path: Path) -> Path:
 # parse_frontmatter tests
 # ---------------------------------------------------------------------------
 
+
 class TestParseFrontmatter:
     def test_basic_scalar(self):
         text = "---\ncard_type: concept_card\ntitle: Hello World\n---\n\nbody text"
@@ -245,6 +244,7 @@ class TestParseFrontmatter:
 # Verdict filtering tests
 # ---------------------------------------------------------------------------
 
+
 class TestVerdictFiltering:
     def test_rejected_excluded_from_critical_rules(self, tmp_path):
         make_dr_card(tmp_path, "DR-001", "Normal Rule", severity="CRITICAL")
@@ -294,6 +294,7 @@ class TestVerdictFiltering:
 # ---------------------------------------------------------------------------
 # Section format tests
 # ---------------------------------------------------------------------------
+
 
 class TestSectionFormats:
     def test_critical_rules_format(self, tmp_path):
@@ -346,7 +347,9 @@ class TestSectionFormats:
         assert result == ""
 
     def test_design_philosophy_extracted(self):
-        soul = "## 6. 设计哲学\nFavor simplicity over cleverness.\n\n## 7. 心智模型\nThink pipeline.\n"
+        soul = (
+            "## 6. 设计哲学\nFavor simplicity over cleverness.\n\n## 7. 心智模型\nThink pipeline.\n"
+        )
         result = build_design_philosophy(soul)
         assert "## DESIGN PHILOSOPHY" in result
         assert "simplicity" in result
@@ -389,6 +392,7 @@ class TestSectionFormats:
 # Exception path ordering
 # ---------------------------------------------------------------------------
 
+
 class TestExceptionPathOrdering:
     def test_exception_after_normal_same_severity(self, tmp_path):
         make_dr_card(tmp_path, "DR-001", "Normal High", severity="HIGH", is_exception_path=False)
@@ -399,7 +403,14 @@ class TestExceptionPathOrdering:
 
     def test_exception_path_trap_ordering(self, tmp_path):
         make_dr_card(tmp_path, "DR-101", "Normal Trap", severity="HIGH", is_community=True)
-        make_dr_card(tmp_path, "DR-102", "Exception Trap", severity="HIGH", is_community=True, is_exception_path=True)
+        make_dr_card(
+            tmp_path,
+            "DR-102",
+            "Exception Trap",
+            severity="HIGH",
+            is_community=True,
+            is_exception_path=True,
+        )
         cards = _load_cards_from(tmp_path)
         result = build_traps(cards, 1000)
         assert result.index("Normal Trap") < result.index("Exception Trap")
@@ -409,15 +420,25 @@ class TestExceptionPathOrdering:
 # Applicable versions annotation
 # ---------------------------------------------------------------------------
 
+
 class TestVersionAnnotation:
     def test_version_note_in_critical_rules(self, tmp_path):
-        make_dr_card(tmp_path, "DR-001", "Versioned Rule", severity="HIGH", applicable_versions=">=2.0")
+        make_dr_card(
+            tmp_path, "DR-001", "Versioned Rule", severity="HIGH", applicable_versions=">=2.0"
+        )
         cards = _load_cards_from(tmp_path)
         result = build_critical_rules(cards, 500)
         assert "适用: >=2.0" in result
 
     def test_version_note_in_traps(self, tmp_path):
-        make_dr_card(tmp_path, "DR-101", "Versioned Trap", severity="HIGH", is_community=True, applicable_versions="<3.0")
+        make_dr_card(
+            tmp_path,
+            "DR-101",
+            "Versioned Trap",
+            severity="HIGH",
+            is_community=True,
+            applicable_versions="<3.0",
+        )
         cards = _load_cards_from(tmp_path)
         result = build_traps(cards, 500)
         assert "适用: <3.0" in result
@@ -426,6 +447,7 @@ class TestVersionAnnotation:
 # ---------------------------------------------------------------------------
 # WHY CHAINS tests
 # ---------------------------------------------------------------------------
+
 
 class TestWhyChains:
     def test_top_3_selected(self, tmp_path):
@@ -456,6 +478,7 @@ class TestWhyChains:
 # Token budget enforcement
 # ---------------------------------------------------------------------------
 
+
 class TestTokenBudget:
     def test_estimate_tokens(self):
         text = "a" * 400
@@ -474,7 +497,7 @@ class TestTokenBudget:
         qr = "## QUICK REFERENCE\n\n| 规则 | 严重度 |\n|------|--------|\n| Rule A | CRITICAL |\n| Rule B | MEDIUM |\n| Rule C | HIGH |\n"
         sections = {
             "quick_reference": qr,
-            "critical_rules": "x" * 400,   # ~100 tokens
+            "critical_rules": "x" * 400,  # ~100 tokens
             "concepts": "x" * 400,
             "workflows": "x" * 400,
             "feature_inventory": "x" * 400,
@@ -530,6 +553,7 @@ class TestTokenBudget:
 # ---------------------------------------------------------------------------
 # Full integration test
 # ---------------------------------------------------------------------------
+
 
 class TestFullCompile:
     def test_compile_produces_output(self, tmp_path):
@@ -661,14 +685,15 @@ class TestFullCompile:
         positions_list = [content.index(f"## {s}") for s in found]
         # Verify positions are strictly increasing (U-shaped order preserved)
         for i in range(len(positions_list) - 1):
-            assert positions_list[i] < positions_list[i + 1], (
-                f"{found[i]} should appear before {found[i+1]}"
-            )
+            assert (
+                positions_list[i] < positions_list[i + 1]
+            ), f"{found[i]} should appear before {found[i+1]}"
 
 
 # ---------------------------------------------------------------------------
 # Backward compatibility
 # ---------------------------------------------------------------------------
+
 
 class TestBackwardCompatibility:
     def test_cards_without_verdict_pass(self, tmp_path):
@@ -698,6 +723,8 @@ class TestBackwardCompatibility:
 # Helper: load cards from tmp_path using compiler's logic
 # ---------------------------------------------------------------------------
 
+
 def _load_cards_from(tmp_path: Path) -> list[tuple[dict, str]]:
     from knowledge_compiler import load_cards
+
     return load_cards(str(tmp_path / "soul"))

@@ -4,23 +4,25 @@ Tests for confidence_system.py
 Run with:  pytest tests/test_confidence_system.py -v
 """
 
-import sys
 import os
+import sys
 
-# Allow running from the racer directory
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Allow running from any working directory
+_REPO_ROOT = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+)
+sys.path.insert(0, os.path.join(_REPO_ROOT, "packages", "extraction"))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "packages", "contracts"))
 
-import pytest
-from confidence_system import (
-    tag_single_ref,
-    tag_evidence_refs,
+from doramagic_extraction.confidence_system import (
+    _path_contains_doc_keyword,
     compute_verdict,
+    inject_verdict_into_frontmatter,
     process_card,
     run_evidence_tagging,
-    inject_verdict_into_frontmatter,
-    _path_contains_doc_keyword,
+    tag_evidence_refs,
+    tag_single_ref,
 )
-
 
 # ---------------------------------------------------------------------------
 # tag_single_ref
@@ -233,9 +235,7 @@ class TestProcessCard:
     def test_card_with_code_refs(self):
         card = {
             "card_id": "DR-001",
-            "evidence_refs": [
-                {"kind": "file_line", "path": "src/main.py", "start_line": 42}
-            ],
+            "evidence_refs": [{"kind": "file_line", "path": "src/main.py", "start_line": 42}],
         }
         result = process_card(card)
         assert result["evidence_tags"] == ["CODE"]
@@ -256,9 +256,7 @@ class TestProcessCard:
     def test_card_community_only(self):
         card = {
             "card_id": "DR-101",
-            "evidence_refs": [
-                {"kind": "community_ref", "path": "https://github.com/issues/42"}
-            ],
+            "evidence_refs": [{"kind": "community_ref", "path": "https://github.com/issues/42"}],
         }
         result = process_card(card)
         assert result["verdict"] == "CONTESTED"
