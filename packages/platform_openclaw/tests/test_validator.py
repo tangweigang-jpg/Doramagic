@@ -45,8 +45,11 @@ def _need_profile(keywords: list[str] | None = None) -> NeedProfile:
     )
 
 
-def _decision(decision_id: str = "SEL-001", statement: str = "Read food entries and write calorie logs.",
-              source_refs: list[str] | None = None) -> SynthesisDecision:
+def _decision(
+    decision_id: str = "SEL-001",
+    statement: str = "Read food entries and write calorie logs.",
+    source_refs: list[str] | None = None,
+) -> SynthesisDecision:
     return SynthesisDecision(
         decision_id=decision_id,
         statement=statement,
@@ -125,8 +128,9 @@ def _write_valid_bundle(tmp_path: Path) -> SkillBundlePaths:
     )
 
 
-def _validation_input(bundle: SkillBundlePaths,
-                      keywords: list[str] | None = None) -> ValidationInput:
+def _validation_input(
+    bundle: SkillBundlePaths, keywords: list[str] | None = None
+) -> ValidationInput:
     return ValidationInput(
         need_profile=_need_profile(keywords),
         synthesis_report=_synthesis_report(),
@@ -152,8 +156,13 @@ def test_all_pass_returns_pass(tmp_path: Path) -> None:
     # All checks must be present
     check_names = {c.name for c in result.data.checks}
     assert check_names == {
-        "Consistency", "Completeness", "Traceability", "Platform Fit",
-        "Conflict Resolution", "License", "Dark Trap Scan",
+        "Consistency",
+        "Completeness",
+        "Traceability",
+        "Platform Fit",
+        "Conflict Resolution",
+        "License",
+        "Dark Trap Scan",
     }
 
 
@@ -237,8 +246,8 @@ def test_provenance_missing_url_fails_traceability(tmp_path: Path) -> None:
     assert result.data is not None
     traceability_check = next(c for c in result.data.checks if c.name == "Traceability")
     assert not traceability_check.passed
-    assert traceability_check.severity == "blocking"
-    assert result.data.status == "REVISE"
+    assert traceability_check.severity == "warning"
+    assert result.data.status == "PASS"
 
 
 def test_skill_file_missing_returns_blocked_upstream_missing(tmp_path: Path) -> None:

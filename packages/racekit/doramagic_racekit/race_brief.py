@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Dict, List
 
 from .race_config import RacerName, canonical_module_name, module_branch_slug, normalize_identifier
 from .race_workspace import _resolve_output_root, _resolve_repo_root
@@ -24,7 +23,7 @@ def _extract_module_section(spec_text: str, module_name: str) -> str:
             break
 
     if start_index is None:
-        raise ValueError("Module spec not found: {0}".format(module_name))
+        raise ValueError(f"Module spec not found: {module_name}")
 
     for index in range(start_index + 1, len(lines)):
         if lines[index].startswith("## "):
@@ -34,8 +33,8 @@ def _extract_module_section(spec_text: str, module_name: str) -> str:
     return "\n".join(lines[start_index:end_index]).strip()
 
 
-def _split_subsections(section_text: str) -> Dict[str, str]:
-    sections: Dict[str, List[str]] = {}
+def _split_subsections(section_text: str) -> dict[str, str]:
+    sections: dict[str, list[str]] = {}
     current_title = ""
 
     for line in section_text.splitlines():
@@ -48,13 +47,10 @@ def _split_subsections(section_text: str) -> Dict[str, str]:
         if current_title:
             sections[current_title].append(line)
 
-    return {
-        title: "\n".join(content).strip()
-        for title, content in sections.items()
-    }
+    return {title: "\n".join(content).strip() for title, content in sections.items()}
 
 
-def _fixture_paths(repo_root: Path) -> List[str]:
+def _fixture_paths(repo_root: Path) -> list[str]:
     fixtures_root = repo_root / "data" / "fixtures"
     if not fixtures_root.exists():
         return ["data/fixtures/"]
@@ -77,7 +73,7 @@ def generate_brief(round_num: int, module_name: str, racer_name: str, spec_path:
     output_root = _resolve_output_root(repo_root)
     output_path = (
         output_root
-        / "r{0:02d}".format(round_num)
+        / f"r{round_num:02d}"
         / module_branch_slug(canonical_module)
         / racer.value
         / "BRIEF.md"
@@ -85,7 +81,7 @@ def generate_brief(round_num: int, module_name: str, racer_name: str, spec_path:
 
     module_section = _extract_module_section(spec_text, canonical_module)
     subsections = _split_subsections(module_section)
-    fixture_lines = "\n".join("- `{0}`".format(item) for item in _fixture_paths(repo_root))
+    fixture_lines = "\n".join(f"- `{item}`" for item in _fixture_paths(repo_root))
 
     content = """# Doramagic Race Brief
 

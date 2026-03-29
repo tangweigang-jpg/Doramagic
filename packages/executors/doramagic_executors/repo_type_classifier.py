@@ -49,8 +49,13 @@ def classify_repo_type(facts: dict, repo_name: str = "") -> RepoType:
 
     # Name patterns for catalogs
     catalog_patterns = [
-        r"^awesome-", r"-awesome$", r"^curated-", r"^list-of-",
-        r"^resources-", r"-resources$", r"^collection-",
+        r"^awesome-",
+        r"-awesome$",
+        r"^curated-",
+        r"^list-of-",
+        r"^resources-",
+        r"-resources$",
+        r"^collection-",
     ]
     for pattern in catalog_patterns:
         if re.search(pattern, name_lower):
@@ -65,8 +70,15 @@ def classify_repo_type(facts: dict, repo_name: str = "") -> RepoType:
 
     # Check for common package manifests
     if not has_package_manifest:
-        for indicator in ["package.json", "setup.py", "pyproject.toml",
-                          "Cargo.toml", "go.mod", "pom.xml", "build.gradle"]:
+        for indicator in [
+            "package.json",
+            "setup.py",
+            "pyproject.toml",
+            "Cargo.toml",
+            "go.mod",
+            "pom.xml",
+            "build.gradle",
+        ]:
             if indicator in facts.get("root_files", []):
                 has_package_manifest = True
                 break
@@ -80,8 +92,13 @@ def classify_repo_type(facts: dict, repo_name: str = "") -> RepoType:
 
     # Framework name patterns
     framework_patterns = [
-        r"-framework$", r"^lib", r"-lib$", r"-sdk$", r"^sdk-",
-        r"-engine$", r"-core$",
+        r"-framework$",
+        r"^lib",
+        r"-lib$",
+        r"-sdk$",
+        r"^sdk-",
+        r"-engine$",
+        r"-core$",
     ]
     for pattern in framework_patterns:
         if re.search(pattern, name_lower):

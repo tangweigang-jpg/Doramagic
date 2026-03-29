@@ -15,7 +15,6 @@ import json
 import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
 
 
 class LeaseError(Exception):
@@ -51,7 +50,9 @@ class LeaseManager:
             "consumed": False,
         }
         lease_file = self._leases_dir / f"{token}.json"
-        lease_file.write_text(json.dumps(lease_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        lease_file.write_text(
+            json.dumps(lease_data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         return token
 
     def validate(self, token: str) -> bool:
@@ -107,7 +108,7 @@ class LeaseManager:
         )
         return True
 
-    def get_current_step(self, token: str) -> Optional[str]:
+    def get_current_step(self, token: str) -> str | None:
         """Get the step name associated with a token."""
         lease_file = self._leases_dir / f"{token}.json"
         if not lease_file.exists():

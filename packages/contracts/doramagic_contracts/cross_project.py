@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -28,8 +28,8 @@ class CommunityKnowledgeItem(BaseModel):
     source: str
     kind: Literal["skill", "tutorial", "use_case"]
     capabilities: list[str]
-    storage_pattern: Optional[str] = None
-    cron_pattern: Optional[str] = None
+    storage_pattern: str | None = None
+    cron_pattern: str | None = None
     reusable_knowledge: list[str]
 
 
@@ -60,8 +60,8 @@ class ApiDomainHint(BaseModel):
 class DiscoveryInput(BaseModel):
     schema_version: str = "dm.discovery-input.v1"
     need_profile: NeedProfile
-    routing: Optional[RoutingDecision] = None
-    api_hint: Optional[ApiDomainHint] = None
+    routing: RoutingDecision | None = None
+    api_hint: ApiDomainHint | None = None
     config: DiscoveryConfig
 
 
@@ -69,7 +69,7 @@ class DiscoveryResult(BaseModel):
     schema_version: str = "dm.discovery-result.v1"
     candidates: list[DiscoveryCandidate]
     search_coverage: list[SearchCoverageItem]
-    no_candidate_reason: Optional[str] = None
+    no_candidate_reason: str | None = None
     excluded_candidates: list[DiscoveryCandidate] = []
     search_evidence: list[str] = []
     candidate_count: int = 0
@@ -103,7 +103,7 @@ class CompareSignal(BaseModel):
     support_independence: float = Field(ge=0, le=1)
     match_score: float = Field(ge=0, le=1)
     evidence_refs: list[EvidenceRef]
-    notes: Optional[str] = None
+    notes: str | None = None
 
 
 class CompareMetrics(BaseModel):
@@ -139,7 +139,7 @@ class SynthesisInput(BaseModel):
     schema_version: str = "dm.synthesis-input.v1"
     need_profile: NeedProfile
     discovery_result: DiscoveryResult
-    extraction_aggregate: Optional[ExtractionAggregateContract] = None
+    extraction_aggregate: ExtractionAggregateContract | None = None
     project_summaries: list[ExtractedProjectSummary]
     comparison_result: CompareOutput
     community_knowledge: CommunityKnowledge
@@ -156,9 +156,7 @@ class SynthesisDecision(BaseModel):
 
 class SynthesisConflict(BaseModel):
     conflict_id: str
-    category: Literal[
-        "semantic", "scope", "architecture", "dependency", "operational", "license"
-    ]
+    category: Literal["semantic", "scope", "architecture", "dependency", "operational", "license"]
     title: str
     positions: list[str]
     recommended_resolution: str

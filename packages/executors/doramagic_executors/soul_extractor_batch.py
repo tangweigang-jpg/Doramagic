@@ -11,26 +11,32 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
-
-from doramagic_community.github_search import download_repo
 from doramagic_community.community_signals import collect_community_signals
+from doramagic_community.github_search import download_repo
 from doramagic_contracts.envelope import ErrorCodes, ModuleResultEnvelope, RunMetrics, WarningItem
 from doramagic_contracts.executor import ExecutorConfig
+from pydantic import BaseModel
 
 logger = logging.getLogger("doramagic.executor.soul_batch")
 
 
 class _RepoResult:
-    def __init__(self, repo_id: str, success: bool, output_dir: str = "",
-                 local_path: str = "", soul: dict | None = None,
-                 error: str = "", metrics: RunMetrics | None = None):
+    def __init__(
+        self,
+        repo_id: str,
+        success: bool,
+        output_dir: str = "",
+        local_path: str = "",
+        soul: dict | None = None,
+        error: str = "",
+        metrics: RunMetrics | None = None,
+    ):
         self.repo_id = repo_id
         self.success = success
         self.output_dir = output_dir
@@ -38,8 +44,11 @@ class _RepoResult:
         self.soul = soul or {}
         self.error = error
         self.metrics = metrics or RunMetrics(
-            wall_time_ms=0, llm_calls=0, prompt_tokens=0,
-            completion_tokens=0, estimated_cost_usd=0.0,
+            wall_time_ms=0,
+            llm_calls=0,
+            prompt_tokens=0,
+            completion_tokens=0,
+            estimated_cost_usd=0.0,
         )
 
 
@@ -47,7 +56,10 @@ class SoulExtractorBatch:
     """Downloads, extracts, harvests, and enriches — the full Phase CD pipeline."""
 
     async def execute(
-        self, input: BaseModel, adapter: object, config: ExecutorConfig,
+        self,
+        input: BaseModel,
+        adapter: object,
+        config: ExecutorConfig,
     ) -> ModuleResultEnvelope:
         start = time.monotonic()
 
@@ -66,7 +78,8 @@ class SoulExtractorBatch:
         if not downloadable:
             return self._error(
                 f"Failed to download all {len(repos)} repos",
-                ErrorCodes.UPSTREAM_MISSING, start,
+                ErrorCodes.UPSTREAM_MISSING,
+                start,
             )
 
         # Step 2: Parallel extraction
@@ -77,7 +90,8 @@ class SoulExtractorBatch:
         if not successful:
             return self._error(
                 f"All {len(downloadable)} repos failed extraction",
-                ErrorCodes.UPSTREAM_MISSING, start,
+                ErrorCodes.UPSTREAM_MISSING,
+                start,
             )
 
         # Step 3: Community signals (serial)
@@ -99,15 +113,19 @@ class SoulExtractorBatch:
         warnings: list[WarningItem] = []
         dl_failed = [d for d in downloaded if not d.local_path]
         if dl_failed:
-            warnings.append(WarningItem(
-                code="DOWNLOAD_FAILED",
-                message=f"{len(dl_failed)} repos failed to download: {[d.repo_id for d in dl_failed]}",
-            ))
+            warnings.append(
+                WarningItem(
+                    code="DOWNLOAD_FAILED",
+                    message=f"{len(dl_failed)} repos failed to download: {[d.repo_id for d in dl_failed]}",
+                )
+            )
         if failed:
-            warnings.append(WarningItem(
-                code="PARTIAL_EXTRACTION",
-                message=f"{len(failed)}/{len(downloadable)} repos failed extraction",
-            ))
+            warnings.append(
+                WarningItem(
+                    code="PARTIAL_EXTRACTION",
+                    message=f"{len(failed)}/{len(downloadable)} repos failed extraction",
+                )
+            )
 
         return ModuleResultEnvelope(
             module_name="SoulExtractorBatch",
@@ -127,7 +145,9 @@ class SoulExtractorBatch:
     # ─── Step 1: Download ─────────────────────────────────────
 
     async def _download_all(
-        self, repos: list[dict], repos_dir: Path,
+        self,
+        repos: list[dict],
+        repos_dir: Path,
     ) -> list[_RepoResult]:
         results = []
         for repo in repos:
@@ -162,24 +182,30 @@ class SoulExtractorBatch:
     # ─── Step 2: Extraction ───────────────────────────────────
 
     async def _extract_all(
-        self, repos: list[_RepoResult], config: ExecutorConfig,
-        sem: asyncio.Semaphore, adapter: object,
+        self,
+        repos: list[_RepoResult],
+        config: ExecutorConfig,
+        sem: asyncio.Semaphore,
+        adapter: object,
     ) -> list[_RepoResult]:
         async def extract_one(repo: _RepoResult) -> _RepoResult:
             async with sem:
-                return await asyncio.to_thread(
-                    self._extract_sync, repo, config, adapter
-                )
+                return await asyncio.to_thread(self._extract_sync, repo, config, adapter)
+
         tasks = [extract_one(r) for r in repos]
         return await asyncio.gather(*tasks)
 
     def _extract_sync(
-        self, repo: _RepoResult, config: ExecutorConfig, adapter: object,
+        self,
+        repo: _RepoResult,
+        config: ExecutorConfig,
+        adapter: object,
     ) -> _RepoResult:
         output_dir = str(config.run_dir / "staging" / repo.repo_id)
         start = time.monotonic()
         try:
             from doramagic_orchestration.phase_runner import run_single_project_pipeline
+
             result = run_single_project_pipeline(
                 repo_path=repo.local_path,
                 output_dir=output_dir,
@@ -192,12 +218,15 @@ class SoulExtractorBatch:
             # Run LLM stages (1-3) for knowledge extraction
             try:
                 from doramagic_extraction.llm_stage_runner import run_llm_stages
+
                 router = self._get_or_build_router()
                 if router:
                     llm_result = run_llm_stages(repo.local_path, output_dir, router)
                     logger.info(
                         "LLM stages for %s: completed=%s failed=%s",
-                        repo.repo_id, llm_result.stages_completed, llm_result.stages_failed,
+                        repo.repo_id,
+                        llm_result.stages_completed,
+                        llm_result.stages_failed,
                     )
             except Exception as e:
                 logger.warning("LLM stages skipped for %s: %s", repo.repo_id, e)
@@ -216,8 +245,10 @@ class SoulExtractorBatch:
                 soul=soul,
                 error=", ".join(result.stages_failed) if result.stages_failed else "",
                 metrics=RunMetrics(
-                    wall_time_ms=elapsed, llm_calls=0,
-                    prompt_tokens=0, completion_tokens=0,
+                    wall_time_ms=elapsed,
+                    llm_calls=0,
+                    prompt_tokens=0,
+                    completion_tokens=0,
                     estimated_cost_usd=0.0,
                 ),
             )
@@ -225,10 +256,15 @@ class SoulExtractorBatch:
             elapsed = int((time.monotonic() - start) * 1000)
             logger.exception(f"Extraction failed for {repo.repo_id}: {e}")
             return _RepoResult(
-                repo_id=repo.repo_id, success=False, error=str(e),
+                repo_id=repo.repo_id,
+                success=False,
+                error=str(e),
                 metrics=RunMetrics(
-                    wall_time_ms=elapsed, llm_calls=0,
-                    prompt_tokens=0, completion_tokens=0, estimated_cost_usd=0.0,
+                    wall_time_ms=elapsed,
+                    llm_calls=0,
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    estimated_cost_usd=0.0,
                 ),
             )
 
@@ -240,6 +276,7 @@ class SoulExtractorBatch:
             return SoulExtractorBatch._router_cache
         try:
             from doramagic_shared_utils.capability_router import CapabilityRouter
+
             router = CapabilityRouter.from_config("models.json")
             SoulExtractorBatch._router_cache = router
             return router
@@ -285,7 +322,9 @@ class SoulExtractorBatch:
                 results[repo_id] = {"skipped": True, "skip_reason": "not a GitHub URL"}
                 continue
             try:
-                signals = await asyncio.to_thread(collect_community_signals, url, None, os.environ.get("GITHUB_TOKEN"))
+                signals = await asyncio.to_thread(
+                    collect_community_signals, url, None, os.environ.get("GITHUB_TOKEN")
+                )
                 results[repo_id] = signals
             except Exception as e:
                 logger.warning(f"Community harvest failed for {repo_id}: {e}")
@@ -295,7 +334,9 @@ class SoulExtractorBatch:
     # ─── Step 4: Enrich ───────────────────────────────────────
 
     def _enrich_souls_with_community(
-        self, successful: list[_RepoResult], community: dict[str, Any],
+        self,
+        successful: list[_RepoResult],
+        community: dict[str, Any],
     ) -> None:
         """Inject top community findings as unsaid_traps into souls.
 
@@ -335,20 +376,23 @@ class SoulExtractorBatch:
         summaries = []
         for r in successful:
             soul = r.soul
-            summaries.append({
-                "project_id": r.repo_id,
-                "repo": {"repo_id": r.repo_id, "full_name": r.repo_id, "url": ""},
-                "top_capabilities": [
-                    f.get("title", f.get("statement", ""))
-                    for f in soul.get("findings", [])[:5]
-                ] if soul.get("findings") else [],
-                "top_constraints": [],
-                "top_failures": [
-                    t.get("trap", t) if isinstance(t, dict) else str(t)
-                    for t in soul.get("unsaid_traps", [])[:3]
-                ],
-                "evidence_refs": [],
-            })
+            summaries.append(
+                {
+                    "project_id": r.repo_id,
+                    "repo": {"repo_id": r.repo_id, "full_name": r.repo_id, "url": ""},
+                    "top_capabilities": [
+                        f.get("title", f.get("statement", "")) for f in soul.get("findings", [])[:5]
+                    ]
+                    if soul.get("findings")
+                    else [],
+                    "top_constraints": [],
+                    "top_failures": [
+                        t.get("trap", t) if isinstance(t, dict) else str(t)
+                        for t in soul.get("unsaid_traps", [])[:3]
+                    ],
+                    "evidence_refs": [],
+                }
+            )
         return summaries
 
     def _get_repos(self, input: BaseModel) -> list[dict[str, str]]:
@@ -362,11 +406,15 @@ class SoulExtractorBatch:
         elapsed = int((time.monotonic() - start) * 1000)
         return ModuleResultEnvelope(
             module_name="SoulExtractorBatch",
-            status="error", error_code=code,
+            status="error",
+            error_code=code,
             warnings=[WarningItem(code=code, message=msg)],
             metrics=RunMetrics(
-                wall_time_ms=elapsed, llm_calls=0,
-                prompt_tokens=0, completion_tokens=0, estimated_cost_usd=0.0,
+                wall_time_ms=elapsed,
+                llm_calls=0,
+                prompt_tokens=0,
+                completion_tokens=0,
+                estimated_cost_usd=0.0,
             ),
         )
 

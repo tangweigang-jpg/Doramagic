@@ -8,14 +8,15 @@ import time
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
-
-from doramagic_contracts.envelope import ErrorCodes, ModuleResultEnvelope, RunMetrics, WarningItem
+from doramagic_contracts.envelope import ModuleResultEnvelope, RunMetrics, WarningItem
 from doramagic_contracts.skill import DeliveryManifest
+from pydantic import BaseModel
 
 
 class DeliveryPackager:
-    async def execute(self, input: BaseModel, adapter: object, config) -> ModuleResultEnvelope[DeliveryManifest]:
+    async def execute(
+        self, input: BaseModel, adapter: object, config
+    ) -> ModuleResultEnvelope[DeliveryManifest]:
         started = time.monotonic()
         artifacts = getattr(input, "phase_artifacts", {})
         delivery_tier = getattr(input, "delivery_tier", "full_skill")
@@ -26,7 +27,9 @@ class DeliveryPackager:
         warnings: list[WarningItem] = []
 
         compile_bundle = artifacts.get("compile_bundle", {})
-        compile_paths = compile_bundle.get("artifact_paths", {}) if isinstance(compile_bundle, dict) else {}
+        compile_paths = (
+            compile_bundle.get("artifact_paths", {}) if isinstance(compile_bundle, dict) else {}
+        )
         if delivery_tier in ("full_skill", "draft_skill") and compile_paths:
             for name, src in compile_paths.items():
                 src_path = Path(src).expanduser()
@@ -37,23 +40,41 @@ class DeliveryPackager:
                 artifact_paths[dst.name] = str(dst)
 
         if delivery_tier == "synthesis_pack":
-            self._write_json(delivery_dir / "synthesis_bundle.json", artifacts.get("synthesis_bundle", {}))
-            self._write_json(delivery_dir / "extraction_aggregate.json", artifacts.get("extraction_aggregate", {}))
+            self._write_json(
+                delivery_dir / "synthesis_bundle.json", artifacts.get("synthesis_bundle", {})
+            )
+            self._write_json(
+                delivery_dir / "extraction_aggregate.json",
+                artifacts.get("extraction_aggregate", {}),
+            )
             artifact_paths["synthesis_bundle.json"] = str(delivery_dir / "synthesis_bundle.json")
-            artifact_paths["extraction_aggregate.json"] = str(delivery_dir / "extraction_aggregate.json")
+            artifact_paths["extraction_aggregate.json"] = str(
+                delivery_dir / "extraction_aggregate.json"
+            )
 
         if delivery_tier == "repo_reports":
-            self._write_json(delivery_dir / "repo_reports.json", artifacts.get("extraction_aggregate", {}))
+            self._write_json(
+                delivery_dir / "repo_reports.json", artifacts.get("extraction_aggregate", {})
+            )
             artifact_paths["repo_reports.json"] = str(delivery_dir / "repo_reports.json")
 
         if delivery_tier == "candidate_brief":
-            self._write_json(delivery_dir / "candidate_brief.json", artifacts.get("discovery_result", {}))
+            self._write_json(
+                delivery_dir / "candidate_brief.json", artifacts.get("discovery_result", {})
+            )
             artifact_paths["candidate_brief.json"] = str(delivery_dir / "candidate_brief.json")
 
         if not artifact_paths:
-            warnings.append(WarningItem(code="EMPTY_DELIVERY", message="No primary artifacts found; writing controller snapshot"))
+            warnings.append(
+                WarningItem(
+                    code="EMPTY_DELIVERY",
+                    message="No primary artifacts found; writing controller snapshot",
+                )
+            )
             self._write_json(delivery_dir / "controller_snapshot.json", artifacts)
-            artifact_paths["controller_snapshot.json"] = str(delivery_dir / "controller_snapshot.json")
+            artifact_paths["controller_snapshot.json"] = str(
+                delivery_dir / "controller_snapshot.json"
+            )
 
         dsd_path = delivery_dir / "DSD_REPORT.md"
         dsd_path.write_text(self._build_dsd_report(artifacts), encoding="utf-8")
@@ -143,18 +164,30 @@ class DeliveryPackager:
         ]
         return "\n".join(sections)
 
-    def _build_confidence_stats(self, artifacts: dict[str, Any], delivery_tier: str) -> dict[str, Any]:
+    def _build_confidence_stats(
+        self, artifacts: dict[str, Any], delivery_tier: str
+    ) -> dict[str, Any]:
         extraction = artifacts.get("extraction_aggregate", {})
         validation = artifacts.get("validation_report", {})
         synthesis = artifacts.get("synthesis_bundle", {})
         return {
             "delivery_tier": delivery_tier,
             "quality_score": self._quality_score(artifacts),
-            "dimension_scores": validation.get("dimension_scores", {}) if isinstance(validation, dict) else {},
-            "weakest_section": validation.get("weakest_section") if isinstance(validation, dict) else None,
-            "success_count": extraction.get("success_count", 0) if isinstance(extraction, dict) else 0,
-            "failed_count": extraction.get("failed_count", 0) if isinstance(extraction, dict) else 0,
-            "compile_ready": synthesis.get("compile_ready", False) if isinstance(synthesis, dict) else False,
+            "dimension_scores": validation.get("dimension_scores", {})
+            if isinstance(validation, dict)
+            else {},
+            "weakest_section": validation.get("weakest_section")
+            if isinstance(validation, dict)
+            else None,
+            "success_count": extraction.get("success_count", 0)
+            if isinstance(extraction, dict)
+            else 0,
+            "failed_count": extraction.get("failed_count", 0)
+            if isinstance(extraction, dict)
+            else 0,
+            "compile_ready": synthesis.get("compile_ready", False)
+            if isinstance(synthesis, dict)
+            else False,
         }
 
     def _quality_score(self, artifacts: dict[str, Any]) -> float:

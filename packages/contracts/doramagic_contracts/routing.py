@@ -5,7 +5,7 @@ Deterministic routing decisions -- no LLM involved.
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -40,7 +40,7 @@ class NeedProfileContract(BaseModel):
     raw_input: str
     keywords: list[str] = []
     intent: str = ""
-    intent_en: Optional[str] = None
+    intent_en: str | None = None
     domain: str = "general"
     search_directions: list[dict] = []
     constraints: list[str] = []
@@ -57,7 +57,7 @@ class DeliveryTier(BaseModel):
     schema_version: str = "dm.delivery-tier.v1"
     tier: Literal["FULL", "PARTIAL_SOULS", "FAST_PATH", "TEMPLATE", "SEARCH_ONLY", "EMPTY"]
     completeness_pct: int = Field(ge=0, le=100)
-    degraded_at_phase: Optional[str] = None
+    degraded_at_phase: str | None = None
     degradation_reason: str = ""
     suggestions: list[str] = []
     user_message: str = ""

@@ -6,24 +6,18 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "packages" / "contracts"))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from doramagic_contracts.base import (  # noqa: E402
+from doramagic_contracts.base import (
     EvidenceRef,
-    KnowledgeAtom,
     NeedProfile,
-    ProjectFingerprint,
     RepoRef,
     SearchDirection,
 )
-from doramagic_contracts.cross_project import (  # noqa: E402
+from doramagic_contracts.cross_project import (
     CommunityKnowledge,
     CommunityKnowledgeItem,
-    CompareConfig,
-    CompareInput,
     CompareMetrics,
     CompareOutput,
     CompareSignal,
@@ -31,22 +25,22 @@ from doramagic_contracts.cross_project import (  # noqa: E402
     ExtractedProjectSummary,
     SynthesisInput,
 )
-from doramagic_contracts.envelope import ErrorCodes  # noqa: E402
-from doramagic_cross_project.synthesis import run_synthesis  # noqa: E402
-
+from doramagic_contracts.envelope import ErrorCodes
+from doramagic_cross_project.synthesis import run_synthesis
 
 # ---------------------------------------------------------------------------
 # Fixture helpers
 # ---------------------------------------------------------------------------
 
+
 def _repo(repo_id: str) -> RepoRef:
     return RepoRef(
         repo_id=repo_id,
-        full_name="example/{0}".format(repo_id),
-        url="https://github.com/example/{0}".format(repo_id),
+        full_name=f"example/{repo_id}",
+        url=f"https://github.com/example/{repo_id}",
         default_branch="main",
         commit_sha="abc123",
-        local_path="/tmp/{0}".format(repo_id),
+        local_path=f"/tmp/{repo_id}",
     )
 
 
@@ -88,7 +82,7 @@ def _aligned_signal(
         support_count=len(project_ids),
         support_independence=0.85,
         match_score=match_score,
-        evidence_refs=[_evidence("proj/{0}/module.py".format(pid)) for pid in project_ids],
+        evidence_refs=[_evidence(f"proj/{pid}/module.py") for pid in project_ids],
         notes="aligned via structured match",
     )
 
@@ -106,7 +100,7 @@ def _original_signal(
         support_count=1,
         support_independence=1.0,
         match_score=0.3,
-        evidence_refs=[_evidence("{0}/unique.py".format(project_id))],
+        evidence_refs=[_evidence(f"{project_id}/unique.py")],
         notes="second-pass retrieval found no comparable atom above partial threshold",
     )
 
@@ -124,7 +118,7 @@ def _drifted_signal(
         support_count=len(project_ids),
         support_independence=0.6,
         match_score=0.70,
-        evidence_refs=[_evidence("{0}/drift.py".format(pid)) for pid in project_ids],
+        evidence_refs=[_evidence(f"{pid}/drift.py") for pid in project_ids],
         notes="partial overlap",
     )
 
@@ -141,7 +135,7 @@ def _project_summary(
         top_capabilities=capabilities or ["LLM-as-Parser", "daily calorie budget"],
         top_constraints=constraints or ["AI estimate uncertainty"],
         top_failures=failures or ["portion estimation drift"],
-        evidence_refs=[_evidence("{0}/README.md".format(project_id))],
+        evidence_refs=[_evidence(f"{project_id}/README.md")],
     )
 
 
@@ -159,11 +153,19 @@ def _compare_output(
     project_ids: list[str] | None = None,
 ) -> CompareOutput:
     _project_ids = project_ids or ["acc", "foodyo", "ont"]
-    _signals = signals if signals is not None else [
-        _aligned_signal("SIG-ALIGN-001", "food input parsed as json schema", _project_ids[:2]),
-        _original_signal("SIG-ORIG-001", "use llm as parser for natural language meal logging", _project_ids[0]),
-        _drifted_signal("SIG-DRIFT-001", "storage format for daily food log", _project_ids),
-    ]
+    _signals = (
+        signals
+        if signals is not None
+        else [
+            _aligned_signal("SIG-ALIGN-001", "food input parsed as json schema", _project_ids[:2]),
+            _original_signal(
+                "SIG-ORIG-001",
+                "use llm as parser for natural language meal logging",
+                _project_ids[0],
+            ),
+            _drifted_signal("SIG-DRIFT-001", "storage format for daily food log", _project_ids),
+        ]
+    )
     return CompareOutput(
         domain_id=domain_id,
         compared_projects=_project_ids,
@@ -209,7 +211,8 @@ def _build_synthesis_input(
     return SynthesisInput(
         need_profile=_need_profile(need_keywords),
         discovery_result=_discovery_result(),
-        project_summaries=project_summaries or [_project_summary("acc"), _project_summary("foodyo")],
+        project_summaries=project_summaries
+        or [_project_summary("acc"), _project_summary("foodyo")],
         comparison_result=_compare_output(signals=signals),
         community_knowledge=community or _community_knowledge(),
     )
@@ -218,6 +221,7 @@ def _build_synthesis_input(
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 class TestRunSynthesisNormalPath:
     """Happy-path tests."""
@@ -255,9 +259,7 @@ class TestRunSynthesisNormalPath:
         result = run_synthesis(_build_synthesis_input())
         assert result.data is not None
         for sel in result.data.selected_knowledge:
-            assert sel.source_refs, (
-                "selected_knowledge item '{0}' has no source_refs".format(sel.statement)
-            )
+            assert sel.source_refs, f"selected_knowledge item '{sel.statement}' has no source_refs"
 
     def test_writes_synthesis_report_json(self, tmp_path, monkeypatch):
         """synthesis_report.json must be written to the domain output dir."""
@@ -372,7 +374,7 @@ class TestRunSynthesisErrorPaths:
         result = run_synthesis(_build_synthesis_input())
         assert result.data is not None
         for ex in result.data.excluded_knowledge:
-            assert ex.rationale, "excluded decision '{0}' has empty rationale".format(ex.statement)
+            assert ex.rationale, f"excluded decision '{ex.statement}' has empty rationale"
 
     def test_community_knowledge_contributes_to_unique(self, tmp_path, monkeypatch):
         """Community reusable_knowledge items must appear in unique_knowledge."""
@@ -388,7 +390,7 @@ class TestRunSynthesisErrorPaths:
         # community item reusable_knowledge entries should appear
         expected = "Store daily logs in ~/clawd/calorie/YYYY-MM-DD.md"
         assert expected in unique_statements, (
-            "Community knowledge '{0}' not found in unique_knowledge".format(expected)
+            f"Community knowledge '{expected}' not found in unique_knowledge"
         )
 
     def test_conflict_category_is_valid(self, tmp_path, monkeypatch):
@@ -396,10 +398,17 @@ class TestRunSynthesisErrorPaths:
         monkeypatch.setenv("DORAMAGIC_SYNTHESIS_OUTPUT_DIR", str(tmp_path))
         result = run_synthesis(_build_synthesis_input())
         assert result.data is not None
-        valid_categories = {"semantic", "scope", "architecture", "dependency", "operational", "license"}
+        valid_categories = {
+            "semantic",
+            "scope",
+            "architecture",
+            "dependency",
+            "operational",
+            "license",
+        }
         for conflict in result.data.conflicts:
             assert conflict.category in valid_categories, (
-                "Invalid conflict category: '{0}'".format(conflict.category)
+                f"Invalid conflict category: '{conflict.category}'"
             )
 
     def test_decision_values_are_valid(self, tmp_path, monkeypatch):
@@ -416,5 +425,5 @@ class TestRunSynthesisErrorPaths:
         )
         for d in all_decisions:
             assert d.decision in valid_decisions, (
-                "Invalid decision value '{0}' for '{1}'".format(d.decision, d.statement)
+                f"Invalid decision value '{d.decision}' for '{d.statement}'"
             )

@@ -102,12 +102,20 @@ class TestRaceReview:
         content = review_path.read_text(encoding="utf-8")
         assert "Contract 正确性 | weight=25 | score=" in content
 
-        filled = content.replace("Contract 正确性 | weight=25 | score=", "Contract 正确性 | weight=25 | score=9")
+        filled = content.replace(
+            "Contract 正确性 | weight=25 | score=", "Contract 正确性 | weight=25 | score=9"
+        )
         filled = filled.replace("可验证性 | weight=20 | score=", "可验证性 | weight=20 | score=8")
-        filled = filled.replace("集成适配度 | weight=20 | score=", "集成适配度 | weight=20 | score=7.5")
-        filled = filled.replace("代码清晰度 | weight=15 | score=", "代码清晰度 | weight=15 | score=8")
+        filled = filled.replace(
+            "集成适配度 | weight=20 | score=", "集成适配度 | weight=20 | score=7.5"
+        )
+        filled = filled.replace(
+            "代码清晰度 | weight=15 | score=", "代码清晰度 | weight=15 | score=8"
+        )
         filled = filled.replace("性能成本 | weight=10 | score=", "性能成本 | weight=10 | score=7")
-        filled = filled.replace("运维稳定性 | weight=10 | score=", "运维稳定性 | weight=10 | score=9")
+        filled = filled.replace(
+            "运维稳定性 | weight=10 | score=", "运维稳定性 | weight=10 | score=9"
+        )
         review_path.write_text(filled, encoding="utf-8")
 
         assert score_submission(str(review_path)) == pytest.approx(81.5)

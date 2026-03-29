@@ -12,12 +12,11 @@ without actually calling GitHub API or LLM. All external calls are mocked.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -29,6 +28,7 @@ for pkg_dir in (_root / "packages").iterdir():
 
 
 # --- Helpers ---
+
 
 def _make_adapter():
     """Create a mock PlatformAdapter."""
@@ -52,8 +52,10 @@ def _make_ok_envelope(name: str, data=None):
         status="ok",
         data=data or {},
         metrics=RunMetrics(
-            wall_time_ms=100, llm_calls=0,
-            prompt_tokens=0, completion_tokens=0,
+            wall_time_ms=100,
+            llm_calls=0,
+            prompt_tokens=0,
+            completion_tokens=0,
             estimated_cost_usd=0.0,
         ),
     )
@@ -61,12 +63,13 @@ def _make_ok_envelope(name: str, data=None):
 
 # --- Test 1: Input Router paths ---
 
+
 class TestInputRouter:
     """Test deterministic input routing."""
 
     def test_direct_url_route(self):
-        from doramagic_controller.input_router import InputRouter
         from doramagic_contracts.base import NeedProfile
+        from doramagic_controller.input_router import InputRouter
 
         profile = NeedProfile(
             raw_input="Extract soul of https://github.com/bytedance/deer-flow",
@@ -83,8 +86,8 @@ class TestInputRouter:
         assert "deer-flow" in decision.repo_urls[0]
 
     def test_named_project_route(self):
-        from doramagic_controller.input_router import InputRouter
         from doramagic_contracts.base import NeedProfile
+        from doramagic_controller.input_router import InputRouter
 
         profile = NeedProfile(
             raw_input="Extract the design soul of bytedance/deer-flow",
@@ -99,8 +102,8 @@ class TestInputRouter:
         assert "bytedance/deer-flow" in decision.project_names
 
     def test_domain_explore_route(self):
-        from doramagic_controller.input_router import InputRouter
         from doramagic_contracts.base import NeedProfile
+        from doramagic_controller.input_router import InputRouter
 
         profile = NeedProfile(
             raw_input="Help me build an expense tracker app",
@@ -117,8 +120,8 @@ class TestInputRouter:
         assert decision.route in ("DOMAIN_EXPLORE", "LOW_CONFIDENCE", "NAMED_PROJECT")
 
     def test_low_confidence_route(self):
-        from doramagic_controller.input_router import InputRouter
         from doramagic_contracts.base import NeedProfile
+        from doramagic_controller.input_router import InputRouter
 
         profile = NeedProfile(
             raw_input="help",
@@ -135,12 +138,15 @@ class TestInputRouter:
 
 # --- Test 2: Conditional edges ---
 
+
 class TestConditionalEdges:
     """Test conditional edge evaluation."""
 
     def test_init_to_phase_a(self):
         from doramagic_controller.state_definitions import (
-            CONDITIONAL_EDGES, EdgeContext, Phase,
+            CONDITIONAL_EDGES,
+            EdgeContext,
+            Phase,
         )
 
         ctx = EdgeContext(raw_input="hello world")
@@ -152,7 +158,9 @@ class TestConditionalEdges:
 
     def test_phase_a_direct_url(self):
         from doramagic_controller.state_definitions import (
-            CONDITIONAL_EDGES, EdgeContext, Phase,
+            CONDITIONAL_EDGES,
+            EdgeContext,
+            Phase,
         )
 
         ctx = EdgeContext(routing_route="DIRECT_URL")
@@ -164,7 +172,9 @@ class TestConditionalEdges:
 
     def test_phase_f_revise(self):
         from doramagic_controller.state_definitions import (
-            CONDITIONAL_EDGES, EdgeContext, Phase,
+            CONDITIONAL_EDGES,
+            EdgeContext,
+            Phase,
         )
 
         ctx = EdgeContext(quality_score=45, revise_count=0, weakest_section="knowledge")
@@ -176,7 +186,9 @@ class TestConditionalEdges:
 
     def test_phase_f_pass(self):
         from doramagic_controller.state_definitions import (
-            CONDITIONAL_EDGES, EdgeContext, Phase,
+            CONDITIONAL_EDGES,
+            EdgeContext,
+            Phase,
         )
 
         ctx = EdgeContext(quality_score=75, blockers=[])
@@ -188,7 +200,9 @@ class TestConditionalEdges:
 
     def test_phase_f_degraded_after_revise(self):
         from doramagic_controller.state_definitions import (
-            CONDITIONAL_EDGES, EdgeContext, Phase,
+            CONDITIONAL_EDGES,
+            EdgeContext,
+            Phase,
         )
 
         ctx = EdgeContext(quality_score=45, revise_count=1)
@@ -200,6 +214,7 @@ class TestConditionalEdges:
 
 
 # --- Test 3: EventBus ---
+
 
 class TestEventBus:
     """Test EventBus JSONL writing."""
@@ -224,6 +239,7 @@ class TestEventBus:
 
     def test_thread_safety(self):
         import threading
+
         from doramagic_controller.event_bus import EventBus
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -247,6 +263,7 @@ class TestEventBus:
 
 
 # --- Test 4: Repo type classifier ---
+
 
 class TestRepoTypeClassifier:
     """Test deterministic repo type classification."""
@@ -278,6 +295,7 @@ class TestRepoTypeClassifier:
 
 
 # --- Test 5: Quality gate ---
+
 
 class TestQualityGate:
     """Test quality scoring for skill quality assessment."""
@@ -336,6 +354,7 @@ you should always prefer specific test strategies over generic approaches.
 
 # --- Test 6: EnvelopeCollector ---
 
+
 class TestEnvelopeCollector:
     """Test fan-in collection."""
 
@@ -345,12 +364,20 @@ class TestEnvelopeCollector:
 
         envelopes = [
             RepoExtractionEnvelope(
-                worker_id="w0", repo_name="good-repo", repo_url="",
-                extraction_confidence=0.8, evidence_count=10, status="ok",
+                worker_id="w0",
+                repo_name="good-repo",
+                repo_url="",
+                extraction_confidence=0.8,
+                evidence_count=10,
+                status="ok",
             ),
             RepoExtractionEnvelope(
-                worker_id="w1", repo_name="bad-repo", repo_url="",
-                extraction_confidence=0.0, evidence_count=0, status="failed",
+                worker_id="w1",
+                repo_name="bad-repo",
+                repo_url="",
+                extraction_confidence=0.0,
+                evidence_count=0,
+                status="failed",
             ),
         ]
         result = EnvelopeCollector().collect(envelopes)
@@ -363,12 +390,20 @@ class TestEnvelopeCollector:
 
         envelopes = [
             RepoExtractionEnvelope(
-                worker_id="w0", repo_name="medium", repo_url="",
-                extraction_confidence=0.5, evidence_count=5, status="ok",
+                worker_id="w0",
+                repo_name="medium",
+                repo_url="",
+                extraction_confidence=0.5,
+                evidence_count=5,
+                status="ok",
             ),
             RepoExtractionEnvelope(
-                worker_id="w1", repo_name="best", repo_url="",
-                extraction_confidence=0.9, evidence_count=15, status="ok",
+                worker_id="w1",
+                repo_name="best",
+                repo_url="",
+                extraction_confidence=0.9,
+                evidence_count=15,
+                status="ok",
             ),
         ]
         result = EnvelopeCollector().collect(envelopes)
@@ -377,16 +412,16 @@ class TestEnvelopeCollector:
 
 # --- Test 7: Delivery tier determination ---
 
+
 class TestDeliveryTier:
     """Test degraded delivery tier logic."""
 
     def test_full_pipeline(self):
         """When compiler output exists, tier should be PARTIAL_SOULS or higher."""
         # This tests the _determine_delivery_tier logic indirectly
-        from doramagic_controller.state_definitions import Phase
-
         # Verify DEGRADED is a terminal state
-        from doramagic_controller.state_definitions import TRANSITIONS
+        from doramagic_controller.state_definitions import TRANSITIONS, Phase
+
         assert Phase.DEGRADED in TRANSITIONS
         assert len(TRANSITIONS[Phase.DEGRADED]) == 0
 

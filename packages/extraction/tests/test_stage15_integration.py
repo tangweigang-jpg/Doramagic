@@ -16,9 +16,6 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import List, Optional, Sequence
-
-import pytest
 
 _THIS_DIR = Path(__file__).resolve().parent
 _RACE_ROOT = _THIS_DIR.parent
@@ -33,18 +30,15 @@ for _p in [
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from doramagic_contracts.base import EvidenceRef  # noqa: E402
-from doramagic_contracts.envelope import ErrorCodes  # noqa: E402
 from doramagic_contracts.extraction import (  # noqa: E402
     Hypothesis,
     Stage15AgenticInput,
     Stage15Budget,
     Stage15Toolset,
 )
-from doramagic_shared_utils.llm_adapter import LLMMessage, MockLLMAdapter  # noqa: E402
+from doramagic_extraction.stage15_agentic import run_stage15_agentic  # noqa: E402
 from doramagic_shared_utils.capability_router import CapabilityRouter  # noqa: E402
-
-from doramagic_extraction.stage15_agentic import check_claims_have_evidence, run_stage15_agentic  # noqa: E402
+from doramagic_shared_utils.llm_adapter import MockLLMAdapter  # noqa: E402
 
 FIXTURES_DIR = _REPO_ROOT / "data" / "fixtures"
 
@@ -69,49 +63,55 @@ def _build_input(tmp_path: Path) -> Stage15AgenticInput:
     src = repo_root / "src" / "app" / "api" / "chat"
     src.mkdir(parents=True, exist_ok=True)
     (src / "route.ts").write_text(
-        "\n".join([
-            "import { streamText } from 'ai';",
-            "import { openai } from '@ai-sdk/openai';",
-            "",
-            "const NUTRITION_SYSTEM_PROMPT = `",
-            "You are a nutrition expert. Estimate calories for the described food.",
-            "Provide: calories, protein, carbs, fat.",
-            "Respond in JSON format.",
-            "`;",
-            "",
-            "export async function POST(req: Request) {",
-            "  const { messages } = await req.json();",
-            "  return streamText({",
-            "    model: openai('gpt-4o-mini'),",
-            "    messages,",
-            "    system: NUTRITION_SYSTEM_PROMPT",
-            "  });",
-            "}",
-        ])
+        "\n".join(
+            [
+                "import { streamText } from 'ai';",
+                "import { openai } from '@ai-sdk/openai';",
+                "",
+                "const NUTRITION_SYSTEM_PROMPT = `",
+                "You are a nutrition expert. Estimate calories for the described food.",
+                "Provide: calories, protein, carbs, fat.",
+                "Respond in JSON format.",
+                "`;",
+                "",
+                "export async function POST(req: Request) {",
+                "  const { messages } = await req.json();",
+                "  return streamText({",
+                "    model: openai('gpt-4o-mini'),",
+                "    messages,",
+                "    system: NUTRITION_SYSTEM_PROMPT",
+                "  });",
+                "}",
+            ]
+        )
     )
 
     lib = repo_root / "src" / "lib"
     lib.mkdir(parents=True, exist_ok=True)
     (lib / "store.ts").write_text(
-        "\n".join([
-            "// In-memory store only — no persistence. Reset on page reload.",
-            "let meals: Meal[] = [];",
-            "export const addMeal = (meal: Meal) => meals.push(meal);",
-            "export const getMeals = () => meals;",
-            "export const clearMeals = () => { meals = []; };",
-        ])
+        "\n".join(
+            [
+                "// In-memory store only — no persistence. Reset on page reload.",
+                "let meals: Meal[] = [];",
+                "export const addMeal = (meal: Meal) => meals.push(meal);",
+                "export const getMeals = () => meals;",
+                "export const clearMeals = () => { meals = []; };",
+            ]
+        )
     )
 
     (repo_root / "README.md").write_text(
-        "\n".join([
-            "# AI Calorie Counter",
-            "",
-            "## About",
-            "We intentionally use LLM estimation over database lookup because",
-            "real-world food descriptions are fuzzy and conversational.",
-            "",
-            "TODO: Add Vercel KV for cross-session persistence",
-        ])
+        "\n".join(
+            [
+                "# AI Calorie Counter",
+                "",
+                "## About",
+                "We intentionally use LLM estimation over database lookup because",
+                "real-world food descriptions are fuzzy and conversational.",
+                "",
+                "TODO: Add Vercel KV for cross-session persistence",
+            ]
+        )
     )
 
     repo_payload["repo"]["local_path"] = str(repo_root)
@@ -156,59 +156,71 @@ def _make_realistic_adapter(input_data: Stage15AgenticInput) -> MockLLMAdapter:
     responses = [
         # === h-001 ===
         # Turn 1: tool selection
-        json.dumps({
-            "tool": "search_repo",
-            "tool_input": {
-                "pattern": "NUTRITION_SYSTEM_PROMPT",
-                "file_glob": "*.ts",
-                "max_results": 5,
-            },
-            "reasoning": "Search for system prompt to check Chinese food handling",
-        }),
+        json.dumps(
+            {
+                "tool": "search_repo",
+                "tool_input": {
+                    "pattern": "NUTRITION_SYSTEM_PROMPT",
+                    "file_glob": "*.ts",
+                    "max_results": 5,
+                },
+                "reasoning": "Search for system prompt to check Chinese food handling",
+            }
+        ),
         # Turn 1: eval
-        json.dumps({
-            "hypothesis_status": "pending",
-            "confidence": "medium",
-            "reasoning": "Found system prompt reference, need to read the file",
-            "should_continue": True,
-            "next_action_hint": "read route.ts to examine system prompt",
-        }),
+        json.dumps(
+            {
+                "hypothesis_status": "pending",
+                "confidence": "medium",
+                "reasoning": "Found system prompt reference, need to read the file",
+                "should_continue": True,
+                "next_action_hint": "read route.ts to examine system prompt",
+            }
+        ),
         # Turn 2: tool selection → read_file
-        json.dumps({
-            "tool": "read_file",
-            "tool_input": {
-                "path": "src/app/api/chat/route.ts",
-                "start_line": 1,
-                "end_line": 17,
-            },
-            "reasoning": "Read the chat route to examine NUTRITION_SYSTEM_PROMPT content",
-        }),
+        json.dumps(
+            {
+                "tool": "read_file",
+                "tool_input": {
+                    "path": "src/app/api/chat/route.ts",
+                    "start_line": 1,
+                    "end_line": 17,
+                },
+                "reasoning": "Read the chat route to examine NUTRITION_SYSTEM_PROMPT content",
+            }
+        ),
         # Turn 2: eval → confirmed, no more exploration needed
-        json.dumps({
-            "hypothesis_status": "confirmed",
-            "confidence": "high",
-            "reasoning": "System prompt is English-only. No Chinese food handling logic found. Hypothesis confirmed.",
-            "should_continue": False,
-            "next_action_hint": "",
-        }),
+        json.dumps(
+            {
+                "hypothesis_status": "confirmed",
+                "confidence": "high",
+                "reasoning": "System prompt is English-only. No Chinese food handling logic found. Hypothesis confirmed.",
+                "should_continue": False,
+                "next_action_hint": "",
+            }
+        ),
         # === h-002 ===
         # Turn 1: tool selection → read_artifact
-        json.dumps({
-            "tool": "read_artifact",
-            "tool_input": {
-                "artifact": "stage1_output.findings",
-                "related_finding_ids": ["f-001"],
-            },
-            "reasoning": "Check Stage 1 findings about the chat API",
-        }),
+        json.dumps(
+            {
+                "tool": "read_artifact",
+                "tool_input": {
+                    "artifact": "stage1_output.findings",
+                    "related_finding_ids": ["f-001"],
+                },
+                "reasoning": "Check Stage 1 findings about the chat API",
+            }
+        ),
         # Turn 1: eval → append immediately
-        json.dumps({
-            "hypothesis_status": "confirmed",
-            "confidence": "medium",
-            "reasoning": "Stage 1 confirms no rate limiting mentioned, chat API is unprotected",
-            "should_continue": False,
-            "next_action_hint": "",
-        }),
+        json.dumps(
+            {
+                "hypothesis_status": "confirmed",
+                "confidence": "medium",
+                "reasoning": "Stage 1 confirms no rate limiting mentioned, chat API is unprotected",
+                "should_continue": False,
+                "next_action_hint": "",
+            }
+        ),
     ]
     return MockLLMAdapter(responses=responses)
 
@@ -232,11 +244,7 @@ class TestIntegrationRealisticExploration:
 
         assert result.data is not None
         log_path = _artifact_root(input_data) / "exploration_log.jsonl"
-        entries = [
-            json.loads(line)
-            for line in log_path.read_text().splitlines()
-            if line.strip()
-        ]
+        entries = [json.loads(line) for line in log_path.read_text().splitlines() if line.strip()]
 
         assert len(entries) >= 2, "Expected at least 2 exploration steps"
         for entry in entries:
@@ -256,9 +264,7 @@ class TestIntegrationRealisticExploration:
         assert result.data is not None
         hyp_path = _artifact_root(input_data) / "hypotheses.jsonl"
         hypotheses = [
-            json.loads(line)
-            for line in hyp_path.read_text().splitlines()
-            if line.strip()
+            json.loads(line) for line in hyp_path.read_text().splitlines() if line.strip()
         ]
         original_ids = {h.hypothesis_id for h in input_data.stage1_output.hypotheses}
         stored_ids = {h["hypothesis_id"] for h in hypotheses}
@@ -269,38 +275,46 @@ class TestIntegrationRealisticExploration:
         input_data = _build_input(tmp_path)
         # Force read_file tool to create real evidence
         responses = [
-            json.dumps({
-                "tool": "read_file",
-                "tool_input": {
-                    "path": "src/app/api/chat/route.ts",
-                    "start_line": 1,
-                    "end_line": 10,
-                },
-                "reasoning": "Read file to get evidence",
-            }),
-            json.dumps({
-                "hypothesis_status": "confirmed",
-                "confidence": "high",
-                "reasoning": "File read successfully, evidence collected",
-                "should_continue": False,
-                "next_action_hint": "",
-            }),
-            json.dumps({
-                "tool": "read_file",
-                "tool_input": {
-                    "path": "src/lib/store.ts",
-                    "start_line": 1,
-                    "end_line": 5,
-                },
-                "reasoning": "Check store for persistence",
-            }),
-            json.dumps({
-                "hypothesis_status": "confirmed",
-                "confidence": "medium",
-                "reasoning": "In-memory store confirmed, no rate limiting",
-                "should_continue": False,
-                "next_action_hint": "",
-            }),
+            json.dumps(
+                {
+                    "tool": "read_file",
+                    "tool_input": {
+                        "path": "src/app/api/chat/route.ts",
+                        "start_line": 1,
+                        "end_line": 10,
+                    },
+                    "reasoning": "Read file to get evidence",
+                }
+            ),
+            json.dumps(
+                {
+                    "hypothesis_status": "confirmed",
+                    "confidence": "high",
+                    "reasoning": "File read successfully, evidence collected",
+                    "should_continue": False,
+                    "next_action_hint": "",
+                }
+            ),
+            json.dumps(
+                {
+                    "tool": "read_file",
+                    "tool_input": {
+                        "path": "src/lib/store.ts",
+                        "start_line": 1,
+                        "end_line": 5,
+                    },
+                    "reasoning": "Check store for persistence",
+                }
+            ),
+            json.dumps(
+                {
+                    "hypothesis_status": "confirmed",
+                    "confidence": "medium",
+                    "reasoning": "In-memory store confirmed, no rate limiting",
+                    "should_continue": False,
+                    "next_action_hint": "",
+                }
+            ),
         ]
         adapter = MockLLMAdapter(responses=responses)
 
@@ -320,32 +334,36 @@ class TestIntegrationRealisticExploration:
     def test_evidence_index_maps_claims_correctly(self, tmp_path: Path) -> None:
         input_data = _build_input(tmp_path)
         responses = [
-            json.dumps({
-                "tool": "append_finding",
-                "tool_input": {
-                    "status": "confirmed",
-                    "statement": "Test confirmed claim",
-                    "confidence": "high",
-                    "evidence_path": "src/app/api/chat/route.ts",
-                    "evidence_start_line": 10,
-                    "evidence_end_line": 15,
-                    "evidence_snippet": "export async function POST(...)",
-                },
-                "reasoning": "Direct evidence in Stage 1",
-            }),
-            json.dumps({
-                "tool": "append_finding",
-                "tool_input": {
-                    "status": "confirmed",
-                    "statement": "Another confirmed claim",
-                    "confidence": "medium",
-                    "evidence_path": "src/lib/store.ts",
-                    "evidence_start_line": 1,
-                    "evidence_end_line": 5,
-                    "evidence_snippet": "// In-memory store only",
-                },
-                "reasoning": "Evidence from store file",
-            }),
+            json.dumps(
+                {
+                    "tool": "append_finding",
+                    "tool_input": {
+                        "status": "confirmed",
+                        "statement": "Test confirmed claim",
+                        "confidence": "high",
+                        "evidence_path": "src/app/api/chat/route.ts",
+                        "evidence_start_line": 10,
+                        "evidence_end_line": 15,
+                        "evidence_snippet": "export async function POST(...)",
+                    },
+                    "reasoning": "Direct evidence in Stage 1",
+                }
+            ),
+            json.dumps(
+                {
+                    "tool": "append_finding",
+                    "tool_input": {
+                        "status": "confirmed",
+                        "statement": "Another confirmed claim",
+                        "confidence": "medium",
+                        "evidence_path": "src/lib/store.ts",
+                        "evidence_start_line": 1,
+                        "evidence_end_line": 5,
+                        "evidence_snippet": "// In-memory store only",
+                    },
+                    "reasoning": "Evidence from store file",
+                }
+            ),
         ]
         adapter = MockLLMAdapter(responses=responses)
 
@@ -380,11 +398,7 @@ class TestIntegrationRealisticExploration:
         assert result.data is not None
         summary = result.data.summary
         ledger_path = _artifact_root(input_data) / "claim_ledger.jsonl"
-        claims = [
-            json.loads(line)
-            for line in ledger_path.read_text().splitlines()
-            if line.strip()
-        ]
+        claims = [json.loads(line) for line in ledger_path.read_text().splitlines() if line.strip()]
         resolved_in_ledger = {
             c["hypothesis_id"]
             for c in claims
@@ -400,22 +414,26 @@ class TestIntegrationRealisticExploration:
         input_data = _build_input(tmp_path)
         # Force search then conclude with whatever evidence was found
         responses = [
-            json.dumps({
-                "tool": "search_repo",
-                "tool_input": {
-                    "pattern": "streamText",
-                    "file_glob": "*.ts",
-                    "max_results": 5,
-                },
-                "reasoning": "Search for streamText usage",
-            }),
-            json.dumps({
-                "hypothesis_status": "confirmed",
-                "confidence": "high",
-                "reasoning": "Found streamText usage in route.ts confirming streaming API",
-                "should_continue": False,
-                "next_action_hint": "",
-            }),
+            json.dumps(
+                {
+                    "tool": "search_repo",
+                    "tool_input": {
+                        "pattern": "streamText",
+                        "file_glob": "*.ts",
+                        "max_results": 5,
+                    },
+                    "reasoning": "Search for streamText usage",
+                }
+            ),
+            json.dumps(
+                {
+                    "hypothesis_status": "confirmed",
+                    "confidence": "high",
+                    "reasoning": "Found streamText usage in route.ts confirming streaming API",
+                    "should_continue": False,
+                    "next_action_hint": "",
+                }
+            ),
         ] * 3  # repeat for multiple hypotheses
         adapter = MockLLMAdapter(responses=responses)
 
@@ -439,41 +457,52 @@ class TestIntegrationRealisticExploration:
             stop_after_no_gain_rounds=2,
         )
         # Always return append_finding with pending status
-        adapter = MockLLMAdapter(default_response=json.dumps({
-            "tool": "append_finding",
-            "tool_input": {
-                "status": "pending",
-                "statement": "Unable to conclude",
-                "confidence": "low",
-            },
-            "reasoning": "not enough info",
-        }))
+        adapter = MockLLMAdapter(
+            default_response=json.dumps(
+                {
+                    "tool": "append_finding",
+                    "tool_input": {
+                        "status": "pending",
+                        "statement": "Unable to conclude",
+                        "confidence": "low",
+                    },
+                    "reasoning": "not enough info",
+                }
+            )
+        )
 
         result = run_stage15_agentic(input_data, adapter=adapter)
 
         assert result.data is not None
         assert result.data.summary.termination_reason in (
-            "no_information_gain", "all_hypotheses_resolved", "budget_exhausted"
+            "no_information_gain",
+            "all_hypotheses_resolved",
+            "budget_exhausted",
         )
 
     def test_router_gets_correct_tasks(self, tmp_path: Path) -> None:
         """CapabilityRouter should be called with correct task names."""
         input_data = _build_input(tmp_path)
-        adapter = MockLLMAdapter(responses=[
-            json.dumps({
-                "tool": "append_finding",
-                "tool_input": {
-                    "status": "confirmed",
-                    "statement": "Test",
-                    "confidence": "high",
-                    "evidence_path": "src/app/api/chat/route.ts",
-                    "evidence_start_line": 10,
-                    "evidence_end_line": 15,
-                    "evidence_snippet": "test snippet",
-                },
-                "reasoning": "test",
-            }),
-        ] * 5)
+        adapter = MockLLMAdapter(
+            responses=[
+                json.dumps(
+                    {
+                        "tool": "append_finding",
+                        "tool_input": {
+                            "status": "confirmed",
+                            "statement": "Test",
+                            "confidence": "high",
+                            "evidence_path": "src/app/api/chat/route.ts",
+                            "evidence_start_line": 10,
+                            "evidence_end_line": 15,
+                            "evidence_snippet": "test snippet",
+                        },
+                        "reasoning": "test",
+                    }
+                ),
+            ]
+            * 5
+        )
 
         # Wrap adapter in router that uses it for everything
         router = CapabilityRouter(forced_adapter=adapter)
@@ -498,21 +527,25 @@ class TestIntegrationEdgeCases:
                 related_finding_ids=["f-001"],
             )
         ]
-        adapter = MockLLMAdapter(responses=[
-            json.dumps({
-                "tool": "append_finding",
-                "tool_input": {
-                    "status": "confirmed",
-                    "statement": "Streaming confirmed via streamText in route.ts",
-                    "confidence": "high",
-                    "evidence_path": "src/app/api/chat/route.ts",
-                    "evidence_start_line": 12,
-                    "evidence_end_line": 45,
-                    "evidence_snippet": "return streamText({...})",
-                },
-                "reasoning": "Stage 1 finding f-001 confirms this directly",
-            }),
-        ])
+        adapter = MockLLMAdapter(
+            responses=[
+                json.dumps(
+                    {
+                        "tool": "append_finding",
+                        "tool_input": {
+                            "status": "confirmed",
+                            "statement": "Streaming confirmed via streamText in route.ts",
+                            "confidence": "high",
+                            "evidence_path": "src/app/api/chat/route.ts",
+                            "evidence_start_line": 12,
+                            "evidence_end_line": 45,
+                            "evidence_snippet": "return streamText({...})",
+                        },
+                        "reasoning": "Stage 1 finding f-001 confirms this directly",
+                    }
+                ),
+            ]
+        )
 
         result = run_stage15_agentic(input_data, adapter=adapter)
 
@@ -523,20 +556,26 @@ class TestIntegrationEdgeCases:
     def test_malformed_llm_response_is_handled_gracefully(self, tmp_path: Path) -> None:
         """Malformed LLM JSON should not crash the pipeline."""
         input_data = _build_input(tmp_path)
-        adapter = MockLLMAdapter(responses=[
-            "this is not valid JSON at all!!!",
-            "also not JSON",
-        ] + [
-            json.dumps({
-                "tool": "append_finding",
-                "tool_input": {
-                    "status": "pending",
-                    "statement": "Could not resolve",
-                    "confidence": "low",
-                },
-                "reasoning": "fallback",
-            }),
-        ] * 5)
+        adapter = MockLLMAdapter(
+            responses=[
+                "this is not valid JSON at all!!!",
+                "also not JSON",
+            ]
+            + [
+                json.dumps(
+                    {
+                        "tool": "append_finding",
+                        "tool_input": {
+                            "status": "pending",
+                            "statement": "Could not resolve",
+                            "confidence": "low",
+                        },
+                        "reasoning": "fallback",
+                    }
+                ),
+            ]
+            * 5
+        )
 
         result = run_stage15_agentic(input_data, adapter=adapter)
 

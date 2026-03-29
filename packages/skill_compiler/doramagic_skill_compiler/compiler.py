@@ -19,7 +19,9 @@ SECTION_SPECS = [
 ]
 REQUIRED_HEADINGS = [heading for _, heading in SECTION_SPECS]
 WHY_RE = re.compile(r"\b(because|why|trade[- ]?off|prefer|avoid|constraint|unless|except)\b", re.I)
-GENERIC_RE = re.compile(r"\b(best practice|it depends|be flexible|optimize|robust|scalable)\b", re.I)
+GENERIC_RE = re.compile(
+    r"\b(best practice|it depends|be flexible|optimize|robust|scalable)\b", re.I
+)
 
 
 def compile_ready(report: dict[str, Any] | Any) -> bool:
@@ -87,7 +89,7 @@ def score_skill_quality(skill_md: str) -> dict[str, Any]:
     h2_lines = [(i, line[3:].strip()) for i, line in enumerate(lines) if line.startswith("## ")]
     for index, (line_no, heading) in enumerate(h2_lines):
         end = h2_lines[index + 1][0] if index + 1 < len(h2_lines) else len(lines)
-        sections[heading] = "\n".join(lines[line_no + 1:end])
+        sections[heading] = "\n".join(lines[line_no + 1 : end])
 
     blockers = []
     present = sum(
@@ -100,16 +102,24 @@ def score_skill_quality(skill_md: str) -> dict[str, Any]:
         coverage -= 12
         blockers.append("missing_yaml_frontmatter")
 
-    knowledge_text = next((body for heading, body in sections.items() if "knowledge" in heading.lower()), "")
-    evidence_hits = len(re.findall(r"github\.com|source:|from:|evidence|repo", knowledge_text, re.I))
+    knowledge_text = next(
+        (body for heading, body in sections.items() if "knowledge" in heading.lower()), ""
+    )
+    evidence_hits = len(
+        re.findall(r"github\.com|source:|from:|evidence|repo", knowledge_text, re.I)
+    )
     evidence = min(100.0, evidence_hits * 18.0)
 
     combined = " ".join(sections.values())
-    specific = len(re.findall(r"\b(prefer|avoid|unless|except|failure|trap|constraint)\b", combined, re.I))
+    specific = len(
+        re.findall(r"\b(prefer|avoid|unless|except|failure|trap|constraint)\b", combined, re.I)
+    )
     generic = len(GENERIC_RE.findall(combined))
     dsd = max(0.0, min(100.0, specific * 10.0 - generic * 5.0))
 
-    sentences = [sentence.strip() for sentence in re.split(r"[.!?\n]+", skill_md) if sentence.strip()]
+    sentences = [
+        sentence.strip() for sentence in re.split(r"[.!?\n]+", skill_md) if sentence.strip()
+    ]
     why_hits = sum(1 for sentence in sentences if WHY_RE.search(sentence))
     why_density = min(100.0, (why_hits / max(1, len(sentences))) * 220.0)
 
@@ -229,7 +239,10 @@ def _section_fallback(key: str, heading: str, input_data: SkillCompilerInput) ->
         bullets = []
         for decision in selected[:5]:
             statement = _decision_field(decision, "statement")
-            rationale = _decision_field(decision, "rationale") or "Prefer the implementation path that already absorbed production trade-offs."
+            rationale = (
+                _decision_field(decision, "rationale")
+                or "Prefer the implementation path that already absorbed production trade-offs."
+            )
             source = next((ref for ref in _decision_field(decision, "source_refs", []) if ref), "")
             line = f"- {statement} because {rationale}."
             if source:
@@ -237,7 +250,10 @@ def _section_fallback(key: str, heading: str, input_data: SkillCompilerInput) ->
             bullets.append(line)
         if not bullets:
             fallback = brief or input_data.synthesis_report.common_why[:5]
-            bullets = [f"- {item} because it is the strongest evidence-backed rationale available." for item in fallback[:6]]
+            bullets = [
+                f"- {item} because it is the strongest evidence-backed rationale available."
+                for item in fallback[:6]
+            ]
         body = "\n".join(bullets)
         return f"{heading}\n{body}"
     if key == "workflow":
@@ -261,8 +277,13 @@ def _section_fallback(key: str, heading: str, input_data: SkillCompilerInput) ->
             trap_lines.append(line)
         if not trap_lines:
             fallback = brief or [item for item in input_data.synthesis_report.divergences[:4]]
-            trap_lines = [f"- Avoid {item} because it weakens evidence quality or hides trade-offs." for item in fallback[:5]]
-        body = "\n".join(trap_lines) or "- Do not replace extracted WHY knowledge with generic advice."
+            trap_lines = [
+                f"- Avoid {item} because it weakens evidence quality or hides trade-offs."
+                for item in fallback[:5]
+            ]
+        body = (
+            "\n".join(trap_lines) or "- Do not replace extracted WHY knowledge with generic advice."
+        )
         return f"{heading}\n{body}"
     return (
         f"{heading}\n"
@@ -289,7 +310,9 @@ def _build_shared_packet(input_data: SkillCompilerInput) -> str:
 
 def _assemble_skill(section_drafts: dict[str, str], input_data: SkillCompilerInput) -> str:
     skill_name = _slugify(input_data.need_profile.intent_en or input_data.need_profile.intent)
-    description = _frontmatter_safe_text(input_data.need_profile.intent_en or input_data.need_profile.intent)
+    description = _frontmatter_safe_text(
+        input_data.need_profile.intent_en or input_data.need_profile.intent
+    )
     sections = [section_drafts[key] for key, _ in SECTION_SPECS if key in section_drafts]
     return "\n\n".join(
         [
@@ -317,7 +340,9 @@ def _build_provenance(input_data: SkillCompilerInput) -> str:
 
 
 def _build_limitations(input_data: SkillCompilerInput) -> str:
-    unknowns = input_data.synthesis_report.unknowns or ["This draft is limited by the extracted evidence that survived the pipeline."]
+    unknowns = input_data.synthesis_report.unknowns or [
+        "This draft is limited by the extracted evidence that survived the pipeline."
+    ]
     return "# LIMITATIONS\n\n" + "\n".join(f"- {item}" for item in unknowns[:6]) + "\n"
 
 

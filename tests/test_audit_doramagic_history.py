@@ -6,7 +6,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 SCRIPT_PATH = Path(__file__).parent.parent / "scripts" / "audit_doramagic_history.py"
 SPEC = importlib.util.spec_from_file_location("audit_doramagic_history", SCRIPT_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)

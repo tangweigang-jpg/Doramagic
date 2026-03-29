@@ -17,8 +17,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "packages" /
 # 引用 extraction 包
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from doramagic_contracts.extraction import RepoFacts  # noqa: E402
-from doramagic_extraction.stage0 import extract_repo_facts  # noqa: E402
+from doramagic_contracts.extraction import RepoFacts
+from doramagic_extraction.stage0 import extract_repo_facts
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -159,7 +159,10 @@ class TestEntrypointDetection:
         assert "main.py" in result.entrypoints
 
     def test_detects_nextjs_chat_route(self, tmp_path: Path) -> None:
-        _write(tmp_path / "src" / "app" / "api" / "chat" / "route.ts", "export async function POST() {}")
+        _write(
+            tmp_path / "src" / "app" / "api" / "chat" / "route.ts",
+            "export async function POST() {}",
+        )
         result = extract_repo_facts(str(tmp_path))
         assert "src/app/api/chat/route.ts" in result.entrypoints
 

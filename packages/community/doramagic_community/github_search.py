@@ -3,6 +3,7 @@
 用法（作为模块导入）：
     from doramagic_community.github_search import search_github, download_repo
 """
+
 from __future__ import annotations
 
 import argparse
@@ -23,7 +24,9 @@ def search_github(keywords: list[str], top_k: int = 5, language: str = "") -> li
         query += f"+language:{quote(language)}"
     url = f"https://api.github.com/search/repositories?q={query}&sort=stars&per_page={top_k}"
 
-    req = Request(url, headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "Doramagic/1.0"})
+    req = Request(
+        url, headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "Doramagic/1.0"}
+    )
     try:
         with urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
@@ -33,16 +36,18 @@ def search_github(keywords: list[str], top_k: int = 5, language: str = "") -> li
 
     results = []
     for item in data.get("items", [])[:top_k]:
-        results.append({
-            "name": item["full_name"],
-            "url": item["html_url"],
-            "stars": item["stargazers_count"],
-            "language": item.get("language", ""),
-            "description": item.get("description", "") or "",
-            "default_branch": item.get("default_branch", "main"),
-            "updated_at": item.get("updated_at", ""),
-            "topics": item.get("topics", []),
-        })
+        results.append(
+            {
+                "name": item["full_name"],
+                "url": item["html_url"],
+                "stars": item["stargazers_count"],
+                "language": item.get("language", ""),
+                "description": item.get("description", "") or "",
+                "default_branch": item.get("default_branch", "main"),
+                "updated_at": item.get("updated_at", ""),
+                "topics": item.get("topics", []),
+            }
+        )
     return results
 
 
@@ -99,5 +104,7 @@ def main():
     else:
         results = search_github(args.keywords, args.top, args.language)
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.output).write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+        Path(args.output).write_text(
+            json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         print(f"Found {len(results)} projects, saved to {args.output}")

@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, Tuple, Union
 
 
 def normalize_identifier(value: str) -> str:
@@ -32,7 +31,7 @@ class RacerName(str, Enum):
         }[self]
 
     @classmethod
-    def coerce(cls, value: Union["RacerName", str]) -> "RacerName":
+    def coerce(cls, value: RacerName | str) -> RacerName:
         if isinstance(value, cls):
             return value
 
@@ -46,20 +45,20 @@ class RacerName(str, Enum):
             if normalized in candidates:
                 return racer
 
-        raise ValueError("Unknown racer name: {0}".format(value))
+        raise ValueError(f"Unknown racer name: {value}")
 
 
 @dataclass(frozen=True)
 class RaceTrack:
     track_name: str
     module_name: str
-    racers: Tuple[RacerName, RacerName]
+    racers: tuple[RacerName, RacerName]
 
 
 @dataclass(frozen=True)
 class RoundRaceConfig:
     round_num: int
-    tracks: Tuple[RaceTrack, RaceTrack]
+    tracks: tuple[RaceTrack, RaceTrack]
 
 
 CANONICAL_MODULE_ALIASES = {
@@ -89,7 +88,7 @@ MODULE_BRANCH_SLUGS = {
 }
 
 
-ROUND_RACE_CONFIGS: Dict[int, RoundRaceConfig] = {
+ROUND_RACE_CONFIGS: dict[int, RoundRaceConfig] = {
     1: RoundRaceConfig(
         round_num=1,
         tracks=(
@@ -202,4 +201,4 @@ def get_round_config(round_num: int) -> RoundRaceConfig:
     try:
         return ROUND_RACE_CONFIGS[round_num]
     except KeyError as exc:
-        raise ValueError("Unknown round number: {0}".format(round_num)) from exc
+        raise ValueError(f"Unknown round number: {round_num}") from exc

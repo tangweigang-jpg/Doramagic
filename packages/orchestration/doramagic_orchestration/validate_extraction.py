@@ -17,14 +17,21 @@ import json
 import os
 import re
 import sys
-from pathlib import Path
-
 
 # --- Config ---
 
 REQUIRED_DR_FIELDS = [
-    "card_type", "card_id", "repo", "type", "title",
-    "severity", "rule", "do", "dont", "confidence", "sources"
+    "card_type",
+    "card_id",
+    "repo",
+    "type",
+    "title",
+    "severity",
+    "rule",
+    "do",
+    "dont",
+    "confidence",
+    "sources",
 ]
 REQUIRED_CC_FIELDS = ["card_type", "card_id", "repo", "title"]
 REQUIRED_WF_FIELDS = ["card_type", "card_id", "repo", "title"]
@@ -38,6 +45,7 @@ MIN_COMMUNITY_RULES = 3
 
 # --- YAML frontmatter parser (minimal, no dependency) ---
 
+
 def parse_frontmatter(text):
     """Parse YAML frontmatter between --- markers. Returns (dict, body)."""
     if not text.startswith("---"):
@@ -48,7 +56,7 @@ def parse_frontmatter(text):
         return {}, text
 
     yaml_block = text[3:end].strip()
-    body = text[end + 3:].strip()
+    body = text[end + 3 :].strip()
     meta = {}
 
     current_key = None
@@ -69,7 +77,11 @@ def parse_frontmatter(text):
             continue
 
         # Handle multiline block scalar (|)
-        if current_key and (line.startswith("  ") or line.startswith("\t")) and not re.match(r'^[a-z_]+:', line):
+        if (
+            current_key
+            and (line.startswith("  ") or line.startswith("\t"))
+            and not re.match(r"^[a-z_]+:", line)
+        ):
             current_value_lines.append(line.strip())
             continue
 
@@ -79,7 +91,7 @@ def parse_frontmatter(text):
             current_value_lines = []
 
         # New key:value pair
-        match = re.match(r'^([a-z_]+):\s*(.*)', line)
+        match = re.match(r"^([a-z_]+):\s*(.*)", line)
         if match:
             current_key = match.group(1)
             value = match.group(2).strip()
@@ -108,6 +120,7 @@ def parse_frontmatter(text):
 
 # --- Validators ---
 
+
 def check_required_fields(meta, required, card_path):
     """Check that all required fields are present and non-empty."""
     errors = []
@@ -115,7 +128,7 @@ def check_required_fields(meta, required, card_path):
         if field not in meta or meta[field] is None or meta[field] == "":
             errors.append(f"Missing required field: {field}")
         elif field == "sources" and not meta[field]:
-            errors.append(f"Empty sources list")
+            errors.append("Empty sources list")
     return errors
 
 
@@ -169,8 +182,14 @@ def check_rule_has_condition(meta):
     """Check that rule field contains IF/THEN or conditional language."""
     rule = str(meta.get("rule", ""))
     condition_patterns = [
-        r'\bif\b', r'\bwhen\b', r'\bthen\b', r'\bunless\b',
-        r'\bbefore\b', r'\bafter\b', r'\bmust\b', r'\bnever\b'
+        r"\bif\b",
+        r"\bwhen\b",
+        r"\bthen\b",
+        r"\bunless\b",
+        r"\bbefore\b",
+        r"\bafter\b",
+        r"\bmust\b",
+        r"\bnever\b",
     ]
     has_condition = any(re.search(p, rule, re.IGNORECASE) for p in condition_patterns)
     if not has_condition:
@@ -185,8 +204,8 @@ def check_critical_has_code_example(meta):
         return []
     do_list = meta.get("do", [])
     do_text = " ".join(str(d) for d in do_list) if isinstance(do_list, list) else str(do_list)
-    if '`' not in do_text and 'code' not in do_text.lower():
-        return [f"CRITICAL/HIGH card lacks code example in do list"]
+    if "`" not in do_text and "code" not in do_text.lower():
+        return ["CRITICAL/HIGH card lacks code example in do list"]
     return []
 
 
@@ -244,15 +263,13 @@ def check_commands_in_facts(meta, body, repo_facts):
     errors = []
     # Find backtick-quoted tokens that look like CLI commands or slash commands
     # e.g. `/plugin marketplace add` or `openclaw agent`
-    for m in re.finditer(r'`(/[\w\s]+|[\w][\w-]+ [\w-]+)`', body):
+    for m in re.finditer(r"`(/[\w\s]+|[\w][\w-]+ [\w-]+)`", body):
         token = m.group(1).strip()
         first_word = token.split()[0].lstrip("/")
         # Only flag if it looks like a command (not a file path)
         if "/" not in token and "." not in token:
             if first_word not in all_known and len(first_word) > 2:
-                errors.append(
-                    f"Command/skill '{token}' not found in repo_facts.json whitelist"
-                )
+                errors.append(f"Command/skill '{token}' not found in repo_facts.json whitelist")
     return errors
 
 
@@ -280,11 +297,12 @@ def check_code_source_refs(meta, repo_file_index):
 
 # --- Main validation ---
 
+
 def load_community_signals(output_dir):
     """Load community_signals.md content for cross-referencing."""
     path = os.path.join(output_dir, "artifacts", "community_signals.md")
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return f.read()
     return None
 
@@ -293,7 +311,7 @@ def load_repo_facts(output_dir):
     """Load repo_facts.json for claim verification."""
     path = os.path.join(output_dir, "artifacts", "repo_facts.json")
     if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             return json.load(f)
     return None
 
@@ -342,12 +360,14 @@ def validate_all(output_dir):
     # Check essence file exists
     essence_path = os.path.join(soul_dir, "00-soul.md")
     if not os.path.exists(essence_path):
-        report["cards"].append({
-            "file": "00-project-essence.md",
-            "errors": ["Essence file missing"],
-            "warnings": [],
-            "pass": False,
-        })
+        report["cards"].append(
+            {
+                "file": "00-project-essence.md",
+                "errors": ["Essence file missing"],
+                "warnings": [],
+                "pass": False,
+            }
+        )
 
     # Validate each card
     seen_ids = set()
@@ -355,7 +375,7 @@ def validate_all(output_dir):
     community_rule_count = 0
 
     for card_path in card_files:
-        with open(card_path, "r", encoding="utf-8") as f:
+        with open(card_path, encoding="utf-8") as f:
             text = f.read()
 
         meta, body = parse_frontmatter(text)
@@ -411,14 +431,16 @@ def validate_all(output_dir):
         elif re.match(r"DR-1\d{2}", card_id):
             community_rule_count += 1
 
-        report["cards"].append({
-            "file": os.path.basename(card_path),
-            "card_id": card_id,
-            "card_type": card_type,
-            "errors": errors,
-            "warnings": warnings,
-            "pass": len(errors) == 0,
-        })
+        report["cards"].append(
+            {
+                "file": os.path.basename(card_path),
+                "card_id": card_id,
+                "card_type": card_type,
+                "errors": errors,
+                "warnings": warnings,
+                "pass": len(errors) == 0,
+            }
+        )
 
     # Count checks
     total_cards = len(report["cards"])
@@ -429,9 +451,13 @@ def validate_all(output_dir):
     # Quantity checks
     quantity_errors = []
     if code_rule_count < MIN_CODE_RULES:
-        quantity_errors.append(f"Only {code_rule_count} code rules (DR-00x), minimum {MIN_CODE_RULES}")
+        quantity_errors.append(
+            f"Only {code_rule_count} code rules (DR-00x), minimum {MIN_CODE_RULES}"
+        )
     if community_rule_count < MIN_COMMUNITY_RULES:
-        quantity_errors.append(f"Only {community_rule_count} community rules (DR-10x), minimum {MIN_COMMUNITY_RULES}")
+        quantity_errors.append(
+            f"Only {community_rule_count} community rules (DR-10x), minimum {MIN_COMMUNITY_RULES}"
+        )
 
     # Community signal utilization
     community_util = 0.0
@@ -444,14 +470,15 @@ def validate_all(output_dir):
     format_compliance = pass_cards / total_cards if total_cards > 0 else 0
     traceability = 1.0  # Will be updated if source errors found
     source_errors = sum(
-        1 for c in report["cards"]
+        1
+        for c in report["cards"]
         for e in c["errors"]
         if "source" in e.lower() or "issue" in e.lower()
     )
     total_sources = sum(
         len(meta.get("sources", []))
         for card_path_item in card_files
-        for meta in [parse_frontmatter(open(card_path_item, "r", encoding="utf-8").read())[0]]
+        for meta in [parse_frontmatter(open(card_path_item, encoding="utf-8").read())[0]]
     )
     if total_sources > 0:
         traceability = 1.0 - (source_errors / total_sources)
@@ -475,11 +502,7 @@ def validate_all(output_dir):
             "min_code_rules_pass": code_rule_count >= MIN_CODE_RULES,
             "min_community_rules_pass": community_rule_count >= MIN_COMMUNITY_RULES,
         },
-        "overall_pass": (
-            total_errors == 0
-            and len(quantity_errors) == 0
-            and traceability >= 1.0
-        ),
+        "overall_pass": (total_errors == 0 and len(quantity_errors) == 0 and traceability >= 1.0),
     }
 
     return report
@@ -508,8 +531,8 @@ def write_report(report, output_dir):
         "",
         "## Metrics",
         "",
-        f"| Metric | Value | Gate | Status |",
-        f"|--------|-------|------|--------|",
+        "| Metric | Value | Gate | Status |",
+        "|--------|-------|------|--------|",
         f"| Format Compliance | {m['format_compliance_rate']:.1%} | ≥ 95% | {'PASS' if g['format_compliance_pass'] else 'FAIL'} |",
         f"| Traceability | {m['traceability_rate']:.1%} | = 100% | {'PASS' if g['traceability_pass'] else 'FAIL'} |",
         f"| Community Utilization | {m['community_utilization']:.1%} | ≥ 30% | {'PASS' if m['community_utilization'] >= 0.30 else 'WARN'} |",
@@ -548,19 +571,23 @@ def write_report(report, output_dir):
     feedback_items = []
     for card in report["cards"]:
         if card["errors"]:
-            feedback_items.append({
-                "card_id": card.get("card_id", card["file"]),
-                "file": card["file"],
-                "errors": card["errors"],
-                "suggestion": "Fix the listed errors and rerun validation"
-            })
+            feedback_items.append(
+                {
+                    "card_id": card.get("card_id", card["file"]),
+                    "file": card["file"],
+                    "errors": card["errors"],
+                    "suggestion": "Fix the listed errors and rerun validation",
+                }
+            )
     if feedback_items:
         feedback_path = os.path.join(soul_dir, "structured_feedback.json")
         with open(feedback_path, "w", encoding="utf-8") as f:
             json.dump(feedback_items, f, indent=2, ensure_ascii=False)
         # Add reference to markdown summary
         with open(md_path, "a", encoding="utf-8") as f:
-            f.write(f"\n## Structured Feedback\n\nSee `structured_feedback.json` for retry instructions.\n")
+            f.write(
+                "\n## Structured Feedback\n\nSee `structured_feedback.json` for retry instructions.\n"
+            )
 
     return json_path, md_path
 
@@ -582,22 +609,22 @@ def main():
     s = report["summary"]
     m = s["metrics"]
 
-    print(f"")
+    print("")
     print(f"Cards: {s['pass_cards']}/{s['total_cards']} pass")
     print(f"Errors: {s['total_errors']}, Warnings: {s['total_warnings']}")
     print(f"Code rules: {s['code_rules']}, Community rules: {s['community_rules']}")
     print(f"Format compliance: {m['format_compliance_rate']:.1%}")
     print(f"Traceability: {m['traceability_rate']:.1%}")
     print(f"Community utilization: {m['community_utilization']:.1%}")
-    print(f"")
+    print("")
     print(f"Report: {json_path}")
     print(f"Summary: {md_path}")
 
     if s["overall_pass"]:
-        print(f"\nRESULT: PASS — Ready for Stage 4 assembly")
+        print("\nRESULT: PASS — Ready for Stage 4 assembly")
         sys.exit(0)
     else:
-        print(f"\nRESULT: BLOCKED — Fix errors before assembly")
+        print("\nRESULT: BLOCKED — Fix errors before assembly")
         if s["quantity_errors"]:
             for q in s["quantity_errors"]:
                 print(f"  - {q}")

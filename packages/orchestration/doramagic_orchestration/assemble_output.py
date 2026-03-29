@@ -15,7 +15,6 @@ import os
 import re
 import sys
 from datetime import date
-from pathlib import Path
 
 
 def load_json(path):
@@ -40,7 +39,7 @@ def parse_card_frontmatter(text):
     if end == -1:
         return {}, text
     yaml_block = text[3:end].strip()
-    body = text[end + 3:].strip()
+    body = text[end + 3 :].strip()
     meta = {}
     current_key = None
     for line in yaml_block.split("\n"):
@@ -52,7 +51,7 @@ def parse_card_frontmatter(text):
             if isinstance(meta[current_key], list):
                 meta[current_key].append(item)
             continue
-        match = re.match(r'^([a-z_]+):\s*(.*)', line)
+        match = re.match(r"^([a-z_]+):\s*(.*)", line)
         if match:
             current_key = match.group(1)
             value = match.group(2).strip().strip('"').strip("'")
@@ -76,7 +75,10 @@ def check_validation_gate(soul_dir):
         return False
     report = load_json(report_path)
     if not report or not report.get("summary", {}).get("overall_pass", False):
-        print("ERROR: Validation did not pass. Fix errors in Stage 3.5 before assembling.", file=sys.stderr)
+        print(
+            "ERROR: Validation did not pass. Fix errors in Stage 3.5 before assembling.",
+            file=sys.stderr,
+        )
         return False
     return True
 
@@ -103,8 +105,10 @@ def load_cards(soul_dir):
 def build_critical_rules(cards):
     """构建 CRITICAL RULES section。"""
     lines = [
-        "## CRITICAL RULES", "",
-        "以下规则从代码分析和社区经验中提取，按严重度排序。", "",
+        "## CRITICAL RULES",
+        "",
+        "以下规则从代码分析和社区经验中提取，按严重度排序。",
+        "",
     ]
     for severity in ["CRITICAL", "HIGH"]:
         for meta, body in cards:
@@ -153,7 +157,8 @@ def build_feature_inventory(output_dir):
 def build_quick_reference(cards):
     """构建 QUICK REFERENCE 速查表。"""
     lines = [
-        "## QUICK REFERENCE", "",
+        "## QUICK REFERENCE",
+        "",
         "| 规则 | 严重度 |",
         "|------|--------|",
     ]
@@ -170,7 +175,8 @@ def build_quick_reference(cards):
 def build_card_index(cards):
     """构建知识卡片索引表。"""
     lines = [
-        "## 知识卡片索引", "",
+        "## 知识卡片索引",
+        "",
         "| ID | 类型 | 标题 | 严重度 |",
         "|----|------|------|--------|",
     ]
@@ -192,21 +198,25 @@ def build_advisor_brief(soul_dir, repo_name):
 
     # 提取核心承诺（Q3）
     promise = ""
-    m = re.search(r'(?:核心承诺|Core Promise|3\.|Q3)[^\n]*\n+(.*?)(?=\n##|\n\d\.|\Z)', soul_content, re.DOTALL)
+    m = re.search(
+        r"(?:核心承诺|Core Promise|3\.|Q3)[^\n]*\n+(.*?)(?=\n##|\n\d\.|\Z)", soul_content, re.DOTALL
+    )
     if m:
         promise = m.group(1).strip()[:200]
 
     # 提取一句话总结（Q5）
     oneliner = ""
-    m = re.search(r'(?:一句话总结|One.liner|5\.|Q5)[^\n]*\n+(.*?)(?=\n##|\n\d\.|\Z)', soul_content, re.DOTALL)
+    m = re.search(
+        r"(?:一句话总结|One.liner|5\.|Q5)[^\n]*\n+(.*?)(?=\n##|\n\d\.|\Z)", soul_content, re.DOTALL
+    )
     if m:
         oneliner = m.group(1).strip()[:200]
 
     # 统计
     module_map = load_text(os.path.join(soul_dir, "module-map.md")) or ""
-    module_count = len(re.findall(r'^### M-\d+', module_map, re.MULTILINE))
+    module_count = len(re.findall(r"^### M-\d+", module_map, re.MULTILINE))
     community = load_text(os.path.join(soul_dir, "community-wisdom.md")) or ""
-    pain_count = len(re.findall(r'^### 痛点', community, re.MULTILINE))
+    pain_count = len(re.findall(r"^### 痛点", community, re.MULTILINE))
 
     # 统计 CRITICAL 规则
     cards_dir = os.path.join(soul_dir, "cards", "rules")
@@ -216,7 +226,7 @@ def build_advisor_brief(soul_dir, repo_name):
             if not fname.endswith(".md"):
                 continue
             text = load_text(os.path.join(cards_dir, fname)) or ""
-            if re.search(r'severity:\s*CRITICAL', text, re.IGNORECASE):
+            if re.search(r"severity:\s*CRITICAL", text, re.IGNORECASE):
                 critical_count += 1
 
     lines = [
@@ -234,7 +244,7 @@ def build_advisor_brief(soul_dir, repo_name):
         lines.append(f"**核心承诺**：{promise}")
         lines.append("")
     lines.append("这位 AI 顾问掌握了：")
-    lines.append("- 项目的设计哲学和心智模型（知道\"为什么\"，不只是\"怎么用\"）")
+    lines.append('- 项目的设计哲学和心智模型（知道"为什么"，不只是"怎么用"）')
     if module_count:
         lines.append(f"- {module_count} 个核心模块的边界和接口")
     if critical_count:
@@ -251,7 +261,7 @@ def build_advisor_brief(soul_dir, repo_name):
         "- \u201c我想做 [X]，这个项目支持吗？最佳做法是什么？\u201d",
         "",
         "---",
-        f"*由 Doramagic v1.1 自动生成*",
+        "*由 Doramagic v1.1 自动生成*",
     ]
     return "\n".join(lines)
 
@@ -276,7 +286,9 @@ def assemble(output_dir):
     # 优先用 compiled_knowledge.md（Knowledge Compiler 输出），fallback 到 expert_narrative.md
     knowledge_content = load_text(compiled_path) or load_text(narrative_path)
     if not knowledge_content:
-        print("ERROR: Neither compiled_knowledge.md nor expert_narrative.md found.", file=sys.stderr)
+        print(
+            "ERROR: Neither compiled_knowledge.md nor expert_narrative.md found.", file=sys.stderr
+        )
         return False
     if not os.path.exists(module_map_path):
         print("ERROR: module-map.md not found. Run Stage M first.", file=sys.stderr)
@@ -303,21 +315,29 @@ def assemble(output_dir):
     community_body = "\n".join(community_lines[2:]) if len(community_lines) > 2 else community
 
     # 组装 CLAUDE.md
-    claude_md = "\n".join([
-        f"# {repo_name} — Doramagic AI Advisor Pack",
-        f"# Generated by Doramagic v1.1 | Three-module: Soul + Architecture + Community",
-        "# Structure: CRITICAL RULES → FEATURE INVENTORY → MODULE MAP → EXPERT KNOWLEDGE → COMMUNITY WISDOM → QUICK REFERENCE",
-        "",
-        critical_rules,
-        feature_inventory,
-        "## MODULE MAP", "",
-        module_body, "",
-        "## EXPERT KNOWLEDGE", "",
-        knowledge_content, "",
-        "## COMMUNITY WISDOM", "",
-        community_body, "",
-        quick_reference,
-    ])
+    claude_md = "\n".join(
+        [
+            f"# {repo_name} — Doramagic AI Advisor Pack",
+            "# Generated by Doramagic v1.1 | Three-module: Soul + Architecture + Community",
+            "# Structure: CRITICAL RULES → FEATURE INVENTORY → MODULE MAP → EXPERT KNOWLEDGE → COMMUNITY WISDOM → QUICK REFERENCE",
+            "",
+            critical_rules,
+            feature_inventory,
+            "## MODULE MAP",
+            "",
+            module_body,
+            "",
+            "## EXPERT KNOWLEDGE",
+            "",
+            knowledge_content,
+            "",
+            "## COMMUNITY WISDOM",
+            "",
+            community_body,
+            "",
+            quick_reference,
+        ]
+    )
 
     # 写文件
     claude_path = os.path.join(inject_dir, "CLAUDE.md")
@@ -340,7 +360,12 @@ def assemble(output_dir):
 
     # project_soul.md
     card_index = build_card_index(cards)
-    soul_summary = claude_md + "\n---\n\n" + card_index + f"\n---\n*Generated by Doramagic v1.1 {date.today()}*\n"
+    soul_summary = (
+        claude_md
+        + "\n---\n\n"
+        + card_index
+        + f"\n---\n*Generated by Doramagic v1.1 {date.today()}*\n"
+    )
     soul_path = os.path.join(soul_dir, "project_soul.md")
     with open(soul_path, "w", encoding="utf-8") as f:
         f.write(soul_summary)
@@ -350,12 +375,14 @@ def assemble(output_dir):
     cc = sum(1 for m, _ in cards if str(m.get("card_id", "")).startswith("CC"))
     wf = sum(1 for m, _ in cards if str(m.get("card_id", "")).startswith("WF"))
     dr = sum(1 for m, _ in cards if str(m.get("card_id", "")).startswith("DR"))
-    print(f"\n=== DORAMAGIC ASSEMBLY COMPLETE ===")
+    print("\n=== DORAMAGIC ASSEMBLY COMPLETE ===")
     print(f"repo={repo_name}")
     print(f"output_size={len(claude_md)} bytes")
     print(f"concepts={cc} workflows={wf} rules={dr}")
     print(f"inject={inject_dir}")
-    print(f"knowledge_source={'compiled_knowledge.md' if os.path.exists(compiled_path) else 'expert_narrative.md'}")
+    print(
+        f"knowledge_source={'compiled_knowledge.md' if os.path.exists(compiled_path) else 'expert_narrative.md'}"
+    )
     return True
 
 
@@ -364,7 +391,9 @@ def main():
     parser.add_argument("--output-dir", required=True, help="Path to extraction output directory")
     args = parser.parse_args()
 
-    print(f"=== Doramagic v1.1: Assembling output for {os.path.basename(os.path.abspath(args.output_dir))} ===")
+    print(
+        f"=== Doramagic v1.1: Assembling output for {os.path.basename(os.path.abspath(args.output_dir))} ==="
+    )
     success = assemble(args.output_dir)
     sys.exit(0 if success else 1)
 

@@ -4,17 +4,14 @@ from __future__ import annotations
 
 import time
 
-from pydantic import BaseModel
-
 from doramagic_contracts.envelope import ModuleResultEnvelope, RunMetrics, WarningItem
 from doramagic_contracts.skill import SkillCompilerInput
 from doramagic_skill_compiler.compiler import build_compile_bundle, compile_ready
+from pydantic import BaseModel
 
 
 class SkillCompilerExecutor:
-    async def execute(
-        self, input: BaseModel, adapter: object, config
-    ) -> ModuleResultEnvelope:
+    async def execute(self, input: BaseModel, adapter: object, config) -> ModuleResultEnvelope:
         started = time.monotonic()
         if not isinstance(input, SkillCompilerInput):
             return self._error("Expected SkillCompilerInput", started)
@@ -23,7 +20,11 @@ class SkillCompilerExecutor:
             return ModuleResultEnvelope(
                 module_name="SkillCompiler",
                 status="blocked",
-                warnings=[WarningItem(code="COMPILE_NOT_READY", message="Synthesis bundle is not compile-ready")],
+                warnings=[
+                    WarningItem(
+                        code="COMPILE_NOT_READY", message="Synthesis bundle is not compile-ready"
+                    )
+                ],
                 data=None,
                 metrics=self._metrics(started),
             )

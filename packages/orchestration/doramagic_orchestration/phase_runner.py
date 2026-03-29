@@ -27,7 +27,6 @@ import os
 import sys
 import traceback
 from pathlib import Path
-from typing import Optional
 
 from pydantic import BaseModel
 
@@ -45,6 +44,7 @@ def _import_extraction_modules():
         from doramagic_extraction.deceptive_source_detection import run_dsd_checks
         from doramagic_extraction.knowledge_compiler import compile_knowledge
         from doramagic_extraction.stage15_agentic import run_stage15_agentic
+
         return run_evidence_tagging, run_dsd_checks, compile_knowledge, run_stage15_agentic
     except ImportError as exc:
         logger.warning("Could not import extraction modules: %s", exc)
@@ -54,6 +54,7 @@ def _import_extraction_modules():
 def _import_validate():
     try:
         from doramagic_orchestration.validate_extraction import validate_all, write_report
+
         return validate_all, write_report
     except ImportError as exc:
         logger.warning("Could not import validate_extraction: %s", exc)
@@ -63,6 +64,7 @@ def _import_validate():
 def _import_assemble():
     try:
         from doramagic_orchestration.assemble_output import assemble
+
         return assemble
     except ImportError as exc:
         logger.warning("Could not import assemble_output: %s", exc)
@@ -72,6 +74,7 @@ def _import_assemble():
 def _import_brick_injector():
     try:
         from doramagic_extraction.brick_injection import load_and_inject_bricks
+
         return load_and_inject_bricks
     except ImportError as exc:
         logger.warning("Could not import brick_injection: %s", exc)
@@ -81,13 +84,14 @@ def _import_brick_injector():
 def _import_stage0():
     try:
         from doramagic_extraction.stage0 import extract_repo_facts
+
         return extract_repo_facts
     except ImportError as exc:
         logger.warning("Could not import extract_repo_facts: %s", exc)
         return None
 
 
-def _resolve_bricks_dir(config: "PipelineConfig") -> Optional[str]:
+def _resolve_bricks_dir(config: PipelineConfig) -> str | None:
     """Resolve bricks dir without relying on CWD."""
     candidate = config.bricks_dir or os.environ.get("DORAMAGIC_BRICKS_DIR")
     if not candidate:
@@ -112,7 +116,7 @@ class PipelineConfig(BaseModel):
     enable_dsd: bool = True
     """是否运行 DSD 检查（Deceptive Source Detection）。"""
 
-    bricks_dir: Optional[str] = None
+    bricks_dir: str | None = None
     """积木 JSONL 文件目录。优先显式值，其次 DORAMAGIC_BRICKS_DIR，否则跳过。"""
 
     knowledge_budget: int = 1800
@@ -121,7 +125,7 @@ class PipelineConfig(BaseModel):
     skip_assembly: bool = False
     """是否跳过 Stage 5（assemble）；主要用于测试。"""
 
-    extract_repo_facts_script: Optional[str] = None
+    extract_repo_facts_script: str | None = None
     """Deprecated compatibility field; Stage 0 now imports package code directly."""
 
 
@@ -132,8 +136,8 @@ class PipelineResult(BaseModel):
     stages_skipped: list[str]
     stages_failed: list[str]
     output_dir: str
-    inject_dir: Optional[str]
-    dsd_report: Optional[dict]
+    inject_dir: str | None
+    dsd_report: dict | None
     total_cards: int
     total_bricks_loaded: int
 
@@ -179,7 +183,7 @@ def _load_cards_as_dicts(output_dir: str) -> list[dict]:
                                 meta[current_key] = []
                             meta[current_key].append(stripped[2:].strip().strip('"').strip("'"))
                             continue
-                        m = re.match(r'^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)', line)
+                        m = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*):\s*(.*)", line)
                         if m:
                             current_key = m.group(1)
                             raw_val = m.group(2).strip()
@@ -197,7 +201,7 @@ def _load_cards_as_dicts(output_dir: str) -> list[dict]:
     return cards
 
 
-def _load_repo_facts(output_dir: str) -> Optional[dict]:
+def _load_repo_facts(output_dir: str) -> dict | None:
     """加载 artifacts/repo_facts.json。"""
     path = os.path.join(output_dir, "artifacts", "repo_facts.json")
     if os.path.exists(path):
@@ -206,7 +210,7 @@ def _load_repo_facts(output_dir: str) -> Optional[dict]:
     return None
 
 
-def _load_community_signals(output_dir: str) -> Optional[str]:
+def _load_community_signals(output_dir: str) -> str | None:
     """加载 artifacts/community_signals.md。"""
     path = os.path.join(output_dir, "artifacts", "community_signals.md")
     if os.path.exists(path):
@@ -262,7 +266,11 @@ def _run_stage0(
 
     try:
         repo_facts = extract_repo_facts(repo_path)
-        payload = repo_facts.model_dump(mode="json") if hasattr(repo_facts, "model_dump") else repo_facts.dict()
+        payload = (
+            repo_facts.model_dump(mode="json")
+            if hasattr(repo_facts, "model_dump")
+            else repo_facts.dict()
+        )
         payload.setdefault("repo_path", repo_path)
         payload.setdefault("skills", [])
         payload.setdefault("files", [])
@@ -302,7 +310,9 @@ def _run_brick_injection(
 
     bricks_dir = _resolve_bricks_dir(config)
     if not bricks_dir:
-        logger.info("Brick injection: no explicit bricks dir and DORAMAGIC_BRICKS_DIR unset — skipping")
+        logger.info(
+            "Brick injection: no explicit bricks dir and DORAMAGIC_BRICKS_DIR unset — skipping"
+        )
         stages_skipped.append("brick_injection")
         return 0
     if not os.path.isdir(bricks_dir):
@@ -381,11 +391,11 @@ def _run_stage15(
         from doramagic_contracts.base import RepoRef
         from doramagic_contracts.extraction import (
             RepoFacts,
+            Stage1Coverage,
+            Stage1ScanOutput,
             Stage15AgenticInput,
             Stage15Budget,
             Stage15Toolset,
-            Stage1Coverage,
-            Stage1ScanOutput,
         )
     except ImportError as exc:
         logger.warning("Stage 1.5: contracts not importable (%s) — skipping", exc)
@@ -406,7 +416,10 @@ def _run_stage15(
         repo_ref = RepoRef(
             repo_id=_repo_basename,
             full_name=repo_facts_raw.get("full_name", _repo_basename),
-            url=repo_facts_raw.get("repo_url", repo_facts_raw.get("url", f"https://github.com/unknown/{_repo_basename}")),
+            url=repo_facts_raw.get(
+                "repo_url",
+                repo_facts_raw.get("url", f"https://github.com/unknown/{_repo_basename}"),
+            ),
             default_branch=repo_facts_raw.get("default_branch", "main"),
             commit_sha=repo_facts_raw.get("commit_sha", "unknown"),
             local_path=repo_path,
@@ -471,7 +484,7 @@ def _run_stage35(
     stages_completed: list[str],
     stages_skipped: list[str],
     stages_failed: list[str],
-) -> tuple[bool, Optional[dict], list[dict]]:
+) -> tuple[bool, dict | None, list[dict]]:
     """Stage 3.5: 验证 + 置信度标注 + DSD。
 
     Returns (validation_passed, dsd_report_dict, tagged_cards).
@@ -557,7 +570,7 @@ def _run_stage35(
             stages_failed.append("stage3.5_confidence")
 
     # ---- 3.5c: DSD ----
-    dsd_report_dict: Optional[dict] = None
+    dsd_report_dict: dict | None = None
 
     if not config.enable_dsd:
         stages_skipped.append("stage3.5_dsd")
@@ -632,7 +645,7 @@ def _run_stage5(
     stages_completed: list[str],
     stages_skipped: list[str],
     stages_failed: list[str],
-) -> Optional[str]:
+) -> str | None:
     """Stage 5: 组装 inject/ 目录。
 
     Returns inject_dir path or None on failure/skip.
@@ -675,7 +688,7 @@ def run_single_project_pipeline(
     output_dir: str,
     adapter=None,
     router=None,
-    config: Optional[PipelineConfig] = None,
+    config: PipelineConfig | None = None,
 ) -> PipelineResult:
     """运行单项目完整提取管线（确定性部分）。
 
@@ -747,9 +760,7 @@ def run_single_project_pipeline(
             # Skip Knowledge Compiler (needs cards) but try assembly
             stages_skipped.append("stage4.5")
         else:
-            logger.warning(
-                "Stage 3.5 validation failed — skipping Stage 4.5 (Knowledge Compiler)"
-            )
+            logger.warning("Stage 3.5 validation failed — skipping Stage 4.5 (Knowledge Compiler)")
             stages_skipped.append("stage4.5")
             stages_skipped.append("stage5")
             inject_dir = None
@@ -758,7 +769,9 @@ def run_single_project_pipeline(
         _run_stage45(output_dir, config, stages_completed, stages_skipped, stages_failed)
 
         # ---- Stage 5: Assemble ----
-        inject_dir = _run_stage5(output_dir, config, stages_completed, stages_skipped, stages_failed)
+        inject_dir = _run_stage5(
+            output_dir, config, stages_completed, stages_skipped, stages_failed
+        )
 
     total_cards = len(tagged_cards)
 
@@ -813,15 +826,9 @@ def _cli():
     parser.add_argument(
         "--skip-stage15", action="store_true", help="Disable Stage 1.5 agentic exploration"
     )
-    parser.add_argument(
-        "--skip-dsd", action="store_true", help="Disable DSD checks"
-    )
-    parser.add_argument(
-        "--skip-bricks", action="store_true", help="Disable brick injection"
-    )
-    parser.add_argument(
-        "--skip-assembly", action="store_true", help="Skip Stage 5 assembly"
-    )
+    parser.add_argument("--skip-dsd", action="store_true", help="Disable DSD checks")
+    parser.add_argument("--skip-bricks", action="store_true", help="Disable brick injection")
+    parser.add_argument("--skip-assembly", action="store_true", help="Skip Stage 5 assembly")
     args = parser.parse_args()
 
     cfg = PipelineConfig(

@@ -10,9 +10,7 @@ from doramagic_contracts.base import NeedProfile, RoutingDecision
 class InputRouter:
     """Route user intent without using an LLM."""
 
-    URL_PATTERN = re.compile(
-        r"https?://(?:github|gitlab|gitee)\.com/[\w.-]+/[\w.-]+/?"
-    )
+    URL_PATTERN = re.compile(r"https?://(?:github|gitlab|gitee)\.com/[\w.-]+/[\w.-]+/?")
     REPO_SLUG_PATTERN = re.compile(r"\b([\w.-]+/[\w.-]+)\b")
     PROJECT_NAME_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$")
     FALSE_POSITIVE_SLUGS = {

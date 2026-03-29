@@ -23,7 +23,6 @@ import re
 from dataclasses import dataclass, field
 from typing import Literal
 
-
 # ---------------------------------------------------------------------------
 # Data models (dataclasses — no pydantic dependency needed here)
 # ---------------------------------------------------------------------------
@@ -33,7 +32,7 @@ from typing import Literal
 class DSDCheck:
     check_id: str
     name: str
-    score: float          # 0..1
+    score: float  # 0..1
     triggered: bool
     detail: str
 
@@ -361,11 +360,7 @@ def check_dsd5_public_context_completeness(cards: list[dict]) -> DSDCheck:
         detail=(
             f"Average inference-word density across {len(card_ratios)} cards = "
             f"{avg_ratio:.3f} (threshold=0.40). "
-            + (
-                "WARNING: cards contain excessive speculation language."
-                if triggered
-                else "OK"
-            )
+            + ("WARNING: cards contain excessive speculation language." if triggered else "OK")
         ),
     )
 
@@ -446,7 +441,8 @@ def check_dsd7_dependency_dominance(cards: list[dict], repo_facts: dict) -> DSDC
 
     # Count cards that reference closed-source dependencies
     core_cards = [
-        c for c in cards
+        c
+        for c in cards
         if c.get("knowledge_type") in ("capability", "interface", "assembly_pattern")
         or c.get("question_key") in ("Q1", "Q3", "Q5")
     ]
@@ -465,9 +461,7 @@ def check_dsd7_dependency_dominance(cards: list[dict], repo_facts: dict) -> DSDC
     repo_closed_ratio = len(closed_deps) / max(1, len(repo_deps)) if repo_deps else 0.0
 
     # Check cards
-    closed_card_count = sum(
-        1 for c in core_cards if _CLOSED_SOURCE_KEYWORDS.search(_card_text(c))
-    )
+    closed_card_count = sum(1 for c in core_cards if _CLOSED_SOURCE_KEYWORDS.search(_card_text(c)))
     card_closed_ratio = closed_card_count / max(1, len(core_cards)) if core_cards else 0.0
 
     # Combined score: weighted average (repo_facts is ground truth, cards are context)
@@ -491,7 +485,11 @@ def check_dsd7_dependency_dominance(cards: list[dict], repo_facts: dict) -> DSDC
             f"cards={card_closed_ratio:.2f} "
             f"({closed_card_count}/{len(core_cards)} core cards). "
             f"Combined score={score:.2f} (threshold=0.50). "
-            + ("WARNING: core functionality depends heavily on closed-source services." if triggered else "OK")
+            + (
+                "WARNING: core functionality depends heavily on closed-source services."
+                if triggered
+                else "OK"
+            )
         ),
     )
 

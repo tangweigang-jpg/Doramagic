@@ -21,11 +21,11 @@ from .race_workspace import (
 )
 
 __all__ = [
-    "ActiveRace",
-    "RacerName",
-    "RaceTrack",
     "REVIEW_DIMENSIONS",
     "ROUND_RACE_CONFIGS",
+    "ActiveRace",
+    "RaceTrack",
+    "RacerName",
     "RoundRaceConfig",
     "canonical_module_name",
     "cleanup_race_worktree",

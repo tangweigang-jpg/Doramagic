@@ -6,7 +6,7 @@ RepoExtractionEnvelope -- standardized fan-in format
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -28,8 +28,8 @@ class RepoExtractionEnvelope(BaseModel):
     repo_type: Literal["TOOL", "FRAMEWORK", "CATALOG"] = "TOOL"
 
     # Extraction results
-    design_philosophy: Optional[str] = None
-    mental_model: Optional[str] = None
+    design_philosophy: str | None = None
+    mental_model: str | None = None
     why_decisions: list[dict] = []
     unsaid_traps: list[dict] = []
     feature_inventory: list[str] = []
@@ -38,7 +38,7 @@ class RepoExtractionEnvelope(BaseModel):
     repo_facts: dict = {}
     evidence_cards: list[dict] = []
     extraction_profile_used: str = ""
-    failure_scope: Optional[str] = None
+    failure_scope: str | None = None
 
     # Community signals
     community_signals: list[dict] = []
@@ -54,14 +54,14 @@ class RepoExtractionEnvelope(BaseModel):
     completion_tokens: int = Field(default=0, ge=0)
 
     # Composite metrics (Codex style)
-    metrics: Optional[RunMetrics] = None
+    metrics: RunMetrics | None = None
 
     # Status
     status: Literal["ok", "degraded", "failed"] = "ok"
     warnings: list[str] = []
 
     # DSD metrics
-    dsd_metrics: Optional[dict] = None
+    dsd_metrics: dict | None = None
 
 
 class CollectionResult(BaseModel):

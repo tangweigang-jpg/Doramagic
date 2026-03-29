@@ -9,20 +9,20 @@ import re
 import sys
 import tempfile
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "packages" / "contracts"))
 
-from doramagic_contracts.base import EvidenceRef, KnowledgeAtom, ProjectFingerprint  # noqa: E402
-from doramagic_contracts.cross_project import (  # noqa: E402
+from doramagic_contracts.base import EvidenceRef, KnowledgeAtom, ProjectFingerprint
+from doramagic_contracts.cross_project import (
     CompareInput,
     CompareMetrics,
     CompareOutput,
     CompareSignal,
 )
-from doramagic_contracts.envelope import (  # noqa: E402
+from doramagic_contracts.envelope import (
     ErrorCodes,
     ModuleResultEnvelope,
     RunMetrics,
@@ -63,12 +63,12 @@ class AtomRecord:
     project_name: str
     atom: KnowledgeAtom
     normalized_statement: str
-    lexical_tokens: Tuple[str, ...]
-    semantic_tokens: Tuple[str, ...]
+    lexical_tokens: tuple[str, ...]
+    semantic_tokens: tuple[str, ...]
     subject_key: str
     predicate_key: str
     object_key: str
-    community_signature: Tuple[str, str, str, str]
+    community_signature: tuple[str, str, str, str]
 
 
 class _UnionFind:
@@ -93,7 +93,7 @@ def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", normalized)
 
 
-def _canonical_tokens(value: str) -> Tuple[str, ...]:
+def _canonical_tokens(value: str) -> tuple[str, ...]:
     tokens = []
     for raw_token in _normalize_text(value).split():
         token = TOKEN_SYNONYMS.get(raw_token, raw_token)
@@ -150,16 +150,9 @@ def _build_record(fingerprint: ProjectFingerprint, atom: KnowledgeAtom) -> AtomR
         project_name=fingerprint.project.full_name,
         atom=atom,
         normalized_statement=_canonical_statement(atom),
-        lexical_tokens=_canonical_tokens(
-            "{0} {1} {2}".format(atom.subject, atom.predicate, atom.object)
-        ),
+        lexical_tokens=_canonical_tokens(f"{atom.subject} {atom.predicate} {atom.object}"),
         semantic_tokens=_canonical_tokens(
-            "{0} {1} {2} {3}".format(
-                atom.knowledge_type,
-                atom.subject,
-                atom.predicate,
-                atom.object,
-            )
+            f"{atom.knowledge_type} {atom.subject} {atom.predicate} {atom.object}"
         ),
         subject_key=" ".join(_canonical_tokens(atom.subject)),
         predicate_key=" ".join(_canonical_tokens(atom.predicate)),
@@ -203,8 +196,8 @@ def _match_score(left: AtomRecord, right: AtomRecord) -> float:
     return round(max(semantic, structured, (semantic + structured) / 2), 4)
 
 
-def _collect_records(fingerprints: Sequence[ProjectFingerprint]) -> List[AtomRecord]:
-    records: List[AtomRecord] = []
+def _collect_records(fingerprints: Sequence[ProjectFingerprint]) -> list[AtomRecord]:
+    records: list[AtomRecord] = []
     for fingerprint in fingerprints:
         for atom in fingerprint.knowledge_atoms:
             records.append(_build_record(fingerprint, atom))
@@ -215,8 +208,8 @@ def _collect_records(fingerprints: Sequence[ProjectFingerprint]) -> List[AtomRec
 def _pairwise_matches(
     records: Sequence[AtomRecord],
     partial_threshold: float,
-) -> Dict[Tuple[int, int], float]:
-    matches: Dict[Tuple[int, int], float] = {}
+) -> dict[tuple[int, int], float]:
+    matches: dict[tuple[int, int], float] = {}
     for left_index in range(len(records)):
         for right_index in range(left_index + 1, len(records)):
             left = records[left_index]
@@ -229,12 +222,14 @@ def _pairwise_matches(
     return matches
 
 
-def _components(records: Sequence[AtomRecord], matches: Dict[Tuple[int, int], float]) -> List[List[int]]:
+def _components(
+    records: Sequence[AtomRecord], matches: dict[tuple[int, int], float]
+) -> list[list[int]]:
     union_find = _UnionFind(len(records))
     for (left_index, right_index), _score in matches.items():
         union_find.union(left_index, right_index)
 
-    grouped: Dict[int, List[int]] = {}
+    grouped: dict[int, list[int]] = {}
     for index in range(len(records)):
         root = union_find.find(index)
         grouped.setdefault(root, []).append(index)
@@ -252,7 +247,7 @@ def _signal_id(signal: str, project_ids: Sequence[str], normalized_statement: st
         normalized_statement,
     )
     digest = hashlib.sha1(stable_payload.encode("utf-8")).hexdigest()[:12].upper()
-    return "SIG-{0}".format(digest)
+    return f"SIG-{digest}"
 
 
 def _community_independence(records: Sequence[AtomRecord]) -> float:
@@ -266,7 +261,7 @@ def _community_independence(records: Sequence[AtomRecord]) -> float:
 def _cluster_score(
     component: Sequence[int],
     records: Sequence[AtomRecord],
-    matches: Dict[Tuple[int, int], float],
+    matches: dict[tuple[int, int], float],
 ) -> float:
     scores = []
     for left_pos in range(len(component)):
@@ -291,9 +286,9 @@ def _second_pass_original(
     component: Sequence[int],
     component_score: float,
     records: Sequence[AtomRecord],
-    matches: Dict[Tuple[int, int], float],
+    matches: dict[tuple[int, int], float],
     partial_threshold: float,
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     if len(component) != 1:
         return False, "second pass skipped: clustered with another project"
 
@@ -308,15 +303,15 @@ def _second_pass_original(
 
     if best_alternative < partial_threshold:
         return True, "second-pass retrieval found no comparable atom above partial threshold"
-    return False, "second-pass retrieval found alternative score {0:.2f}".format(best_alternative)
+    return False, f"second-pass retrieval found alternative score {best_alternative:.2f}"
 
 
 def _component_signal(
     component: Sequence[int],
     records: Sequence[AtomRecord],
-    matches: Dict[Tuple[int, int], float],
+    matches: dict[tuple[int, int], float],
     input_data: CompareInput,
-) -> Optional[CompareSignal]:
+) -> CompareSignal | None:
     project_ids = sorted({records[index].project_id for index in component})
     support_count = len(project_ids)
     support_independence = _community_independence([records[index] for index in component])
@@ -325,7 +320,7 @@ def _component_signal(
     normalized_statement = representative.normalized_statement
     project_count = len(input_data.fingerprints)
     coverage = support_count / project_count
-    evidence_refs: List[EvidenceRef] = []
+    evidence_refs: list[EvidenceRef] = []
     for index in component:
         evidence_refs.extend(records[index].atom.evidence_refs[:1])
 
@@ -338,7 +333,7 @@ def _component_signal(
         and support_independence >= input_data.config.missing_min_independence
     ):
         signal = "MISSING"
-        notes = "coverage={0:.2f}; independence={1:.2f}".format(coverage, support_independence)
+        notes = f"coverage={coverage:.2f}; independence={support_independence:.2f}"
     elif support_count >= 2 and match_score >= input_data.config.semantic_threshold:
         signal = "ALIGNED"
         if match_score >= input_data.config.exact_aligned_threshold:
@@ -364,7 +359,7 @@ def _component_signal(
     if signal is None:
         return None
     if signal not in VALID_SIGNALS:
-        raise ValueError("Unexpected signal emitted: {0}".format(signal))
+        raise ValueError(f"Unexpected signal emitted: {signal}")
 
     return CompareSignal(
         signal_id=_signal_id(signal, project_ids, normalized_statement),

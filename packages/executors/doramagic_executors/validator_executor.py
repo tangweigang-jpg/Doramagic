@@ -4,15 +4,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import BaseModel
-
 from doramagic_contracts.envelope import ModuleResultEnvelope
 from doramagic_contracts.skill import ValidationInput, ValidationReport
 from doramagic_skill_compiler.compiler import score_skill_quality
+from pydantic import BaseModel
 
 
 class ValidatorExecutor:
-    async def execute(self, input: BaseModel, adapter: object, config) -> ModuleResultEnvelope[ValidationReport]:
+    async def execute(
+        self, input: BaseModel, adapter: object, config
+    ) -> ModuleResultEnvelope[ValidationReport]:
         if not isinstance(input, ValidationInput):
             raise TypeError("ValidatorExecutor expects ValidationInput")
 
@@ -22,15 +23,19 @@ class ValidatorExecutor:
         report = result.data or ValidationReport(status="BLOCKED", checks=[])
 
         skill_md = self._read_text(input.skill_bundle.skill_md_path)
-        quality = score_skill_quality(skill_md) if skill_md else {
-            "overall_score": 0.0,
-            "dimension_scores": {},
-            "weakest_dimension": "Coverage",
-            "weakest_section": "knowledge",
-            "repairable": False,
-            "repair_plan": [],
-            "blockers": ["missing_skill_md"],
-        }
+        quality = (
+            score_skill_quality(skill_md)
+            if skill_md
+            else {
+                "overall_score": 0.0,
+                "dimension_scores": {},
+                "weakest_dimension": "Coverage",
+                "weakest_section": "knowledge",
+                "repairable": False,
+                "repair_plan": [],
+                "blockers": ["missing_skill_md"],
+            }
+        )
 
         has_blockers = report.status == "BLOCKED" or any(
             not check.passed and check.severity == "blocking" for check in report.checks

@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Optional, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from doramagic_contracts.base import Confidence, KnowledgeAtom, KnowledgeType
 from doramagic_contracts.domain_graph import (
-    DomainBrick,
-    AtomCluster,
     DeprecationEvent,
-    SnapshotStats,
+    DomainBrick,
 )
-from doramagic_contracts.base import KnowledgeAtom, KnowledgeType, Confidence
-
 
 # --- Domain Listing ---
 
@@ -65,9 +62,9 @@ class DomainTruthResponse(BaseModel):
 class AtomQueryParams(BaseModel):
     """GET /domains/{id}/atoms 查询参数。"""
 
-    knowledge_type: Optional[KnowledgeType] = None
-    confidence_min: Optional[Confidence] = None
-    keyword: Optional[str] = None
+    knowledge_type: KnowledgeType | None = None
+    confidence_min: Confidence | None = None
+    keyword: str | None = None
     limit: int = Field(default=50, ge=1, le=200)
     offset: int = Field(default=0, ge=0)
 

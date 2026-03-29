@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -62,8 +62,8 @@ class Stage1Finding(BaseModel):
     evidence_refs: list[EvidenceRef]
     # 置信度体系 (v1.1)
     evidence_tags: list[EvidenceTag] = []
-    verdict: Optional[Verdict] = None
-    policy_action: Optional[PolicyAction] = None
+    verdict: Verdict | None = None
+    policy_action: PolicyAction | None = None
 
 
 class Hypothesis(BaseModel):
@@ -96,7 +96,7 @@ class Stage1ScanOutput(BaseModel):
     hypotheses: list[Hypothesis]
     coverage: Stage1Coverage
     recommended_for_stage15: bool
-    why_recoverability: Optional[WHYRecoverability] = None  # v1.1
+    why_recoverability: WHYRecoverability | None = None  # v1.1
 
 
 # --- Stage 1.5 ---
@@ -129,9 +129,7 @@ class Stage15AgenticInput(BaseModel):
 class ExplorationLogEntry(BaseModel):
     step_id: str
     round_index: int = Field(ge=1)
-    tool_name: Literal[
-        "read_artifact", "list_tree", "search_repo", "read_file", "append_finding"
-    ]
+    tool_name: Literal["read_artifact", "list_tree", "search_repo", "read_file", "append_finding"]
     tool_input: dict
     observation: str
     produced_evidence_refs: list[EvidenceRef] = []
@@ -142,13 +140,13 @@ class ClaimRecord(BaseModel):
     statement: str
     status: Literal["confirmed", "rejected", "pending", "inference"]
     confidence: Confidence
-    hypothesis_id: Optional[str] = None
+    hypothesis_id: str | None = None
     supporting_step_ids: list[str]
     evidence_refs: list[EvidenceRef]
     # 置信度体系 (v1.1)
     evidence_tags: list[EvidenceTag] = []
-    verdict: Optional[Verdict] = None
-    policy_action: Optional[PolicyAction] = None
+    verdict: Verdict | None = None
+    policy_action: PolicyAction | None = None
 
 
 class Stage15Summary(BaseModel):

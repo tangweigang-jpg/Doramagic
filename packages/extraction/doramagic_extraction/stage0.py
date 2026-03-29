@@ -12,13 +12,12 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 # 引用 contracts 包
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "packages" / "contracts"))
 
-from doramagic_contracts.base import RepoRef  # noqa: E402
-from doramagic_contracts.extraction import RepoFacts  # noqa: E402
+from doramagic_contracts.base import RepoRef
+from doramagic_contracts.extraction import RepoFacts
 
 # ---------------------------------------------------------------------------
 # 语言检测规则：文件扩展名 → 语言名
@@ -125,8 +124,16 @@ def _detect_languages(repo_path: Path) -> list[str]:
     """统计仓库中各语言的文件数，返回按数量降序的语言列表。"""
     lang_counts: dict[str, int] = {}
     skip_dirs = {
-        ".git", "node_modules", "__pycache__", ".venv", "venv",
-        "dist", "build", ".next", ".nuxt", "coverage",
+        ".git",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "dist",
+        "build",
+        ".next",
+        ".nuxt",
+        "coverage",
     }
 
     for root, dirs, files in os.walk(repo_path):
@@ -198,6 +205,7 @@ def _detect_commands(repo_path: Path) -> list[str]:
     if pkg_json.exists():
         try:
             import json
+
             data = json.loads(pkg_json.read_text(encoding="utf-8"))
             scripts = data.get("scripts", {})
             for script_name in ["dev", "start", "build", "test", "lint"]:
@@ -257,6 +265,7 @@ def _detect_dependencies(repo_path: Path) -> list[str]:
     if pkg_json.exists():
         try:
             import json
+
             data = json.loads(pkg_json.read_text(encoding="utf-8"))
             for section in ["dependencies", "devDependencies"]:
                 deps.extend(data.get(section, {}).keys())
@@ -285,7 +294,7 @@ def _build_repo_summary(
     languages: list[str],
     frameworks: list[str],
     entrypoints: list[str],
-    config: Optional[dict],
+    config: dict | None,
 ) -> str:
     """生成简短的仓库摘要（纯确定性，不调用 LLM）。"""
     parts: list[str] = []
@@ -312,7 +321,7 @@ def _build_repo_summary(
 
 def extract_repo_facts(
     repo_path: str,
-    config: Optional[dict] = None,
+    config: dict | None = None,
 ) -> RepoFacts:
     """从本地仓库路径提取 RepoFacts（Stage 0 确定性提取）。
 

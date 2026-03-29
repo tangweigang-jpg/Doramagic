@@ -9,7 +9,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT / "packages" / "contracts"))
 sys.path.insert(0, str(PROJECT_ROOT / "packages" / "doramagic_product"))
 
-from doramagic_contracts.base import CandidateQualitySignals, DiscoveryCandidate, SearchCoverageItem  # noqa: E402
+from doramagic_contracts.base import (  # noqa: E402
+    CandidateQualitySignals,
+    DiscoveryCandidate,
+    SearchCoverageItem,
+)
 from doramagic_contracts.cross_project import DiscoveryResult  # noqa: E402
 from doramagic_product.pipeline import CandidateInfo, DoramagicProductPipeline  # noqa: E402
 
@@ -39,7 +43,7 @@ class _FakeHttpClient:
 def _make_local_repo(path: Path, readme_title: str, storage_file: str) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     (path / "README.md").write_text(
-        "# {0}\n\nA local-first app for recipe planning and household meal tracking.\n".format(readme_title),
+        f"# {readme_title}\n\nA local-first app for recipe planning and household meal tracking.\n",
         encoding="utf-8",
     )
     (path / "app.py").write_text(
@@ -182,9 +186,11 @@ def test_pipeline_run_writes_delivery_bundle(tmp_path: Path, monkeypatch) -> Non
 
     skill_md = result.skill_path.read_text(encoding="utf-8")
     provenance_md = result.provenance_path.read_text(encoding="utf-8")
-    validation_report = result.delivery_dir.joinpath("validation_report.json").read_text(encoding="utf-8")
+    validation_report = result.delivery_dir.joinpath("validation_report.json").read_text(
+        encoding="utf-8"
+    )
 
     assert "## Why This Skill Exists" in skill_md
     assert "## Community Gotchas" in skill_md
     assert "https://github.com/example/recipe-slate" in provenance_md
-    assert "\"status\": \"PASS\"" in validation_report
+    assert '"status": "PASS"' in validation_report

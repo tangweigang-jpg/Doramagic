@@ -506,8 +506,8 @@ class TestTokenBudget:
             "why_chains": "x" * 400,
             "traps": "x" * 400,
         }
-        # Total ~900 tokens + qr. With budget=850 it should trim qr.
-        result = enforce_budget(sections, 850)
+        # Total ~827 tokens. With budget=800 it should trim qr.
+        result = enforce_budget(sections, 800)
         # Either qr is reduced or removed
         new_qr = result.get("quick_reference", "")
         assert "MEDIUM" not in new_qr or new_qr == ""
@@ -685,9 +685,9 @@ class TestFullCompile:
         positions_list = [content.index(f"## {s}") for s in found]
         # Verify positions are strictly increasing (U-shaped order preserved)
         for i in range(len(positions_list) - 1):
-            assert (
-                positions_list[i] < positions_list[i + 1]
-            ), f"{found[i]} should appear before {found[i+1]}"
+            assert positions_list[i] < positions_list[i + 1], (
+                f"{found[i]} should appear before {found[i + 1]}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -725,6 +725,6 @@ class TestBackwardCompatibility:
 
 
 def _load_cards_from(tmp_path: Path) -> list[tuple[dict, str]]:
-    from knowledge_compiler import load_cards
+    from doramagic_extraction.knowledge_compiler import load_cards
 
     return load_cards(str(tmp_path / "soul"))

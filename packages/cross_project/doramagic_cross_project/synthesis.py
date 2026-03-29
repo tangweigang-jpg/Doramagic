@@ -9,12 +9,11 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "packages" / "contracts"))
 
-from doramagic_contracts.base import Priority  # noqa: E402
-from doramagic_contracts.cross_project import (  # noqa: E402
+from doramagic_contracts.base import Priority
+from doramagic_contracts.cross_project import (
     CommunityKnowledge,
     CompareOutput,
     CompareSignal,
@@ -24,7 +23,7 @@ from doramagic_contracts.cross_project import (  # noqa: E402
     SynthesisInput,
     SynthesisReportData,
 )
-from doramagic_contracts.envelope import (  # noqa: E402
+from doramagic_contracts.envelope import (
     ErrorCodes,
     ModuleResultEnvelope,
     RunMetrics,
@@ -36,9 +35,12 @@ SYNTHESIS_JSON_FILENAME = "synthesis_report.json"
 SYNTHESIS_MD_FILENAME = "synthesis_report.md"
 
 # Conflict category heuristics: keywords in statement → category
-_CONFLICT_CATEGORY_HINTS: List[Tuple[List[str], str]] = [
+_CONFLICT_CATEGORY_HINTS: list[tuple[list[str], str]] = [
     (["license", "mit", "apache", "gpl", "copyright", "bsd"], "license"),
-    (["architecture", "storage", "database", "sqlite", "json", "markdown", "format", "backend"], "architecture"),
+    (
+        ["architecture", "storage", "database", "sqlite", "json", "markdown", "format", "backend"],
+        "architecture",
+    ),
     (["dependency", "library", "package", "version", "require", "import"], "dependency"),
     (["scope", "feature", "micronutrient", "field", "track", "export", "goal"], "scope"),
     (["deploy", "operation", "cron", "schedule", "background", "service", "run"], "operational"),
@@ -49,11 +51,12 @@ _CONFLICT_CATEGORY_HINTS: List[Tuple[List[str], str]] = [
 # Stable ID helpers
 # ---------------------------------------------------------------------------
 
+
 def _stable_id(prefix: str, *parts: str) -> str:
     """SHA-1 based stable identifier; first 10 hex chars."""
     payload = "|".join(parts)
     digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10].upper()
-    return "{0}-{1}".format(prefix, digest)
+    return f"{prefix}-{digest}"
 
 
 def _decision_id(statement: str, decision: str) -> str:
@@ -67,6 +70,7 @@ def _conflict_id(category: str, title: str) -> str:
 # ---------------------------------------------------------------------------
 # Category inference
 # ---------------------------------------------------------------------------
+
 
 def _infer_conflict_category(statement: str) -> str:
     """Infer the most relevant conflict category from the statement text."""
@@ -82,7 +86,8 @@ def _infer_conflict_category(statement: str) -> str:
 # Demand-fit scoring
 # ---------------------------------------------------------------------------
 
-def _score_demand_fit(statement: str, need_profile_keywords: List[str]) -> Priority:
+
+def _score_demand_fit(statement: str, need_profile_keywords: list[str]) -> Priority:
     """Estimate demand fit based on keyword overlap with need profile."""
     lower = statement.lower()
     matched = sum(1 for kw in need_profile_keywords if kw.lower() in lower)
@@ -97,20 +102,20 @@ def _score_demand_fit(statement: str, need_profile_keywords: List[str]) -> Prior
 # Conflict detection between DRIFTED / DIVERGENT / CONTESTED signals
 # ---------------------------------------------------------------------------
 
+
 def _extract_conflicts_from_signals(
-    signals: List[CompareSignal],
-    need_keywords: List[str],
-) -> List[SynthesisConflict]:
+    signals: list[CompareSignal],
+    need_keywords: list[str],
+) -> list[SynthesisConflict]:
     """Build SynthesisConflict entries from DRIFTED/DIVERGENT/CONTESTED signals."""
     conflict_signals = [s for s in signals if s.signal in ("DRIFTED", "DIVERGENT", "CONTESTED")]
-    conflicts: List[SynthesisConflict] = []
+    conflicts: list[SynthesisConflict] = []
 
     for sig in conflict_signals:
         category = _infer_conflict_category(sig.normalized_statement)
-        title = "Conflicting views on: {0}".format(sig.normalized_statement[:80])
+        title = f"Conflicting views on: {sig.normalized_statement[:80]}"
         positions = [
-            "Project {0}: {1}".format(pid, sig.normalized_statement)
-            for pid in sig.subject_project_ids
+            f"Project {pid}: {sig.normalized_statement}" for pid in sig.subject_project_ids
         ]
         if len(positions) < 2:
             # Add a generic second position to make it a real conflict
@@ -135,7 +140,7 @@ def _extract_conflicts_from_signals(
 
 def _recommend_resolution(category: str, statement: str) -> str:
     """Return a human-readable recommended resolution per category."""
-    resolutions: Dict[str, str] = {
+    resolutions: dict[str, str] = {
         "license": (
             "Resolve license incompatibility before including this knowledge. "
             "Prefer MIT/Apache-2.0 dual-track; GPL-licensed knowledge must be excluded unless the skill is also GPL."
@@ -168,22 +173,21 @@ def _recommend_resolution(category: str, statement: str) -> str:
 # Consensus extraction (ALIGNED signals)
 # ---------------------------------------------------------------------------
 
+
 def _build_consensus(
-    aligned_signals: List[CompareSignal],
-    need_keywords: List[str],
-) -> List[SynthesisDecision]:
+    aligned_signals: list[CompareSignal],
+    need_keywords: list[str],
+) -> list[SynthesisDecision]:
     """Turn ALIGNED signals into consensus include/exclude decisions."""
-    decisions: List[SynthesisDecision] = []
+    decisions: list[SynthesisDecision] = []
 
     for sig in aligned_signals:
         demand_fit = _score_demand_fit(sig.normalized_statement, need_keywords)
         # High-support aligned signals → include; very low fit → option
         decision: str = "include" if demand_fit in ("high", "medium") else "option"
         rationale = (
-            "Aligned across {0} independent projects (match_score={1:.2f}). "
-            "This represents cross-project consensus and is a strong candidate for compilation.".format(
-                sig.support_count, sig.match_score
-            )
+            f"Aligned across {sig.support_count} independent projects (match_score={sig.match_score:.2f}). "
+            "This represents cross-project consensus and is a strong candidate for compilation."
         )
         source_refs = [sig.signal_id] + [ref.path for ref in sig.evidence_refs[:3]]
         decisions.append(
@@ -204,14 +208,15 @@ def _build_consensus(
 # Unique / original knowledge extraction
 # ---------------------------------------------------------------------------
 
+
 def _build_unique_knowledge(
-    original_signals: List[CompareSignal],
-    project_summaries: List[ExtractedProjectSummary],
+    original_signals: list[CompareSignal],
+    project_summaries: list[ExtractedProjectSummary],
     community: CommunityKnowledge,
-    need_keywords: List[str],
-) -> List[SynthesisDecision]:
+    need_keywords: list[str],
+) -> list[SynthesisDecision]:
     """Extract unique knowledge from ORIGINAL signals + project capabilities."""
-    decisions: List[SynthesisDecision] = []
+    decisions: list[SynthesisDecision] = []
 
     # From ORIGINAL compare signals
     for sig in original_signals:
@@ -244,10 +249,8 @@ def _build_unique_knowledge(
             demand_fit = _score_demand_fit(cap, need_keywords)
             decision = "include" if demand_fit in ("high", "medium") else "option"
             rationale = (
-                "Unique capability surfaced from {0} extraction. "
-                "Not observed in other projects — represents original design thinking.".format(
-                    summary.project_id
-                )
+                f"Unique capability surfaced from {summary.project_id} extraction. "
+                "Not observed in other projects — represents original design thinking."
             )
             ref_paths = [ref.path for ref in summary.evidence_refs[:2]] or [summary.project_id]
             decisions.append(
@@ -271,8 +274,8 @@ def _build_unique_knowledge(
             demand_fit = _score_demand_fit(knowledge, need_keywords)
             decision = "include" if demand_fit in ("high", "medium") else "option"
             rationale = (
-                "Community-sourced knowledge from '{0}' ({1}). "
-                "Reusable pattern validated in practice by the community.".format(item.name, item.kind)
+                f"Community-sourced knowledge from '{item.name}' ({item.kind}). "
+                "Reusable pattern validated in practice by the community."
             )
             decisions.append(
                 SynthesisDecision(
@@ -293,12 +296,13 @@ def _build_unique_knowledge(
 # Excluded knowledge (constraints + failures worth flagging)
 # ---------------------------------------------------------------------------
 
+
 def _build_excluded_knowledge(
-    project_summaries: List[ExtractedProjectSummary],
-    need_keywords: List[str],
-) -> List[SynthesisDecision]:
+    project_summaries: list[ExtractedProjectSummary],
+    need_keywords: list[str],
+) -> list[SynthesisDecision]:
     """Build excluded decisions from constraints and failures."""
-    decisions: List[SynthesisDecision] = []
+    decisions: list[SynthesisDecision] = []
     captured: set = set()
 
     for summary in project_summaries:
@@ -308,11 +312,9 @@ def _build_excluded_knowledge(
             demand_fit = _score_demand_fit(constraint, need_keywords)
             # Constraints are excluded from the skill because they represent limitations, not features
             rationale = (
-                "Constraint from {0}: '{1}'. "
+                f"Constraint from {summary.project_id}: '{constraint}'. "
                 "Excluded from active selection — documented as a known limitation that "
-                "the skill must account for but does not implement directly.".format(
-                    summary.project_id, constraint
-                )
+                "the skill must account for but does not implement directly."
             )
             ref_paths = [ref.path for ref in summary.evidence_refs[:2]] or [summary.project_id]
             decisions.append(
@@ -332,9 +334,9 @@ def _build_excluded_knowledge(
                 continue
             demand_fit = _score_demand_fit(failure, need_keywords)
             rationale = (
-                "Known failure mode from {0}: '{1}'. "
+                f"Known failure mode from {summary.project_id}: '{failure}'. "
                 "Excluded from selection — this is a dark trap the skill design should avoid, "
-                "not a pattern to include.".format(summary.project_id, failure)
+                "not a pattern to include."
             )
             ref_paths = [ref.path for ref in summary.evidence_refs[:2]] or [summary.project_id]
             decisions.append(
@@ -356,12 +358,13 @@ def _build_excluded_knowledge(
 # Selected knowledge assembly
 # ---------------------------------------------------------------------------
 
+
 def _assemble_selected(
-    consensus: List[SynthesisDecision],
-    unique_knowledge: List[SynthesisDecision],
-) -> List[SynthesisDecision]:
+    consensus: list[SynthesisDecision],
+    unique_knowledge: list[SynthesisDecision],
+) -> list[SynthesisDecision]:
     """Select the final knowledge to compile from consensus + unique include decisions."""
-    selected: List[SynthesisDecision] = []
+    selected: list[SynthesisDecision] = []
     seen_statements: set = set()
 
     for decision in consensus + unique_knowledge:
@@ -387,34 +390,33 @@ def _assemble_selected(
 # Open questions
 # ---------------------------------------------------------------------------
 
+
 def _derive_open_questions(
-    conflicts: List[SynthesisConflict],
-    warnings: List[WarningItem],
-    project_summaries: List[ExtractedProjectSummary],
-) -> List[str]:
+    conflicts: list[SynthesisConflict],
+    warnings: list[WarningItem],
+    project_summaries: list[ExtractedProjectSummary],
+) -> list[str]:
     """Generate open questions from unresolved conflicts and data gaps."""
-    questions: List[str] = []
+    questions: list[str] = []
 
     for conflict in conflicts:
         if conflict.category == "license":
             questions.append(
-                "LICENSE GATE: Conflict '{0}' must be resolved before compilation. "
-                "Which license applies to the synthesized skill?".format(conflict.title)
+                f"LICENSE GATE: Conflict '{conflict.title}' must be resolved before compilation. "
+                "Which license applies to the synthesized skill?"
             )
         elif conflict.category == "architecture":
             questions.append(
-                "ARCHITECTURE CHOICE: {0} — should the skill prefer local file storage or "
-                "in-message JSON state?".format(conflict.title)
+                f"ARCHITECTURE CHOICE: {conflict.title} — should the skill prefer local file storage or "
+                "in-message JSON state?"
             )
         else:
             questions.append(
-                "OPEN: {0} (category={1}) — review positions and decide before compiling.".format(
-                    conflict.title, conflict.category
-                )
+                f"OPEN: {conflict.title} (category={conflict.category}) — review positions and decide before compiling."
             )
 
     for w in warnings:
-        questions.append("WARNING: {0}".format(w.message))
+        questions.append(f"WARNING: {w.message}")
 
     if not project_summaries:
         questions.append("No project summaries provided — extraction phase may be incomplete.")
@@ -426,22 +428,27 @@ def _derive_open_questions(
 # License conflict detection
 # ---------------------------------------------------------------------------
 
-def _has_unresolved_license_conflict(conflicts: List[SynthesisConflict]) -> bool:
+
+def _has_unresolved_license_conflict(conflicts: list[SynthesisConflict]) -> bool:
     """Return True if any license conflict exists (always unresolved at synthesis stage)."""
     return any(c.category == "license" for c in conflicts)
 
 
 def _detect_license_conflicts_from_summaries(
-    project_summaries: List[ExtractedProjectSummary],
-    signals: List[CompareSignal],
-) -> List[SynthesisConflict]:
+    project_summaries: list[ExtractedProjectSummary],
+    signals: list[CompareSignal],
+) -> list[SynthesisConflict]:
     """Check for license conflicts from project data."""
-    conflicts: List[SynthesisConflict] = []
+    conflicts: list[SynthesisConflict] = []
 
     # Look for license-related statements in signals
     license_signals = [
-        s for s in signals
-        if any(kw in s.normalized_statement for kw in ("license", "mit", "apache", "gpl", "bsd", "copyright"))
+        s
+        for s in signals
+        if any(
+            kw in s.normalized_statement
+            for kw in ("license", "mit", "apache", "gpl", "bsd", "copyright")
+        )
     ]
 
     if len(license_signals) >= 2:
@@ -449,7 +456,9 @@ def _detect_license_conflicts_from_summaries(
         positions = []
         source_refs = []
         for sig in license_signals[:3]:
-            positions.append("{0}: {1}".format(", ".join(sig.subject_project_ids), sig.normalized_statement))
+            positions.append(
+                "{0}: {1}".format(", ".join(sig.subject_project_ids), sig.normalized_statement)
+            )
             source_refs.append(sig.signal_id)
 
         title = "Incompatible license terms detected across projects"
@@ -471,6 +480,7 @@ def _detect_license_conflicts_from_summaries(
 # Output writers
 # ---------------------------------------------------------------------------
 
+
 def _synthesis_output_dir(domain_id: str) -> Path:
     base = os.environ.get("DORAMAGIC_SYNTHESIS_OUTPUT_DIR")
     if base:
@@ -491,15 +501,17 @@ def _write_json(report: SynthesisReportData, output_dir: Path) -> Path:
 
 
 def _decision_to_md(d: SynthesisDecision, index: int) -> str:
-    badge = {"include": "✅ INCLUDE", "exclude": "❌ EXCLUDE", "option": "🔀 OPTION"}.get(d.decision, d.decision)
+    badge = {"include": "✅ INCLUDE", "exclude": "❌ EXCLUDE", "option": "🔀 OPTION"}.get(
+        d.decision, d.decision
+    )
     lines = [
-        "### {0}. [{1}] `{2}`".format(index + 1, badge, d.decision_id),
+        f"### {index + 1}. [{badge}] `{d.decision_id}`",
         "",
-        "**Statement:** {0}".format(d.statement),
+        f"**Statement:** {d.statement}",
         "",
-        "**Demand fit:** `{0}`".format(d.demand_fit),
+        f"**Demand fit:** `{d.demand_fit}`",
         "",
-        "**Rationale:** {0}".format(d.rationale),
+        f"**Rationale:** {d.rationale}",
         "",
         "**Sources:** {0}".format(", ".join(d.source_refs) if d.source_refs else "_none_"),
         "",
@@ -509,17 +521,17 @@ def _decision_to_md(d: SynthesisDecision, index: int) -> str:
 
 def _conflict_to_md(c: SynthesisConflict, index: int) -> str:
     lines = [
-        "### {0}. [{1}] `{2}`".format(index + 1, c.category.upper(), c.conflict_id),
+        f"### {index + 1}. [{c.category.upper()}] `{c.conflict_id}`",
         "",
-        "**Title:** {0}".format(c.title),
+        f"**Title:** {c.title}",
         "",
         "**Positions:**",
     ]
     for pos in c.positions:
-        lines.append("- {0}".format(pos))
+        lines.append(f"- {pos}")
     lines += [
         "",
-        "**Recommended resolution:** {0}".format(c.recommended_resolution),
+        f"**Recommended resolution:** {c.recommended_resolution}",
         "",
         "**Sources:** {0}".format(", ".join(c.source_refs) if c.source_refs else "_none_"),
         "",
@@ -528,13 +540,11 @@ def _conflict_to_md(c: SynthesisConflict, index: int) -> str:
 
 
 def _render_markdown(report: SynthesisReportData, domain_id: str) -> str:
-    sections: List[str] = [
-        "# Synthesis Report — `{0}`".format(domain_id),
+    sections: list[str] = [
+        f"# Synthesis Report — `{domain_id}`",
         "",
         "> Auto-generated by `cross-project.synthesis`. "
-        "JSON canonical: `{0}` | Human mirror: `{1}`".format(
-            SYNTHESIS_JSON_FILENAME, SYNTHESIS_MD_FILENAME
-        ),
+        f"JSON canonical: `{SYNTHESIS_JSON_FILENAME}` | Human mirror: `{SYNTHESIS_MD_FILENAME}`",
         "",
         "---",
         "",
@@ -595,7 +605,7 @@ def _render_markdown(report: SynthesisReportData, domain_id: str) -> str:
     sections.append("")
     if report.open_questions:
         for q in report.open_questions:
-            sections.append("- {0}".format(q))
+            sections.append(f"- {q}")
         sections.append("")
     else:
         sections.append("_No open questions._")
@@ -614,6 +624,7 @@ def _write_markdown(report: SynthesisReportData, domain_id: str, output_dir: Pat
 # ---------------------------------------------------------------------------
 # Blocked helpers
 # ---------------------------------------------------------------------------
+
 
 def _blocked(error_code: str, elapsed_ms: int = 0) -> ModuleResultEnvelope[SynthesisReportData]:
     return ModuleResultEnvelope(
@@ -636,6 +647,7 @@ def _blocked(error_code: str, elapsed_ms: int = 0) -> ModuleResultEnvelope[Synth
 # Public entry point
 # ---------------------------------------------------------------------------
 
+
 def run_synthesis(input_data: SynthesisInput) -> ModuleResultEnvelope[SynthesisReportData]:
     """Synthesise knowledge from comparison signals, project summaries, and community data.
 
@@ -644,17 +656,17 @@ def run_synthesis(input_data: SynthesisInput) -> ModuleResultEnvelope[SynthesisR
     - synthesis_report.md    (human-readable mirror)
     """
     started_at = time.perf_counter()
-    warnings: List[WarningItem] = []
+    warnings: list[WarningItem] = []
 
     # --- Guard: comparison_result must be present ---
-    comparison: Optional[CompareOutput] = input_data.comparison_result
+    comparison: CompareOutput | None = input_data.comparison_result
     if comparison is None or not comparison.compared_projects:
         elapsed = int((time.perf_counter() - started_at) * 1000)
         return _blocked(ErrorCodes.UPSTREAM_MISSING, elapsed)
 
     domain_id = comparison.domain_id
     signals = comparison.signals
-    need_keywords: List[str] = input_data.need_profile.keywords or []
+    need_keywords: list[str] = input_data.need_profile.keywords or []
 
     # Separate signals by kind
     aligned = [s for s in signals if s.signal == "ALIGNED"]

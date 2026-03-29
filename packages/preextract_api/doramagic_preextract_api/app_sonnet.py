@@ -20,7 +20,6 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 # ---------------------------------------------------------------------------
 # sys.path bootstrap — allow running from any working directory
@@ -33,20 +32,16 @@ sys.path.insert(0, str(_REPO_ROOT / "packages" / "contracts"))
 # ---------------------------------------------------------------------------
 # FastAPI imports
 # ---------------------------------------------------------------------------
-from fastapi import FastAPI, HTTPException, Query  # noqa: E402
-from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
-
 # ---------------------------------------------------------------------------
 # Contract imports
 # ---------------------------------------------------------------------------
 from doramagic_contracts.api import (  # noqa: E402
-    ApiReadConfig,
     AtomQueryResponse,
+    DeprecationListResponse,
     DomainBricksResponse,
     DomainListItem,
     DomainListResponse,
     DomainTruthResponse,
-    DeprecationListResponse,
     HealthCheckResponse,
 )
 from doramagic_contracts.base import KnowledgeAtom  # noqa: E402
@@ -54,6 +49,8 @@ from doramagic_contracts.domain_graph import (  # noqa: E402
     DeprecationEvent,
     DomainSnapshot,
 )
+from fastapi import FastAPI, HTTPException, Query  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -82,12 +79,13 @@ def _get_port() -> int:
 # In-memory snapshot store (module-level singleton)
 # ---------------------------------------------------------------------------
 
+
 class _SnapshotStore:
     """Holds all loaded domain snapshots, indexed by domain_id."""
 
     def __init__(self) -> None:
         # domain_id -> DomainSnapshot (or None if corrupt)
-        self._snapshots: dict[str, Optional[DomainSnapshot]] = {}
+        self._snapshots: dict[str, DomainSnapshot | None] = {}
         # domain_id -> raw truth markdown
         self._truths: dict[str, str] = {}
         # domain_id -> list of KnowledgeAtom (from atoms.json)
@@ -123,11 +121,7 @@ class _SnapshotStore:
                     else {}
                 )
                 snapshot = DomainSnapshot(**bricks_data)
-                truth_md = (
-                    truth_path.read_text(encoding="utf-8")
-                    if truth_path.exists()
-                    else ""
-                )
+                truth_md = truth_path.read_text(encoding="utf-8") if truth_path.exists() else ""
                 # Load atoms.json if present
                 atoms: list[KnowledgeAtom] = []
                 if atoms_path.exists():
@@ -149,9 +143,7 @@ class _SnapshotStore:
     def get_snapshot(self, domain_id: str) -> DomainSnapshot:
         """Return snapshot or raise HTTPException (404 / 500)."""
         if domain_id not in self._snapshots:
-            raise HTTPException(
-                status_code=404, detail=f"Domain not found: {domain_id}"
-            )
+            raise HTTPException(status_code=404, detail=f"Domain not found: {domain_id}")
         snap = self._snapshots[domain_id]
         if snap is None:
             raise HTTPException(
@@ -176,7 +168,7 @@ _store = _SnapshotStore()
 # ---------------------------------------------------------------------------
 
 
-def load_snapshots(data_dir: Optional[Path] = None) -> None:
+def load_snapshots(data_dir: Path | None = None) -> None:
     """(Re-)load all snapshots from disk.
 
     Args:
@@ -273,9 +265,9 @@ async def get_truth(domain_id: str) -> DomainTruthResponse:
 @app.get("/domains/{domain_id}/atoms", response_model=AtomQueryResponse)
 async def query_atoms(
     domain_id: str,
-    knowledge_type: Optional[str] = Query(default=None),
-    confidence_min: Optional[str] = Query(default=None),
-    keyword: Optional[str] = Query(default=None),
+    knowledge_type: str | None = Query(default=None),
+    confidence_min: str | None = Query(default=None),
+    keyword: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
 ) -> AtomQueryResponse:
@@ -304,18 +296,14 @@ async def query_atoms(
 
     if confidence_min is not None:
         min_rank = _conf_rank.get(confidence_min, 0)
-        all_atoms = [
-            a for a in all_atoms if _conf_rank.get(a.confidence, 0) >= min_rank
-        ]
+        all_atoms = [a for a in all_atoms if _conf_rank.get(a.confidence, 0) >= min_rank]
 
     if keyword is not None:
         kw = keyword.lower()
         all_atoms = [
             a
             for a in all_atoms
-            if kw in a.subject.lower()
-            or kw in a.predicate.lower()
-            or kw in a.object.lower()
+            if kw in a.subject.lower() or kw in a.predicate.lower() or kw in a.object.lower()
         ]
 
     total_count = len(all_atoms)
@@ -355,9 +343,7 @@ async def get_health(domain_id: str, project_id: str) -> HealthCheckResponse:
     snap = _store.get_snapshot(domain_id)
 
     # Bricks that mention this project
-    covered_bricks = [
-        b for b in snap.bricks if project_id in b.source_project_ids
-    ]
+    covered_bricks = [b for b in snap.bricks if project_id in b.source_project_ids]
 
     total_bricks = len(snap.bricks)
     coverage = len(covered_bricks) / total_bricks if total_bricks > 0 else 0.0
@@ -370,9 +356,7 @@ async def get_health(domain_id: str, project_id: str) -> HealthCheckResponse:
         health_md = ""
     elif stale_count > 0:
         overall_status = "stale"
-        health_md = (
-            f"# Health Report: {project_id}\n\n{stale_count} stale brick(s) detected."
-        )
+        health_md = f"# Health Report: {project_id}\n\n{stale_count} stale brick(s) detected."
     else:
         overall_status = "healthy"
         health_md = (

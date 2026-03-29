@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Optional, Literal
-
 from pydantic import BaseModel, Field
 
 from doramagic_contracts.base import (
     Confidence,
     EvidenceRef,
-    KnowledgeAtom,
     KnowledgeType,
     SignalKind,
 )
-
 
 # --- Domain Brick ---
 
@@ -58,7 +54,7 @@ class DeprecationEvent(BaseModel):
     brick_id: str
     reason: str
     deprecated_at: str
-    replacement_brick_id: Optional[str] = None
+    replacement_brick_id: str | None = None
 
 
 # --- Snapshot Stats ---
@@ -81,7 +77,7 @@ class SnapshotStats(BaseModel):
 class SnapshotConfig(BaseModel):
     """snapshot_builder 配置。"""
 
-    output_dir: Optional[str] = None
+    output_dir: str | None = None
     include_parquet: bool = True
     include_sqlite: bool = True
     min_support_for_brick: int = Field(default=2, ge=1)
@@ -122,7 +118,7 @@ class SnapshotBuilderOutput(BaseModel):
     snapshot_version: str
     domain_bricks_path: str
     domain_truth_path: str
-    atoms_parquet_path: Optional[str] = None
-    domain_map_sqlite_path: Optional[str] = None
+    atoms_parquet_path: str | None = None
+    domain_map_sqlite_path: str | None = None
     snapshot_manifest_path: str
     stats: SnapshotStats

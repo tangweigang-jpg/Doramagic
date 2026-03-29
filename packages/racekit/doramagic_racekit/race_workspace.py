@@ -8,7 +8,6 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
 
 from .race_config import (
     RacerName,
@@ -31,7 +30,7 @@ class ActiveRace:
     head_sha: str
 
 
-def _run_git(repo_root: Path, args: List[str], check: bool = True) -> subprocess.CompletedProcess:
+def _run_git(repo_root: Path, args: list[str], check: bool = True) -> subprocess.CompletedProcess:
     completed = subprocess.run(
         ["git", "-C", str(repo_root)] + args,
         capture_output=True,
@@ -46,7 +45,7 @@ def _run_git(repo_root: Path, args: List[str], check: bool = True) -> subprocess
     return completed
 
 
-def _resolve_repo_root(start_path: Optional[Path] = None) -> Path:
+def _resolve_repo_root(start_path: Path | None = None) -> Path:
     override = os.environ.get("DORAMAGIC_RACE_REPO_ROOT")
     if override:
         return Path(override).expanduser().resolve()
@@ -59,7 +58,7 @@ def _resolve_repo_root(start_path: Optional[Path] = None) -> Path:
         check=False,
     )
     if completed.returncode != 0:
-        raise RuntimeError("Unable to resolve git repo root from {0}".format(probe_path))
+        raise RuntimeError(f"Unable to resolve git repo root from {probe_path}")
     return Path(completed.stdout.strip()).resolve()
 
 
@@ -74,16 +73,16 @@ def _resolve_worktree_root(repo_root: Path) -> Path:
     override = os.environ.get("DORAMAGIC_RACE_WORKTREE_ROOT")
     if override:
         return Path(override).expanduser().resolve()
-    return (repo_root.parent / "{0}-races".format(repo_root.name)).resolve()
+    return (repo_root.parent / f"{repo_root.name}-races").resolve()
 
 
 def _branch_name(round_num: int, module_name: str, racer: RacerName) -> str:
-    return "race/r{0:02d}/{1}/{2}".format(round_num, module_branch_slug(module_name), racer.value)
+    return f"race/r{round_num:02d}/{module_branch_slug(module_name)}/{racer.value}"
 
 
-def _parse_worktree_blocks(raw_text: str) -> List[Dict[str, str]]:
+def _parse_worktree_blocks(raw_text: str) -> list[dict[str, str]]:
     blocks = []
-    current: Dict[str, str] = {}
+    current: dict[str, str] = {}
     for line in raw_text.splitlines():
         if not line.strip():
             if current:
@@ -99,7 +98,7 @@ def _parse_worktree_blocks(raw_text: str) -> List[Dict[str, str]]:
     return blocks
 
 
-def _read_race_metadata(worktree_path: Path, branch_name: str, head_sha: str) -> Optional[ActiveRace]:
+def _read_race_metadata(worktree_path: Path, branch_name: str, head_sha: str) -> ActiveRace | None:
     metadata_path = worktree_path / RACE_METADATA_FILENAME
     if not metadata_path.exists():
         return None
@@ -116,7 +115,9 @@ def _read_race_metadata(worktree_path: Path, branch_name: str, head_sha: str) ->
     )
 
 
-def _fallback_active_race(worktree_path: Path, branch_name: str, head_sha: str) -> Optional[ActiveRace]:
+def _fallback_active_race(
+    worktree_path: Path, branch_name: str, head_sha: str
+) -> ActiveRace | None:
     prefix = "race/"
     if not branch_name.startswith(prefix):
         return None
@@ -148,23 +149,26 @@ def create_race_worktree(round_num: int, module_name: str, racer_name: str) -> P
     resolved_module_name = canonical_module_name(module_name)
     module_slug = module_branch_slug(resolved_module_name)
     branch_name = _branch_name(round_num, resolved_module_name, racer)
-    target_path = worktree_root / "r{0:02d}".format(round_num) / module_slug / racer.value
+    target_path = worktree_root / f"r{round_num:02d}" / module_slug / racer.value
 
     for race in list_active_races():
         if race.branch_name == branch_name:
             return race.path
 
     if target_path.exists():
-        raise FileExistsError("Worktree path already exists: {0}".format(target_path))
+        raise FileExistsError(f"Worktree path already exists: {target_path}")
 
     worktree_root.mkdir(parents=True, exist_ok=True)
     target_path.parent.mkdir(parents=True, exist_ok=True)
 
-    branch_exists = _run_git(
-        repo_root,
-        ["rev-parse", "--verify", "--quiet", branch_name],
-        check=False,
-    ).returncode == 0
+    branch_exists = (
+        _run_git(
+            repo_root,
+            ["rev-parse", "--verify", "--quiet", branch_name],
+            check=False,
+        ).returncode
+        == 0
+    )
 
     if branch_exists:
         _run_git(repo_root, ["worktree", "add", str(target_path), branch_name])
@@ -194,7 +198,7 @@ def cleanup_race_worktree(path: Path) -> None:
     resolved_path = Path(path).expanduser().resolve()
     active_paths = {race.path for race in list_active_races()}
     if resolved_path not in active_paths:
-        raise ValueError("Not an active race worktree: {0}".format(resolved_path))
+        raise ValueError(f"Not an active race worktree: {resolved_path}")
 
     _run_git(repo_root, ["worktree", "remove", "--force", str(resolved_path)])
     _run_git(repo_root, ["worktree", "prune"])
@@ -203,12 +207,12 @@ def cleanup_race_worktree(path: Path) -> None:
         shutil.rmtree(resolved_path, ignore_errors=True)
 
 
-def list_active_races() -> List[ActiveRace]:
+def list_active_races() -> list[ActiveRace]:
     """List active race worktrees tracked by git."""
 
     repo_root = _resolve_repo_root()
     completed = _run_git(repo_root, ["worktree", "list", "--porcelain"])
-    races: List[ActiveRace] = []
+    races: list[ActiveRace] = []
 
     for block in _parse_worktree_blocks(completed.stdout):
         branch_ref = block.get("branch")

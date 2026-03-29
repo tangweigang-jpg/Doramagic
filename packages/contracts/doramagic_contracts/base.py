@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional, Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, HttpUrl
 
@@ -17,9 +17,7 @@ RepoType = Literal["TOOL", "FRAMEWORK", "CATALOG"]
 KnowledgeType = Literal[
     "capability", "rationale", "constraint", "interface", "failure", "assembly_pattern"
 ]
-SignalKind = Literal[
-    "ALIGNED", "STALE", "MISSING", "ORIGINAL", "DRIFTED", "DIVERGENT", "CONTESTED"
-]
+SignalKind = Literal["ALIGNED", "STALE", "MISSING", "ORIGINAL", "DRIFTED", "DIVERGENT", "CONTESTED"]
 NormativeForce = Literal["must", "should", "may", "observed"]
 
 # --- 置信度体系 (v1.1) ---
@@ -44,12 +42,12 @@ class EvidenceRef(BaseModel):
 
     kind: Literal["file_line", "artifact_ref", "community_ref"]
     path: str
-    start_line: Optional[int] = Field(default=None, ge=1)
-    end_line: Optional[int] = Field(default=None, ge=1)
-    snippet: Optional[str] = None
-    artifact_name: Optional[str] = None
-    source_url: Optional[str] = None
-    evidence_tag: Optional[EvidenceTag] = None  # CODE/DOC/COMMUNITY/INFERENCE
+    start_line: int | None = Field(default=None, ge=1)
+    end_line: int | None = Field(default=None, ge=1)
+    snippet: str | None = None
+    artifact_name: str | None = None
+    source_url: str | None = None
+    evidence_tag: EvidenceTag | None = None  # CODE/DOC/COMMUNITY/INFERENCE
 
 
 class SearchDirection(BaseModel):
@@ -72,7 +70,7 @@ class NeedProfile(BaseModel):
     quality_expectations: dict[str, str] = {}
     # v1.1: LLM-generated search optimization
     domain: str = "general"
-    intent_en: Optional[str] = None
+    intent_en: str | None = None
     github_queries: list[str] = []
     relevance_terms: list[str] = []
     confidence: float = Field(default=0.8, ge=0, le=1)
@@ -110,12 +108,12 @@ class NeedProfileContract(BaseModel):
 
 
 class CandidateQualitySignals(BaseModel):
-    stars: Optional[int] = Field(default=None, ge=0)
-    forks: Optional[int] = Field(default=None, ge=0)
-    last_updated: Optional[str] = None
+    stars: int | None = Field(default=None, ge=0)
+    forks: int | None = Field(default=None, ge=0)
+    last_updated: str | None = None
     has_readme: bool = True
-    issue_activity: Optional[str] = None
-    license: Optional[str] = None
+    issue_activity: str | None = None
+    license: str | None = None
 
 
 class DiscoveryCandidate(BaseModel):
@@ -132,7 +130,7 @@ class DiscoveryCandidate(BaseModel):
     source: str = "github"
     confidence: float = Field(default=0.5, ge=0, le=1)
     why_selected: str = ""
-    repo_type_hint: Optional[RepoType] = None
+    repo_type_hint: RepoType | None = None
     extraction_profile: str = "deep"
     selected_for_phase_c: bool = False
     selected_for_phase_d: bool = False
@@ -141,7 +139,7 @@ class DiscoveryCandidate(BaseModel):
 class SearchCoverageItem(BaseModel):
     direction: str
     status: SearchStatus
-    notes: Optional[str] = None
+    notes: str | None = None
 
 
 class KnowledgeAtom(BaseModel):
@@ -159,8 +157,8 @@ class KnowledgeAtom(BaseModel):
     source_card_ids: list[str]
     # 置信度体系 (v1.1)
     evidence_tags: list[EvidenceTag] = []
-    verdict: Optional[Verdict] = None
-    policy_action: Optional[PolicyAction] = None
+    verdict: Verdict | None = None
+    policy_action: PolicyAction | None = None
 
 
 class CommunitySignalItem(BaseModel):
@@ -172,7 +170,7 @@ class CommunitySignalItem(BaseModel):
     source_type: Literal["issue", "pr", "changelog", "security_advisory", "discussion"]
     source_ref: str  # Issue #123, CHANGELOG v2.0
     # 适用域约束
-    applicable_versions: Optional[str] = None  # ">=2.0,<3.0" or None = all
+    applicable_versions: str | None = None  # ">=2.0,<3.0" or None = all
     applicable_environments: list[str] = []  # ["linux", "docker"] or [] = all
     applicable_personas: list[str] = []  # ["beginner", "enterprise"] or [] = all
     is_exception_path: bool = False  # True = edge case, False = common path
@@ -180,10 +178,10 @@ class CommunitySignalItem(BaseModel):
 
 
 class CommunitySignals(BaseModel):
-    issue_activity: Optional[str] = None
-    pr_merge_velocity: Optional[str] = None
-    changelog_frequency: Optional[str] = None
-    sentiment: Optional[Literal["positive", "mixed", "controversial", "quiet"]] = None
+    issue_activity: str | None = None
+    pr_merge_velocity: str | None = None
+    changelog_frequency: str | None = None
+    sentiment: Literal["positive", "mixed", "controversial", "quiet"] | None = None
     structured_signals: list[CommunitySignalItem] = []  # v1.1: 结构化信号
 
 
@@ -214,14 +212,14 @@ class RepoExtractionEnvelope(BaseModel):
     anti_patterns: list[str] = []
     why_decisions: list[dict[str, Any]] = []
     unsaid_traps: list[dict[str, Any]] = []
-    design_philosophy: Optional[str] = None
-    mental_model: Optional[str] = None
+    design_philosophy: str | None = None
+    mental_model: str | None = None
     feature_inventory: list[str] = []
     community_signals: dict[str, Any] = {}
     extraction_confidence: float = Field(default=0.0, ge=0, le=1)
     evidence_count: int = Field(default=0, ge=0)
-    failure_scope: Optional[str] = None
-    dsd_metrics: Optional[dict[str, Any]] = None
+    failure_scope: str | None = None
+    dsd_metrics: dict[str, Any] | None = None
     warnings: list[str] = []
     metrics: RunMetrics
 

@@ -9,22 +9,22 @@ v12.1.1 changes:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import Enum
-from typing import Callable, Optional
 
 
 class Phase(str, Enum):
     """Controller states. Each state maps to an executor or a control action."""
 
     INIT = "INIT"
-    PHASE_A = "PHASE_A"                  # Need Profile + Input Router
+    PHASE_A = "PHASE_A"  # Need Profile + Input Router
     PHASE_A_CLARIFY = "PHASE_A_CLARIFY"  # Socratic Gate (waiting for user)
-    PHASE_B = "PHASE_B"                  # Discovery
-    PHASE_C = "PHASE_C"                  # Fan-out Repo Workers (extraction + community)
-    PHASE_D = "PHASE_D"                  # Synthesis
-    PHASE_E = "PHASE_E"                  # Compile
-    PHASE_F = "PHASE_F"                  # Validate + QA Gate
-    PHASE_G = "PHASE_G"                  # Package + Deliver
+    PHASE_B = "PHASE_B"  # Discovery
+    PHASE_C = "PHASE_C"  # Fan-out Repo Workers (extraction + community)
+    PHASE_D = "PHASE_D"  # Synthesis
+    PHASE_E = "PHASE_E"  # Compile
+    PHASE_F = "PHASE_F"  # Validate + QA Gate
+    PHASE_G = "PHASE_G"  # Package + Deliver
     DONE = "DONE"
     DEGRADED = "DEGRADED"
     ERROR = "ERROR"
@@ -32,18 +32,24 @@ class Phase(str, Enum):
 
 # Valid state transitions (legality check). Key = current, value = set of allowed next states.
 TRANSITIONS: dict[Phase, set[Phase]] = {
-    Phase.INIT:            {Phase.PHASE_A, Phase.ERROR},
-    Phase.PHASE_A:         {Phase.PHASE_A_CLARIFY, Phase.PHASE_B, Phase.PHASE_C, Phase.DEGRADED, Phase.ERROR},
+    Phase.INIT: {Phase.PHASE_A, Phase.ERROR},
+    Phase.PHASE_A: {
+        Phase.PHASE_A_CLARIFY,
+        Phase.PHASE_B,
+        Phase.PHASE_C,
+        Phase.DEGRADED,
+        Phase.ERROR,
+    },
     Phase.PHASE_A_CLARIFY: {Phase.PHASE_A, Phase.PHASE_B, Phase.DEGRADED, Phase.ERROR},
-    Phase.PHASE_B:         {Phase.PHASE_C, Phase.DEGRADED, Phase.ERROR},
-    Phase.PHASE_C:         {Phase.PHASE_D, Phase.DEGRADED, Phase.ERROR},
-    Phase.PHASE_D:         {Phase.PHASE_E, Phase.DEGRADED, Phase.ERROR},
-    Phase.PHASE_E:         {Phase.PHASE_F, Phase.DEGRADED, Phase.ERROR},
-    Phase.PHASE_F:         {Phase.PHASE_G, Phase.PHASE_E, Phase.DEGRADED, Phase.ERROR},  # F->E = REVISE
-    Phase.PHASE_G:         {Phase.DONE, Phase.DEGRADED, Phase.ERROR},
-    Phase.DONE:            set(),
-    Phase.DEGRADED:        set(),
-    Phase.ERROR:           set(),
+    Phase.PHASE_B: {Phase.PHASE_C, Phase.DEGRADED, Phase.ERROR},
+    Phase.PHASE_C: {Phase.PHASE_D, Phase.DEGRADED, Phase.ERROR},
+    Phase.PHASE_D: {Phase.PHASE_E, Phase.DEGRADED, Phase.ERROR},
+    Phase.PHASE_E: {Phase.PHASE_F, Phase.DEGRADED, Phase.ERROR},
+    Phase.PHASE_F: {Phase.PHASE_G, Phase.PHASE_E, Phase.DEGRADED, Phase.ERROR},  # F->E = REVISE
+    Phase.PHASE_G: {Phase.DONE, Phase.DEGRADED, Phase.ERROR},
+    Phase.DONE: set(),
+    Phase.DEGRADED: set(),
+    Phase.ERROR: set(),
 }
 
 
@@ -66,7 +72,7 @@ class EdgeContext:
         compile_ready: bool = True,
         quality_score: float = 0.0,
         revise_count: int = 0,
-        weakest_section: Optional[str] = None,
+        weakest_section: str | None = None,
         blockers: list[str] | None = None,
         budget_exceeded: bool = False,
     ):
@@ -93,48 +99,44 @@ CONDITIONAL_EDGES: dict[Phase, list[tuple[Callable[[EdgeContext], bool], Phase]]
         (lambda ctx: bool(ctx.raw_input.strip()), Phase.PHASE_A),
         (lambda ctx: True, Phase.ERROR),
     ],
-
     Phase.PHASE_A: [
         (lambda ctx: ctx.routing_route == "LOW_CONFIDENCE", Phase.PHASE_A_CLARIFY),
-        (lambda ctx: ctx.routing_route == "DIRECT_URL", Phase.PHASE_C),    # skip B
+        (lambda ctx: ctx.routing_route == "DIRECT_URL", Phase.PHASE_C),  # skip B
         (lambda ctx: ctx.routing_route in ("NAMED_PROJECT", "DOMAIN_EXPLORE"), Phase.PHASE_B),
         (lambda ctx: True, Phase.PHASE_B),  # fallback
     ],
-
     Phase.PHASE_A_CLARIFY: [
-        (lambda ctx: ctx.clarification_round < 2, Phase.PHASE_A),       # re-profile
+        (lambda ctx: ctx.clarification_round < 2, Phase.PHASE_A),  # re-profile
         (lambda ctx: True, Phase.PHASE_B),  # exceeded max rounds, try best guess
     ],
-
     Phase.PHASE_B: [
         (lambda ctx: ctx.candidate_count > 0, Phase.PHASE_C),
         (lambda ctx: True, Phase.DEGRADED),
     ],
-
     Phase.PHASE_C: [
         (lambda ctx: ctx.successful_extractions > 0, Phase.PHASE_D),
         (lambda ctx: ctx.successful_extractions == 0 and ctx.has_clawhub, Phase.PHASE_D),
         (lambda ctx: True, Phase.DEGRADED),
     ],
-
     Phase.PHASE_D: [
         (lambda ctx: ctx.synthesis_ok and ctx.compile_ready, Phase.PHASE_E),
         (lambda ctx: ctx.synthesis_ok and not ctx.compile_ready, Phase.DEGRADED),
         (lambda ctx: True, Phase.DEGRADED),
     ],
-
     Phase.PHASE_E: [
         (lambda ctx: ctx.compile_ok, Phase.PHASE_F),
         (lambda ctx: True, Phase.DEGRADED),
     ],
-
     Phase.PHASE_F: [
         (lambda ctx: ctx.quality_score >= 60 and not ctx.blockers, Phase.PHASE_G),
-        (lambda ctx: ctx.quality_score < 60 and ctx.revise_count < 1
-                     and ctx.weakest_section is not None, Phase.PHASE_E),  # REVISE
+        (
+            lambda ctx: (
+                ctx.quality_score < 60 and ctx.revise_count < 1 and ctx.weakest_section is not None
+            ),
+            Phase.PHASE_E,
+        ),  # REVISE
         (lambda ctx: True, Phase.DEGRADED),
     ],
-
     Phase.PHASE_G: [
         (lambda ctx: True, Phase.DONE),
     ],
@@ -145,7 +147,7 @@ CONDITIONAL_EDGES: dict[Phase, list[tuple[Callable[[EdgeContext], bool], Phase]]
 PHASE_EXECUTOR_MAP: dict[Phase, str | None] = {
     Phase.INIT: None,
     Phase.PHASE_A: "NeedProfileBuilder",
-    Phase.PHASE_A_CLARIFY: None,       # controller handles (wait for user)
+    Phase.PHASE_A_CLARIFY: None,  # controller handles (wait for user)
     Phase.PHASE_B: "DiscoveryRunner",
     Phase.PHASE_C: "WorkerSupervisor",  # fan-out repo workers
     Phase.PHASE_D: "SynthesisRunner",
@@ -162,8 +164,16 @@ MAX_REVISE_LOOPS = 1
 
 # Phase progress percentage estimates for enhanced feedback
 PHASE_PROGRESS_PCT: dict[Phase, int] = {
-    Phase.INIT: 0, Phase.PHASE_A: 5, Phase.PHASE_A_CLARIFY: 5,
-    Phase.PHASE_B: 15, Phase.PHASE_C: 25, Phase.PHASE_D: 60,
-    Phase.PHASE_E: 70, Phase.PHASE_F: 85, Phase.PHASE_G: 95,
-    Phase.DONE: 100, Phase.DEGRADED: 100, Phase.ERROR: 100,
+    Phase.INIT: 0,
+    Phase.PHASE_A: 5,
+    Phase.PHASE_A_CLARIFY: 5,
+    Phase.PHASE_B: 15,
+    Phase.PHASE_C: 25,
+    Phase.PHASE_D: 60,
+    Phase.PHASE_E: 70,
+    Phase.PHASE_F: 85,
+    Phase.PHASE_G: 95,
+    Phase.DONE: 100,
+    Phase.DEGRADED: 100,
+    Phase.ERROR: 100,
 }

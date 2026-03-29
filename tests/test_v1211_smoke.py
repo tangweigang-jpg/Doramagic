@@ -14,8 +14,6 @@ for pkg_dir in (PROJECT_ROOT / "packages").iterdir():
         if str(pkg_dir) not in sys.path:
             sys.path.insert(0, str(pkg_dir))
 
-from doramagic_controller.flow_controller import FlowController
-from doramagic_controller.state_definitions import Phase
 from doramagic_contracts.adapter import ClarificationRequest, ProgressUpdate
 from doramagic_contracts.base import (
     CandidateQualitySignals,
@@ -29,6 +27,8 @@ from doramagic_contracts.budget import BudgetPolicy
 from doramagic_contracts.cross_project import DiscoveryResult
 from doramagic_contracts.envelope import ModuleResultEnvelope, RunMetrics
 from doramagic_contracts.skill import PlatformRules
+from doramagic_controller.flow_controller import FlowController
+from doramagic_controller.state_definitions import Phase
 from doramagic_executors.delivery_packager import DeliveryPackager
 from doramagic_executors.need_profile_builder import NeedProfileBuilder
 from doramagic_executors.skill_compiler_executor import SkillCompilerExecutor
@@ -102,7 +102,9 @@ class StaticExecutor:
         return True
 
 
-def _profile(*, raw_input: str, domain: str, keywords: list[str], confidence: float = 0.86) -> NeedProfile:
+def _profile(
+    *, raw_input: str, domain: str, keywords: list[str], confidence: float = 0.86
+) -> NeedProfile:
     return NeedProfile(
         raw_input=raw_input,
         keywords=keywords,
@@ -172,16 +174,25 @@ def _repo_envelope(
         },
         extraction_profile_used=extraction_profile,
         evidence_cards=[
-            {"title": f"{name} evidence", "summary": "Explicit state transitions are cheaper to reason about than hidden side effects."}
-        ] if status != "failed" else [],
+            {
+                "title": f"{name} evidence",
+                "summary": "Explicit state transitions are cheaper to reason about than hidden side effects.",
+            }
+        ]
+        if status != "failed"
+        else [],
         why_hypotheses=[
             f"{name} prefers explicit state transitions because failures become visible early and repairable.",
             f"{name} keeps user intent intact because broad abstractions hide the operational trade-off.",
-        ] if status != "failed" else [],
+        ]
+        if status != "failed"
+        else [],
         anti_patterns=[
             "implicit mutations across multiple files",
             "generic best-practice advice with no source anchoring",
-        ] if status != "failed" else [],
+        ]
+        if status != "failed"
+        else [],
         design_philosophy=(
             f"{name} favors explicit, inspectable workflow stages because each transition should carry enough evidence for the next phase."
             if status != "failed"
@@ -196,7 +207,9 @@ def _repo_envelope(
             "extract repo facts",
             "surface trade-offs",
             "package reusable advisor guidance",
-        ] if status != "failed" else [],
+        ]
+        if status != "failed"
+        else [],
         community_signals={
             "dsd_metrics": {
                 "dsd_warnings": [],
@@ -222,7 +235,14 @@ def _aggregate(envelopes: list[RepoExtractionEnvelope]) -> ExtractionAggregateCo
     )
 
 
-def _build_controller(run_dir: Path, adapter: MemoryAdapter, *, need_profile_executor: object, discovery_executor: object, worker_executor: object) -> FlowController:
+def _build_controller(
+    run_dir: Path,
+    adapter: MemoryAdapter,
+    *,
+    need_profile_executor: object,
+    discovery_executor: object,
+    worker_executor: object,
+) -> FlowController:
     executors = {
         "NeedProfileBuilder": need_profile_executor,
         "DiscoveryRunner": discovery_executor,
@@ -344,7 +364,13 @@ def test_awesome_list_uses_catalog_shallow_path(tmp_path: Path) -> None:
     discovery = StaticExecutor(
         "DiscoveryRunner",
         data=DiscoveryResult(
-            candidates=[_candidate("vinta/awesome-python", "https://github.com/vinta/awesome-python", repo_type_hint="CATALOG")],
+            candidates=[
+                _candidate(
+                    "vinta/awesome-python",
+                    "https://github.com/vinta/awesome-python",
+                    repo_type_hint="CATALOG",
+                )
+            ],
             search_coverage=[],
             candidate_count=1,
             search_evidence=["broad:python tooling"],
@@ -352,14 +378,16 @@ def test_awesome_list_uses_catalog_shallow_path(tmp_path: Path) -> None:
     )
     worker = StaticExecutor(
         "WorkerSupervisor",
-        data=_aggregate([
-            _repo_envelope(
-                "vinta/awesome-python",
-                "https://github.com/vinta/awesome-python",
-                repo_type="CATALOG",
-                extraction_profile="shallow",
-            )
-        ]),
+        data=_aggregate(
+            [
+                _repo_envelope(
+                    "vinta/awesome-python",
+                    "https://github.com/vinta/awesome-python",
+                    repo_type="CATALOG",
+                    extraction_profile="shallow",
+                )
+            ]
+        ),
     )
     controller = _build_controller(
         run_dir,
@@ -409,7 +437,9 @@ def test_three_projects_one_failure_finishes_with_degraded_delivery(tmp_path: Pa
             [
                 _repo_envelope("acme/ledger", "https://github.com/acme/ledger"),
                 _repo_envelope("acme/budget", "https://github.com/acme/budget"),
-                _repo_envelope("acme/reporting", "https://github.com/acme/reporting", status="failed"),
+                _repo_envelope(
+                    "acme/reporting", "https://github.com/acme/reporting", status="failed"
+                ),
             ]
         ),
     )

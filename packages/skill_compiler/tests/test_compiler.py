@@ -49,7 +49,8 @@ def _decision(
         statement=statement,
         decision=decision,
         rationale=rationale,
-        source_refs=source_refs or [
+        source_refs=source_refs
+        or [
             "https://github.com/acme/calorie-skill license:MIT",
         ],
         demand_fit="high",
@@ -79,11 +80,17 @@ def _report(
         unique_knowledge=[],
         selected_knowledge=selected
         or [
-            _decision("SEL-001", "Read nutrition entries, parse them, and write normalized meal summaries."),
+            _decision(
+                "SEL-001",
+                "Read nutrition entries, parse them, and write normalized meal summaries.",
+            ),
             _decision("SEL-002", "Store daily logs separately from user profile memory."),
-            _decision("SEL-003", "Ask the model to explain confidence and missing nutrition fields."),
+            _decision(
+                "SEL-003", "Ask the model to explain confidence and missing nutrition fields."
+            ),
         ],
-        excluded_knowledge=excluded or [
+        excluded_knowledge=excluded
+        or [
             _decision(
                 "EX-001",
                 "Run a cron job every night to refresh nutrition indexes.",
@@ -125,7 +132,9 @@ def test_normal_path_writes_skill_bundle(tmp_path) -> None:
 
 def test_unresolved_option_returns_blocked(tmp_path) -> None:
     os.environ["DORAMAGIC_SKILL_COMPILER_OUTPUT_DIR"] = str(tmp_path)
-    report = _report(consensus=[_decision("OPT-001", "Choose either sqlite or json storage.", decision="option")])
+    report = _report(
+        consensus=[_decision("OPT-001", "Choose either sqlite or json storage.", decision="option")]
+    )
     result = run_skill_compiler(_input(report))
 
     assert result.status == "blocked"

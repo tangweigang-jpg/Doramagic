@@ -6,25 +6,28 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
-
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "packages" / "contracts"))
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from doramagic_contracts.base import EvidenceRef, KnowledgeAtom, ProjectFingerprint, RepoRef  # noqa: E402
-from doramagic_contracts.cross_project import CompareConfig, CompareInput  # noqa: E402
-from doramagic_contracts.envelope import ErrorCodes  # noqa: E402
-from doramagic_cross_project.compare import run_compare  # noqa: E402
+from doramagic_contracts.base import (
+    EvidenceRef,
+    KnowledgeAtom,
+    ProjectFingerprint,
+    RepoRef,
+)
+from doramagic_contracts.cross_project import CompareConfig, CompareInput
+from doramagic_contracts.envelope import ErrorCodes
+from doramagic_cross_project.compare import run_compare
 
 
 def _repo(repo_id: str) -> RepoRef:
     return RepoRef(
         repo_id=repo_id,
-        full_name="example/{0}".format(repo_id),
-        url="https://github.com/example/{0}".format(repo_id),
+        full_name=f"example/{repo_id}",
+        url=f"https://github.com/example/{repo_id}",
         default_branch="main",
         commit_sha="abc123",
-        local_path="/tmp/{0}".format(repo_id),
+        local_path=f"/tmp/{repo_id}",
     )
 
 
@@ -85,7 +88,14 @@ def _compare_input() -> CompareInput:
         "acc",
         [
             _atom("A-001", "interface", "food_input", "parsed_as", "json_contract", "a/parser.ts"),
-            _atom("A-002", "assembly_pattern", "meal_text", "direct_llm_parse", "json_macro_response", "a/chat.ts"),
+            _atom(
+                "A-002",
+                "assembly_pattern",
+                "meal_text",
+                "direct_llm_parse",
+                "json_macro_response",
+                "a/chat.ts",
+            ),
         ],
         issue_activity="low",
         sentiment="positive",
@@ -93,7 +103,14 @@ def _compare_input() -> CompareInput:
     fp_b = _fingerprint(
         "foodyo",
         [
-            _atom("B-001", "interface", "food input", "parses into", "structured schema", "b/parser.ts"),
+            _atom(
+                "B-001",
+                "interface",
+                "food input",
+                "parses into",
+                "structured schema",
+                "b/parser.ts",
+            ),
             _atom("B-002", "constraint", "daily_log", "stored_in", "session_memory", "b/store.ts"),
         ],
         issue_activity="high",
@@ -143,12 +160,11 @@ class TestRunCompare:
         result = run_compare(input_data)
 
         assert result.data is not None
-        originals = [
-            signal
-            for signal in result.data.signals
-            if signal.signal == "ORIGINAL"
-        ]
-        assert not any("food input parse schema runtime must" in signal.normalized_statement for signal in originals)
+        originals = [signal for signal in result.data.signals if signal.signal == "ORIGINAL"]
+        assert not any(
+            "food input parse schema runtime must" in signal.normalized_statement
+            for signal in originals
+        )
 
     def test_signal_ids_are_stable(self) -> None:
         first = run_compare(_compare_input())
@@ -165,9 +181,7 @@ class TestRunCompare:
 
         assert result.data is not None
         original_notes = [
-            signal.notes
-            for signal in result.data.signals
-            if signal.signal == "ORIGINAL"
+            signal.notes for signal in result.data.signals if signal.signal == "ORIGINAL"
         ]
         assert original_notes
         assert all("second-pass retrieval" in (note or "") for note in original_notes)

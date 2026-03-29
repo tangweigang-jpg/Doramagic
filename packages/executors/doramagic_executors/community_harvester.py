@@ -12,11 +12,10 @@ from __future__ import annotations
 
 import time
 
-from pydantic import BaseModel
-
 from doramagic_contracts.cross_project import CommunityKnowledge, CommunityKnowledgeItem
 from doramagic_contracts.envelope import ModuleResultEnvelope, RunMetrics, WarningItem
 from doramagic_contracts.executor import ExecutorConfig
+from pydantic import BaseModel
 
 
 class CommunityHarvester:
@@ -27,7 +26,10 @@ class CommunityHarvester:
     """
 
     async def execute(
-        self, input: BaseModel, adapter: object, config: ExecutorConfig,
+        self,
+        input: BaseModel,
+        adapter: object,
+        config: ExecutorConfig,
     ) -> ModuleResultEnvelope[CommunityKnowledge]:
         start = time.monotonic()
         warnings: list[WarningItem] = []
@@ -42,10 +44,12 @@ class CommunityHarvester:
         # ClawHub search (deterministic, no LLM, always available)
         clawhub_skills = self._search_clawhub(keywords)
         if not clawhub_skills:
-            warnings.append(WarningItem(
-                code="W_CLAWHUB_EMPTY",
-                message="ClawHub returned no results",
-            ))
+            warnings.append(
+                WarningItem(
+                    code="W_CLAWHUB_EMPTY",
+                    message="ClawHub returned no results",
+                )
+            )
 
         community = CommunityKnowledge(
             skills=clawhub_skills,
@@ -60,8 +64,10 @@ class CommunityHarvester:
             warnings=warnings,
             data=community,
             metrics=RunMetrics(
-                wall_time_ms=elapsed, llm_calls=0,
-                prompt_tokens=0, completion_tokens=0,
+                wall_time_ms=elapsed,
+                llm_calls=0,
+                prompt_tokens=0,
+                completion_tokens=0,
                 estimated_cost_usd=0.0,
             ),
         )
@@ -72,8 +78,8 @@ class CommunityHarvester:
             return []
 
         try:
-            import urllib.request
             import json
+            import urllib.request
 
             query = " ".join(keywords[:3])
             url = f"https://clawhub.ai/api/search?q={urllib.parse.quote(query)}&limit=5"
@@ -83,14 +89,16 @@ class CommunityHarvester:
 
             items = []
             for skill in data.get("skills", [])[:5]:
-                items.append(CommunityKnowledgeItem(
-                    item_id=f"clawhub-{skill.get('id', 'unknown')}",
-                    name=skill.get("name", ""),
-                    source=f"clawhub:{skill.get('id', '')}",
-                    kind="community_skill",
-                    capabilities=skill.get("capabilities", []),
-                    reusable_knowledge=skill.get("description", ""),
-                ))
+                items.append(
+                    CommunityKnowledgeItem(
+                        item_id=f"clawhub-{skill.get('id', 'unknown')}",
+                        name=skill.get("name", ""),
+                        source=f"clawhub:{skill.get('id', '')}",
+                        kind="community_skill",
+                        capabilities=skill.get("capabilities", []),
+                        reusable_knowledge=skill.get("description", ""),
+                    )
+                )
             return items
         except Exception:
             return []  # Graceful degradation

@@ -13,12 +13,20 @@ Pass threshold: 60 points.
 from __future__ import annotations
 
 import re
-from typing import Optional
 
-_REQUIRED_HEADINGS = ["Role", "Domain Knowledge", "Decision Framework",
-                      "Recommended Workflow", "Anti-Patterns"]
-_WHY_RE = re.compile(r"\b(because|why|rather than|instead of|trade[- ]?off|constraint|rationale)\b", re.I)
-_GENERIC_RE = re.compile(r"\b(best practice|industry standard|scalable solution|robust system)\b", re.I)
+_REQUIRED_HEADINGS = [
+    "Role",
+    "Domain Knowledge",
+    "Decision Framework",
+    "Recommended Workflow",
+    "Anti-Patterns",
+]
+_WHY_RE = re.compile(
+    r"\b(because|why|rather than|instead of|trade[- ]?off|constraint|rationale)\b", re.I
+)
+_GENERIC_RE = re.compile(
+    r"\b(best practice|industry standard|scalable solution|robust system)\b", re.I
+)
 
 
 def score_quality(skill_md: str) -> dict:
@@ -34,7 +42,7 @@ def score_quality(skill_md: str) -> dict:
     h2_lines = [(i, line[3:].strip()) for i, line in enumerate(lines) if line.startswith("## ")]
     for idx, (line_no, heading) in enumerate(h2_lines):
         end = h2_lines[idx + 1][0] if idx + 1 < len(h2_lines) else len(lines)
-        sections[heading] = "\n".join(lines[line_no + 1:end])
+        sections[heading] = "\n".join(lines[line_no + 1 : end])
 
     # --- Coverage (30%) ---
     present = sum(1 for h in _REQUIRED_HEADINGS if any(h.lower() in sh.lower() for sh in sections))
@@ -44,7 +52,11 @@ def score_quality(skill_md: str) -> dict:
         blockers.append("missing_yaml_frontmatter")
     workflow_text = next((v for k, v in sections.items() if "workflow" in k.lower()), "")
     anti_text = next((v for k, v in sections.items() if "anti-pattern" in k.lower()), "")
-    wf_bullets = sum(1 for line in workflow_text.splitlines() if line.strip().startswith(("-", "*", "1", "2", "3", "4", "5")))
+    wf_bullets = sum(
+        1
+        for line in workflow_text.splitlines()
+        if line.strip().startswith(("-", "*", "1", "2", "3", "4", "5"))
+    )
     ap_bullets = sum(1 for line in anti_text.splitlines() if line.strip().startswith(("-", "*")))
     if wf_bullets < 4:
         cov_raw -= 10
@@ -54,20 +66,35 @@ def score_quality(skill_md: str) -> dict:
 
     # --- Evidence Quality (25%) ---
     knowledge_text = next((v for k, v in sections.items() if "knowledge" in k.lower()), "")
-    evidence_markers = len(re.findall(
-        r"\[(CODE|CATALOG|BASELINE)\]|github\.com|source:|README|from:|"
-        r"\(from:|\(source:|\(evidence:|\bfile:|\bcommit\b",
-        knowledge_text, re.I))
+    evidence_markers = len(
+        re.findall(
+            r"\[(CODE|CATALOG|BASELINE)\]|github\.com|source:|README|from:|"
+            r"\(from:|\(source:|\(evidence:|\bfile:|\bcommit\b",
+            knowledge_text,
+            re.I,
+        )
+    )
     attributed = len(re.findall(r"[-*]\s+.+\(.+\)", knowledge_text))
     evidence_hits = evidence_markers + attributed
-    kb_bullets = max(1, sum(1 for line in knowledge_text.splitlines() if line.strip().startswith(("-", "*"))))
+    kb_bullets = max(
+        1, sum(1 for line in knowledge_text.splitlines() if line.strip().startswith(("-", "*")))
+    )
     ev_raw = min(100, (evidence_hits / kb_bullets) * 100)
     ev_raw = max(0, min(100, ev_raw))
 
     # --- DSD Health (20%) ---
-    combined = " ".join(sections.get(k, "") for k in sections if any(
-        w in k.lower() for w in ("knowledge", "framework", "anti-pattern", "safety")))
-    specific = len(re.findall(r"\b(prefer|avoid|unless|except|trade[- ]?off|failure|trap|constraint)\b", combined, re.I))
+    combined = " ".join(
+        sections.get(k, "")
+        for k in sections
+        if any(w in k.lower() for w in ("knowledge", "framework", "anti-pattern", "safety"))
+    )
+    specific = len(
+        re.findall(
+            r"\b(prefer|avoid|unless|except|trade[- ]?off|failure|trap|constraint)\b",
+            combined,
+            re.I,
+        )
+    )
     generic = len(_GENERIC_RE.findall(combined))
     dsd_raw = min(100, specific * 9.0) - min(25, generic * 5.0)
     dsd_raw = max(0, dsd_raw)
@@ -87,7 +114,9 @@ def score_quality(skill_md: str) -> dict:
     sub_raw = max(0, min(100, sub_raw))
 
     # --- Total ---
-    total = round(cov_raw * 0.30 + ev_raw * 0.25 + dsd_raw * 0.20 + why_raw * 0.15 + sub_raw * 0.10, 1)
+    total = round(
+        cov_raw * 0.30 + ev_raw * 0.25 + dsd_raw * 0.20 + why_raw * 0.15 + sub_raw * 0.10, 1
+    )
 
     if present < 3:
         blockers.append("fewer_than_3_required_sections")
@@ -121,7 +150,7 @@ def score_quality(skill_md: str) -> dict:
     }
 
 
-def _map_weakest_to_section(scores: dict[str, float]) -> Optional[str]:
+def _map_weakest_to_section(scores: dict[str, float]) -> str | None:
     """Map weakest quality dimension to a compilable section key.
 
     Returns the section key that should be re-compiled to address

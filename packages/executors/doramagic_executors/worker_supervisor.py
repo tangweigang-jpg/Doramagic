@@ -6,12 +6,10 @@ import asyncio
 import json
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
-from pydantic import BaseModel
 
 from doramagic_community.community_signals import collect_community_signals
 from doramagic_community.github_search import download_repo
@@ -19,6 +17,7 @@ from doramagic_contracts.base import ExtractionAggregateContract, RepoExtraction
 from doramagic_contracts.envelope import ErrorCodes, ModuleResultEnvelope, RunMetrics, WarningItem
 from doramagic_contracts.executor import ExecutorConfig
 from doramagic_extraction.brick_injection import load_and_inject_bricks
+from pydantic import BaseModel
 
 logger = logging.getLogger("doramagic.executor.worker_supervisor")
 
@@ -68,7 +67,9 @@ class WorkerSupervisor:
             ),
         )
 
-    def _allocate_workers(self, repos: list[dict[str, Any]], config: ExecutorConfig) -> list[RepoWorkerContext]:
+    def _allocate_workers(
+        self, repos: list[dict[str, Any]], config: ExecutorConfig
+    ) -> list[RepoWorkerContext]:
         total_tokens = max(config.budget_remaining.remaining_tokens, 1)
         total_cost = max(config.budget_remaining.remaining_usd, 0.01)
         count = max(1, len(repos))
@@ -90,8 +91,10 @@ class WorkerSupervisor:
             )
         return contexts
 
-    def _fan_out(self, contexts: list[RepoWorkerContext], adapter: object, config: ExecutorConfig) -> list[RepoExtractionEnvelope]:
-        from concurrent.futures import wait, FIRST_COMPLETED
+    def _fan_out(
+        self, contexts: list[RepoWorkerContext], adapter: object, config: ExecutorConfig
+    ) -> list[RepoExtractionEnvelope]:
+        from concurrent.futures import FIRST_COMPLETED, wait
 
         envelopes: list[RepoExtractionEnvelope] = []
         with ThreadPoolExecutor(max_workers=min(config.concurrency_limit, len(contexts))) as pool:
@@ -108,17 +111,23 @@ class WorkerSupervisor:
                     for future in pending:
                         future.cancel()
                         context = future_map[future]
-                        envelopes.append(self._failed_envelope(context, f"Worker timed out after {context.timeout_seconds}s"))
+                        envelopes.append(
+                            self._failed_envelope(
+                                context, f"Worker timed out after {context.timeout_seconds}s"
+                            )
+                        )
                     break
                 for future in done:
                     context = future_map[future]
                     try:
                         envelopes.append(future.result(timeout=0))
-                    except Exception as exc:  # noqa: BLE001
+                    except Exception as exc:
                         envelopes.append(self._failed_envelope(context, str(exc)))
         return envelopes
 
-    def _run_worker(self, context: RepoWorkerContext, adapter: object, config: ExecutorConfig) -> RepoExtractionEnvelope:
+    def _run_worker(
+        self, context: RepoWorkerContext, adapter: object, config: ExecutorConfig
+    ) -> RepoExtractionEnvelope:
         started = time.monotonic()
         context.work_dir.mkdir(parents=True, exist_ok=True)
         if config.event_bus is not None:
@@ -154,7 +163,9 @@ class WorkerSupervisor:
 
             facts = self._load_json(output_dir / "artifacts" / "repo_facts.json")
             repo_type = self._classify_repo_type(context, facts)
-            bricks = load_and_inject_bricks(facts.get("frameworks", []), output_dir=str(output_dir)).raw_bricks
+            bricks = load_and_inject_bricks(
+                facts.get("frameworks", []), output_dir=str(output_dir)
+            ).raw_bricks
 
             if repo_type == "CATALOG":
                 summary = self._shallow_extract(output_dir, facts)
@@ -164,7 +175,7 @@ class WorkerSupervisor:
             community = {}
             try:
                 community = collect_community_signals(context.repo_url, local_path, None)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 community = {}
 
             envelope = RepoExtractionEnvelope(
@@ -203,8 +214,10 @@ class WorkerSupervisor:
                     meta={"repo_type": repo_type, "confidence": envelope.extraction_confidence},
                 )
             return envelope
-        except Exception as exc:  # noqa: BLE001
-            envelope = self._failed_envelope(context, str(exc), int((time.monotonic() - started) * 1000))
+        except Exception as exc:
+            envelope = self._failed_envelope(
+                context, str(exc), int((time.monotonic() - started) * 1000)
+            )
             if config.event_bus is not None:
                 config.event_bus.emit(
                     "worker_failed",
@@ -227,20 +240,33 @@ class WorkerSupervisor:
             return "FRAMEWORK"
         return "TOOL"
 
-    def _deep_extract(self, output_dir: Path, facts: dict[str, Any], bricks: list[dict[str, Any]]) -> dict[str, Any]:
+    def _deep_extract(
+        self, output_dir: Path, facts: dict[str, Any], bricks: list[dict[str, Any]]
+    ) -> dict[str, Any]:
         repo_summary = facts.get("repo_summary", "")
         frameworks = facts.get("frameworks", [])
         dependencies = facts.get("dependencies", [])
         commands = facts.get("commands", [])
         return {
-            "design_philosophy": repo_summary or "Prefer extracted repo evidence over generic advice.",
-            "mental_model": f"Frameworks: {', '.join(frameworks[:3])}" if frameworks else "General purpose tool",
+            "design_philosophy": repo_summary
+            or "Prefer extracted repo evidence over generic advice.",
+            "mental_model": f"Frameworks: {', '.join(frameworks[:3])}"
+            if frameworks
+            else "General purpose tool",
             "why_hypotheses": [
                 f"Uses {framework} as a core architectural choice" for framework in frameworks[:3]
-            ] or ["Favors a practical implementation with explicit entrypoints."],
+            ]
+            or ["Favors a practical implementation with explicit entrypoints."],
             "anti_patterns": [f"Avoid breaking {dependency}" for dependency in dependencies[:3]],
             "feature_inventory": commands[:5] or dependencies[:5] or frameworks[:5],
-            "evidence_cards": [{"kind": "repo_fact", "summary": repo_summary, "frameworks": frameworks[:3], "bricks": [brick.get("brick_id") for brick in bricks[:3]]}],
+            "evidence_cards": [
+                {
+                    "kind": "repo_fact",
+                    "summary": repo_summary,
+                    "frameworks": frameworks[:3],
+                    "bricks": [brick.get("brick_id") for brick in bricks[:3]],
+                }
+            ],
             "confidence": 0.82 if repo_summary else 0.66,
         }
 
@@ -253,9 +279,12 @@ class WorkerSupervisor:
                 break
         link_density = readme.count("http://") + readme.count("https://")
         return {
-            "design_philosophy": facts.get("repo_summary", "") or "Curated catalog for this domain.",
+            "design_philosophy": facts.get("repo_summary", "")
+            or "Curated catalog for this domain.",
             "mental_model": "A catalog is useful as market context, not a deep implementation source.",
-            "why_hypotheses": ["Treat this repository as a reference index instead of a deep code exemplar."],
+            "why_hypotheses": [
+                "Treat this repository as a reference index instead of a deep code exemplar."
+            ],
             "anti_patterns": ["Do not overfit to a catalog repository's README structure."],
             "feature_inventory": [f"external_links={link_density}"],
             "evidence_cards": [{"kind": "catalog", "summary": readme[:500]}],
@@ -331,10 +360,12 @@ class WorkerSupervisor:
             return {}
         try:
             return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:  # noqa: BLE001
+        except Exception:
             return {}
 
-    def _error(self, message: str, code: str, started: float) -> ModuleResultEnvelope[ExtractionAggregateContract]:
+    def _error(
+        self, message: str, code: str, started: float
+    ) -> ModuleResultEnvelope[ExtractionAggregateContract]:
         return ModuleResultEnvelope(
             module_name="WorkerSupervisor",
             status="error",

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Generic, Literal, TypeVar
+from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, Field
 
@@ -31,9 +31,9 @@ class ModuleResultEnvelope(BaseModel, Generic[T]):
     schema_version: str = "dm.module-envelope.v1"
     module_name: str
     status: Literal["ok", "degraded", "blocked", "error"]
-    error_code: Optional[str] = None
+    error_code: str | None = None
     warnings: list[WarningItem] = []
-    data: Optional[T] = None
+    data: T | None = None
     metrics: RunMetrics
 
 

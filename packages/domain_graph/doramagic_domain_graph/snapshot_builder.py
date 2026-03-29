@@ -9,21 +9,21 @@ import sqlite3
 import sys
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from collections.abc import Iterable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "packages" / "contracts"))
 
-from doramagic_contracts.base import EvidenceRef, KnowledgeAtom, ProjectFingerprint  # noqa: E402
-from doramagic_contracts.cross_project import (  # noqa: E402
+from doramagic_contracts.base import EvidenceRef, KnowledgeAtom, ProjectFingerprint
+from doramagic_contracts.cross_project import (
     CommunityKnowledge,
     CompareOutput,
     CompareSignal,
     SynthesisDecision,
     SynthesisReportData,
 )
-from doramagic_contracts.domain_graph import (  # noqa: E402
+from doramagic_contracts.domain_graph import (
     AtomCluster,
     DomainBrick,
     DomainSnapshot,
@@ -31,7 +31,7 @@ from doramagic_contracts.domain_graph import (  # noqa: E402
     SnapshotBuilderOutput,
     SnapshotStats,
 )
-from doramagic_contracts.envelope import (  # noqa: E402
+from doramagic_contracts.envelope import (
     ErrorCodes,
     ModuleResultEnvelope,
     RunMetrics,
@@ -131,7 +131,9 @@ def _metrics(wall_time_ms: int) -> RunMetrics:
     )
 
 
-def _blocked_envelope(error_code: str, wall_time_ms: int = 0) -> ModuleResultEnvelope[SnapshotBuilderOutput]:
+def _blocked_envelope(
+    error_code: str, wall_time_ms: int = 0
+) -> ModuleResultEnvelope[SnapshotBuilderOutput]:
     return ModuleResultEnvelope(
         module_name=MODULE_NAME,
         status="blocked",
@@ -161,7 +163,7 @@ def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", lowered)
 
 
-def _tokenize(value: str) -> Tuple[str, ...]:
+def _tokenize(value: str) -> tuple[str, ...]:
     tokens = []
     for raw_token in _normalize_text(value).split():
         tokens.append(_TOKEN_SYNONYMS.get(raw_token, raw_token))
@@ -180,7 +182,7 @@ def _jaccard(left: Sequence[str], right: Sequence[str]) -> float:
 
 
 def _atom_statement(atom: KnowledgeAtom) -> str:
-    return "{0} {1} {2}".format(atom.subject, atom.predicate, atom.object).strip()
+    return f"{atom.subject} {atom.predicate} {atom.object}".strip()
 
 
 def _atom_signal_score(atom: KnowledgeAtom, signal: CompareSignal) -> float:
@@ -195,7 +197,7 @@ def _atom_signal_score(atom: KnowledgeAtom, signal: CompareSignal) -> float:
 
 
 def _now_utc() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _repo_root() -> Path:
@@ -233,7 +235,7 @@ def _write_json(path: Path, payload: dict) -> None:
     )
 
 
-def _all_synthesis_decisions(report: SynthesisReportData) -> List[SynthesisDecision]:
+def _all_synthesis_decisions(report: SynthesisReportData) -> list[SynthesisDecision]:
     decisions = []
     decisions.extend(report.selected_knowledge)
     decisions.extend(report.consensus)
@@ -242,7 +244,7 @@ def _all_synthesis_decisions(report: SynthesisReportData) -> List[SynthesisDecis
     return decisions
 
 
-def _decision_lookup(report: SynthesisReportData) -> Dict[str, SynthesisDecision]:
+def _decision_lookup(report: SynthesisReportData) -> dict[str, SynthesisDecision]:
     mapping = {}
     for decision in _all_synthesis_decisions(report):
         for source_ref in decision.source_refs:
@@ -250,7 +252,7 @@ def _decision_lookup(report: SynthesisReportData) -> Dict[str, SynthesisDecision
     return mapping
 
 
-def _signal_sort_key(signal: CompareSignal, decision_lookup: Dict[str, SynthesisDecision]) -> Tuple:
+def _signal_sort_key(signal: CompareSignal, decision_lookup: dict[str, SynthesisDecision]) -> tuple:
     statement = _statement_for_signal(signal, decision_lookup)
     return (
         _SIGNAL_PRIORITY.get(signal.signal, 99),
@@ -261,7 +263,9 @@ def _signal_sort_key(signal: CompareSignal, decision_lookup: Dict[str, Synthesis
     )
 
 
-def _statement_for_signal(signal: CompareSignal, decision_lookup: Dict[str, SynthesisDecision]) -> str:
+def _statement_for_signal(
+    signal: CompareSignal, decision_lookup: dict[str, SynthesisDecision]
+) -> str:
     decision = decision_lookup.get(signal.signal_id)
     if decision is not None and decision.statement.strip():
         return decision.statement.strip()
@@ -272,7 +276,10 @@ def _infer_knowledge_type(statement: str) -> str:
     lowered = statement.lower()
     if any(token in lowered for token in ("accept", "input", "interface", "api", "chat")):
         return "interface"
-    if any(token in lowered for token in ("persist", "store", "storage", "backend", "directory", "json")):
+    if any(
+        token in lowered
+        for token in ("persist", "store", "storage", "backend", "directory", "json")
+    ):
         return "constraint"
     if any(token in lowered for token in ("because", "improve", "accuracy", "rationale", "why")):
         return "rationale"
@@ -317,7 +324,7 @@ def _confidence_for_signal(signal: CompareSignal, selected_atoms: Sequence[Knowl
     return "medium"
 
 
-def _dedupe_evidence_refs(refs: Iterable[EvidenceRef]) -> List[EvidenceRef]:
+def _dedupe_evidence_refs(refs: Iterable[EvidenceRef]) -> list[EvidenceRef]:
     deduped = []
     seen = set()
     for ref in refs:
@@ -337,7 +344,7 @@ def _dedupe_evidence_refs(refs: Iterable[EvidenceRef]) -> List[EvidenceRef]:
     return deduped
 
 
-def _tags_from_statement(statement: str, knowledge_type: str) -> List[str]:
+def _tags_from_statement(statement: str, knowledge_type: str) -> list[str]:
     tags = [knowledge_type]
     for token in _tokenize(statement):
         if token in _TAG_STOPWORDS or len(token) < 4:
@@ -364,8 +371,8 @@ def _theme_for_signal(statement: str, knowledge_type: str) -> str:
 
 def _select_atoms_for_signal(
     signal: CompareSignal,
-    atoms_by_project: Dict[str, List[KnowledgeAtom]],
-) -> List[KnowledgeAtom]:
+    atoms_by_project: dict[str, list[KnowledgeAtom]],
+) -> list[KnowledgeAtom]:
     selected = []
     for project_id in sorted(set(signal.subject_project_ids)):
         candidates = atoms_by_project.get(project_id, [])
@@ -386,12 +393,14 @@ def _select_atoms_for_signal(
 def _build_clusters(
     input_data: SnapshotBuilderInput,
     compare_output: CompareOutput,
-    decision_lookup: Dict[str, SynthesisDecision],
-    atoms_by_project: Dict[str, List[KnowledgeAtom]],
-) -> Tuple[List[AtomCluster], Dict[str, List[KnowledgeAtom]]]:
+    decision_lookup: dict[str, SynthesisDecision],
+    atoms_by_project: dict[str, list[KnowledgeAtom]],
+) -> tuple[list[AtomCluster], dict[str, list[KnowledgeAtom]]]:
     clusters = []
     selected_atoms_by_signal = {}
-    ordered_signals = sorted(compare_output.signals, key=lambda signal: _signal_sort_key(signal, decision_lookup))
+    ordered_signals = sorted(
+        compare_output.signals, key=lambda signal: _signal_sort_key(signal, decision_lookup)
+    )
     for index, signal in enumerate(ordered_signals, start=1):
         selected_atoms = _select_atoms_for_signal(signal, atoms_by_project)
         selected_atoms_by_signal[signal.signal_id] = selected_atoms
@@ -401,7 +410,7 @@ def _build_clusters(
         knowledge_type = _knowledge_type_for_signal(selected_atoms, statement)
         clusters.append(
             AtomCluster(
-                cluster_id="CL-{0}-{1:03d}".format(input_data.domain_id, index),
+                cluster_id=f"CL-{input_data.domain_id}-{index:03d}",
                 theme=_theme_for_signal(statement, knowledge_type),
                 consensus_statement=statement,
                 atom_ids=[atom.atom_id for atom in selected_atoms],
@@ -415,7 +424,7 @@ def _build_clusters(
 def _eligible_brick_signals(
     compare_output: CompareOutput,
     min_support: int,
-) -> List[CompareSignal]:
+) -> list[CompareSignal]:
     eligible = []
     for signal in compare_output.signals:
         if signal.signal != "ALIGNED":
@@ -429,10 +438,12 @@ def _eligible_brick_signals(
 def _build_bricks(
     input_data: SnapshotBuilderInput,
     eligible_signals: Sequence[CompareSignal],
-    decision_lookup: Dict[str, SynthesisDecision],
-    selected_atoms_by_signal: Dict[str, List[KnowledgeAtom]],
-) -> List[DomainBrick]:
-    ordered_signals = sorted(eligible_signals, key=lambda signal: _signal_sort_key(signal, decision_lookup))
+    decision_lookup: dict[str, SynthesisDecision],
+    selected_atoms_by_signal: dict[str, list[KnowledgeAtom]],
+) -> list[DomainBrick]:
+    ordered_signals = sorted(
+        eligible_signals, key=lambda signal: _signal_sort_key(signal, decision_lookup)
+    )
     bricks = []
     for index, signal in enumerate(ordered_signals, start=1):
         statement = _statement_for_signal(signal, decision_lookup)
@@ -443,7 +454,7 @@ def _build_bricks(
             evidence_refs.extend(atom.evidence_refs[:2])
         bricks.append(
             DomainBrick(
-                brick_id="B-{0}-{1:03d}".format(input_data.domain_id, index),
+                brick_id=f"B-{input_data.domain_id}-{index:03d}",
                 domain_id=input_data.domain_id,
                 knowledge_type=_knowledge_type_for_signal(selected_atoms, statement),
                 statement=statement,
@@ -452,7 +463,9 @@ def _build_bricks(
                 source_project_ids=sorted(set(signal.subject_project_ids)),
                 support_count=signal.support_count,
                 evidence_refs=_dedupe_evidence_refs(evidence_refs),
-                tags=_tags_from_statement(statement, _knowledge_type_for_signal(selected_atoms, statement)),
+                tags=_tags_from_statement(
+                    statement, _knowledge_type_for_signal(selected_atoms, statement)
+                ),
             )
         )
     return bricks
@@ -486,18 +499,22 @@ def _build_stats(
 def _unique_insights(
     compare_output: CompareOutput,
     report: SynthesisReportData,
-    decision_lookup: Dict[str, SynthesisDecision],
-) -> List[str]:
+    decision_lookup: dict[str, SynthesisDecision],
+) -> list[str]:
     lines = []
     seen = set()
-    original_signal_ids = {signal.signal_id for signal in compare_output.signals if signal.signal == "ORIGINAL"}
+    original_signal_ids = {
+        signal.signal_id for signal in compare_output.signals if signal.signal == "ORIGINAL"
+    }
     for decision in report.unique_knowledge + report.selected_knowledge:
         if not set(decision.source_refs) & original_signal_ids:
             continue
         if decision.statement in seen:
             continue
         seen.add(decision.statement)
-        source_hint = ", ".join(decision.source_refs[:1]) if decision.source_refs else "unique source"
+        source_hint = (
+            ", ".join(decision.source_refs[:1]) if decision.source_refs else "unique source"
+        )
         lines.append(
             "- **{0}**: {1} ({2})".format(
                 decision.statement,
@@ -521,34 +538,36 @@ def _unique_insights(
     return lines
 
 
-def _disputed_lines(compare_output: CompareOutput, decision_lookup: Dict[str, SynthesisDecision]) -> List[str]:
+def _disputed_lines(
+    compare_output: CompareOutput, decision_lookup: dict[str, SynthesisDecision]
+) -> list[str]:
     lines = []
-    for signal in sorted(compare_output.signals, key=lambda item: _signal_sort_key(item, decision_lookup)):
+    for signal in sorted(
+        compare_output.signals, key=lambda item: _signal_sort_key(item, decision_lookup)
+    ):
         if signal.signal not in ("DIVERGENT", "CONTESTED", "DRIFTED"):
             continue
         statement = _statement_for_signal(signal, decision_lookup)
         suffix = signal.notes or "Cross-project disagreement requires manual resolution."
-        lines.append(
-            "- **{0}** ({1}): {2}".format(
-                statement,
-                signal.signal,
-                suffix,
-            )
-        )
+        lines.append(f"- **{statement}** ({signal.signal}): {suffix}")
     return lines
 
 
-def _community_lines(community_knowledge: CommunityKnowledge) -> List[str]:
+def _community_lines(community_knowledge: CommunityKnowledge) -> list[str]:
     lines = []
-    for item in community_knowledge.skills + community_knowledge.tutorials + community_knowledge.use_cases:
-        reusable = "; ".join(item.reusable_knowledge[:2]) if item.reusable_knowledge else "no reusable notes"
-        lines.append(
-            "- **{0}**: {1}".format(item.name, reusable)
+    for item in (
+        community_knowledge.skills + community_knowledge.tutorials + community_knowledge.use_cases
+    ):
+        reusable = (
+            "; ".join(item.reusable_knowledge[:2])
+            if item.reusable_knowledge
+            else "no reusable notes"
         )
+        lines.append(f"- **{item.name}**: {reusable}")
     return lines
 
 
-def _brick_lines(bricks: Sequence[DomainBrick], project_count: int) -> List[str]:
+def _brick_lines(bricks: Sequence[DomainBrick], project_count: int) -> list[str]:
     if not bricks:
         return [
             "No knowledge signal met the current `min_support_for_brick` threshold.",
@@ -566,18 +585,13 @@ def _brick_lines(bricks: Sequence[DomainBrick], project_count: int) -> List[str]
     return lines
 
 
-def _cluster_lines(clusters: Sequence[AtomCluster]) -> List[str]:
+def _cluster_lines(clusters: Sequence[AtomCluster]) -> list[str]:
     if not clusters:
         return ["No atom clusters were built from the current compare output."]
     lines = []
     for cluster in clusters:
         lines.append(
-            "- **{0}** ({1} atoms, {2}): {3}".format(
-                cluster.theme,
-                len(cluster.atom_ids),
-                cluster.signal,
-                cluster.consensus_statement,
-            )
+            f"- **{cluster.theme}** ({len(cluster.atom_ids)} atoms, {cluster.signal}): {cluster.consensus_statement}"
         )
     return lines
 
@@ -590,7 +604,7 @@ def _render_truth_markdown(
     compare_output: CompareOutput,
     report: SynthesisReportData,
     community_knowledge: CommunityKnowledge,
-    decision_lookup: Dict[str, SynthesisDecision],
+    decision_lookup: dict[str, SynthesisDecision],
 ) -> str:
     display_name = input_data.domain_display_name or input_data.domain_id
     project_count = len(compare_output.compared_projects)
@@ -600,10 +614,10 @@ def _render_truth_markdown(
     open_questions = report.open_questions or ["No open questions recorded."]
 
     sections = [
-        "# Domain Truth: {0}".format(display_name),
+        f"# Domain Truth: {display_name}",
         "",
-        "> Snapshot version: {0}".format(snapshot_version),
-        "> Projects analyzed: {0}".format(project_count),
+        f"> Snapshot version: {snapshot_version}",
+        f"> Projects analyzed: {project_count}",
         "",
         "## Consensus Bricks",
     ]
@@ -642,7 +656,7 @@ def _render_truth_markdown(
             "## Open Questions",
         ]
     )
-    sections.extend("- {0}".format(item) for item in open_questions)
+    sections.extend(f"- {item}" for item in open_questions)
     sections.append("")
     return "\n".join(sections)
 
@@ -650,7 +664,7 @@ def _render_truth_markdown(
 def _atom_rows(
     fingerprints: Sequence[ProjectFingerprint],
     clusters: Sequence[AtomCluster],
-) -> List[dict]:
+) -> list[dict]:
     project_by_atom_id = {}
     atom_by_id = {}
     for fingerprint in fingerprints:
@@ -689,7 +703,7 @@ def _write_atoms_json(output_dir: Path, atoms: Sequence[KnowledgeAtom]) -> None:
     _write_json(output_dir / ATOMS_JSON_FILENAME, payload)
 
 
-def _write_atoms_parquet(output_dir: Path, rows: Sequence[dict]) -> Optional[str]:
+def _write_atoms_parquet(output_dir: Path, rows: Sequence[dict]) -> str | None:
     try:
         import pandas as pd  # type: ignore
     except Exception:
@@ -709,7 +723,7 @@ def _write_sqlite(
     atom_rows: Sequence[dict],
     clusters: Sequence[AtomCluster],
     bricks: Sequence[DomainBrick],
-) -> Optional[str]:
+) -> str | None:
     target = output_dir / SQLITE_FILENAME
     connection = sqlite3.connect(str(target))
     try:
@@ -809,11 +823,7 @@ def _write_sqlite(
         )
         cursor.executemany(
             "INSERT INTO cluster_atoms (cluster_id, atom_id) VALUES (?, ?)",
-            [
-                (cluster.cluster_id, atom_id)
-                for cluster in clusters
-                for atom_id in cluster.atom_ids
-            ],
+            [(cluster.cluster_id, atom_id) for cluster in clusters for atom_id in cluster.atom_ids],
         )
         cursor.executemany(
             """
@@ -844,8 +854,8 @@ def _snapshot_output(
     input_data: SnapshotBuilderInput,
     snapshot_version: str,
     stats: SnapshotStats,
-    atoms_parquet_path: Optional[str],
-    sqlite_path: Optional[str],
+    atoms_parquet_path: str | None,
+    sqlite_path: str | None,
 ) -> SnapshotBuilderOutput:
     return SnapshotBuilderOutput(
         domain_id=input_data.domain_id,
@@ -861,7 +871,12 @@ def _snapshot_output(
 
 def _validate_inputs(
     input_data: SnapshotBuilderInput,
-) -> Tuple[Optional[List[ProjectFingerprint]], Optional[CompareOutput], Optional[SynthesisReportData], Optional[CommunityKnowledge]]:
+) -> tuple[
+    list[ProjectFingerprint] | None,
+    CompareOutput | None,
+    SynthesisReportData | None,
+    CommunityKnowledge | None,
+]:
     if not input_data.fingerprints:
         return None, None, None, None
 
@@ -872,7 +887,9 @@ def _validate_inputs(
     return fingerprints, compare_output, synthesis_report, community_knowledge
 
 
-def run_snapshot_builder(input: SnapshotBuilderInput) -> ModuleResultEnvelope[SnapshotBuilderOutput]:
+def run_snapshot_builder(
+    input: SnapshotBuilderInput,
+) -> ModuleResultEnvelope[SnapshotBuilderOutput]:
     """Build a domain snapshot and write fixed output artifacts."""
 
     started_at = time.perf_counter()
@@ -882,12 +899,19 @@ def run_snapshot_builder(input: SnapshotBuilderInput) -> ModuleResultEnvelope[Sn
             return _blocked_envelope(ErrorCodes.INPUT_INVALID, elapsed_ms)
 
         try:
-            fingerprints, compare_output, synthesis_report, community_knowledge = _validate_inputs(input)
+            fingerprints, compare_output, synthesis_report, community_knowledge = _validate_inputs(
+                input
+            )
         except Exception:
             elapsed_ms = int((time.perf_counter() - started_at) * 1000)
             return _blocked_envelope(ErrorCodes.SCHEMA_MISMATCH, elapsed_ms)
 
-        if fingerprints is None or compare_output is None or synthesis_report is None or community_knowledge is None:
+        if (
+            fingerprints is None
+            or compare_output is None
+            or synthesis_report is None
+            or community_knowledge is None
+        ):
             elapsed_ms = int((time.perf_counter() - started_at) * 1000)
             return _blocked_envelope(ErrorCodes.INPUT_INVALID, elapsed_ms)
 
@@ -965,9 +989,7 @@ def run_snapshot_builder(input: SnapshotBuilderInput) -> ModuleResultEnvelope[Sn
             warnings.append(
                 WarningItem(
                     code="NO_BRICKS",
-                    message="No ALIGNED signal met min_support_for_brick={0}.".format(
-                        input.config.min_support_for_brick
-                    ),
+                    message=f"No ALIGNED signal met min_support_for_brick={input.config.min_support_for_brick}.",
                 )
             )
 

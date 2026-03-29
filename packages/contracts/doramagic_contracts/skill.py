@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional, Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -88,7 +88,7 @@ class ValidationInput(BaseModel):
     synthesis_report: SynthesisReportData
     skill_bundle: SkillBundlePaths
     platform_rules: PlatformRules
-    compile_bundle: Optional[CompileBundleContract] = None
+    compile_bundle: CompileBundleContract | None = None
 
 
 class ValidationCheck(BaseModel):
@@ -113,8 +113,8 @@ class ValidationReport(BaseModel):
     revise_instructions: list[str] = []
     overall_score: float = 0.0
     dimension_scores: dict[str, float] = {}
-    weakest_dimension: Optional[str] = None
-    weakest_section: Optional[str] = None
+    weakest_dimension: str | None = None
+    weakest_section: str | None = None
     repairable: bool = False
     repair_plan: list[str] = []
     delivery_tier: str = "full_skill"

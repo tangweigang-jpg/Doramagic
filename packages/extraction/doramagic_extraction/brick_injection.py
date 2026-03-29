@@ -15,7 +15,6 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 # ---------------------------------------------------------------------------
 # 路径设置：支持独立运行和从 worktree 运行
@@ -26,8 +25,7 @@ _HERE = Path(__file__).parent.resolve()
 for _candidate in [
     _HERE.parent.parent.parent.parent / "packages" / "contracts",
     _HERE.parent.parent.parent.parent.parent / "packages" / "contracts",
-    Path(__file__).resolve().parent.parent.parent.parent.parent.parent
-    / "packages" / "contracts",
+    Path(__file__).resolve().parent.parent.parent.parent.parent.parent / "packages" / "contracts",
 ]:
     if _candidate.exists() and str(_candidate) not in sys.path:
         sys.path.insert(0, str(_candidate))
@@ -35,6 +33,7 @@ for _candidate in [
 
 try:
     from doramagic_contracts.domain_graph import DomainBrick
+
     _CONTRACTS_AVAILABLE = True
 except ImportError:
     _CONTRACTS_AVAILABLE = False
@@ -192,7 +191,7 @@ class BrickInjectionResult:
     injection_text: str
     """供注入 Stage 1/2/3 prompt 的文本。"""
 
-    bricks_path: Optional[str]
+    bricks_path: str | None
     """domain_bricks.jsonl 的完整路径；若 output_dir=None 则为 None。"""
 
     raw_bricks: list[dict]
@@ -336,8 +335,8 @@ def _write_merged_bricks(
 
 def load_and_inject_bricks(
     frameworks: list[str],
-    bricks_dir: Optional[str] = None,
-    output_dir: Optional[str] = None,
+    bricks_dir: str | None = None,
+    output_dir: str | None = None,
 ) -> BrickInjectionResult:
     """匹配框架 → 加载积木 → 写入 artifacts → 返回注入文本。
 
@@ -399,7 +398,7 @@ def load_and_inject_bricks(
     injection_text = _generate_injection_text(all_bricks, frameworks_matched)
 
     # 写文件（若 output_dir 已提供）
-    bricks_file_path: Optional[str] = None
+    bricks_file_path: str | None = None
     if output_dir is not None:
         bricks_file_path = _write_merged_bricks(all_bricks, output_dir)
 

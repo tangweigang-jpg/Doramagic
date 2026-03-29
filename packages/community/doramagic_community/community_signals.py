@@ -30,6 +30,7 @@
         "skip_reason": null
     }
 """
+
 from __future__ import annotations
 
 import argparse
@@ -113,19 +114,24 @@ def collect_changelog_signals(repo_path: str) -> list[dict]:
     for i, line in enumerate(lines):
         for pattern in breaking_patterns:
             if re.search(pattern, line):
-                context = " ".join(lines[max(0, i-1):min(len(lines), i+2)]).strip()
+                context = " ".join(lines[max(0, i - 1) : min(len(lines), i + 2)]).strip()
                 signal_type = (
-                    "breaking_change" if re.search(r"(?i)breaking|rewrite|overhaul|migration", line)
-                    else "boundary_statement" if re.search(r"(?i)won'?t|by design|not a bug", line)
-                    else "security" if re.search(r"(?i)security|CVE", line)
+                    "breaking_change"
+                    if re.search(r"(?i)breaking|rewrite|overhaul|migration", line)
+                    else "boundary_statement"
+                    if re.search(r"(?i)won'?t|by design|not a bug", line)
+                    else "security"
+                    if re.search(r"(?i)security|CVE", line)
                     else "deprecation"
                 )
-                signals.append({
-                    "type": signal_type,
-                    "content": context[:200],
-                    "source": "CHANGELOG",
-                    "tier": 1 if signal_type in ("breaking_change", "security") else 2,
-                })
+                signals.append(
+                    {
+                        "type": signal_type,
+                        "content": context[:200],
+                        "source": "CHANGELOG",
+                        "tier": 1 if signal_type in ("breaking_change", "security") else 2,
+                    }
+                )
                 break
 
     return signals[:10]  # Cap at 10 changelog signals
@@ -134,7 +140,11 @@ def collect_changelog_signals(repo_path: str) -> list[dict]:
 def score_issue(issue: dict) -> float:
     """Score an issue by relevance/importance."""
     comments = issue.get("comments", 0)
-    reactions = issue.get("reactions", {}).get("total_count", 0) if isinstance(issue.get("reactions"), dict) else 0
+    reactions = (
+        issue.get("reactions", {}).get("total_count", 0)
+        if isinstance(issue.get("reactions"), dict)
+        else 0
+    )
     labels = [lb.get("name", "").lower() for lb in issue.get("labels", [])]
 
     score = log1p(comments) * 2 + log1p(reactions)
@@ -153,7 +163,10 @@ def classify_issue(issue: dict) -> str:
 
     if any(l in ("wontfix", "by design", "intended", "not a bug") for l in labels):
         return "wont_fix"
-    if any(k in title or k in body for k in ["how to", "how do i", "help", "getting started", "setup", "install"]):
+    if any(
+        k in title or k in body
+        for k in ["how to", "how do i", "help", "getting started", "setup", "install"]
+    ):
         return "support_desk"
     if any(l in ("bug", "defect", "regression") for l in labels):
         if any(k in title for k in ["edge case", "rare", "specific", "only when", "unusual"]):
@@ -191,12 +204,14 @@ def compute_dsd_metrics(issues: list[dict], signals_from_issues: list[dict]) -> 
     boundary_statements = []
     for i, issue in enumerate(issues):
         if classifications[i] == "wont_fix":
-            boundary_statements.append({
-                "issue_number": issue.get("number"),
-                "title": issue.get("title", ""),
-                "url": issue.get("html_url", ""),
-                "comments": issue.get("comments", 0),
-            })
+            boundary_statements.append(
+                {
+                    "issue_number": issue.get("number"),
+                    "title": issue.get("title", ""),
+                    "url": issue.get("html_url", ""),
+                    "comments": issue.get("comments", 0),
+                }
+            )
     boundary_statements = sorted(boundary_statements, key=lambda x: -x["comments"])[:5]
 
     # High frequency issue patterns (extract keywords)
@@ -205,7 +220,19 @@ def compute_dsd_metrics(issues: list[dict], signals_from_issues: list[dict]) -> 
         title = issue.get("title", "").lower()
         words = re.findall(r"\b[a-z]{4,}\b", title)
         for w in words:
-            if w not in {"with", "when", "that", "this", "from", "have", "does", "been", "will", "using", "after"}:
+            if w not in {
+                "with",
+                "when",
+                "that",
+                "this",
+                "from",
+                "have",
+                "does",
+                "been",
+                "will",
+                "using",
+                "after",
+            }:
                 title_words[w] = title_words.get(w, 0) + 1
     high_freq = [(w, c) for w, c in sorted(title_words.items(), key=lambda x: -x[1]) if c >= 2][:10]
 
@@ -249,19 +276,23 @@ def process_issues_to_signals(issues: list[dict]) -> list[dict]:
         if issue_type == "security" or score > 6.0:
             tier = 1
 
-        signals.append({
-            "id": f"SIG-{rank+1:03d}",
-            "type": issue_type,
-            "title": issue.get("title", ""),
-            "issue_number": issue.get("number"),
-            "comment_count": issue.get("comments", 0),
-            "reactions": issue.get("reactions", {}).get("total_count", 0) if isinstance(issue.get("reactions"), dict) else 0,
-            "state": issue.get("state", ""),
-            "labels": labels,
-            "url": issue.get("html_url", ""),
-            "tier": tier,
-            "relevance_score": round(score, 2),
-        })
+        signals.append(
+            {
+                "id": f"SIG-{rank + 1:03d}",
+                "type": issue_type,
+                "title": issue.get("title", ""),
+                "issue_number": issue.get("number"),
+                "comment_count": issue.get("comments", 0),
+                "reactions": issue.get("reactions", {}).get("total_count", 0)
+                if isinstance(issue.get("reactions"), dict)
+                else 0,
+                "state": issue.get("state", ""),
+                "labels": labels,
+                "url": issue.get("html_url", ""),
+                "tier": tier,
+                "relevance_score": round(score, 2),
+            }
+        )
 
     return signals
 
@@ -330,7 +361,9 @@ def main():
     parser.add_argument("--repo-url", help="GitHub 仓库 URL（如 https://github.com/owner/repo）")
     parser.add_argument("--repo-path", help="本地仓库目录路径（用于 CHANGELOG 分析）")
     parser.add_argument("--output", required=True, help="输出 JSON 文件路径")
-    parser.add_argument("--token", default=None, help="GitHub Personal Access Token（可选，提高 API 限制）")
+    parser.add_argument(
+        "--token", default=None, help="GitHub Personal Access Token（可选，提高 API 限制）"
+    )
     args = parser.parse_args()
 
     if not args.repo_url and not args.repo_path:

@@ -19,36 +19,30 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
-
 # 引用 contracts 包
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "packages" / "contracts"))
 # 引用 cross_project 包
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from doramagic_contracts.base import NeedProfile, SearchDirection  # noqa: E402
-from doramagic_contracts.cross_project import (  # noqa: E402
+from doramagic_contracts.base import NeedProfile, SearchDirection
+from doramagic_contracts.cross_project import (
     ApiDomainHint,
     DiscoveryConfig,
     DiscoveryInput,
     DiscoveryResult,
 )
-from doramagic_contracts.envelope import ErrorCodes, ModuleResultEnvelope  # noqa: E402
-from doramagic_cross_project.discovery import (  # noqa: E402
+from doramagic_contracts.envelope import ErrorCodes
+from doramagic_cross_project.discovery import (
+    _DARK_TRAP_BLACKLIST,
     _make_candidate_id,
     run_discovery,
-    _MOCK_PROJECT_LIBRARY,
-    _passes_coarse_filter,
-    _DARK_TRAP_BLACKLIST,
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Fixture 路径
 # ──────────────────────────────────────────────────────────────────────────────
 
-FIXTURE_DIR = (
-    Path(__file__).parent.parent.parent.parent / "data" / "fixtures"
-)
+FIXTURE_DIR = Path(__file__).parent.parent.parent.parent / "data" / "fixtures"
 SIM2_PATH = FIXTURE_DIR / "sim2_need_profile.json"
 SIM3_PATH = FIXTURE_DIR / "sim3_need_profile_flight.json"
 
@@ -112,8 +106,7 @@ def test_sim2_calorie_normal_path():
     community_skills = [c for c in result.candidates if c.type == "community_skill"]
 
     assert len(github_repos) >= 2, (
-        f"Expected ≥2 github_repos, got {len(github_repos)}: "
-        f"{[c.name for c in github_repos]}"
+        f"Expected ≥2 github_repos, got {len(github_repos)}: {[c.name for c in github_repos]}"
     )
     assert len(community_skills) >= 1, (
         f"Expected ≥1 community_skill, got {len(community_skills)}: "
@@ -143,8 +136,7 @@ def test_sim3_flight_normal_path():
     community_skills = [c for c in result.candidates if c.type == "community_skill"]
 
     assert len(github_repos) >= 2, (
-        f"Expected ≥2 github_repos, got {len(github_repos)}: "
-        f"{[c.name for c in github_repos]}"
+        f"Expected ≥2 github_repos, got {len(github_repos)}: {[c.name for c in github_repos]}"
     )
     assert len(community_skills) >= 1, (
         f"Expected ≥1 community_skill, got {len(community_skills)}: "
@@ -239,9 +231,7 @@ def test_no_api_hint_still_works():
 
     # 应有 W_NO_API_HINT 警告，但不影响结果
     warning_codes = [w.code for w in envelope.warnings]
-    assert "W_NO_API_HINT" in warning_codes, (
-        f"Expected W_NO_API_HINT warning, got: {warning_codes}"
-    )
+    assert "W_NO_API_HINT" in warning_codes, f"Expected W_NO_API_HINT warning, got: {warning_codes}"
 
     assert envelope.data is not None
     assert len(envelope.data.candidates) >= 2, (
@@ -361,9 +351,7 @@ def test_candidate_type_distinction():
             )
 
         if cand.url.startswith("https://github.com/"):
-            assert cand.type == "github_repo", (
-                f"{cand.url} should be github_repo, got {cand.type}"
-            )
+            assert cand.type == "github_repo", f"{cand.url} should be github_repo, got {cand.type}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────

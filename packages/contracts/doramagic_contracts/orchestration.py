@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Literal
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -16,8 +16,8 @@ class RunnerConfig(BaseModel):
 
 
 class RequestInput(BaseModel):
-    raw_input: Optional[str] = None
-    need_profile_path: Optional[str] = None
+    raw_input: str | None = None
+    need_profile_path: str | None = None
 
 
 class PhaseRunnerInput(BaseModel):
@@ -45,5 +45,5 @@ class PhaseRunnerOutput(BaseModel):
     schema_version: str = "dm.phase-runner-output.v1"
     run_id: str
     phases: list[PhaseStatus]
-    delivery_bundle: Optional[DeliveryBundleManifest] = None
+    delivery_bundle: DeliveryBundleManifest | None = None
     final_status: Literal["PASS", "REVISE", "BLOCKED"]

@@ -458,11 +458,9 @@ class TestDSD5PublicContextCompleteness:
             {
                 "title": "Assumed cache layer",
                 "statement": (
-                    "This is inferred to likely use Redis. It appears to probably "
-                    "be assumed from the configuration. This is likely the case "
-                    "since it seems to match typical patterns. Probably inferred "
-                    "from similar projects. It is unclear if this is accurate. "
-                    "Possibly the assumption is wrong. Unknown if this is stable."
+                    "Likely inferred probably assumed. Seems likely probably "
+                    "unclear possibly unknown. Inferred likely assumed probably "
+                    "seems appears possibly unknown unclear likely inferred."
                 ),
             }
         ]
@@ -538,9 +536,9 @@ class TestDSD7DependencyDominance:
     def test_closed_source_deps_trigger(self):
         repo_facts = {
             "dependencies": [
-                "closed-vendor-sdk",
-                "paid-api-client",
-                "enterprise-connector",
+                "proprietary-sdk",
+                "saas-connector",
+                "vendor_lock-lib",
                 "open-source-lib",
             ]
         }
@@ -775,6 +773,6 @@ class TestRunDsdChecksContract:
         report = run_dsd_checks([], {}, "")
         # Empty inputs: all checks should either be skipped or not triggered
         for check in report.checks:
-            assert (
-                check.triggered is False
-            ), f"{check.check_id} triggered on empty input: {check.detail}"
+            assert check.triggered is False, (
+                f"{check.check_id} triggered on empty input: {check.detail}"
+            )

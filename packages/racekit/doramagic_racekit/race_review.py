@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Dict
 
 from .race_config import canonical_module_name, module_branch_slug
 from .race_workspace import _resolve_output_root, _resolve_repo_root
@@ -29,16 +28,17 @@ def generate_review_template(round_num: int, module_name: str) -> Path:
     canonical_module = canonical_module_name(module_name)
     repo_root = _resolve_repo_root()
     output_root = _resolve_output_root(repo_root)
-    output_path = output_root / "r{0:02d}".format(round_num) / module_branch_slug(canonical_module) / "REVIEW.md"
+    output_path = (
+        output_root / f"r{round_num:02d}" / module_branch_slug(canonical_module) / "REVIEW.md"
+    )
     score_lines = "\n".join(
-        "- {0} | weight={1:g} | score=".format(name, weight)
-        for name, weight in REVIEW_DIMENSIONS.items()
+        f"- {name} | weight={weight:g} | score=" for name, weight in REVIEW_DIMENSIONS.items()
     )
 
-    content = """# Doramagic Race Review
+    content = f"""# Doramagic Race Review
 
 - Round: {round_num}
-- Module: `{module_name}`
+- Module: `{canonical_module}`
 - Review Result: TBD
 
 ## Submission Checklist
@@ -74,11 +74,7 @@ def generate_review_template(round_num: int, module_name: str) -> Path:
 
 - Strengths:
 - Risks:
-""".format(
-        round_num=round_num,
-        module_name=canonical_module,
-        score_lines=score_lines,
-    )
+"""
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(content, encoding="utf-8")
@@ -89,7 +85,7 @@ def score_submission(review_path: str) -> float:
     """Calculate the weighted total score from a completed review report."""
 
     review_file = Path(review_path).expanduser().resolve()
-    scores: Dict[str, float] = {}
+    scores: dict[str, float] = {}
 
     for line in review_file.read_text(encoding="utf-8").splitlines():
         match = SCORE_LINE_PATTERN.match(line.strip())
@@ -102,11 +98,11 @@ def score_submission(review_path: str) -> float:
 
         expected_weight = REVIEW_DIMENSIONS.get(dimension)
         if expected_weight is None:
-            raise ValueError("Unexpected review dimension: {0}".format(dimension))
+            raise ValueError(f"Unexpected review dimension: {dimension}")
         if abs(expected_weight - weight) > 1e-6:
-            raise ValueError("Weight mismatch for {0}: {1}".format(dimension, weight))
+            raise ValueError(f"Weight mismatch for {dimension}: {weight}")
         if score < 0 or score > 10:
-            raise ValueError("Score must be between 0 and 10: {0}={1}".format(dimension, score))
+            raise ValueError(f"Score must be between 0 and 10: {dimension}={score}")
 
         scores[dimension] = score
 

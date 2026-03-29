@@ -20,9 +20,6 @@ import json
 import os
 import re
 import sys
-from pathlib import Path
-from typing import Optional
-
 
 # ---------------------------------------------------------------------------
 # Token budget constants
@@ -47,6 +44,7 @@ SECTION_RATIOS = {
 # YAML frontmatter parser (no external deps)
 # ---------------------------------------------------------------------------
 
+
 def parse_frontmatter(text: str) -> tuple[dict, str]:
     """
     Parse YAML frontmatter from a markdown file.
@@ -65,10 +63,10 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
         return {}, text
 
     yaml_block = text[3:end].strip()
-    body = text[end + 3:].strip()
+    body = text[end + 3 :].strip()
 
     meta: dict = {}
-    current_key: Optional[str] = None
+    current_key: str | None = None
     in_block_scalar = False
     block_lines: list[str] = []
 
@@ -78,7 +76,7 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 
         if in_block_scalar:
             # Continuation of a | block value
-            if re.match(r'^[a-z_]+:\s*', line) and not line.startswith(" "):
+            if re.match(r"^[a-z_]+:\s*", line) and not line.startswith(" "):
                 # New key — flush block
                 meta[current_key] = "\n".join(block_lines).strip()  # type: ignore[index]
                 block_lines = []
@@ -95,7 +93,7 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
             meta[current_key].append(item)
             continue
 
-        m = re.match(r'^([a-z_A-Z][a-zA-Z0-9_]*):\s*(.*)', line)
+        m = re.match(r"^([a-z_A-Z][a-zA-Z0-9_]*):\s*(.*)", line)
         if m:
             # Flush any pending block
             if in_block_scalar and current_key is not None:
@@ -127,6 +125,7 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
 # Token estimation
 # ---------------------------------------------------------------------------
 
+
 def estimate_tokens(text: str) -> int:
     """Estimate token count using characters/4 heuristic."""
     return max(1, len(text) // 4)
@@ -136,14 +135,15 @@ def estimate_tokens(text: str) -> int:
 # File loaders
 # ---------------------------------------------------------------------------
 
-def load_text(path: str) -> Optional[str]:
+
+def load_text(path: str) -> str | None:
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             return f.read()
     return None
 
 
-def load_json(path: str) -> Optional[dict]:
+def load_json(path: str) -> dict | None:
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             return json.load(f)
@@ -181,7 +181,8 @@ def load_cards(soul_dir: str) -> list[tuple[dict, str]]:
 # Verdict / confidence filtering
 # ---------------------------------------------------------------------------
 
-def verdict_label(meta: dict) -> Optional[str]:
+
+def verdict_label(meta: dict) -> str | None:
     """
     Return verdict string (upper-cased) or None if not present.
     Backward compatible: missing verdict field is treated as None (pass).
@@ -207,6 +208,7 @@ def weak_prefix(meta: dict) -> str:
 # ---------------------------------------------------------------------------
 # Section builders
 # ---------------------------------------------------------------------------
+
 
 def _version_note(meta: dict) -> str:
     """Produce ' (适用: >=2.0)' style annotation if applicable_versions set."""
@@ -243,7 +245,8 @@ def build_critical_rules(cards: list[tuple[dict, str]], budget: int) -> str:
         return (sev_order.get(sev, 99), exc)
 
     eligible = [
-        (m, b) for m, b in cards
+        (m, b)
+        for m, b in cards
         if m.get("card_type") == "decision_rule_card"
         and str(m.get("severity", "")).upper() in ("CRITICAL", "HIGH")
         and not is_rejected(m)
@@ -330,7 +333,7 @@ def build_workflows(cards: list[tuple[dict, str]], budget: int) -> str:
     return "\n".join(lines)
 
 
-def build_feature_inventory(repo_facts: Optional[dict]) -> str:
+def build_feature_inventory(repo_facts: dict | None) -> str:
     """
     Section 4: FEATURE INVENTORY from repo_facts.json.
     """
@@ -399,9 +402,9 @@ def build_why_chains(cards: list[tuple[dict, str]], budget: int) -> str:
     lines: list[str] = ["## WHY CHAINS", ""]
 
     candidates = [
-        (m, b) for m, b in cards
-        if m.get("card_type") == "decision_rule_card"
-        and not is_rejected(m)
+        (m, b)
+        for m, b in cards
+        if m.get("card_type") == "decision_rule_card" and not is_rejected(m)
     ]
 
     def richness(entry: tuple[dict, str]) -> int:
@@ -438,7 +441,12 @@ def build_traps(cards: list[tuple[dict, str]], budget: int) -> str:
     Format: warning block with issue references.
     Sorted: non-exception first, exception_path last within same severity.
     """
-    lines: list[str] = ["## TRAPS", "", "社区反复踩坑的模式，来自 Issues / CHANGELOG / 安全公告。", ""]
+    lines: list[str] = [
+        "## TRAPS",
+        "",
+        "社区反复踩坑的模式，来自 Issues / CHANGELOG / 安全公告。",
+        "",
+    ]
 
     def is_trap(meta: dict) -> bool:
         card_id = str(meta.get("card_id", ""))
@@ -456,10 +464,9 @@ def build_traps(cards: list[tuple[dict, str]], budget: int) -> str:
         return (sev_order.get(sev, 99), exc)
 
     traps = [
-        (m, b) for m, b in cards
-        if m.get("card_type") == "decision_rule_card"
-        and is_trap(m)
-        and not is_rejected(m)
+        (m, b)
+        for m, b in cards
+        if m.get("card_type") == "decision_rule_card" and is_trap(m) and not is_rejected(m)
     ]
     traps.sort(key=trap_sort_key)
 
@@ -519,13 +526,14 @@ def build_quick_reference(cards: list[tuple[dict, str]], full_budget: bool = Tru
 # Helpers for content extraction
 # ---------------------------------------------------------------------------
 
+
 def _extract_section(body: str, heading: str) -> str:
     """
     Extract text under a markdown ## heading in the body.
     Returns the first non-empty paragraph (up to 300 chars).
     """
     pattern = re.compile(
-        r'##\s+' + re.escape(heading) + r'\s*\n(.*?)(?=\n##|\Z)',
+        r"##\s+" + re.escape(heading) + r"\s*\n(.*?)(?=\n##|\Z)",
         re.DOTALL | re.IGNORECASE,
     )
     m = pattern.search(body)
@@ -535,7 +543,12 @@ def _extract_section(body: str, heading: str) -> str:
     # Return first non-table, non-bullet paragraph
     for line in content.split("\n"):
         line = line.strip()
-        if line and not line.startswith("|") and not line.startswith("-") and not line.startswith("#"):
+        if (
+            line
+            and not line.startswith("|")
+            and not line.startswith("-")
+            and not line.startswith("#")
+        ):
             return line[:300]
     return content[:300]
 
@@ -544,7 +557,12 @@ def _first_sentence(text: str) -> str:
     """Return first non-empty, non-markdown line up to 200 chars."""
     for line in text.split("\n"):
         line = line.strip()
-        if line and not line.startswith("#") and not line.startswith("|") and not line.startswith("-"):
+        if (
+            line
+            and not line.startswith("#")
+            and not line.startswith("|")
+            and not line.startswith("-")
+        ):
             return line[:200]
     return ""
 
@@ -563,7 +581,7 @@ def _extract_table_col(body: str, col_header: str, col: int) -> str:
         if col < len(cells):
             cell = cells[col]
             # Skip header and separator rows
-            if col_header.lower() in cell.lower() or re.match(r'^[-:]+$', cell):
+            if col_header.lower() in cell.lower() or re.match(r"^[-:]+$", cell):
                 continue
             if cell:
                 return cell[:150]
@@ -576,7 +594,7 @@ def _extract_steps(body: str) -> list[str]:
     Returns list of step descriptions (stripped).
     """
     steps: list[str] = []
-    pattern = re.compile(r'^\d+\.\s+(.+)', re.MULTILINE)
+    pattern = re.compile(r"^\d+\.\s+(.+)", re.MULTILINE)
     for m in pattern.finditer(body):
         step = m.group(1).strip()
         # Trim very long steps
@@ -592,7 +610,7 @@ def _extract_soul_section(soul: str, markers: list[str]) -> str:
     for marker in markers:
         # Try ## heading
         pattern = re.compile(
-            r'##\s+[^\n]*' + re.escape(marker) + r'[^\n]*\n(.*?)(?=\n##|\Z)',
+            r"##\s+[^\n]*" + re.escape(marker) + r"[^\n]*\n(.*?)(?=\n##|\Z)",
             re.DOTALL | re.IGNORECASE,
         )
         m = pattern.search(soul)
@@ -600,7 +618,7 @@ def _extract_soul_section(soul: str, markers: list[str]) -> str:
             return m.group(1).strip()[:600]
         # Try numbered item like "6. 设计哲学\n..."
         pattern2 = re.compile(
-            r'(?:^|\n)' + re.escape(marker) + r'[^\n]*\n(.*?)(?=\n\d+\.|\n##|\Z)',
+            r"(?:^|\n)" + re.escape(marker) + r"[^\n]*\n(.*?)(?=\n\d+\.|\n##|\Z)",
             re.DOTALL | re.IGNORECASE,
         )
         m2 = pattern2.search(soul)
@@ -612,6 +630,7 @@ def _extract_soul_section(soul: str, markers: list[str]) -> str:
 # ---------------------------------------------------------------------------
 # Token budget enforcement
 # ---------------------------------------------------------------------------
+
 
 def enforce_budget(sections: dict[str, str], budget: int) -> dict[str, str]:
     """
@@ -638,7 +657,11 @@ def enforce_budget(sections: dict[str, str], budget: int) -> dict[str, str]:
         filtered_lines: list[str] = []
         for line in qr.split("\n"):
             # Keep header rows, separators, and CRITICAL/HIGH data rows
-            if line.strip().startswith("| 规则") or line.strip().startswith("|---") or not line.strip().startswith("|"):
+            if (
+                line.strip().startswith("| 规则")
+                or line.strip().startswith("|---")
+                or not line.strip().startswith("|")
+            ):
                 filtered_lines.append(line)
             else:
                 # Data row — check severity column (last |...|)
@@ -684,6 +707,7 @@ def enforce_budget(sections: dict[str, str], budget: int) -> dict[str, str]:
 # Main compiler
 # ---------------------------------------------------------------------------
 
+
 def compile_knowledge(output_dir: str, budget: int = DEFAULT_BUDGET) -> bool:
     """
     Main entry point.
@@ -714,7 +738,9 @@ def compile_knowledge(output_dir: str, budget: int = DEFAULT_BUDGET) -> bool:
     sections: dict[str, str] = {}
 
     # 1 — CRITICAL RULES
-    sections["critical_rules"] = build_critical_rules(cards, int(budget * SECTION_RATIOS["critical_rules"]))
+    sections["critical_rules"] = build_critical_rules(
+        cards, int(budget * SECTION_RATIOS["critical_rules"])
+    )
     # 2 — CONCEPTS
     sections["concepts"] = build_concepts(cards, int(budget * SECTION_RATIOS["concepts"]))
     # 3 — WORKFLOWS
@@ -742,18 +768,24 @@ def compile_knowledge(output_dir: str, budget: int = DEFAULT_BUDGET) -> bool:
     rejected_count = sum(1 for m, _ in cards if is_rejected(m))
     weak_count = sum(1 for m, _ in cards if is_weak(m))
 
-    repo_name = repo_facts.get("repo_path", output_dir).rstrip("/").split("/")[-1] if repo_facts else os.path.basename(output_dir)
+    repo_name = (
+        repo_facts.get("repo_path", output_dir).rstrip("/").split("/")[-1]
+        if repo_facts
+        else os.path.basename(output_dir)
+    )
 
     # Compose header
-    header = "\n".join([
-        f"# {repo_name} — Compiled Knowledge",
-        "<!-- Generated by Doramagic Knowledge Compiler (Stage 4.5) -->",
-        f"<!-- Cards: {cc_count} concepts, {wf_count} workflows, {dr_count} rules -->",
-        f"<!-- Filtered: {rejected_count} REJECTED, {weak_count} WEAK ([推测] annotated) -->",
-        "<!-- Order: CRITICAL RULES → CONCEPTS → WORKFLOWS → FEATURE INVENTORY",
-        "          → DESIGN PHILOSOPHY → MENTAL MODEL → WHY CHAINS → TRAPS → QUICK REFERENCE -->",
-        "",
-    ])
+    header = "\n".join(
+        [
+            f"# {repo_name} — Compiled Knowledge",
+            "<!-- Generated by Doramagic Knowledge Compiler (Stage 4.5) -->",
+            f"<!-- Cards: {cc_count} concepts, {wf_count} workflows, {dr_count} rules -->",
+            f"<!-- Filtered: {rejected_count} REJECTED, {weak_count} WEAK ([推测] annotated) -->",
+            "<!-- Order: CRITICAL RULES → CONCEPTS → WORKFLOWS → FEATURE INVENTORY",
+            "          → DESIGN PHILOSOPHY → MENTAL MODEL → WHY CHAINS → TRAPS → QUICK REFERENCE -->",
+            "",
+        ]
+    )
 
     # Assemble in U-shaped order
     ordered_keys = [
@@ -783,7 +815,7 @@ def compile_knowledge(output_dir: str, budget: int = DEFAULT_BUDGET) -> bool:
         f.write(final_content)
 
     token_count = estimate_tokens(final_content)
-    print(f"=== Knowledge Compiler Complete ===")
+    print("=== Knowledge Compiler Complete ===")
     print(f"output:  {out_path}")
     print(f"tokens:  ~{token_count} (budget: {budget})")
     print(f"cards:   CC={cc_count} WF={wf_count} DR={dr_count}")
@@ -796,10 +828,9 @@ def compile_knowledge(output_dir: str, budget: int = DEFAULT_BUDGET) -> bool:
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Doramagic Knowledge Compiler — Stage 4.5"
-    )
+    parser = argparse.ArgumentParser(description="Doramagic Knowledge Compiler — Stage 4.5")
     parser.add_argument(
         "--output-dir",
         required=True,

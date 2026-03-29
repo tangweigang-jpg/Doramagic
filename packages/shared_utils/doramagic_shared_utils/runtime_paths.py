@@ -29,13 +29,13 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional, Union
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 内部工具
 # ---------------------------------------------------------------------------
+
 
 def _is_candidate_root(path: Path) -> bool:
     """判断 path 是否满足运行根目录的最低条件。
@@ -53,7 +53,7 @@ def _is_candidate_root(path: Path) -> bool:
     return has_bricks or has_scripts or has_skills
 
 
-def _walk_up_for_root(start: Path) -> Optional[Path]:
+def _walk_up_for_root(start: Path) -> Path | None:
     """从 start 逐级向上查找满足 _is_candidate_root() 的目录。"""
     current = start if start.is_dir() else start.parent
     # 最多向上查找 10 层，避免无限遍历到文件系统根
@@ -72,7 +72,8 @@ def _walk_up_for_root(start: Path) -> Optional[Path]:
 # 公共 API
 # ---------------------------------------------------------------------------
 
-def find_runtime_root(anchor_file: Optional[Union[str, Path]] = None) -> Path:
+
+def find_runtime_root(anchor_file: str | Path | None = None) -> Path:
     """找到运行根目录。
 
     优先级：
@@ -118,9 +119,9 @@ def find_runtime_root(anchor_file: Optional[Union[str, Path]] = None) -> Path:
 
 
 def resolve_bricks_dir(
-    explicit: Optional[Union[str, Path]] = None,
-    root: Optional[Path] = None,
-) -> Optional[Path]:
+    explicit: str | Path | None = None,
+    root: Path | None = None,
+) -> Path | None:
     """解析积木目录路径。
 
     优先级：
@@ -144,9 +145,7 @@ def resolve_bricks_dir(
         if p.is_dir():
             logger.debug("bricks_dir from DORAMAGIC_BRICKS_DIR: %s", p)
             return p
-        logger.warning(
-            "DORAMAGIC_BRICKS_DIR=%s is not a valid directory", env_val
-        )
+        logger.warning("DORAMAGIC_BRICKS_DIR=%s is not a valid directory", env_val)
 
     # 3. root/bricks/
     if root is not None:
@@ -159,9 +158,9 @@ def resolve_bricks_dir(
 
 
 def resolve_platform_rules(
-    explicit: Optional[Union[str, Path]] = None,
-    root: Optional[Path] = None,
-) -> Optional[Path]:
+    explicit: str | Path | None = None,
+    root: Path | None = None,
+) -> Path | None:
     """解析 platform_rules.json 路径。
 
     优先级：
@@ -184,18 +183,16 @@ def resolve_platform_rules(
         # 开发布局兜底：root/skills/doramagic/platform_rules.json
         dev_candidate = root / "skills" / "doramagic" / "platform_rules.json"
         if dev_candidate.is_file():
-            logger.debug(
-                "platform_rules resolved under dev skills dir: %s", dev_candidate
-            )
+            logger.debug("platform_rules resolved under dev skills dir: %s", dev_candidate)
             return dev_candidate
 
     return None
 
 
 def resolve_models_config(
-    explicit: Optional[Union[str, Path]] = None,
-    root: Optional[Path] = None,
-) -> Optional[Path]:
+    explicit: str | Path | None = None,
+    root: Path | None = None,
+) -> Path | None:
     """解析 models.json 路径。
 
     优先级：
@@ -217,9 +214,7 @@ def resolve_models_config(
         if p.is_file():
             logger.debug("models_config from DORAMAGIC_MODELS_CONFIG: %s", p)
             return p
-        logger.warning(
-            "DORAMAGIC_MODELS_CONFIG=%s is not a valid file", env_val
-        )
+        logger.warning("DORAMAGIC_MODELS_CONFIG=%s is not a valid file", env_val)
 
     # 3. root/models.json
     if root is not None:
@@ -231,15 +226,13 @@ def resolve_models_config(
         # 4. 示例文件兜底
         example = root / "models.json.example"
         if example.is_file():
-            logger.debug(
-                "models_config falling back to example: %s", example
-            )
+            logger.debug("models_config falling back to example: %s", example)
             return example
 
     return None
 
 
-def resolve_scripts_dir(root: Optional[Path] = None) -> Optional[Path]:
+def resolve_scripts_dir(root: Path | None = None) -> Path | None:
     """解析 scripts 目录路径。
 
     自包含布局：root/scripts/
@@ -263,7 +256,7 @@ def resolve_scripts_dir(root: Optional[Path] = None) -> Optional[Path]:
     return None
 
 
-def bootstrap_sys_path(root: Optional[Path] = None) -> Path:
+def bootstrap_sys_path(root: Path | None = None) -> Path:
     """将 root/packages/ 下所有包目录加入 sys.path，返回 root。
 
     如果 root 未提供，先调用 find_runtime_root() 自动探测。
@@ -280,9 +273,7 @@ def bootstrap_sys_path(root: Optional[Path] = None) -> Path:
 
     packages_dir = root / "packages"
     if not packages_dir.is_dir():
-        logger.warning(
-            "packages/ not found under runtime root: %s", root
-        )
+        logger.warning("packages/ not found under runtime root: %s", root)
         return root
 
     added: list[str] = []

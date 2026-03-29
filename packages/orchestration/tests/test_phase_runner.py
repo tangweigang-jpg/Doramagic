@@ -11,11 +11,8 @@ from __future__ import annotations
 import json
 import os
 import sys
-import tempfile
-import types
 from pathlib import Path
-from typing import Optional
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -35,7 +32,6 @@ from doramagic_orchestration.phase_runner import (  # noqa: E402
     _load_repo_facts,
     run_single_project_pipeline,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -256,6 +252,7 @@ class MockDSDReport:
 
 def _make_mock_stage0_fn(repo_path: str, output_dir: str):
     """Return a mock extract_repo_facts function that writes repo_facts.json."""
+
     def _stage0_fn(rp):
         facts = {
             "repo_path": rp,
@@ -274,6 +271,7 @@ def _make_mock_stage0_fn(repo_path: str, output_dir: str):
         mock_result = MagicMock()
         mock_result.model_dump.return_value = facts
         return mock_result
+
     return _stage0_fn
 
 
@@ -375,9 +373,16 @@ class TestStage0:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=mock_stage0_fn),
-            patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_stage0", return_value=mock_stage0_fn
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_extraction_modules",
+                return_value=(None, None, None, None),
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -398,8 +403,13 @@ class TestStage0:
         )
         with (
             patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
-            patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_extraction_modules",
+                return_value=(None, None, None, None),
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -420,9 +430,16 @@ class TestStage0:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=mock_stage0_fn),
-            patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_stage0", return_value=mock_stage0_fn
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_extraction_modules",
+                return_value=(None, None, None, None),
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -443,9 +460,16 @@ class TestStage0:
             skip_assembly=True,
         )
         with (
-            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=mock_stage0_fn),
-            patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_stage0", return_value=mock_stage0_fn
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_extraction_modules",
+                return_value=(None, None, None, None),
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -468,8 +492,13 @@ class TestBrickInjection:
         )
         with (
             patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
-            patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_extraction_modules",
+                return_value=(None, None, None, None),
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -490,8 +519,13 @@ class TestBrickInjection:
         )
         with (
             patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
-            patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_extraction_modules",
+                return_value=(None, None, None, None),
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -522,9 +556,17 @@ class TestBrickInjection:
         )
         with (
             patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
-            patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
-            patch("doramagic_orchestration.phase_runner._import_brick_injector", return_value=mock_injector),
+            patch(
+                "doramagic_orchestration.phase_runner._import_extraction_modules",
+                return_value=(None, None, None, None),
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_brick_injector",
+                return_value=mock_injector,
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -548,8 +590,13 @@ class TestStage15:
         )
         with (
             patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
-            patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_extraction_modules",
+                return_value=(None, None, None, None),
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -570,8 +617,13 @@ class TestStage15:
         mock_adapter = MagicMock()
         with (
             patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
-            patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_extraction_modules",
+                return_value=(None, None, None, None),
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -615,12 +667,17 @@ class TestStage15:
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(MagicMock(), MagicMock(), None, mock_run_stage15),
             ),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
-            patch.dict("sys.modules", {
-                "doramagic_contracts": mock_contracts,
-                "doramagic_contracts.base": mock_contracts.base,
-                "doramagic_contracts.extraction": mock_contracts.extraction,
-            }),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)
+            ),
+            patch.dict(
+                "sys.modules",
+                {
+                    "doramagic_contracts": mock_contracts,
+                    "doramagic_contracts.base": mock_contracts.base,
+                    "doramagic_contracts.extraction": mock_contracts.extraction,
+                },
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -650,7 +707,9 @@ class TestStage15:
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(MagicMock(), MagicMock(), None, mock_run_stage15),
             ),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -686,7 +745,10 @@ class TestStage35:
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, mock_dsd, mock_compile, None),
             ),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(mock_validate_all, mock_write_report)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate",
+                return_value=(mock_validate_all, mock_write_report),
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -718,7 +780,10 @@ class TestStage35:
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, mock_dsd, mock_compile, None),
             ),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(mock_validate_all, mock_write_report)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate",
+                return_value=(mock_validate_all, mock_write_report),
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -750,7 +815,10 @@ class TestStage35:
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, mock_dsd, mock_compile, None),
             ),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(mock_validate_all, mock_write_report)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate",
+                return_value=(mock_validate_all, mock_write_report),
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -786,7 +854,10 @@ class TestStage35:
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, mock_dsd, mock_compile, None),
             ),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(mock_validate_all, mock_write_report)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate",
+                return_value=(mock_validate_all, mock_write_report),
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -820,7 +891,10 @@ class TestStage45:
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, None, mock_compile, None),
             ),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(mock_validate_all, mock_write_report)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate",
+                return_value=(mock_validate_all, mock_write_report),
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -850,7 +924,10 @@ class TestStage45:
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, None, mock_compile, None),
             ),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(mock_validate_all, mock_write_report)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate",
+                return_value=(mock_validate_all, mock_write_report),
+            ),
         ):
             run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -878,7 +955,10 @@ class TestStage45:
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, None, mock_compile, None),
             ),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(mock_validate_all, mock_write_report)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate",
+                return_value=(mock_validate_all, mock_write_report),
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -918,8 +998,13 @@ class TestStage5:
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, None, mock_compile, None),
             ),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(mock_validate_all, mock_write_report)),
-            patch("doramagic_orchestration.phase_runner._import_assemble", return_value=fake_assemble),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate",
+                return_value=(mock_validate_all, mock_write_report),
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_assemble", return_value=fake_assemble
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -950,8 +1035,13 @@ class TestStage5:
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, None, mock_compile, None),
             ),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(mock_validate_all, mock_write_report)),
-            patch("doramagic_orchestration.phase_runner._import_assemble", return_value=mock_assemble),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate",
+                return_value=(mock_validate_all, mock_write_report),
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_assemble", return_value=mock_assemble
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -982,8 +1072,13 @@ class TestStage5:
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, None, mock_compile, None),
             ),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(mock_validate_all, mock_write_report)),
-            patch("doramagic_orchestration.phase_runner._import_assemble", return_value=mock_assemble),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate",
+                return_value=(mock_validate_all, mock_write_report),
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_assemble", return_value=mock_assemble
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -1043,13 +1138,20 @@ class TestFullHappyPath:
         )
 
         with (
-            patch("doramagic_orchestration.phase_runner._import_stage0", return_value=fake_stage0_fn),
+            patch(
+                "doramagic_orchestration.phase_runner._import_stage0", return_value=fake_stage0_fn
+            ),
             patch(
                 "doramagic_orchestration.phase_runner._import_extraction_modules",
                 return_value=(mock_run_evidence_tagging, mock_dsd, mock_compile, None),
             ),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(mock_validate_all, mock_write_report)),
-            patch("doramagic_orchestration.phase_runner._import_assemble", return_value=fake_assemble),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate",
+                return_value=(mock_validate_all, mock_write_report),
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_assemble", return_value=fake_assemble
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),
@@ -1082,8 +1184,13 @@ class TestGracefulDegradation:
         )
         with (
             patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
-            patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_extraction_modules",
+                return_value=(None, None, None, None),
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)
+            ),
             patch("doramagic_orchestration.phase_runner._import_assemble", return_value=None),
             patch("doramagic_orchestration.phase_runner._import_brick_injector", return_value=None),
         ):
@@ -1112,8 +1219,13 @@ class TestGracefulDegradation:
         )
         with (
             patch("doramagic_orchestration.phase_runner._import_stage0", return_value=None),
-            patch("doramagic_orchestration.phase_runner._import_extraction_modules", return_value=(None, None, None, None)),
-            patch("doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)),
+            patch(
+                "doramagic_orchestration.phase_runner._import_extraction_modules",
+                return_value=(None, None, None, None),
+            ),
+            patch(
+                "doramagic_orchestration.phase_runner._import_validate", return_value=(None, None)
+            ),
         ):
             result = run_single_project_pipeline(
                 repo_path=str(tmp_repo),

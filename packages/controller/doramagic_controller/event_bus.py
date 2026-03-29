@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -37,7 +37,7 @@ class EventBus:
         with self._lock:
             self._seq += 1
             entry: dict[str, Any] = {
-                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "ts": datetime.now(UTC).isoformat(timespec="seconds"),
                 "run_id": self._run_id,
                 "seq": self._seq,
                 "event_type": event_type,

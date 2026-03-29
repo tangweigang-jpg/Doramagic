@@ -42,7 +42,7 @@ class PhaseExecutor(Protocol):
         input: BaseModel,
         adapter: object,  # LLMAdapter — untyped to avoid circular import
         config: ExecutorConfig,
-    ) -> "ModuleResultEnvelope": ...
+    ) -> ModuleResultEnvelope: ...
 
     def validate_input(self, input: BaseModel) -> list[str]:
         """Pre-flight input validation. Returns list of error strings."""

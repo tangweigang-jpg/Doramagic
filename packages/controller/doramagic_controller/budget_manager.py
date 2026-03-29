@@ -7,7 +7,6 @@ Produces BudgetSnapshot for executors and warnings for the controller.
 from __future__ import annotations
 
 import time
-from typing import Optional
 
 from doramagic_contracts.budget import BudgetPolicy, BudgetSnapshot
 from doramagic_contracts.envelope import RunMetrics
@@ -25,7 +24,7 @@ class BudgetManager:
             # transition to DEGRADED
     """
 
-    def __init__(self, policy: Optional[BudgetPolicy] = None) -> None:
+    def __init__(self, policy: BudgetPolicy | None = None) -> None:
         self._policy = policy or BudgetPolicy()
         self._total_cost: float = 0.0
         self._total_tokens: int = 0
@@ -57,7 +56,10 @@ class BudgetManager:
 
         # Check phase overshoot
         allocation = self._policy.allocation_for(phase)
-        if allocation > 0 and self._phase_costs[phase] > allocation * self._policy.overshoot_warning_pct / 100:
+        if (
+            allocation > 0
+            and self._phase_costs[phase] > allocation * self._policy.overshoot_warning_pct / 100
+        ):
             msg = f"Phase {phase} exceeded {self._policy.overshoot_warning_pct}% of budget allocation (${self._phase_costs[phase]:.3f} / ${allocation:.3f})"
             new_warnings.append(msg)
             self._warnings.append(msg)

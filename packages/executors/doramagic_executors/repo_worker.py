@@ -23,7 +23,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 logger = logging.getLogger("doramagic.worker")
 
@@ -43,8 +43,8 @@ class RepoWorkerContext:
     timeout_seconds: int = 180
     max_retries: int = 2
     status: str = "pending"
-    started_at: Optional[float] = None
-    finished_at: Optional[float] = None
+    started_at: float | None = None
+    finished_at: float | None = None
 
 
 class RepoWorker:
@@ -58,6 +58,7 @@ class RepoWorker:
     def run(self) -> Any:
         """Execute the full extraction pipeline. Returns RepoExtractionEnvelope."""
         from doramagic_contracts.worker import RepoExtractionEnvelope
+
         from .repo_type_classifier import classify_repo_type
 
         self.ctx.status = "running"
@@ -145,6 +146,7 @@ class RepoWorker:
 
         try:
             from doramagic_community.github_search import download_repo
+
             local_path = download_repo(full_name, "main", str(self.ctx.work_dir / "repo"))
             if local_path:
                 return local_path
@@ -154,6 +156,7 @@ class RepoWorker:
         # Try with master branch
         try:
             from doramagic_community.github_search import download_repo
+
             local_path = download_repo(full_name, "master", str(self.ctx.work_dir / "repo"))
             if local_path:
                 return local_path
@@ -166,6 +169,7 @@ class RepoWorker:
         """Extract repo_facts.json deterministically (no LLM)."""
         try:
             from doramagic_extraction.stage0 import run_stage0
+
             result = run_stage0(local_path, str(self.ctx.work_dir / "artifacts"))
             facts_path = self.ctx.work_dir / "artifacts" / "repo_facts.json"
             if facts_path.exists():
@@ -190,6 +194,7 @@ class RepoWorker:
         """Load domain-matched bricks for this worker. Domain-isolated."""
         try:
             from doramagic_extraction.brick_injection import load_bricks_for_domain
+
             domain = facts.get("primary_domain", facts.get("domain", "general"))
             return load_bricks_for_domain(domain)
         except Exception:
@@ -202,6 +207,7 @@ class RepoWorker:
         # Run the orchestration pipeline
         try:
             from doramagic_orchestration.phase_runner import run_single_project_pipeline
+
             result = run_single_project_pipeline(
                 repo_path=local_path,
                 output_dir=str(self.ctx.work_dir / "extraction"),
@@ -216,6 +222,7 @@ class RepoWorker:
         try:
             from doramagic_extraction.llm_stage_runner import run_llm_stages
             from doramagic_shared_utils.capability_router import CapabilityRouter
+
             router = CapabilityRouter.from_config("models.json")
             run_llm_stages(local_path, str(self.ctx.work_dir / "extraction"), router)
         except Exception as e:
@@ -245,19 +252,25 @@ class RepoWorker:
 
             # Count links (catalog indicator)
             import re
-            links = re.findall(r'\[([^\]]+)\]\(([^)]+)\)', readme)
+
+            links = re.findall(r"\[([^\]]+)\]\(([^)]+)\)", readme)
             soul["feature_inventory"] = [
-                f"Catalog entry: {name}" for name, url in links[:20]
+                f"Catalog entry: {name}"
+                for name, url in links[:20]
                 if "github.com" in url or "http" in url
             ]
             soul["design_philosophy"] = f"Curated catalog of {len(links)} resources"
             soul["mental_model"] = "Resource curation and categorization"
 
             # Extract section headings as taxonomy
-            sections = re.findall(r'^##\s+(.+)', readme, re.MULTILINE)
+            sections = re.findall(r"^##\s+(.+)", readme, re.MULTILINE)
             if sections:
                 soul["why_decisions"] = [
-                    {"decision": f"Category: {s}", "reasoning": "Catalog taxonomy", "evidence": "README"}
+                    {
+                        "decision": f"Category: {s}",
+                        "reasoning": "Catalog taxonomy",
+                        "evidence": "README",
+                    }
                     for s in sections[:10]
                 ]
 
@@ -270,6 +283,7 @@ class RepoWorker:
 
         try:
             from doramagic_community.community_signals import collect_community_signals
+
             token = os.environ.get("GITHUB_TOKEN")
             signals = collect_community_signals(self.ctx.repo_url, None, token)
             if isinstance(signals, dict):

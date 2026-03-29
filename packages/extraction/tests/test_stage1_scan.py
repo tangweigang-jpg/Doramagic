@@ -11,22 +11,20 @@ import re
 import sys
 from pathlib import Path
 
-import pytest
-
 # 引用 contracts 包
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "packages" / "contracts"))
 # 引用 extraction 包
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from doramagic_contracts.base import RepoRef  # noqa: E402
-from doramagic_contracts.envelope import ErrorCodes, ModuleResultEnvelope  # noqa: E402
-from doramagic_contracts.extraction import (  # noqa: E402
+from doramagic_contracts.base import RepoRef
+from doramagic_contracts.envelope import ErrorCodes
+from doramagic_contracts.extraction import (
     RepoFacts,
     Stage1ScanConfig,
     Stage1ScanInput,
     Stage1ScanOutput,
 )
-from doramagic_extraction.stage1_scan import run_stage1_scan  # noqa: E402
+from doramagic_extraction.stage1_scan import run_stage1_scan
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Fixtures
@@ -34,7 +32,9 @@ from doramagic_extraction.stage1_scan import run_stage1_scan  # noqa: E402
 
 FIXTURE_PATH = (
     Path(__file__).parent.parent.parent.parent
-    / "data" / "fixtures" / "sim2_repo_facts_calorie.json"
+    / "data"
+    / "fixtures"
+    / "sim2_repo_facts_calorie.json"
 )
 
 
@@ -127,18 +127,14 @@ class TestNormalPath:
         """Must have at least one 'interface' knowledge_type finding (acceptance criterion)."""
         result = run_stage1_scan(_load_calorie_input())
         assert result.data is not None
-        interface_findings = [
-            f for f in result.data.findings if f.knowledge_type == "interface"
-        ]
+        interface_findings = [f for f in result.data.findings if f.knowledge_type == "interface"]
         assert len(interface_findings) >= 1, "No interface findings found"
 
     def test_has_rationale_finding(self) -> None:
         """Must have at least one 'rationale' knowledge_type finding (acceptance criterion)."""
         result = run_stage1_scan(_load_calorie_input())
         assert result.data is not None
-        rationale_findings = [
-            f for f in result.data.findings if f.knowledge_type == "rationale"
-        ]
+        rationale_findings = [f for f in result.data.findings if f.knowledge_type == "rationale"]
         assert len(rationale_findings) >= 1, "No rationale findings found"
 
     def test_has_hypotheses(self) -> None:
@@ -248,18 +244,14 @@ class TestSchemaCompliance:
         result = run_stage1_scan(_load_calorie_input())
         assert result.data is not None
         for f in result.data.findings:
-            assert len(f.evidence_refs) >= 1, (
-                f"Finding {f.finding_id} has no evidence_refs"
-            )
+            assert len(f.evidence_refs) >= 1, f"Finding {f.finding_id} has no evidence_refs"
 
     def test_hypotheses_have_search_hints(self) -> None:
         """Every hypothesis must have at least one search hint."""
         result = run_stage1_scan(_load_calorie_input())
         assert result.data is not None
         for h in result.data.hypotheses:
-            assert len(h.search_hints) >= 1, (
-                f"Hypothesis {h.hypothesis_id} has no search_hints"
-            )
+            assert len(h.search_hints) >= 1, f"Hypothesis {h.hypothesis_id} has no search_hints"
 
     def test_finding_question_keys_valid(self) -> None:
         """question_key must be one of Q1-Q7."""
@@ -290,11 +282,11 @@ class TestSchemaCompliance:
         result = run_stage1_scan(_load_calorie_input())
         assert result.data is not None
         cov = result.data.coverage
-        all_q = set(cov.answered_questions) | set(cov.partial_questions) | set(cov.uncovered_questions)
+        all_q = (
+            set(cov.answered_questions) | set(cov.partial_questions) | set(cov.uncovered_questions)
+        )
         total = (
-            len(cov.answered_questions)
-            + len(cov.partial_questions)
-            + len(cov.uncovered_questions)
+            len(cov.answered_questions) + len(cov.partial_questions) + len(cov.uncovered_questions)
         )
         assert len(all_q) == total, "Coverage categories overlap"
 
@@ -304,9 +296,7 @@ class TestSchemaCompliance:
         assert result.data is not None
         cov = result.data.coverage
         total = (
-            len(cov.answered_questions)
-            + len(cov.partial_questions)
-            + len(cov.uncovered_questions)
+            len(cov.answered_questions) + len(cov.partial_questions) + len(cov.uncovered_questions)
         )
         assert total == 7, f"Expected 7 total questions, got {total}"
 
@@ -460,27 +450,21 @@ class TestCalorieCounterContent:
         """Must have at least one 'constraint' knowledge_type finding."""
         result = run_stage1_scan(_load_calorie_input())
         assert result.data is not None
-        constraint_findings = [
-            f for f in result.data.findings if f.knowledge_type == "constraint"
-        ]
+        constraint_findings = [f for f in result.data.findings if f.knowledge_type == "constraint"]
         assert len(constraint_findings) >= 1
 
     def test_has_failure_finding(self) -> None:
         """Must have at least one 'failure' knowledge_type finding."""
         result = run_stage1_scan(_load_calorie_input())
         assert result.data is not None
-        failure_findings = [
-            f for f in result.data.findings if f.knowledge_type == "failure"
-        ]
+        failure_findings = [f for f in result.data.findings if f.knowledge_type == "failure"]
         assert len(failure_findings) >= 1
 
     def test_has_assembly_pattern_finding(self) -> None:
         """Must have at least one 'assembly_pattern' knowledge_type finding."""
         result = run_stage1_scan(_load_calorie_input())
         assert result.data is not None
-        ap_findings = [
-            f for f in result.data.findings if f.knowledge_type == "assembly_pattern"
-        ]
+        ap_findings = [f for f in result.data.findings if f.knowledge_type == "assembly_pattern"]
         assert len(ap_findings) >= 1
 
     def test_high_priority_hypothesis_exists(self) -> None:

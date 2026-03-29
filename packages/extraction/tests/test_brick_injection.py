@@ -233,7 +233,9 @@ class TestLoadBricksFromFile:
 
     def test_skips_corrupt_lines(self, tmp_path: Path):
         jsonl = tmp_path / "mixed.jsonl"
-        jsonl.write_text('{"brick_id": "good"}\nNOT_JSON\n{"brick_id": "also_good"}\n', encoding="utf-8")
+        jsonl.write_text(
+            '{"brick_id": "good"}\nNOT_JSON\n{"brick_id": "also_good"}\n', encoding="utf-8"
+        )
         result = _load_bricks_from_file(jsonl)
         assert len(result) == 2
         assert result[0]["brick_id"] == "good"
@@ -274,7 +276,7 @@ class TestGenerateInjectionText:
         # 截断后应 <= 200 字符 (197 + "...")
         for line in text.splitlines():
             if line.startswith("[Django]"):
-                statement_part = line[len("[Django] "):]
+                statement_part = line[len("[Django] ") :]
                 assert len(statement_part) <= 200
 
     def test_multiple_bricks(self):
@@ -417,7 +419,8 @@ class TestLoadAndInjectBricks:
             output_dir=str(output_dir),
         )
         lines = [
-            l for l in Path(result.bricks_path).read_text(encoding="utf-8").splitlines()
+            l
+            for l in Path(result.bricks_path).read_text(encoding="utf-8").splitlines()
             if l.strip()
         ]
         assert len(lines) == 5  # 3 + 2
@@ -502,7 +505,8 @@ class TestWithRealBricks:
         assert result.bricks_loaded >= 13
         assert result.bricks_path is not None
         lines = [
-            l for l in Path(result.bricks_path).read_text(encoding="utf-8").splitlines()
+            l
+            for l in Path(result.bricks_path).read_text(encoding="utf-8").splitlines()
             if l.strip()
         ]
         assert len(lines) == result.bricks_loaded
@@ -510,7 +514,7 @@ class TestWithRealBricks:
     def test_all_12_files_loadable(self, real_bricks_dir: Path):
         """12 个 JSONL 文件都应能正常加载。"""
         all_jsonl = list(real_bricks_dir.glob("*.jsonl"))
-        assert len(all_jsonl) >=12, f"Expected at least 12, got {len(all_jsonl)}"
+        assert len(all_jsonl) >= 12, f"Expected at least 12, got {len(all_jsonl)}"
         total = 0
         for f in all_jsonl:
             bricks = _load_bricks_from_file(f)
@@ -521,8 +525,14 @@ class TestWithRealBricks:
     def test_total_89_bricks(self, real_bricks_dir: Path):
         """对所有已知框架调用，总积木数 = 89。"""
         all_frameworks = [
-            "Django", "React", "FastAPI", "Python", "Go module",
-            "Home Assistant", "Obsidian", "Logseq",
+            "Django",
+            "React",
+            "FastAPI",
+            "Python",
+            "Go module",
+            "Home Assistant",
+            "Obsidian",
+            "Logseq",
         ]
         result = load_and_inject_bricks(
             frameworks=all_frameworks,

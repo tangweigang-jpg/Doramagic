@@ -16,7 +16,7 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
     if end == -1:
         return {}, text
     yaml_block = text[3:end].strip()
-    body = text[end + 3:].strip()
+    body = text[end + 3 :].strip()
     meta = {}
     current_key = None
 
@@ -29,7 +29,7 @@ def parse_frontmatter(text: str) -> tuple[dict, str]:
             if isinstance(meta[current_key], list):
                 meta[current_key].append(item)
             continue
-        match = re.match(r'^([a-z_]+):\s*(.*)', line)
+        match = re.match(r"^([a-z_]+):\s*(.*)", line)
         if match:
             current_key = match.group(1)
             value = match.group(2).strip()
@@ -53,12 +53,14 @@ def _sources_to_evidence_refs(sources: list) -> list[dict]:
     refs = []
     for src in sources:
         src_str = str(src)
-        if re.search(r'#\d+|Issue\s*\d+', src_str, re.IGNORECASE):
-            refs.append({
-                "kind": "community_ref",
-                "path": src_str,
-                "source_url": src_str,
-            })
+        if re.search(r"#\d+|Issue\s*\d+", src_str, re.IGNORECASE):
+            refs.append(
+                {
+                    "kind": "community_ref",
+                    "path": src_str,
+                    "source_url": src_str,
+                }
+            )
         elif ":" in src_str and not src_str.startswith("http"):
             # file:line reference like "src/dotenv/main.py:42"
             parts = src_str.split(":")
@@ -71,17 +73,21 @@ def _sources_to_evidence_refs(sources: list) -> list[dict]:
                     pass
             refs.append(ref)
         elif src_str.startswith("http"):
-            refs.append({
-                "kind": "community_ref",
-                "path": src_str,
-                "source_url": src_str,
-            })
+            refs.append(
+                {
+                    "kind": "community_ref",
+                    "path": src_str,
+                    "source_url": src_str,
+                }
+            )
         else:
-            refs.append({
-                "kind": "artifact_ref",
-                "path": src_str,
-                "artifact_name": src_str,
-            })
+            refs.append(
+                {
+                    "kind": "artifact_ref",
+                    "path": src_str,
+                    "artifact_name": src_str,
+                }
+            )
     return refs
 
 

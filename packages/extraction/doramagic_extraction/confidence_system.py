@@ -273,9 +273,7 @@ def inject_verdict_into_frontmatter(frontmatter_text: str, card: dict) -> str:
     # Remove any existing occurrences of these keys
     lines = frontmatter_text.split("\n")
     filtered = [
-        ln
-        for ln in lines
-        if not re.match(r"^(evidence_tags|verdict|policy_action)\s*:", ln)
+        ln for ln in lines if not re.match(r"^(evidence_tags|verdict|policy_action)\s*:", ln)
     ]
 
     # Find the closing --- (second occurrence) and inject before it

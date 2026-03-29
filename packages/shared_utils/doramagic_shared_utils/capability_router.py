@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Sequence
 
 # 管线使用的能力标签
 CAPABILITY_DEEP_REASONING = "deep_reasoning"
@@ -36,13 +36,15 @@ _TASK_TO_CAPABILITIES = {
 
 COST_TIER_ORDER = {"low": 0, "medium": 1, "high": 2}
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 # ─── Routing Decision Log ────────────────────────────────────────
+
 
 @dataclass
 class RoutingDecision:
     """Records a single model routing decision for transparency."""
+
     stage: str
     required_capabilities: list[str]
     selected_model: str
@@ -55,7 +57,7 @@ class RoutingDecision:
 
     def __post_init__(self):
         if not self.timestamp:
-            self.timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self.timestamp = datetime.now(UTC).isoformat(timespec="seconds")
 
 
 # Module-level routing log (reset between runs)
@@ -91,11 +93,11 @@ def get_routing_summary() -> str:
         )
 
     lines.append("")
-    lines.append(f"*Decisions: {len(_routing_log)} | "
-                 f"Degraded: {sum(1 for d in _routing_log if d.is_degraded)}*")
+    lines.append(
+        f"*Decisions: {len(_routing_log)} | "
+        f"Degraded: {sum(1 for d in _routing_log if d.is_degraded)}*"
+    )
     return "\n".join(lines)
-
-
 
 
 @dataclass
@@ -193,6 +195,7 @@ class CapabilityRouter:
         result = self.route(caps)
         # 返回一个带 _default_model 的标记对象
         from doramagic_shared_utils.llm_adapter import LLMAdapter
+
         adapter = LLMAdapter(provider_override=result.provider)
         adapter._default_model = result.model_id
         # Pass base_url for OpenAI-compatible providers (GLM/Qwen/Kimi/DeepSeek/...)
@@ -216,16 +219,18 @@ class CapabilityRouter:
                 provider=selected.provider,
                 cost_tier=selected.cost_tier,
             )
-            _routing_log.append(RoutingDecision(
-                stage=getattr(self, "_current_stage", "unknown"),
-                required_capabilities=list(required_capabilities),
-                selected_model=selected.model_id,
-                provider=selected.provider,
-                cost_tier=selected.cost_tier,
-                is_degraded=False,
-                reason=self.preference,
-                alternatives=alternatives,
-            ))
+            _routing_log.append(
+                RoutingDecision(
+                    stage=getattr(self, "_current_stage", "unknown"),
+                    required_capabilities=list(required_capabilities),
+                    selected_model=selected.model_id,
+                    provider=selected.provider,
+                    cost_tier=selected.cost_tier,
+                    is_degraded=False,
+                    reason=self.preference,
+                    alternatives=alternatives,
+                )
+            )
             return result
 
         # 无完美匹配 — 降级
@@ -239,16 +244,18 @@ class CapabilityRouter:
                 missing_capabilities=missing,
                 cost_tier=best.cost_tier,
             )
-            _routing_log.append(RoutingDecision(
-                stage=getattr(self, "_current_stage", "unknown"),
-                required_capabilities=list(required_capabilities),
-                selected_model=best.model_id,
-                provider=best.provider,
-                cost_tier=best.cost_tier,
-                is_degraded=True,
-                reason=f"degraded: missing {missing}",
-                alternatives=[],
-            ))
+            _routing_log.append(
+                RoutingDecision(
+                    stage=getattr(self, "_current_stage", "unknown"),
+                    required_capabilities=list(required_capabilities),
+                    selected_model=best.model_id,
+                    provider=best.provider,
+                    cost_tier=best.cost_tier,
+                    is_degraded=True,
+                    reason=f"degraded: missing {missing}",
+                    alternatives=[],
+                )
+            )
             return result
 
         # strict 模式：无匹配则报错
@@ -262,11 +269,13 @@ class CapabilityRouter:
         results = []
         for m in self.models:
             if m.has_capabilities(required_capabilities):
-                results.append(RoutingResult(
-                    model_id=m.model_id,
-                    provider=m.provider,
-                    cost_tier=m.cost_tier,
-                ))
+                results.append(
+                    RoutingResult(
+                        model_id=m.model_id,
+                        provider=m.provider,
+                        cost_tier=m.cost_tier,
+                    )
+                )
         return results
 
     def route_for_stage(self, stage_name: str) -> RoutingResult:
@@ -290,12 +299,13 @@ class CapabilityRouter:
         self._current_stage = stage_name
         return self.route(caps)
 
-    def build_adapter_for_stage(self, stage_name: str) -> "LLMAdapter":
+    def build_adapter_for_stage(self, stage_name: str) -> LLMAdapter:
         """Route a stage and return a configured LLMAdapter ready to call."""
         result = self.route_for_stage(stage_name)
         if result.provider == "none":
             return None  # deterministic stage, no LLM needed
         from doramagic_shared_utils.llm_adapter import LLMAdapter
+
         adapter = LLMAdapter(provider_override=result.provider)
         adapter._default_model = result.model_id
         matched = next((m for m in self.models if m.model_id == result.model_id), None)
