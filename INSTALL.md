@@ -1,6 +1,6 @@
 # Installing and Using Doramagic
 
-Doramagic v12.1.4 is a **skill-forging skill** for OpenClaw and Claude Code environments.
+Doramagic v12.1.5 is a **skill-forging skill** for OpenClaw and Claude Code environments.
 
 It runs a 7-phase conditional DAG pipeline:
 

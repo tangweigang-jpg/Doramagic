@@ -157,7 +157,7 @@ Doramagic supports 4 input types, each routed deterministically:
 | Domain Exploration | `/dora What design wisdom can I learn from PKM projects?` | Multi-project discovery + extraction |
 | Clarification | `/dora I need something for my team` | Asks clarifying questions first |
 
-## Key Features (v12.1.4)
+## Key Features (v12.1.5)
 
 - **Deterministic Routing DAG** -- 4 input paths with conditional edges
 - **Fan-out Extraction** -- Up to 3 isolated RepoWorkers in parallel

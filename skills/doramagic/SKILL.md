@@ -4,7 +4,7 @@ description: >
   Doramagic: extract the soul of open-source projects — design philosophy, decision rules,
   and community wisdom compiled into injectable AI advisor packs.
   Triggers on: "dora", "doramagic", "extract soul", "extract knowledge".
-version: 12.1.4
+version: 12.1.5
 user-invocable: true
 license: MIT
 tags: [doramagic, knowledge-extraction, skill-generation]
