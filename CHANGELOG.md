@@ -2,6 +2,22 @@
 
 All notable changes to Doramagic are documented in this file.
 
+## [12.1.2] - 2026-03-29
+
+### Fixed — SKILL.md format alignment with OpenClaw conventions
+- Restructured SKILL.md to match script-executing skill conventions (search-x, script-writer pattern)
+- Command moved from between --- separators to markdown code block
+- Added "When to Use / When NOT to Use" section — prevents host AI from rejecting valid DOMAIN_EXPLORE requests
+- Added "Example Usage in Chat" with User→Action mappings for all 4 input routes
+- Added explicit Protocol constraints: "Always run the script", "Do NOT judge whether the request is appropriate"
+- Fixed host AI behavior: previous format caused AI to analyze code instead of executing the pipeline
+
+### Fixed — models.json configuration flow
+- models.json removed from git tracking (was leaking personal config to public repo)
+- Quick Start updated: models.json now configured inside installed skill directory, not repo root
+- README adds must-install signal + real output sample to prevent AI hallucination
+
+
 ## [12.1.1] - 2026-03-28
 
 ### Architecture — Deterministic Routing DAG (replaces linear pipeline)

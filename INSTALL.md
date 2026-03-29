@@ -1,6 +1,6 @@
 # Installing and Using Doramagic
 
-Doramagic v12.1.1 is a **skill-forging skill** for OpenClaw and Claude Code environments.
+Doramagic v12.1.2 is a **skill-forging skill** for OpenClaw and Claude Code environments.
 
 It runs a 7-phase conditional DAG pipeline:
 
@@ -31,13 +31,32 @@ A typical generated Skill bundle contains:
 
 After installation, your AI assistant inherits the target domain's design philosophy and can reason with real project conventions instead of generic advice.
 
-## Prerequisites
+## Fastest Install (recommended)
+
+**One-line installer** -- handles Python deps, host detection, and skill setup automatically:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tangweigang-jpg/Doramagic/main/install.sh | bash
+```
+
+**OpenClaw users** can also install from ClawHub:
+
+```bash
+openclaw skills install doramagic
+```
+
+After either method, set your API key, restart the session, and run `/dora`.
+
+## Prerequisites (for manual install)
 
 - Git
 - Python 3.12+
 - [uv](https://docs.astral.sh/uv/) (recommended) or pip
+- Runtime Python packages: `pydantic` + at least one LLM SDK (`anthropic`, `openai`, or `google-genai`)
 - At least one LLM model accessible via API
 - API keys for the providers you declare in `models.json`
+
+**No marketplace or registry is required.** Both OpenClaw and Claude Code discover skills by scanning their skill directories. Installation is just copying files.
 
 ## Install Method 1: OpenClaw
 
@@ -47,14 +66,25 @@ After installation, your AI assistant inherits the target domain's design philos
 git clone https://github.com/tangweigang-jpg/Doramagic.git ~/Doramagic
 ```
 
-### Step 2. Install the skill
+### Step 2. Install Python dependencies
+
+```bash
+cd ~/Doramagic
+uv venv && source .venv/bin/activate
+uv pip install pydantic                        # required
+uv pip install anthropic openai google-genai   # install SDK(s) for your provider(s)
+```
+
+### Step 3. Install the skill
+
+Use `cp -rL` to dereference any symlinks, ensuring the skill directory is truly self-contained:
 
 ```bash
 mkdir -p ~/.openclaw/skills
-cp -r ~/Doramagic/skills/doramagic ~/.openclaw/skills/dora
+cp -rL ~/Doramagic/skills/doramagic ~/.openclaw/skills/dora
 ```
 
-### Step 3. Configure models
+### Step 4. Configure models
 
 Configure `models.json` **inside the installed skill directory**:
 
@@ -90,11 +120,11 @@ export GOOGLE_API_KEY="..."    # optional
 export OPENAI_API_KEY="..."    # optional
 ```
 
-### Step 4. Restart your OpenClaw session
+### Step 5. Restart your OpenClaw session
 
-Open a fresh session so the host reloads the `dora` skill.
+Open a fresh session so the host re-scans the skill directory and picks up `/dora`.
 
-### Step 5. Use `/dora`
+### Step 6. Use `/dora`
 
 ```text
 /dora I want a Skill for reviewing API designs.
@@ -102,7 +132,7 @@ Open a fresh session so the host reloads the `dora` skill.
      and https://github.com/encode/django-rest-framework
 ```
 
-### Step 6. Install the generated Skill bundle
+### Step 7. Install the generated Skill bundle
 
 After Doramagic completes, copy the delivery bundle:
 
@@ -125,26 +155,35 @@ Then use it:
 git clone https://github.com/tangweigang-jpg/Doramagic.git ~/Doramagic
 ```
 
-### Step 2. Install the skill
+### Step 2. Install Python dependencies
+
+```bash
+cd ~/Doramagic
+uv venv && source .venv/bin/activate
+uv pip install pydantic                        # required
+uv pip install anthropic openai google-genai   # install SDK(s) for your provider(s)
+```
+
+### Step 3. Install the skill
 
 ```bash
 mkdir -p ~/.claude/skills
-cp -r ~/Doramagic/skills/doramagic ~/.claude/skills/dora
+cp -rL ~/Doramagic/skills/doramagic ~/.claude/skills/dora
 ```
 
-### Step 3. Configure models
+### Step 4. Configure models
 
 ```bash
 cp ~/.claude/skills/dora/models.json.example ~/.claude/skills/dora/models.json
 ```
 
-Edit `~/.claude/skills/dora/models.json` with your available models and export API keys (see Method 1, Step 3 for format).
+Edit `~/.claude/skills/dora/models.json` with your available models and export API keys (see Method 1, Step 4 for format).
 
-### Step 4. Restart Claude Code
+### Step 5. Restart Claude Code
 
-Open a new session so the host picks up the skill.
+Open a new session so the host re-scans the skill directory and picks up `/dora`.
 
-### Step 5. Use `/dora`
+### Step 6. Use `/dora`
 
 ```text
 /dora I want a Skill for managing personal knowledge and reading notes.
@@ -152,7 +191,7 @@ Open a new session so the host picks up the skill.
      and https://github.com/logseq/logseq
 ```
 
-### Step 6. Install the generated Skill bundle
+### Step 7. Install the generated Skill bundle
 
 ```bash
 mkdir -p ~/.claude/skills/pkm-advisor
@@ -161,7 +200,7 @@ cp -R ~/.doramagic/runs/<run-id>/delivery/* ~/.claude/skills/pkm-advisor/
 
 ## Install Method 3: Python CLI (Local Forge Mode)
 
-For local testing, debugging, or CI workflows:
+For local testing, debugging, or CI workflows -- no OpenClaw or Claude Code needed:
 
 ### Step 1. Clone and set up
 
@@ -170,7 +209,7 @@ git clone https://github.com/tangweigang-jpg/Doramagic.git ~/Doramagic
 cd ~/Doramagic
 uv venv && source .venv/bin/activate
 uv pip install -e .
-uv pip install anthropic openai google-genai  # install SDK for your provider(s)
+uv pip install anthropic openai google-genai  # install SDK(s) for your provider(s)
 ```
 
 ### Step 2. Configure models
@@ -220,7 +259,7 @@ No. One capable model is enough. Adding more improves routing flexibility and co
 
 ### Can I delete the cloned repo after installation?
 
-Yes. The installed skill directory is self-contained -- all packages, bricks, and your `models.json` are inside it.
+Yes, if you used `cp -rL` (which dereferences symlinks). The installed skill directory contains all packages, bricks, and scripts it needs. Just ensure the Python dependencies (`pydantic` + your LLM SDK) remain installed in a virtualenv that the skill can access.
 
 ### Where do I find the generated skill bundle?
 

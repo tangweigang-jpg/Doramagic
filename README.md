@@ -10,6 +10,31 @@ Doramagic extracts the **soul** of open-source projects -- not just what the cod
 
 ## Quick Start
 
+### One-line install (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/tangweigang-jpg/Doramagic/main/install.sh | bash
+```
+
+This auto-detects OpenClaw / Claude Code, installs Python dependencies, and sets everything up. After it finishes, set your API key and restart:
+
+```bash
+export ANTHROPIC_API_KEY="your-key"
+# Restart your session, then:
+/dora https://github.com/owner/repo
+```
+
+**OpenClaw users** can also install from ClawHub directly:
+
+```bash
+openclaw skills install doramagic
+```
+
+### Manual install
+
+<details>
+<summary>Click to expand manual steps</summary>
+
 ### 1. Clone
 
 ```bash
@@ -17,21 +42,33 @@ git clone https://github.com/tangweigang-jpg/Doramagic.git ~/Doramagic
 cd ~/Doramagic
 ```
 
-### 2. Install as a skill
+### 2. Install Python dependencies
+
+Doramagic requires Python 3.12+ and a few runtime packages. Install them in a dedicated virtualenv:
+
+```bash
+uv venv && source .venv/bin/activate
+uv pip install pydantic                        # required
+uv pip install anthropic openai google-genai   # install SDK(s) for your LLM provider(s)
+```
+
+### 3. Install as a skill
+
+Copy the self-contained skill directory into your host's skill directory. Use `cp -rL` to dereference any symlinks:
 
 **OpenClaw:**
 ```bash
 mkdir -p ~/.openclaw/skills
-cp -r ~/Doramagic/skills/doramagic ~/.openclaw/skills/dora
+cp -rL ~/Doramagic/skills/doramagic ~/.openclaw/skills/dora
 ```
 
 **Claude Code:**
 ```bash
 mkdir -p ~/.claude/skills
-cp -r ~/Doramagic/skills/doramagic ~/.claude/skills/dora
+cp -rL ~/Doramagic/skills/doramagic ~/.claude/skills/dora
 ```
 
-### 3. Configure models
+### 4. Configure models
 
 The installed skill includes `models.json.example`. Copy and edit it **inside the skill directory**:
 
@@ -54,9 +91,9 @@ export GOOGLE_API_KEY="..."
 export OPENAI_API_KEY="..."
 ```
 
-### 4. Use `/dora`
+### 5. Use `/dora`
 
-Restart your host session, then invoke:
+Restart your host session (so the host re-scans the skill directory), then invoke:
 
 ```text
 /dora I want a Skill for managing family recipes and weekly menus.
@@ -65,6 +102,8 @@ Restart your host session, then invoke:
 ```
 
 Doramagic runs its 7-phase pipeline and produces a Skill bundle you can install.
+
+</details>
 
 ## What Doramagic Produces
 
@@ -106,7 +145,7 @@ Doramagic supports 4 input types, each routed deterministically:
 | Domain Exploration | `/dora What design wisdom can I learn from PKM projects?` | Multi-project discovery + extraction |
 | Clarification | `/dora I need something for my team` | Asks clarifying questions first |
 
-## Key Features (v12.1.1)
+## Key Features (v12.1.2)
 
 - **Deterministic Routing DAG** -- 4 input paths with conditional edges
 - **Fan-out Extraction** -- Up to 3 isolated RepoWorkers in parallel
@@ -166,6 +205,14 @@ Doramagic routes by **capability**, not by model name:
 
 One model is enough. Adding more improves routing flexibility and cost control.
 
+## Distribution
+
+Doramagic is distributed as a **self-contained skill directory**. There is no marketplace, package registry, or store listing required.
+
+- **OpenClaw** and **Claude Code** both discover skills by scanning their skill directories (`~/.openclaw/skills/` and `~/.claude/skills/`).
+- Installation is just copying files. No `npm install`, no `pip install`, no registration step.
+- The cloned repo can be deleted after copying -- the installed skill directory contains all packages, bricks, and scripts it needs. Just make sure Python dependencies (Step 2) are installed in a virtualenv that the skill's Python can access.
+
 ## Development
 
 ```bash
@@ -200,7 +247,7 @@ No. One capable model is enough.
 
 ### Can I delete the cloned repo after installation?
 
-Yes. The installed skill directory is self-contained. Your `models.json` is inside the skill directory, not in the cloned repo.
+Yes, if you used `cp -rL` (which dereferences symlinks). The installed skill directory contains all packages, bricks, and scripts. Your `models.json` is inside the skill directory, not in the cloned repo. Just ensure Python dependencies (`pydantic` + your LLM SDK) remain installed in an accessible virtualenv.
 
 ### Where do I find the generated skill bundle?
 
