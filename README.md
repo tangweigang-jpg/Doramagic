@@ -24,10 +24,22 @@ export ANTHROPIC_API_KEY="your-key"
 /dora https://github.com/owner/repo
 ```
 
-**OpenClaw users** can also install from ClawHub directly:
+### Other install methods
 
+**OpenClaw (ClawHub):**
 ```bash
 openclaw skills install doramagic
+```
+
+**Claude Code (plugin marketplace):**
+```
+/plugin marketplace add tangweigang-jpg/Doramagic
+/plugin install doramagic
+```
+
+**Cross-platform (Claude Code, Codex, Cursor, and 39+ agents):**
+```bash
+npx skills add tangweigang-jpg/Doramagic
 ```
 
 ### Manual install
