@@ -52,6 +52,13 @@
 - 不要在计划中加入不影响目标的步骤（因为是伪工作，"删掉这步目标会受影响吗？"如果不会就不该存在，发现于 2026-03-29）
 - 不要按技术排行榜选产品方向（因为应该从市场需求反推，ClawHub 下载数据比框架热度排行更能反映真实需求，发现于 2026-03-29）
 
+## 打包与部署
+
+- 不要在 setup_packages_path 的开发者布局检测中只判断 packages/ 和 skills/doramagic/ 是否存在（因为 ~/.openclaw/ 会同时含有旧版残留，应额外验证 pyproject.toml 或 Makefile 才算真正的开发目录，发现于 2026-03-29）
+- 不要在 _brick_catalog_dir 中把 skills/doramagic/bricks/ 路径排在 bricks/ 之前（因为安装模式下 skills/doramagic/ 不存在，会解析到错误路径；应优先检查 DORAMAGIC_BRICKS_DIR 环境变量，发现于 2026-03-29）
+- 不要在相关性过滤器中只用英文关键词匹配（因为 GitHub 返回的中文描述仓库会被误过滤；非 ASCII 字符占比高时应直接放行，信任 GitHub 搜索排序，发现于 2026-03-29）
+- 不要在版本字符串中硬编码版本号（因为发版后容易忘记同步，应从 SKILL.md 或 pyproject.toml 动态读取，发现于 2026-03-29）
+
 ## 通用
 
 - 不要假设两个环境的 schema 一致（因为 legacy 生产表可能缺列，需做列探测/降级分支，来自 WhisperX 教训 2026-03-17）
