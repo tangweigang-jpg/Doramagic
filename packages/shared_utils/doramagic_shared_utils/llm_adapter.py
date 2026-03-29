@@ -10,9 +10,17 @@
 
 from __future__ import annotations
 
+import logging
 import os
+import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Optional, Sequence
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
+_RETRY_DELAYS_SECONDS = (1, 2, 4)
 
 
 @dataclass
@@ -21,8 +29,8 @@ class LLMMessage:
 
     role: str  # "system", "user", "assistant", "tool"
     content: str
-    tool_call_id: Optional[str] = None
-    tool_calls: Optional[list[dict]] = None
+    tool_call_id: str | None = None
+    tool_calls: list[dict] | None = None
 
 
 @dataclass
@@ -94,6 +102,36 @@ def _provider_from_model_id(model_id: str) -> str:
     return "unknown"
 
 
+def _status_code_from_exception(exc: Exception) -> int | None:
+    """提取异常里携带的 HTTP 状态码。"""
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+
+    response = getattr(exc, "response", None)
+    if response is not None:
+        response_status_code = getattr(response, "status_code", None)
+        if isinstance(response_status_code, int):
+            return response_status_code
+
+        response_status = getattr(response, "status", None)
+        if isinstance(response_status, int):
+            return response_status
+
+    status = getattr(exc, "status", None)
+    if isinstance(status, int):
+        return status
+
+    return None
+
+
+def _is_retryable_exception(exc: Exception) -> bool:
+    """判断是否应该对该异常进行重试。"""
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    return _status_code_from_exception(exc) in _RETRYABLE_STATUS_CODES
+
+
 class LLMAdapter:
     """
     统一 LLM 调用接口。
@@ -102,56 +140,86 @@ class LLMAdapter:
     这样不依赖用户安装所有 SDK — 只需安装自己用的 provider 的 SDK。
     """
 
-    def __init__(self, provider_override: Optional[str] = None, config: Any = None):
-        if config is not None and hasattr(config, 'provider'):
+    def __init__(self, provider_override: str | None = None, config: Any = None):
+        if config is not None and hasattr(config, "provider"):
             self._provider_override = config.provider
         else:
             self._provider_override = provider_override
         self._clients: dict[str, Any] = {}
         self._default_model: str = ""
-        self._base_url: Optional[str] = None  # For OpenAI-compatible APIs (GLM/Qwen/Kimi/DeepSeek/...)  # set by router or config
+        self._base_url: str | None = (
+            None  # For OpenAI-compatible APIs (GLM/Qwen/Kimi/DeepSeek/...)  # set by router or config
+        )
 
     def chat(
         self,
         messages: Sequence[LLMMessage],
-        system: Optional[str] = None,
+        system: str | None = None,
         *,
         temperature: float = 0.0,
         max_tokens: int = 4096,
     ) -> LLMResponse:
         """同步调用接口 — S1-Sonnet 风格。内部 async 桥接。"""
         import asyncio
+
         model_id = self._default_model or "default"
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        if loop and loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                return pool.submit(
-                    asyncio.run,
-                    self.generate(model_id, messages, system=system, temperature=temperature, max_tokens=max_tokens)
-                ).result()
-        return asyncio.run(
-            self.generate(model_id, messages, system=system, temperature=temperature, max_tokens=max_tokens)
-        )
+
+        def _invoke_generate() -> LLMResponse:
+            def _run_generate() -> LLMResponse:
+                return asyncio.run(
+                    self.generate(
+                        model_id,
+                        messages,
+                        system=system,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                    )
+                )
+
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop and loop.is_running():
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    return pool.submit(_run_generate).result()
+            return _run_generate()
+
+        for attempt, delay in enumerate(_RETRY_DELAYS_SECONDS + (None,)):
+            try:
+                return _invoke_generate()
+            except Exception as exc:
+                if not _is_retryable_exception(exc) or delay is None:
+                    raise
+                logger.warning(
+                    "LLMAdapter.chat() failed on attempt %s with %s; retrying in %ss",
+                    attempt + 1,
+                    exc.__class__.__name__,
+                    delay,
+                )
+                time.sleep(delay)
 
     async def generate(
         self,
         model_id: str,
         messages: Sequence[LLMMessage],
         *,
-        provider: Optional[str] = None,
+        provider: str | None = None,
         temperature: float = 0.0,
         max_tokens: int = 4096,
-        system: Optional[str] = None,
+        system: str | None = None,
     ) -> LLMResponse:
         """统一文本生成接口。"""
         resolved_provider = provider or self._provider_override or _provider_from_model_id(model_id)
         return await self._dispatch(
-            resolved_provider, model_id, messages,
-            temperature=temperature, max_tokens=max_tokens, system=system,
+            resolved_provider,
+            model_id,
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            system=system,
         )
 
     async def generate_with_tools(
@@ -160,16 +228,21 @@ class LLMAdapter:
         messages: Sequence[LLMMessage],
         tools: Sequence[LLMToolDefinition],
         *,
-        provider: Optional[str] = None,
+        provider: str | None = None,
         temperature: float = 0.0,
         max_tokens: int = 4096,
-        system: Optional[str] = None,
+        system: str | None = None,
     ) -> LLMResponse:
         """统一工具调用接口。对不支持 tool_use 的模型，回退到 prompt-based 工具选择。"""
         resolved_provider = provider or self._provider_override or _provider_from_model_id(model_id)
         return await self._dispatch_with_tools(
-            resolved_provider, model_id, messages, tools,
-            temperature=temperature, max_tokens=max_tokens, system=system,
+            resolved_provider,
+            model_id,
+            messages,
+            tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            system=system,
         )
 
     async def _dispatch(
@@ -191,8 +264,12 @@ class LLMAdapter:
         )
 
     async def _dispatch_with_tools(
-        self, provider: str, model_id: str, messages: Sequence[LLMMessage],
-        tools: Sequence[LLMToolDefinition], **kwargs
+        self,
+        provider: str,
+        model_id: str,
+        messages: Sequence[LLMMessage],
+        tools: Sequence[LLMToolDefinition],
+        **kwargs,
     ) -> LLMResponse:
         """分发工具调用到具体 provider。"""
         if provider == "anthropic":
@@ -208,11 +285,18 @@ class LLMAdapter:
 
     # --- Anthropic ---
 
-    async def _call_anthropic(self, model_id: str, messages: Sequence[LLMMessage], **kwargs) -> LLMResponse:
+    async def _call_anthropic(
+        self, model_id: str, messages: Sequence[LLMMessage], **kwargs
+    ) -> LLMResponse:
         import anthropic
+
         client = self._get_or_create_client("anthropic", lambda: anthropic.AsyncAnthropic())
-        api_messages = [{"role": m.role, "content": m.content} for m in messages if m.role != "system"]
-        system_text = kwargs.get("system") or next((m.content for m in messages if m.role == "system"), None)
+        api_messages = [
+            {"role": m.role, "content": m.content} for m in messages if m.role != "system"
+        ]
+        system_text = kwargs.get("system") or next(
+            (m.content for m in messages if m.role == "system"), None
+        )
         resp = await client.messages.create(
             model=model_id,
             messages=api_messages,
@@ -229,13 +313,21 @@ class LLMAdapter:
         )
 
     async def _call_anthropic_tools(
-        self, model_id: str, messages: Sequence[LLMMessage],
-        tools: Sequence[LLMToolDefinition], **kwargs
+        self,
+        model_id: str,
+        messages: Sequence[LLMMessage],
+        tools: Sequence[LLMToolDefinition],
+        **kwargs,
     ) -> LLMResponse:
         import anthropic
+
         client = self._get_or_create_client("anthropic", lambda: anthropic.AsyncAnthropic())
-        api_messages = [{"role": m.role, "content": m.content} for m in messages if m.role != "system"]
-        system_text = kwargs.get("system") or next((m.content for m in messages if m.role == "system"), None)
+        api_messages = [
+            {"role": m.role, "content": m.content} for m in messages if m.role != "system"
+        ]
+        system_text = kwargs.get("system") or next(
+            (m.content for m in messages if m.role == "system"), None
+        )
         api_tools = [
             {"name": t.name, "description": t.description, "input_schema": t.parameters}
             for t in tools
@@ -266,14 +358,18 @@ class LLMAdapter:
 
     # --- OpenAI ---
 
-    async def _call_openai(self, model_id: str, messages: Sequence[LLMMessage], **kwargs) -> LLMResponse:
+    async def _call_openai(
+        self, model_id: str, messages: Sequence[LLMMessage], **kwargs
+    ) -> LLMResponse:
         import openai
+
         def _make_openai_client():
             kw = {}
             if self._base_url:
                 kw["base_url"] = self._base_url
             return openai.AsyncOpenAI(**kw)
-        client_key = f"openai:{self._base_url or default}"
+
+        client_key = f"openai:{self._base_url or 'default'}"
         client = self._get_or_create_client(client_key, _make_openai_client)
         api_messages = [{"role": m.role, "content": m.content} for m in messages]
         resp = await client.chat.completions.create(
@@ -292,20 +388,32 @@ class LLMAdapter:
         )
 
     async def _call_openai_tools(
-        self, model_id: str, messages: Sequence[LLMMessage],
-        tools: Sequence[LLMToolDefinition], **kwargs
+        self,
+        model_id: str,
+        messages: Sequence[LLMMessage],
+        tools: Sequence[LLMToolDefinition],
+        **kwargs,
     ) -> LLMResponse:
         import openai
+
         def _make_openai_client():
             kw = {}
             if self._base_url:
                 kw["base_url"] = self._base_url
             return openai.AsyncOpenAI(**kw)
-        client_key = f"openai:{self._base_url or default}"
+
+        client_key = f"openai:{self._base_url or 'default'}"
         client = self._get_or_create_client(client_key, _make_openai_client)
         api_messages = [{"role": m.role, "content": m.content} for m in messages]
         api_tools = [
-            {"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.parameters}}
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
+                },
+            }
             for t in tools
         ]
         resp = await client.chat.completions.create(
@@ -319,12 +427,15 @@ class LLMAdapter:
         tool_calls = []
         if choice.message.tool_calls:
             import json as _json
+
             for tc in choice.message.tool_calls:
-                tool_calls.append({
-                    "id": tc.id,
-                    "name": tc.function.name,
-                    "arguments": _json.loads(tc.function.arguments),
-                })
+                tool_calls.append(
+                    {
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "arguments": _json.loads(tc.function.arguments),
+                    }
+                )
         return LLMResponse(
             content=choice.message.content or "",
             model_id=model_id,
@@ -336,8 +447,11 @@ class LLMAdapter:
 
     # --- Google ---
 
-    async def _call_google(self, model_id: str, messages: Sequence[LLMMessage], **kwargs) -> LLMResponse:
+    async def _call_google(
+        self, model_id: str, messages: Sequence[LLMMessage], **kwargs
+    ) -> LLMResponse:
         from google import genai
+
         client = self._get_or_create_client(
             "google",
             lambda: genai.Client(api_key=os.environ.get("GOOGLE_API_KEY", "")),
@@ -359,8 +473,11 @@ class LLMAdapter:
         )
 
     async def _call_google_tools(
-        self, model_id: str, messages: Sequence[LLMMessage],
-        tools: Sequence[LLMToolDefinition], **kwargs
+        self,
+        model_id: str,
+        messages: Sequence[LLMMessage],
+        tools: Sequence[LLMToolDefinition],
+        **kwargs,
     ) -> LLMResponse:
         # Gemini tool calling — simplified; full impl would use google.genai tool objects
         # 回退到 prompt-based
@@ -380,11 +497,16 @@ class LLMAdapter:
     # --- Fallback: prompt-based tool calling ---
 
     async def _fallback_prompt_tools(
-        self, provider: str, model_id: str, messages: Sequence[LLMMessage],
-        tools: Sequence[LLMToolDefinition], **kwargs
+        self,
+        provider: str,
+        model_id: str,
+        messages: Sequence[LLMMessage],
+        tools: Sequence[LLMToolDefinition],
+        **kwargs,
     ) -> LLMResponse:
         """对不支持原生工具调用的模型，将工具定义注入 system prompt。"""
         import json as _json
+
         tool_descriptions = []
         for t in tools:
             tool_descriptions.append(
@@ -394,8 +516,7 @@ class LLMAdapter:
         tool_prompt = (
             "You have access to the following tools. "
             "To use a tool, respond with a JSON object: "
-            '{"tool": "tool_name", "arguments": {...}}\n\n'
-            + "\n---\n".join(tool_descriptions)
+            '{"tool": "tool_name", "arguments": {...}}\n\n' + "\n---\n".join(tool_descriptions)
         )
         augmented = [LLMMessage(role="system", content=tool_prompt)] + list(messages)
         return await self._dispatch(provider, model_id, augmented, **kwargs)
@@ -410,15 +531,18 @@ class LLMAdapter:
 
 # --- Config helper ---
 
+
 @dataclass
 class LLMAdapterConfig:
     """Simple config for adapter construction."""
+
     provider: str = "mock"
     model: str = ""
     api_key_env: str = ""
 
 
 # --- Mock adapter for testing ---
+
 
 class MockLLMAdapter(LLMAdapter):
     """Deterministic adapter for unit tests. No real LLM calls.
@@ -431,7 +555,7 @@ class MockLLMAdapter(LLMAdapter):
 
     def __init__(
         self,
-        responses: Optional[list] = None,
+        responses: list | None = None,
         response_fn: Any = None,
         default_response: str = '{"tool": "append_finding", "arguments": {"status": "pending", "statement": "mock"}}',
     ) -> None:
@@ -445,7 +569,7 @@ class MockLLMAdapter(LLMAdapter):
     def chat(
         self,
         messages: Sequence[LLMMessage],
-        system: Optional[str] = None,
+        system: str | None = None,
         **kwargs,
     ) -> LLMResponse:
         if self._response_fn is not None:
