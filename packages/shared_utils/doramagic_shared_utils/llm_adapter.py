@@ -151,6 +151,15 @@ class LLMAdapter:
             None  # For OpenAI-compatible APIs (GLM/Qwen/Kimi/DeepSeek/...)  # set by router or config
         )
 
+    @property
+    def provider(self) -> str:
+        """Resolved provider for strategy selection."""
+        if self._provider_override:
+            return self._provider_override
+        if self._default_model:
+            return _provider_from_model_id(self._default_model)
+        return "unknown"
+
     def chat(
         self,
         messages: Sequence[LLMMessage],

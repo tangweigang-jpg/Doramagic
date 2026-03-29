@@ -59,8 +59,8 @@ def _load_json(path: Path) -> dict:
 
 
 def _build_input(tmp_path: Path) -> Stage15AgenticInput:
-    repo_payload = _load_json(FIXTURES_DIR / "sim2_repo_facts_calorie.json")
-    stage1_payload = _load_json(FIXTURES_DIR / "sim2_stage1_output_calorie.json")
+    repo_payload = _load_json(FIXTURES_DIR / "example_calorie_repo_facts_calorie.json")
+    stage1_payload = _load_json(FIXTURES_DIR / "example_calorie_stage1_output_calorie.json")
 
     repo_root = tmp_path / "ai-calorie-counter"
     repo_root.mkdir(parents=True, exist_ok=True)

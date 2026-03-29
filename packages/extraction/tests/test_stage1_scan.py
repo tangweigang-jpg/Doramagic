@@ -1,6 +1,6 @@
 """Stage 1 Scan 模块测试。
 
-使用 sim2_repo_facts_calorie.json 作为主要测试输入，
+使用 example_calorie_repo_facts_calorie.json 作为主要测试输入，
 验证正常路径、schema 合规、错误路径、降级路径和假说生成。
 """
 
@@ -34,7 +34,7 @@ FIXTURE_PATH = (
     Path(__file__).parent.parent.parent.parent
     / "data"
     / "fixtures"
-    / "sim2_repo_facts_calorie.json"
+    / "example_calorie_repo_facts_calorie.json"
 )
 
 

@@ -16,7 +16,24 @@ Direct anthropic/openai/google imports are forbidden here.
 
 from __future__ import annotations
 
+import logging
+import sys
 import time
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# sys.path setup (mirrors the pattern used in stage15_agentic.py base)
+# ---------------------------------------------------------------------------
+
+_THIS_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _THIS_DIR.parent.parent.parent  # repository root
+_CONTRACTS_DIR = _REPO_ROOT / "packages" / "contracts"
+_SHARED_UTILS_DIR = _REPO_ROOT / "packages" / "shared_utils"
+_EXTRACTION_DIR = _REPO_ROOT / "packages" / "extraction"
+
+for _p in [str(_CONTRACTS_DIR), str(_SHARED_UTILS_DIR), str(_EXTRACTION_DIR)]:
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 from doramagic_contracts.envelope import (
     ErrorCodes,
@@ -44,6 +61,7 @@ from .stage15_config import PRIORITY_ORDER
 from .stage15_explorer import _AgenticExplorer
 
 MODULE_NAME = "extraction.stage15_agentic"
+logger = logging.getLogger(__name__)
 
 
 def _sorted_hypotheses(hypotheses: list[Hypothesis]) -> list[Hypothesis]:
@@ -53,7 +71,7 @@ def _sorted_hypotheses(hypotheses: list[Hypothesis]) -> list[Hypothesis]:
     )
 
 
-def run_stage15_agentic(
+def _run_stage15_agentic_core(
     input_data: Stage15AgenticInput,
     adapter: LLMAdapter | None = None,
     router: CapabilityRouter | None = None,
@@ -324,3 +342,69 @@ def _minimal_mock_run(
             retries=0,
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Provider strategies
+# ---------------------------------------------------------------------------
+
+
+def _normalize_provider_name(provider: str | None) -> str:
+    if not provider:
+        return "unknown"
+    normalized = provider.strip().lower()
+    if normalized == "gemini":
+        return "google"
+    return normalized
+
+
+class _Stage15AgenticStrategy:
+    name = "default"
+    providers = frozenset({"anthropic", "openai", "mock", "unknown"})
+
+    def run(
+        self,
+        input_data: Stage15AgenticInput,
+        *,
+        adapter: LLMAdapter | None = None,
+        router: CapabilityRouter | None = None,
+    ) -> ModuleResultEnvelope[Stage15AgenticOutput]:
+        return _run_stage15_agentic_core(input_data, adapter=adapter, router=router)
+
+
+class _GeminiStage15AgenticStrategy(_Stage15AgenticStrategy):
+    name = "gemini"
+    providers = frozenset({"google"})
+
+
+_DEFAULT_STAGE15_STRATEGY = _Stage15AgenticStrategy()
+_GEMINI_STAGE15_STRATEGY = _GeminiStage15AgenticStrategy()
+_STAGE15_STRATEGIES = (_GEMINI_STAGE15_STRATEGY, _DEFAULT_STAGE15_STRATEGY)
+
+
+def resolve_stage15_agentic_strategy(
+    adapter: LLMAdapter | None,
+) -> _Stage15AgenticStrategy:
+    """Pick the provider strategy from LLMAdapter.provider."""
+    provider = _normalize_provider_name(
+        getattr(adapter, "provider", None) or getattr(adapter, "_provider_override", None)
+    )
+    for strategy in _STAGE15_STRATEGIES:
+        if provider in strategy.providers:
+            return strategy
+    return _DEFAULT_STAGE15_STRATEGY
+
+
+def run_stage15_agentic(
+    input_data: Stage15AgenticInput,
+    adapter: LLMAdapter | None = None,
+    router: CapabilityRouter | None = None,
+) -> ModuleResultEnvelope[Stage15AgenticOutput]:
+    """Run Stage 1.5 agentic exploration with provider-based strategy routing."""
+    strategy = resolve_stage15_agentic_strategy(adapter)
+    logger.info(
+        "Stage 1.5 strategy selected: %s (provider=%s)",
+        strategy.name,
+        _normalize_provider_name(getattr(adapter, "provider", None)),
+    )
+    return strategy.run(input_data, adapter=adapter, router=router)
