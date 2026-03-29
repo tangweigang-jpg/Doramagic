@@ -16,13 +16,6 @@
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
-
-# 引用 contracts 包
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "packages" / "contracts"))
-# 引用 cross_project 包
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from doramagic_contracts.base import NeedProfile, SearchDirection
 from doramagic_contracts.cross_project import (

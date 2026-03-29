@@ -18,16 +18,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
-from pathlib import Path
-
-# ---------------------------------------------------------------------------
-# sys.path bootstrap — allow running from any working directory
-# ---------------------------------------------------------------------------
-_HERE = Path(__file__).resolve().parent
-# packages/preextract_api/doramagic_preextract_api -> up 3 levels = repo root
-_REPO_ROOT = _HERE.parents[2]
-sys.path.insert(0, str(_REPO_ROOT / "packages" / "contracts"))
 
 # ---------------------------------------------------------------------------
 # FastAPI imports
@@ -35,7 +25,7 @@ sys.path.insert(0, str(_REPO_ROOT / "packages" / "contracts"))
 # ---------------------------------------------------------------------------
 # Contract imports
 # ---------------------------------------------------------------------------
-from doramagic_contracts.api import (  # noqa: E402
+from doramagic_contracts.api import (
     AtomQueryResponse,
     DeprecationListResponse,
     DomainBricksResponse,
@@ -44,13 +34,13 @@ from doramagic_contracts.api import (  # noqa: E402
     DomainTruthResponse,
     HealthCheckResponse,
 )
-from doramagic_contracts.base import KnowledgeAtom  # noqa: E402
-from doramagic_contracts.domain_graph import (  # noqa: E402
+from doramagic_contracts.base import KnowledgeAtom
+from doramagic_contracts.domain_graph import (
     DeprecationEvent,
     DomainSnapshot,
 )
-from fastapi import FastAPI, HTTPException, Query  # noqa: E402
-from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 # ---------------------------------------------------------------------------
 # Configuration

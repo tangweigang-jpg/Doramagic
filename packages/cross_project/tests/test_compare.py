@@ -3,11 +3,6 @@
 from __future__ import annotations
 
 import json
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "packages" / "contracts"))
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from doramagic_contracts.base import (
     EvidenceRef,

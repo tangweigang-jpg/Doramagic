@@ -10,22 +10,15 @@ import json
 import logging
 import math
 import os
-import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# 引用 contracts 包
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "contracts"))
-# 引用 cross_project 包(供外部调用时使用)
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from doramagic_contracts.base import (  # noqa: E402
+from doramagic_contracts.base import (
     CandidateQualitySignals,
     DiscoveryCandidate,
     SearchCoverageItem,

@@ -5,12 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import sys
 import tempfile
 import time
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "packages" / "contracts"))
 
 from doramagic_contracts.base import Priority
 from doramagic_contracts.cross_project import (

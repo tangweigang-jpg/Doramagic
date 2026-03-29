@@ -3,27 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sys
 import time
-from pathlib import Path
 from typing import Any, Literal, Optional
-
-# --- Environment Setup ---
-# Add contracts and extraction to sys.path as requested
-try:
-    # This assumes we are in packages/extraction/doramagic_extraction/
-    current_dir = Path(__file__).resolve().parent
-    project_root = current_dir.parent.parent.parent
-    contracts_path = project_root / "packages" / "contracts"
-    extraction_path = project_root / "packages" / "extraction"
-
-    if str(contracts_path) not in sys.path:
-        sys.path.insert(0, str(contracts_path))
-    if str(extraction_path) not in sys.path:
-        sys.path.insert(0, str(extraction_path))
-except Exception:
-    # Fallback to current working directory if __file__ is not available
-    pass
 
 from pydantic import Field
 

@@ -3,11 +3,7 @@
 from __future__ import annotations
 
 import re
-import sys
 import time
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent / "packages" / "contracts"))
 
 from doramagic_contracts.envelope import (
     ErrorCodes,

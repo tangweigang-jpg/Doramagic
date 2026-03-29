@@ -6,14 +6,10 @@ import json
 import os
 import re
 import sqlite3
-import sys
 import time
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "packages" / "contracts"))
 
 from doramagic_contracts.base import EvidenceRef, KnowledgeAtom, ProjectFingerprint
 from doramagic_contracts.cross_project import (

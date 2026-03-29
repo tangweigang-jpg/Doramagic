@@ -4,18 +4,7 @@ from __future__ import annotations
 
 import re
 import subprocess
-import sys
 from pathlib import Path
-
-_THIS_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _THIS_DIR.parent.parent.parent  # repository root
-_CONTRACTS_DIR = _REPO_ROOT / "packages" / "contracts"
-_SHARED_UTILS_DIR = _REPO_ROOT / "packages" / "shared_utils"
-_EXTRACTION_DIR = _REPO_ROOT / "packages" / "extraction"
-
-for _p in [str(_CONTRACTS_DIR), str(_SHARED_UTILS_DIR), str(_EXTRACTION_DIR)]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 from doramagic_contracts.base import EvidenceRef
 from doramagic_contracts.extraction import Stage1Finding, Stage15AgenticInput

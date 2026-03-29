@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import zipfile
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -21,13 +20,8 @@ from pathlib import Path
 import httpx
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(_PROJECT_ROOT / "packages" / "contracts"))
-sys.path.insert(0, str(_PROJECT_ROOT / "packages" / "cross_project"))
-sys.path.insert(0, str(_PROJECT_ROOT / "packages" / "skill_compiler"))
-sys.path.insert(0, str(_PROJECT_ROOT / "packages" / "platform_openclaw"))
-sys.path.insert(0, str(_PROJECT_ROOT / "packages" / "shared_utils"))
 
-from doramagic_contracts.base import (  # noqa: E402
+from doramagic_contracts.base import (
     CandidateQualitySignals,
     CommunitySignals,
     DiscoveryCandidate,

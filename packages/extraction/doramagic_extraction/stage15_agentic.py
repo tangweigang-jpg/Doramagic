@@ -16,23 +16,7 @@ Direct anthropic/openai/google imports are forbidden here.
 
 from __future__ import annotations
 
-import sys
 import time
-from pathlib import Path
-
-# ---------------------------------------------------------------------------
-# sys.path setup (mirrors the pattern used in stage15_agentic.py base)
-# ---------------------------------------------------------------------------
-
-_THIS_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _THIS_DIR.parent.parent.parent  # repository root
-_CONTRACTS_DIR = _REPO_ROOT / "packages" / "contracts"
-_SHARED_UTILS_DIR = _REPO_ROOT / "packages" / "shared_utils"
-_EXTRACTION_DIR = _REPO_ROOT / "packages" / "extraction"
-
-for _p in [str(_CONTRACTS_DIR), str(_SHARED_UTILS_DIR), str(_EXTRACTION_DIR)]:
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
 
 from doramagic_contracts.envelope import (
     ErrorCodes,
