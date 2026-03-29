@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import importlib.util
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -456,10 +457,19 @@ class FlowController:
         return None
 
     def _brick_catalog_dir(self) -> Path:
+        # 优先使用 setup_packages_path 已解析好的环境变量（最可靠，覆盖所有安装方式）
+        env_bricks = os.environ.get("DORAMAGIC_BRICKS_DIR")
+        if env_bricks:
+            p = Path(env_bricks)
+            if p.exists():
+                return p
+
         root = Path(__file__).resolve().parents[3]
         candidates = [
-            root / "skills" / "doramagic" / "bricks",
+            # 自包含安装（skill 包根目录下的 bricks/）
             root / "bricks",
+            # 开发者布局（project_root/skills/doramagic/ 下的 bricks/）
+            root / "skills" / "doramagic" / "bricks",
         ]
         for candidate in candidates:
             if candidate.exists():
