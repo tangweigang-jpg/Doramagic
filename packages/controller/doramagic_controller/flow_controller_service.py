@@ -310,3 +310,6 @@ def write_run_log(run_log: list[dict[str, Any]], run_dir: Path) -> None:
     with open(log_path, "a", encoding="utf-8") as handle:
         for entry in run_log:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    run_log.clear()

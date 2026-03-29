@@ -98,7 +98,7 @@ class FlowController:
 
         self._budget.start()
         setup_directories(self._run_dir)
-        if reset_routing_log is not None:
+        if self._capability_router is not None and reset_routing_log is not None:
             with contextlib.suppress(Exception):
                 reset_routing_log()
 
@@ -151,10 +151,19 @@ class FlowController:
             await self._dispatch_executor(phase)
 
         if self._state.phase != phase:
-            self._emit("phase_completed", f"{phase.value} completed", status="completed")
-            await self._progress(
+            self._emit(
+                "phase_completed",
+                f"{phase.value} completed",
+                phase_override=phase.value,
+                status="completed",
+            )
+            await send_progress(
+                self._adapter,
+                self._budget,
+                phase=phase.value,
                 status="completed",
                 message=phase_complete_message(phase, self._state),
+                percent=phase_progress_pct(self._state.phase),
             )
 
     async def _handle_phase_a(self) -> None:
