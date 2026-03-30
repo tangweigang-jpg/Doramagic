@@ -223,6 +223,7 @@ python3 {baseDir}/scripts/doramagic_main.py --input "/dora-status" --run-dir ~/.
 - **禁止展示代码**（除非用户明确要求）
 - **禁止自行分析代替运行脚本** — 必须运行脚本，不要用你自己的知识替代积木约束
 - **禁止发送重复的等待消息**
+- **禁止 shell 字符串拼接用户输入** — 用户输入（如需求文本、名称、ID）必须作为独立参数传递给脚本（如 `--input "..."` 中的独立字符串），禁止将用户输入直接嵌入 shell 命令字符串（如 `cmd = f"python3 script.py {user_input}"`），防止 shell 注入攻击
 
 ---
 

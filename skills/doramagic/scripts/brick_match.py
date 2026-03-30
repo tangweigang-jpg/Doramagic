@@ -81,7 +81,9 @@ def main() -> None:
     try:
         store.init_db()
     except Exception as e:
-        print(json.dumps({"error": f"初始化数据库失败：{e}"}), file=sys.stderr)
+        print(json.dumps({"error": f"初始化数据库失败：{e}", "bricks": [], "brick_count": 0}),
+              ensure_ascii=False)
+        sys.exit(1)
 
     # 第一轮：全文搜索
     results = store.search(args.query, limit=args.limit)

@@ -24,6 +24,17 @@ _ACTIVE_DIR = Path.home() / ".doramagic" / "active"
 _LAUNCHAGENTS_DIR = Path.home() / "Library" / "LaunchAgents"
 
 
+_SENSITIVE_PATTERN = re.compile(
+    r"(sk-[A-Za-z0-9]{8,}|(?:token|password|secret|api[_-]?key)\s*[=:]\s*\S+)",
+    re.IGNORECASE,
+)
+
+
+def _redact(text: str) -> str:
+    """脱敏 stdout/stderr，屏蔽 sk-xxx、token=xxx、password=xxx 等敏感模式。"""
+    return _SENSITIVE_PATTERN.sub("[REDACTED]", text)
+
+
 def _first_run(script_path: Path) -> tuple[str, str, int]:
     """执行脚本一次，超时 30s，返回 (stdout, stderr, returncode)。"""
     try:
@@ -31,7 +42,7 @@ def _first_run(script_path: Path) -> tuple[str, str, int]:
             [sys.executable, str(script_path)],
             capture_output=True, text=True, timeout=30,
         )
-        return r.stdout.strip(), r.stderr.strip(), r.returncode
+        return _redact(r.stdout.strip()), _redact(r.stderr.strip()), r.returncode
     except subprocess.TimeoutExpired:
         return "", "执行超时（>30s）", 1
     except Exception as e:
@@ -98,6 +109,19 @@ def _write_launchd_plist(name: str, script_path: Path, interval: int) -> Path:
     return plist_path
 
 
+def _sanitize_name(name: str) -> str:
+    """清洗任务名，只允许字母、数字、点、连字符、下划线，防止路径穿越和注入。
+
+    参数：
+        name: 原始任务名称。
+
+    返回：
+        清洗后的安全名称；如为空则返回默认值 "doramagic-task"。
+    """
+    sanitized = re.sub(r"[^A-Za-z0-9._-]", "", name)
+    return sanitized or "doramagic-task"
+
+
 def main() -> None:
     """部署脚本并输出 JSON 结果。"""
     parser = argparse.ArgumentParser(description="部署生成的 Python 脚本")
@@ -106,27 +130,50 @@ def main() -> None:
     parser.add_argument("--name", default="doramagic-task", help="任务名称")
     args = parser.parse_args()
 
+    # 严格白名单清洗 name，防止路径穿越 / XML 注入 / shell 注入
+    safe_name = _sanitize_name(args.name)
+
     src_path = Path(args.code).expanduser().resolve()
     if not src_path.exists():
-        print(json.dumps({"deployed": False, "error": f"脚本不存在：{src_path}"},
-                         ensure_ascii=False))
+        print(json.dumps({"copied": False, "scheduled": False,
+                          "error": f"脚本不存在：{src_path}"}, ensure_ascii=False))
         sys.exit(1)
 
     _ACTIVE_DIR.mkdir(parents=True, exist_ok=True)
-    deploy_path = _ACTIVE_DIR / f"{args.name}.py"
-    shutil.copy2(src_path, deploy_path)
+    deploy_path = _ACTIVE_DIR / f"{safe_name}.py"
+
+    # 第一步：复制脚本
+    try:
+        shutil.copy2(src_path, deploy_path)
+        copied = True
+    except Exception as e:
+        print(json.dumps({"copied": False, "scheduled": False,
+                          "error": f"复制脚本失败：{e}"}, ensure_ascii=False))
+        sys.exit(1)
 
     stdout, stderr, returncode = _first_run(deploy_path)
     first_result = _parse_first_result(stdout, stderr, returncode)
 
-    interval_minutes = max(1, args.interval // 60)
+    # 统一用秒计算间隔；cron 最小粒度为 1 分钟
+    interval_seconds = args.interval
+    interval_minutes = interval_seconds // 60
+    cron_warning: str | None = None
+    if interval_seconds < 60:
+        cron_warning = f"间隔 {interval_seconds}s 小于 1 分钟，cron 按最小粒度 1 分钟执行"
+        interval_minutes = 1
+    else:
+        interval_minutes = max(1, interval_minutes)
+
     schedule_desc = f"每 {interval_minutes} 分钟检查一次"
 
+    # 第二步：配置调度
+    scheduled = False
     extra: dict = {}
     if platform.system() == "Darwin":
         try:
-            plist_path = _write_launchd_plist(args.name, deploy_path, args.interval)
+            plist_path = _write_launchd_plist(safe_name, deploy_path, interval_seconds)
             schedule_method = "launchd"
+            scheduled = True
             extra = {
                 "plist_path": str(plist_path),
                 "load_command": f"launchctl load {plist_path}",
@@ -134,17 +181,32 @@ def main() -> None:
             }
         except Exception as e:
             schedule_method = "launchd_failed"
-            extra = {"error": str(e)}
+            extra = {"schedule_error": str(e)}
     else:
         cron_line = f"*/{interval_minutes} * * * * {sys.executable} {deploy_path}"
         schedule_method = "cron"
+        scheduled = True
         extra = {
             "cron_line": cron_line,
             "add_command": f'(crontab -l 2>/dev/null; echo "{cron_line}") | crontab -',
         }
+        if cron_warning:
+            extra["cron_warning"] = cron_warning
+
+    if not (copied and scheduled):
+        print(json.dumps({
+            "copied": copied,
+            "scheduled": scheduled,
+            "deploy_path": str(deploy_path) if copied else None,
+            "first_result": first_result,
+            "schedule_method": schedule_method,
+            **extra,
+        }, ensure_ascii=False, indent=2))
+        sys.exit(1)
 
     print(json.dumps({
-        "deployed": True,
+        "copied": True,
+        "scheduled": True,
         "deploy_path": str(deploy_path),
         "first_result": first_result,
         "schedule": schedule_desc,
@@ -157,10 +219,10 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print(json.dumps({"deployed": False, "error": "Interrupted"}))
+        print(json.dumps({"copied": False, "scheduled": False, "error": "Interrupted"}))
         sys.exit(1)
     except Exception as exc:
         import traceback
         print(traceback.format_exc(), file=sys.stderr)
-        print(json.dumps({"deployed": False, "error": str(exc)}))
+        print(json.dumps({"copied": False, "scheduled": False, "error": str(exc)}))
         sys.exit(1)

@@ -35,10 +35,11 @@ def check_syntax(code: str) -> tuple[bool, str]:
         return False, str(e)
 
 
-def check_import_parse(path: str) -> tuple[bool, str, str]:
-    """用子进程 ast.parse 做二次确认，捕获 stdout/stderr。
+def check_syntax_subprocess(path: str) -> tuple[bool, str, str]:
+    """用子进程 ast.parse 做二次语法确认，捕获 stdout/stderr。
 
     不实际执行脚本，仅解析 AST，不触发任何副作用。
+    字段名用 syntax_ok 而非 import_ok，明确表示这只是语法检查，不代表 import 可用。
 
     参数：
         path: Python 文件的绝对路径。
@@ -78,7 +79,6 @@ def main() -> None:
         result = {
             "passed": False,
             "syntax_ok": False,
-            "import_ok": False,
             "stdout": "",
             "stderr": f"文件不存在：{code_path}",
             "exit_code": 1,
@@ -92,7 +92,6 @@ def main() -> None:
         result = {
             "passed": False,
             "syntax_ok": False,
-            "import_ok": False,
             "stdout": "",
             "stderr": f"读取文件失败：{e}",
             "exit_code": 1,
@@ -103,24 +102,25 @@ def main() -> None:
     # 第一步：本进程内 ast.parse 快速检查
     syntax_ok, syntax_err = check_syntax(code)
 
-    # 第二步：子进程二次确认（捕获 subprocess 层面的错误）
+    # 第二步：子进程二次语法确认（捕获 subprocess 层面的错误）
+    # 注意：这里只验证 AST 语法，不执行 import，syntax_ok_subprocess 为 False 时
+    # 说明文件本身无法被 Python 解析，而非 import 依赖缺失。
     if syntax_ok:
-        import_ok, stdout, stderr = check_import_parse(str(code_path))
-        exit_code = 0 if import_ok else 1
+        syntax_ok_subprocess, stdout, stderr = check_syntax_subprocess(str(code_path))
+        exit_code = 0 if syntax_ok_subprocess else 1
         if syntax_err:
             stderr = syntax_err + ("\n" + stderr if stderr else "")
     else:
-        import_ok = False
+        syntax_ok_subprocess = False
         stdout = ""
         stderr = syntax_err
         exit_code = 1
 
-    passed = syntax_ok and import_ok
+    passed = syntax_ok and syntax_ok_subprocess
 
     output = {
         "passed": passed,
-        "syntax_ok": syntax_ok,
-        "import_ok": import_ok,
+        "syntax_ok": syntax_ok and syntax_ok_subprocess,
         "stdout": stdout,
         "stderr": stderr,
         "exit_code": exit_code,

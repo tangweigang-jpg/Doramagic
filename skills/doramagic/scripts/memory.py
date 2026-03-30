@@ -97,7 +97,17 @@ def main() -> None:
         print(json.dumps(data, ensure_ascii=False, indent=2))
     else:
         bricks = [b.strip() for b in args.bricks.split(",") if b.strip()] if args.bricks else []
-        success = args.success.lower() not in ("false", "0", "no")
+        _success_val = args.success.lower().strip()
+        if _success_val in ("true", "1", "yes"):
+            success = True
+        elif _success_val in ("false", "0", "no"):
+            success = False
+        else:
+            print(json.dumps({
+                "updated": False,
+                "error": f"--success 只接受 true/false/1/0/yes/no，收到：{args.success!r}",
+            }, ensure_ascii=False))
+            sys.exit(1)
         updated = mgr.update_from_interaction(
             user_id=args.user_id,
             user_input=args.input,
