@@ -41,9 +41,11 @@ class DiscoveryRunner:
             searchable = f"{candidate.name} {candidate.contribution}".lower()
             non_ascii_ratio = sum(1 for c in searchable if ord(c) > 127) / max(len(searchable), 1)
             if non_ascii_ratio > 0.3:
-                # 中文描述仓库：用 repo name 做弱相关检查（至少名字要和查询词沾边）
-                name_lower = candidate.name.lower()
-                if not ascii_terms or any(term in name_lower for term in ascii_terms if term):
+                # 中文描述仓库：无法用英文关键词做跨语言匹配，信任 GitHub 搜索排序。
+                # 用更高的 star 门槛（100）过滤低质量噪音，避免完全无关的小仓库混入。
+                sigs = candidate.quality_signals
+                stars = sigs.get("stars", 0) if isinstance(sigs, dict) else 0
+                if stars >= 100 or not ascii_terms:
                     filtered.append(candidate)
                 else:
                     excluded.append(candidate)
