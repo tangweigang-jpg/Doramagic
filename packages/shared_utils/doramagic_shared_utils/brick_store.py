@@ -474,7 +474,7 @@ class BrickStore:
             try:
                 self.import_from_yaml(yaml_file)
                 success_count += 1
-            except (FileNotFoundError, ValueError) as e:
+            except (FileNotFoundError, ValueError, yaml.YAMLError) as e:
                 logger.warning("跳过文件 %s：%s", yaml_file.name, e)
 
         logger.info("批量导入完成：%d / %d 个文件成功", success_count, len(yaml_files))

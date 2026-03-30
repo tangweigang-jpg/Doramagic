@@ -1,0 +1,142 @@
+# 知识积木 v2 — 网页搜索与调研
+# 用途：实时网页搜索、内容提取、摘要生成
+
+# === 信封层（给系统看）===
+id: web-search-v1
+name: 网页搜索与调研
+version: 1.0.0
+category:
+  - 搜索
+  - 调研
+tags:
+  - DuckDuckGo
+  - Serper
+  - Google Search
+  - Bing
+  - 网页抓取
+  - readability
+  - 内容提取
+capability_type: poll
+data_source: null
+
+inputs:
+  query:
+    type: string
+    required: true
+    description: "搜索查询词，支持 site: filetype: 等高级语法"
+    validation: "1 <= len(value) <= 500"
+  provider:
+    type: enum
+    required: false
+    default: "duckduckgo"
+    description: "搜索引擎：duckduckgo（免费无限）、serper（100 free/mo）、
+                  google_cse（$5/1K queries）、bing（$3/1K transactions）"
+    enum_values:
+      - duckduckgo
+      - serper
+      - google_cse
+      - bing
+  api_key:
+    type: string
+    required: false
+    default: ""
+    description: "API Key；duckduckgo 模式下忽略；其他模式从环境变量读取时此参数留空"
+  max_results:
+    type: integer
+    required: false
+    default: 5
+    description: "返回搜索结果数量"
+    validation: "1 <= value <= 20"
+  fetch_content:
+    type: boolean
+    required: false
+    default: false
+    description: "是否抓取并提取搜索结果页面的正文内容（慢但内容丰富）"
+  content_max_length:
+    type: integer
+    required: false
+    default: 2000
+    description: "每个页面提取的正文最大字符数（fetch_content=true 时生效）"
+    validation: "100 <= value <= 10000"
+
+outputs:
+  results:
+    type: "list[dict]"
+    description: "搜索结果列表，每项含 title/url/snippet/content（fetch_content=true）字段"
+  result_count:
+    type: integer
+    description: "实际返回的结果数量"
+  provider_used:
+    type: string
+    description: "实际使用的搜索引擎（可能因失败而降级）"
+
+requires: []
+conflicts_with: []
+compatible_with:
+  - telegram-notifier-v1
+  - daily-briefing-v1
+
+# === 内容层（给 LLM 看）===
+core_capability: >
+  通过 DuckDuckGo Instant Answer API（免费无限）或 Serper/Google CSE/Bing（付费）执行网页搜索，
+  可选用 readability 算法提取页面正文，去广告后返回结构化结果列表。
+
+constraints:
+  - "DuckDuckGo Instant Answer API（默认免费方案）：
+     GET https://api.duckduckgo.com/?q={query}&format=json&no_html=1&skip_disambig=1；
+     无需 API Key，无限制；但返回的是摘要型结果（Abstract/RelatedTopics），
+     不是完整网页搜索列表；适合实体查询（人物/地点/定义），不适合长尾搜索"
+  - "DuckDuckGo HTML 搜索（非官方）：用 duckduckgo_search 库（pip install duckduckgo-search）；
+     DDGS().text(query, max_results=n) 返回完整搜索结果列表，无需 Key；
+     限流约 30 req/min，超过时抛 RatelimitException，需 sleep(2) 重试"
+  - "Serper API：POST https://google.serper.dev/search；
+     Header: X-API-KEY: {api_key}；Body: {\"q\": query, \"num\": max_results}；
+     免费层 100 req/mo，付费 $50/2500 req；Key 从环境变量 SERPER_API_KEY 读取"
+  - "Google Custom Search Engine API：
+     GET https://customsearch.googleapis.com/customsearch/v1?key=KEY&cx=CX&q=query；
+     $5/1000 queries（超出免费 100 req/day 后）；需预先创建 CSE 并获取 cx ID"
+  - "Bing Web Search API（Azure Cognitive Services）：
+     GET https://api.bing.microsoft.com/v7.0/search?q=query；
+     Header: Ocp-Apim-Subscription-Key: KEY；$3/1000 transactions（F1 免费层 3 req/s）"
+  - "页面内容提取（fetch_content=True）：用 requests.get(url, timeout=10) 获取 HTML，
+     再用 readability-lxml 库（pip install readability-lxml）的 Document(html).summary()
+     提取正文；比 BeautifulSoup 对广告和导航栏的去除效果更好"
+  - "去广告策略：readability 提取后仍需过滤：
+     1) 删除长度 < 20 字符的段落（通常是菜单/标签）；
+     2) 删除含 'advertisement'/'sponsor'/'cookie' 的段落；
+     3) 截断到 content_max_length"
+  - "降级策略：provider 按顺序降级 duckduckgo → serper → bing；
+     当前 provider 连续失败 3 次自动切换到下一个，并在 provider_used 中标注实际使用的 provider"
+
+common_failures:
+  - severity: HIGH
+    pattern: "DuckDuckGo duckduckgo-search 库触发 CloudFlare 反爬保护，抛 HTTPError 403"
+    mitigation: "捕获 403 后降级到 Serper；同时设置随机 User-Agent 和 requests.Session 复用；
+                 连续失败时在日志中记录 'DDG blocked, fallback to serper'"
+  - severity: HIGH
+    pattern: "fetch_content=True 时目标页面有 JS 渲染（SPA），requests 获取的 HTML 为空 shell"
+    mitigation: "检测 body 文本长度 < 200 字符时判断为 JS 渲染，跳过内容提取，
+                 snippet 仍使用搜索结果中的摘要字段"
+  - severity: MEDIUM
+    pattern: "搜索结果包含 PDF/PPT/Excel 文件 URL，requests 下载后 readability 无法解析"
+    mitigation: "检测 URL 后缀或 Content-Type 含 pdf/msword/excel 时跳过内容提取，
+                 返回 content='' 并记录 'binary file skipped'"
+  - severity: MEDIUM
+    pattern: "部分搜索结果 URL 为 Google AMP 或重定向链接，实际内容在重定向后地址"
+    mitigation: "用 requests.get(allow_redirects=True) 跟随重定向，取 response.url 为最终 URL"
+  - severity: LOW
+    pattern: "Serper/Google CSE 返回地理限制内容（与服务器 IP 所在地区相关），结果与用户预期不符"
+    mitigation: "Serper API 支持 gl（国家）和 hl（语言）参数，按用户 locale 设置"
+
+# === 元数据 ===
+source: manual
+freshness_date: "2026-03-29"
+quality_score: 81.0
+usage_count: 0
+evidence_refs:
+  - "https://api.duckduckgo.com/api"
+  - "https://github.com/deedy5/duckduckgo_search"
+  - "https://serper.dev/api-reference"
+  - "https://developers.google.com/custom-search/v1/reference/rest/v1/cse/list"
+  - "https://learn.microsoft.com/en-us/bing/search-apis/bing-web-search/reference/query-parameters"
+  - "https://github.com/buriy/python-readability"

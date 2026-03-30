@@ -1,0 +1,165 @@
+# 知识积木 v2 — PDF & Document Parsing
+# 用途：从 PDF 中提取文本、识别表格、执行 OCR，支持本地工具与付费 API 升级
+
+# === 信封层（给系统看）===
+id: pdf-parsing-v1
+name: PDF & Document Parsing
+version: 1.0.0
+category:
+  - Document Processing
+  - Data Extraction
+tags:
+  - pdf
+  - ocr
+  - table extraction
+  - text extraction
+  - pymupdf
+  - pdfplumber
+  - tesseract
+  - adobe pdf services
+  - aws textract
+capability_type: transform
+data_source: filesystem
+
+inputs:
+  file_path:
+    type: string
+    required: true
+    description: "Local path to the PDF file to process"
+    validation: "value.endswith('.pdf') and len(value) <= 1024"
+  extract_tables:
+    type: boolean
+    required: false
+    default: false
+    description: "Whether to extract tables in addition to plain text"
+  ocr_fallback:
+    type: boolean
+    required: false
+    default: true
+    description: "Whether to fall back to Tesseract OCR if the PDF contains no extractable text (scanned document)"
+  language:
+    type: string
+    required: false
+    default: "eng"
+    description: "Tesseract OCR language code(s), e.g. 'eng', 'chi_sim', 'eng+chi_sim'"
+    validation: "len(value) <= 64"
+  page_range:
+    type: string
+    required: false
+    default: "all"
+    description: "Page range to process, e.g. '1-5', '3', 'all'. Single-indexed."
+    validation: "value == 'all' or value.replace('-', '').replace(',', '').isdigit()"
+  backend:
+    type: enum
+    required: false
+    default: "auto"
+    description: "Parsing backend: 'auto' selects pymupdf for text PDFs, tesseract for scanned; 'adobe' uses Adobe PDF Services API; 'textract' uses AWS Textract"
+    enum_values:
+      - auto
+      - pymupdf
+      - pdfplumber
+      - tesseract
+      - adobe
+      - textract
+
+outputs:
+  text:
+    type: string
+    description: "Extracted plain text content from the document"
+  tables:
+    type: string
+    description: "JSON-serialized list of tables; each table is a list of rows (list of strings). Empty list if extract_tables=false."
+  page_count:
+    type: integer
+    description: "Total number of pages in the document"
+  is_scanned:
+    type: boolean
+    description: "Whether the PDF was detected as a scanned (image-based) document"
+  metadata:
+    type: string
+    description: "JSON-serialized document metadata: title, author, creation_date, encrypted"
+
+requires: []
+conflicts_with: []
+compatible_with:
+  - customer-comms-v1
+  - data-reporting-v1
+  - academic-research-v1
+
+# === 内容层（给 LLM 看）===
+core_capability: >
+  Detect whether a PDF is text-based or scanned, extract text and optional tables using the
+  appropriate local tool (PyMuPDF for text PDFs, pdfplumber for tables, Tesseract for OCR),
+  and optionally upgrade to Adobe PDF Services or AWS Textract for higher accuracy on
+  complex layouts.
+
+constraints:
+  - "Scanned detection: open with PyMuPDF (fitz), call page.get_text('text').strip() on the
+     first 3 pages; if all return empty string, classify as scanned and route to OCR pipeline.
+     Never assume scanned/text based on file size alone."
+  - "Text PDF extraction: use 'import fitz' (PyMuPDF). Open with fitz.open(file_path),
+     iterate pages, call page.get_text('text'). For multi-column layouts use
+     page.get_text('blocks') and sort blocks by (y0, x0) to preserve reading order."
+  - "Table extraction: use pdfplumber (pip install pdfplumber). Call
+     pdfplumber.open(file_path) then page.extract_tables(). Returns list[list[str|None]].
+     Replace None cells with '' before serialising to JSON."
+  - "OCR pipeline: convert PDF pages to images via PyMuPDF (page.get_pixmap(dpi=300)),
+     then run pytesseract.image_to_string(img, lang=language). DPI must be >=300 for
+     acceptable accuracy; lower DPI causes character recognition errors."
+  - "Page range: parse the page_range input BEFORE opening the document.
+     Convert to 0-indexed list for fitz (fitz uses 0-index), but report to the user
+     in 1-indexed terms in output metadata."
+  - "Encrypted PDFs: fitz.open() will raise fitz.fitz.PasswordError if the PDF is
+     encrypted. Catch this exception and return {'text': '', 'error': 'encrypted_pdf'}
+     immediately; do NOT attempt to continue parsing."
+  - "Memory limit: for files >100 MB, process pages in batches of 10 and concatenate
+     results. Never load the full document text into a single string before streaming
+     to output."
+  - "Adobe PDF Services API (paid upgrade): endpoint POST
+     https://pdf-services.adobe.io/operation/extractpdf. Free tier: 500 pages/month.
+     Requires CLIENT_ID + CLIENT_SECRET from environment variables
+     ADOBE_PDF_CLIENT_ID and ADOBE_PDF_CLIENT_SECRET. Returns structured JSON with
+     text, tables, and bounding boxes."
+  - "AWS Textract (paid upgrade): use boto3 client 'textract'. For sync call use
+     detect_document_text() for pure text; for tables use analyze_document() with
+     FeatureTypes=['TABLES']. Region must match the bucket if uploading via S3."
+  - "Never import pytesseract unless ocr_fallback=True or backend='tesseract';
+     tesseract binary must be pre-installed on the host (brew install tesseract on macOS,
+     apt install tesseract-ocr on Linux)."
+
+common_failures:
+  - severity: HIGH
+    pattern: "Scanned PDF silently returns empty string — caller assumes successful extraction"
+    mitigation: "Always check is_scanned in the output and warn if text is empty; include
+      is_scanned=True in output so downstream bricks can decide whether to retry with OCR"
+  - severity: HIGH
+    pattern: "Encrypted PDF raises PasswordError and crashes the pipeline"
+    mitigation: "Wrap fitz.open() in try/except fitz.fitz.PasswordError and return a
+      structured error dict instead of raising"
+  - severity: HIGH
+    pattern: "Multi-column academic papers extracted in wrong reading order"
+    mitigation: "Use page.get_text('blocks') and sort by (y0, x0) rather than
+      page.get_text('text') which streams left-to-right across columns"
+  - severity: MEDIUM
+    pattern: "pdfplumber table extraction returns None cells causing JSON serialization errors"
+    mitigation: "Replace all None with '' via nested list comprehension before json.dumps()"
+  - severity: MEDIUM
+    pattern: "Large PDF (>200 MB) causes OOM when all pages loaded simultaneously"
+    mitigation: "Process in batches of 10 pages, free pixmap objects after each batch
+      with del pixmap; gc.collect()"
+  - severity: LOW
+    pattern: "Tesseract language pack not installed causes TesseractError"
+    mitigation: "Catch pytesseract.TesseractError, log the missing language code,
+      fall back to 'eng' before retrying"
+
+# === 元数据 ===
+source: manual
+freshness_date: "2026-03-29"
+quality_score: 85.0
+usage_count: 0
+evidence_refs:
+  - "https://pymupdf.readthedocs.io/en/latest/page.html#Page.get_text"
+  - "https://jsvine.github.io/pdfplumber/stable/extracting-data.html#extract-tables"
+  - "https://tesseract-ocr.github.io/tessdoc/ImproveQuality.html"
+  - "https://developer.adobe.com/document-services/docs/overview/pdf-extract-api/"
+  - "https://docs.aws.amazon.com/textract/latest/dg/how-it-works-tables.html"

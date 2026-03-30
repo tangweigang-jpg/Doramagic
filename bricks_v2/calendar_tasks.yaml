@@ -1,0 +1,158 @@
+# 知识积木 v2 — 日历与任务管理
+# 用途：创建/查询/修改 Google Calendar 事件和任务
+
+# === 信封层（给系统看）===
+id: calendar-tasks-v1
+name: 日历与任务管理
+version: 1.0.0
+category:
+  - 日历
+  - 任务管理
+tags:
+  - Google Calendar
+  - CalDAV
+  - 时区
+  - RRULE
+  - 任务
+  - 提醒
+  - OAuth2
+capability_type: poll
+data_source: null
+
+inputs:
+  operation:
+    type: enum
+    required: true
+    description: "操作类型：list_events（查询事件）、create_event（创建事件）、
+                  update_event（修改事件）、list_tasks（查询任务）、create_task（创建任务）"
+    enum_values:
+      - list_events
+      - create_event
+      - update_event
+      - list_tasks
+      - create_task
+  credentials_path:
+    type: string
+    required: true
+    description: "OAuth credentials.json 文件路径，从 Google Cloud Console 下载"
+  token_path:
+    type: string
+    required: false
+    default: "~/.doramagic/gcal_token.json"
+    description: "OAuth token 缓存文件路径"
+  calendar_id:
+    type: string
+    required: false
+    default: "primary"
+    description: "日历 ID；'primary' 表示主日历；从 calendar.list 接口获取完整列表"
+  time_min:
+    type: string
+    required: false
+    default: ""
+    description: "查询时间下界，RFC 3339 格式（如 '2026-03-29T00:00:00Z'）；空则为当前时间"
+  time_max:
+    type: string
+    required: false
+    default: ""
+    description: "查询时间上界，RFC 3339 格式；空则为 time_min + 7 天"
+  event_data:
+    type: text
+    required: false
+    default: ""
+    description: "create_event/update_event 时的事件数据，JSON 格式；
+                  示例：{\"summary\":\"周会\",\"start\":{\"dateTime\":\"2026-03-29T10:00:00+08:00\"},
+                         \"end\":{\"dateTime\":\"2026-03-29T11:00:00+08:00\"}}"
+  timezone:
+    type: string
+    required: false
+    default: "UTC"
+    description: "用户本地时区，如 'Asia/Shanghai'、'America/New_York'；
+                  用于将用户输入的本地时间转换为 UTC 存储"
+
+outputs:
+  events:
+    type: "list[dict]"
+    description: "查询到的事件列表，每项含 id/summary/start/end/location/recurrence 字段"
+  tasks:
+    type: "list[dict]"
+    description: "查询到的任务列表，每项含 id/title/due/status 字段"
+  created_id:
+    type: "string | null"
+    description: "create 操作成功时返回新建事件/任务 ID"
+  next_event:
+    type: "dict | null"
+    description: "距当前时间最近的即将到来事件摘要，用于简报场景"
+
+requires: []
+conflicts_with: []
+compatible_with:
+  - telegram-notifier-v1
+  - daily-briefing-v1
+
+# === 内容层（给 LLM 看）===
+core_capability: >
+  通过 Google Calendar API（OAuth 2.0）执行日历事件 CRUD 和 Google Tasks 查询/创建，
+  正确处理时区转换（UTC 存储 + 本地显示）、全天事件、重复事件展开。
+
+constraints:
+  - "Google Calendar API 认证：google-auth + google-api-python-client；
+     Scopes：['https://www.googleapis.com/auth/calendar']（读写），
+     只读场景用 ['https://www.googleapis.com/auth/calendar.readonly'] 最小权限；
+     Tasks API 需额外 Scope：'https://www.googleapis.com/auth/tasks'"
+  - "Google Calendar API 免费限制：1,000,000 requests/day，100 requests/100s/user；
+     远超常规使用量；付费升级无需操作（默认配额足够），但需在 Google Cloud Console 开启 API"
+  - "时区处理（关键）：所有时间必须以 UTC 存储（dateTime 字段含时区偏移）；
+     用户输入本地时间时，用 zoneinfo.ZoneInfo(timezone) 转换：
+     local_dt = datetime.fromisoformat(user_input).replace(tzinfo=ZoneInfo(timezone))；
+     存储时转 UTC：local_dt.astimezone(ZoneInfo('UTC')).isoformat()；
+     禁止用 pytz.localize()（已弃用），改用 zoneinfo（Python 3.9+ 内置）"
+  - "全天事件：全天事件使用 date 字段（非 dateTime），格式 YYYY-MM-DD；
+     区分全天事件的方法：event['start'].get('date') is not None；
+     不可对全天事件调用 dateTime 时区转换逻辑"
+  - "重复事件（RRULE）：list_events 返回的单次实例含 recurringEventId 字段；
+     展开重复事件用 events.list(singleEvents=True, orderBy='startTime')；
+     不展开时用 singleEvents=False（返回重复事件的主记录，含 recurrence 字段）"
+  - "CalDAV 协议（非 Google 日历替代方案）：使用 caldav 库，
+     client = caldav.DAVClient(url, username, password)；
+     适用于 Apple Calendar、Nextcloud、Fastmail 等；
+     时区处理同 Google API，均以 UTC 为基准"
+  - "create_event 必须验证 start < end，start 不在过去 30 天前；
+     event_data 必须含 summary、start、end 三个字段，否则返回错误不发起 API 调用"
+  - "Calendly API / Cal.com API（付费调度场景）：均提供 REST API，需单独 OAuth；
+     本积木不直接集成，通过 operation 扩展点预留"
+
+common_failures:
+  - severity: HIGH
+    pattern: "用户输入本地时间但未指定时区，datetime.fromisoformat() 解析为 naive datetime，
+              存入 Google Calendar 后实际时间偏差"
+    mitigation: "若解析出 naive datetime（tzinfo is None），强制附加 timezone 参数的时区；
+                 记录警告日志 'assumed timezone: {timezone}'"
+  - severity: HIGH
+    pattern: "OAuth Scope 不包含 tasks，调用 Google Tasks API 时返回 403 insufficientPermissions"
+    mitigation: "在初始化时检查 operation 类型，list_tasks/create_task 时确保 Scopes 包含 tasks；
+                 已有 token 的 Scope 不足时需清除 token 文件重新授权"
+  - severity: MEDIUM
+    pattern: "重复事件 list 时 singleEvents=False，返回的 start.dateTime 是第一次发生时间，
+              不是下一次发生时间，导致错误的'即将到来事件'判断"
+    mitigation: "查询近期事件时始终用 singleEvents=True + time_min=now，避免重复事件主记录干扰"
+  - severity: MEDIUM
+    pattern: "全天事件的 start 字段为 date（非 dateTime），代码直接解析为 datetime 时抛 KeyError"
+    mitigation: "解析前检查 event['start'].get('dateTime')，为 None 时改读 event['start']['date']
+                 并用 date.fromisoformat() 解析"
+  - severity: LOW
+    pattern: "calendar_id 含 # 或 @ 等特殊字符（如 group email），在 URL 路径中未编码导致 404"
+    mitigation: "用 urllib.parse.quote(calendar_id, safe='') 编码后再拼 URL；
+                 google-api-python-client 会自动处理，但自行拼 URL 时必须手动编码"
+
+# === 元数据 ===
+source: manual
+freshness_date: "2026-03-29"
+quality_score: 83.0
+usage_count: 0
+evidence_refs:
+  - "https://developers.google.com/calendar/api/v3/reference/events/list"
+  - "https://developers.google.com/calendar/api/v3/reference/events/insert"
+  - "https://developers.google.com/tasks/reference/rest/v1/tasks/list"
+  - "https://developers.google.com/identity/protocols/oauth2/scopes#calendar"
+  - "https://docs.python.org/3/library/zoneinfo.html"
+  - "https://github.com/python-caldav/caldav"

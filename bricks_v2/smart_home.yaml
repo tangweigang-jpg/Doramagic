@@ -1,0 +1,157 @@
+# 知识积木 v2 — 智能家居控制
+# 用途：轮询设备状态、执行自动化规则、场景联动控制
+
+# === 信封层（给系统看）===
+id: smart-home-v1
+name: 智能家居控制
+version: 1.0.0
+category:
+  - 物联网
+  - 智能家居
+  - 自动化
+tags:
+  - Home Assistant
+  - MQTT
+  - 设备控制
+  - 自动化规则
+  - 场景控制
+  - SmartThings
+  - mDNS
+  - 状态轮询
+capability_type: poll
+data_source: webhook
+
+inputs:
+  ha_base_url:
+    type: string
+    required: true
+    description: "Home Assistant 实例的本地 URL，如 http://homeassistant.local:8123 或 http://192.168.1.x:8123"
+    validation: "value.startswith('http://') or value.startswith('https://')"
+  ha_access_token:
+    type: string
+    required: true
+    description: "Home Assistant Long-Lived Access Token，从 HA 用户设置页面生成"
+  entity_ids:
+    type: text
+    required: false
+    default: ""
+    description: "要查询/控制的实体 ID 列表，逗号分隔，如 'light.living_room,switch.fan'；
+                  空字符串则查询所有实体状态"
+  action:
+    type: enum
+    required: false
+    default: "get_state"
+    description: "操作类型：get_state=查询状态，call_service=调用服务，trigger_scene=触发场景"
+    enum_values:
+      - get_state
+      - call_service
+      - trigger_scene
+  service_domain:
+    type: string
+    required: false
+    default: ""
+    description: "call_service 模式下的服务域，如 light/switch/climate"
+  service_name:
+    type: string
+    required: false
+    default: ""
+    description: "call_service 模式下的服务名，如 turn_on/turn_off/set_temperature"
+  poll_interval_sec:
+    type: integer
+    required: false
+    default: 30
+    description: "状态轮询间隔（秒），建议不低于 10 秒以避免 HA 过载"
+    validation: "10 <= value <= 3600"
+
+outputs:
+  states:
+    type: "list[dict]"
+    description: "实体状态列表，每项含 entity_id/state/attributes/last_changed 字段"
+  triggered:
+    type: boolean
+    description: "是否有状态变化触发了自动化规则"
+  service_result:
+    type: "dict"
+    description: "call_service 模式下的执行结果，含 success/context_id 字段"
+
+requires: []
+conflicts_with: []
+compatible_with:
+  - telegram-notifier-v1
+
+# === 内容层（给 LLM 看）===
+core_capability: >
+  通过 Home Assistant REST API（本地，免费）轮询设备状态，
+  支持服务调用（开关控制、温度设定）和场景触发；
+  MQTT 作为事件驱动的替代协议，适合低延迟实时响应；
+  SmartThings 和 Apple HomeKit 作为云端付费升级选项。
+
+constraints:
+  - "Home Assistant REST API 基础 URL：{ha_base_url}/api/；
+     所有请求必须携带 Authorization: Bearer {ha_access_token} 头；
+     GET /api/states 返回所有实体；GET /api/states/{entity_id} 返回单个实体；
+     POST /api/services/{domain}/{service} 调用服务（请求体为 JSON）"
+  - "实体 ID 格式规范：{domain}.{object_id}，如 light.living_room；
+     domain 为小写字母，object_id 只含小写字母、数字和下划线；
+     传入 entity_ids 时必须验证格式，不合法的 ID 跳过并记录警告"
+  - "设备发现：局域网内 Home Assistant 实例通过 mDNS 广播 _home-assistant._tcp.local；
+     若 ha_base_url 填写的是域名（homeassistant.local），需用 zeroconf 库解析；
+     生产环境建议固定 IP + 端口，不依赖 mDNS 动态发现"
+  - "MQTT 集成（低延迟替代方案）：使用 paho-mqtt 库（pip install paho-mqtt）；
+     订阅 homeassistant/# 主题获取所有实体状态变化；
+     消息 QoS 级别建议 1（至少一次），不可用 QoS 0（可能丢失状态变化事件）"
+  - "离线回退策略：HA 不可达时（连接超时 < 5 秒），必须返回缓存的最后已知状态，
+     并在 states 列表每项的 attributes 中追加 _cached: true 和 _cached_at: ISO 时间戳；
+     不可抛异常导致整个自动化流程中断"
+  - "服务调用幂等性：turn_on 对已开启的设备调用不会报错（HA 本身幂等）；
+     set_temperature 等有参数的服务必须检查设备能力（通过 attributes.supported_features 位掩码）；
+     不支持的服务调用不返回错误，HA 静默忽略"
+  - "付费升级：SmartThings API（https://developer-preview.smartthings.com/）需注册 SmartThings 开发者账号，
+     免费层支持 250 设备；Apple HomeKit 无公开 REST API，只能通过 HomeKit Accessory Protocol（HAP）
+     或 Home Assistant HomeKit Bridge 集成，不可直接调用"
+  - "状态变化检测：轮询时比较当前 state 和 last_changed 字段与上次缓存值；
+     仅 state 变化（如 on→off）或 attributes 中关键字段变化（温度、亮度）才触发通知；
+     避免因 last_updated（HA 内部心跳）频繁刷新导致误触发"
+
+common_failures:
+  - severity: HIGH
+    pattern: "设备离线时 HA 实体 state 值变为 'unavailable' 而非报错，
+              调用方未检查此状态直接读取 attributes，导致 KeyError"
+    mitigation: "读取 attributes 前检查 state != 'unavailable' and state != 'unknown'；
+                 unavailable 状态时跳过该实体并记录日志"
+  - severity: HIGH
+    pattern: "Long-Lived Token 过期（HA 默认永不过期，但用户手动撤销后返回 401），
+              且没有重新认证逻辑，导致所有请求静默失败"
+    mitigation: "捕获 401 响应，立即停止轮询并向用户发送 token 已失效告警，不重试"
+  - severity: HIGH
+    pattern: "固件更新后设备实体 ID 变化（厂商更新导致 object_id 重命名），
+              硬编码的 entity_id 失效后 API 返回 404 被静默忽略"
+    mitigation: "404 响应时记录 ERROR 级别日志，触发告警；不可将 404 视为正常空响应"
+  - severity: MEDIUM
+    pattern: "WiFi 断连导致 MQTT broker（Mosquitto）重启，订阅丢失，
+              后续状态变化事件全部漏收但客户端无感知"
+    mitigation: "使用 paho-mqtt 的 on_disconnect 回调，断连后指数退避重连（初始 5s，最多 300s），
+                 重连后必须重新订阅所有主题"
+  - severity: MEDIUM
+    pattern: "通过 POST /api/services 调用 climate.set_temperature 时，
+              temperature 参数单位不匹配（设备用华氏度，HA 配置用摄氏度），
+              导致空调被设置到 75°C"
+    mitigation: "调用温度相关服务前检查 attributes.unit_of_measurement 字段，
+                 必要时做 (F-32)*5/9 转换，并设置合理范围校验（0-35°C）"
+  - severity: LOW
+    pattern: "poll_interval_sec 设置过短（<10s）时，大型 HA 实例（100+ 设备）的
+              GET /api/states 响应时间超过间隔，导致请求堆积"
+    mitigation: "实现基于响应时间的自适应间隔：若上次请求耗时 >interval/2，
+                 自动将间隔扩大到响应时间的 3 倍"
+
+# === 元数据 ===
+source: manual
+freshness_date: "2026-03-29"
+quality_score: 79.0
+usage_count: 0
+evidence_refs:
+  - "https://developers.home-assistant.io/docs/api/rest/"
+  - "https://www.home-assistant.io/docs/authentication/long-lived-access-token/"
+  - "https://mqtt.org/mqtt-specification/"
+  - "https://eclipse.dev/paho/index.php?page=clients/python/index.php"
+  - "https://developer-preview.smartthings.com/docs/api/public"

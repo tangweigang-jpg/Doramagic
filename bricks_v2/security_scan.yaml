@@ -1,0 +1,171 @@
+# 知识积木 v2 — 安全与隐私扫描
+# 用途：依赖漏洞检测、密钥泄露扫描、代码安全审计
+
+# === 信封层（给系统看）===
+id: security-scan-v1
+name: 安全与隐私扫描
+version: 1.0.0
+category:
+  - 安全
+  - DevSecOps
+  - 代码质量
+tags:
+  - 漏洞检测
+  - 密钥泄露
+  - SAST
+  - SCA
+  - Trivy
+  - gitleaks
+  - Bandit
+  - CVE
+  - CVSS
+  - Snyk
+  - 依赖扫描
+capability_type: transform
+data_source: filesystem
+
+inputs:
+  scan_target:
+    type: string
+    required: true
+    description: "扫描目标路径：代码目录的绝对路径、容器镜像名（如 nginx:latest）或 git 仓库路径"
+  scan_type:
+    type: enum
+    required: true
+    description: "扫描类型：deps=依赖漏洞（SCA），secrets=密钥泄露，sast=代码安全静态分析，all=全量扫描"
+    enum_values:
+      - deps
+      - secrets
+      - sast
+      - all
+  language:
+    type: enum
+    required: false
+    default: "python"
+    description: "目标代码语言，影响 SAST 工具选择"
+    enum_values:
+      - python
+      - javascript
+      - typescript
+      - go
+      - java
+      - ruby
+      - mixed
+  severity_threshold:
+    type: enum
+    required: false
+    default: "MEDIUM"
+    description: "最低告警严重等级，低于此等级的发现不输出"
+    enum_values:
+      - LOW
+      - MEDIUM
+      - HIGH
+      - CRITICAL
+  fail_on_finding:
+    type: boolean
+    required: false
+    default: false
+    description: "发现任何不低于 severity_threshold 的问题时是否返回失败状态（CI 门禁模式）"
+
+outputs:
+  vulnerabilities:
+    type: "list[dict]"
+    description: "漏洞列表，每项含 cve_id/package/installed_version/fixed_version/cvss_score/severity 字段"
+  secrets_found:
+    type: "list[dict]"
+    description: "泄露密钥列表，每项含 file/line/rule_id/match_preview（部分脱敏）字段"
+  sast_findings:
+    type: "list[dict]"
+    description: "SAST 发现列表，每项含 file/line/cwe_id/severity/message/mitigation 字段"
+  scan_passed:
+    type: boolean
+    description: "是否通过扫描（fail_on_finding=true 时有意义）"
+  summary:
+    type: string
+    description: "扫描摘要，含各严重等级数量统计"
+
+requires: []
+conflicts_with: []
+compatible_with:
+  - code-assistance-v1
+
+# === 内容层（给 LLM 看）===
+core_capability: >
+  使用 Trivy（容器/依赖扫描）、gitleaks（密钥泄露检测）、Bandit（Python 安全 SAST）
+  对代码仓库和容器镜像执行安全扫描；所有工具免费开源；
+  Snyk 和 GitHub Advanced Security 作为付费深度扫描选项。
+
+constraints:
+  - "Trivy（deps/all 模式）调用方式：subprocess.run(['trivy', 'fs', '--format', 'json',
+     '--severity', severity_threshold, '--exit-code', '0', scan_target], capture_output=True)；
+     --exit-code 0 避免非零退出码被误判为工具失败；
+     输出 JSON 中 Results[].Vulnerabilities[] 包含 CVE 详情"
+  - "Trivy 漏洞数据库更新：首次运行会自动下载 CVE 数据库（~100MB）；
+     CI 环境中必须挂载 trivy-db 缓存目录（~/.cache/trivy/）；
+     数据库超过 12 小时未更新时，扫描结果在 VulnerabilityID 字段附加 _STALE 标注"
+  - "gitleaks（secrets 模式）调用方式：subprocess.run(['gitleaks', 'detect', '--source', scan_target,
+     '--report-format', 'json', '--report-path', '/tmp/gitleaks.json', '--no-git'], capture_output=True)；
+     --no-git 对非 git 目录有效；git 仓库必须去掉 --no-git 以扫描历史提交"
+  - "密钥输出脱敏：gitleaks 的 Match 字段包含完整密钥明文；
+     输出时必须截断为前 4 位 + '****' + 后 4 位（如 AKIA****XYZW）；
+     禁止将完整密钥写入日志或传给下游系统"
+  - "Bandit（Python SAST）调用方式：subprocess.run(['bandit', '-r', '-f', 'json', '-l', '-i',
+     scan_target], capture_output=True)；-l -i 分别设置 LOW 以上和 INFO 以上；
+     通过 -s <test_id> 可跳过特定规则（如 B101=assert 用法，测试代码中可接受）"
+  - "CVSS 评分分级标准（CVSS v3.1）：0=None，0.1-3.9=LOW，4.0-6.9=MEDIUM，
+     7.0-8.9=HIGH，9.0-10.0=CRITICAL；
+     按此标准过滤 severity_threshold，不可使用工具自定义的严重等级名"
+  - "付费升级：Snyk CLI（snyk test --json --severity-threshold=medium）支持 200 tests/月免费额度；
+     超限后需 --token 配合付费账号；GitHub Advanced Security 通过 Code Scanning API
+     (https://api.github.com/repos/{owner}/{repo}/code-scanning/alerts) 获取结果，
+     仅限 GitHub 平台仓库"
+  - "误报率管理：Bandit B603/B607（subprocess 调用）在 CI 脚本中大量误报；
+     应维护 .bandit 配置文件排除测试目录（[exclude_dirs] = tests/）；
+     Trivy 对已知误报 CVE 维护 .trivyignore 文件，格式为每行一个 CVE ID"
+
+common_failures:
+  - severity: HIGH
+    pattern: "Trivy CVE 数据库过期（>7 天），漏洞库缺少近期 CVE，新发现的高危漏洞被漏报，
+              扫描结果显示 PASSED 实则不安全"
+    mitigation: "扫描前检查数据库年龄：trivy image --download-db-only 或检查 ~/.cache/trivy/db/metadata.json；
+                 db_update_time 超过 48 小时必须先更新再扫描"
+  - severity: HIGH
+    pattern: "密钥脱敏处理缺失，gitleaks JSON 输出中的 Match 字段包含真实 API Key，
+              被写入通知消息或日志后造成密钥泄露（二次泄露）"
+    mitigation: "所有 secrets_found 输出必须经过脱敏函数处理，
+                 函数签名：def redact_secret(match: str) -> str，
+                 单元测试必须验证输出不包含输入的原始值"
+  - severity: HIGH
+    pattern: "扫描大型 monorepo（>10 万文件）时 Trivy/gitleaks 超时（默认无超时限制），
+              占用 CI 资源 >30 分钟，阻塞其他流水线"
+    mitigation: "设置扫描超时：subprocess.run(..., timeout=600)；
+                 超时时返回部分结果并在 summary 中标注 'SCAN INCOMPLETE (timeout)'"
+  - severity: MEDIUM
+    pattern: "告警疲劳：低价值 LOW/MEDIUM CVE 数量过多（如 openssl 的 200+ 历史 CVE），
+              淹没真正需要处理的 HIGH/CRITICAL 漏洞"
+    mitigation: "默认 severity_threshold=MEDIUM；输出时 CRITICAL 和 HIGH 放最前面；
+                 有 fixed_version 的漏洞优先展示（可立即修复）；
+                 无 fixed_version 的 LOW CVE 折叠到摘要中不展开"
+  - severity: MEDIUM
+    pattern: "Bandit 将测试代码中的 assert 语句（B101）标记为安全漏洞，产生大量误报，
+              开发者开始忽略所有 Bandit 告警（狼来了效应）"
+    mitigation: "在 .bandit 配置中 skips = B101 排除测试目录的 assert 检查；
+                 同时保留生产代码的 B101 检查（assert 不应在生产逻辑中作安全检查）"
+  - severity: LOW
+    pattern: "gitleaks 对注释中的假密钥示例（如文档中的 'YOUR_API_KEY_HERE'）误报，
+              每次 CI 运行都触发告警"
+    mitigation: "在代码行添加 gitleaks:allow 注释，或在 .gitleaks.toml 中配置
+                 [[allowlists]] 排除已知安全的模式（如长度不符合真实密钥的占位符）"
+
+# === 元数据 ===
+source: manual
+freshness_date: "2026-03-29"
+quality_score: 83.0
+usage_count: 0
+evidence_refs:
+  - "https://trivy.dev/latest/docs/references/configuration/cli/trivy_filesystem/"
+  - "https://github.com/gitleaks/gitleaks#readme"
+  - "https://bandit.readthedocs.io/en/latest/config.html"
+  - "https://www.first.org/cvss/specification-document"
+  - "https://docs.snyk.io/snyk-cli/commands/test"
+  - "https://docs.github.com/en/rest/code-scanning"

@@ -1,0 +1,184 @@
+# 知识积木 v2 — Academic Research
+# 用途：搜索学术论文、生成摘要、管理引用、辅助文献综述，支持免费 API 及付费升级
+
+# === 信封层（给系统看）===
+id: academic-research-v1
+name: Academic Research
+version: 1.0.0
+category:
+  - Research
+  - Knowledge Management
+tags:
+  - academic
+  - paper search
+  - citation
+  - arxiv
+  - semantic scholar
+  - crossref
+  - doi
+  - literature review
+  - apa
+  - mla
+  - abstract
+capability_type: poll
+data_source: null
+
+inputs:
+  query:
+    type: string
+    required: true
+    description: "Search query; supports boolean operators AND/OR/NOT for Semantic Scholar and CrossRef"
+    validation: "0 < len(value) <= 500"
+  sources:
+    type: text
+    required: false
+    default: "[\"arxiv\", \"semantic_scholar\", \"crossref\"]"
+    description: "JSON array of sources to query; options: arxiv, semantic_scholar, crossref, scopus, wos"
+    validation: "len(value) <= 200"
+  max_results:
+    type: integer
+    required: false
+    default: 10
+    description: "Maximum number of papers to return per source"
+    validation: "1 <= value <= 100"
+  date_from:
+    type: string
+    required: false
+    default: ""
+    description: "Filter papers published on or after this date, format YYYY-MM-DD"
+    validation: "value == '' or (len(value) == 10 and value[4] == '-' and value[7] == '-')"
+  date_to:
+    type: string
+    required: false
+    default: ""
+    description: "Filter papers published on or before this date, format YYYY-MM-DD"
+    validation: "value == '' or (len(value) == 10 and value[4] == '-' and value[7] == '-')"
+  citation_format:
+    type: enum
+    required: false
+    default: "apa"
+    description: "Citation format for formatted references"
+    enum_values:
+      - apa
+      - mla
+      - chicago
+      - bibtex
+      - plain
+  generate_summary:
+    type: boolean
+    required: false
+    default: true
+    description: "Whether to generate an LLM-powered structured abstract for each result"
+  full_text_access:
+    type: boolean
+    required: false
+    default: false
+    description: "Whether to attempt to fetch full-text PDF via open-access links (arXiv only)"
+
+outputs:
+  papers:
+    type: string
+    description: "JSON array of paper objects: {title, authors, year, abstract, doi, arxiv_id, url, citations_count, is_preprint, formatted_citation, summary}"
+  total_found:
+    type: integer
+    description: "Total number of papers returned across all sources (after deduplication by DOI)"
+  literature_review:
+    type: string
+    description: "LLM-generated literature review narrative based on the returned papers; empty if generate_summary=false"
+  rate_limit_warnings:
+    type: string
+    description: "JSON array of sources that hit rate limits and returned partial results"
+
+requires: []
+conflicts_with: []
+compatible_with:
+  - pdf-parsing-v1
+  - data-reporting-v1
+
+# === 内容层（给 LLM 看）===
+core_capability: >
+  Query multiple academic databases (arXiv, Semantic Scholar, CrossRef) in parallel,
+  deduplicate results by DOI, format citations in the requested style, optionally generate
+  per-paper summaries and a synthesised literature review, and flag preprints vs.
+  peer-reviewed publications.
+
+constraints:
+  - "arXiv API: use http://export.arxiv.org/api/query?search_query={q}&max_results={n}.
+     No API key required. Parse the Atom XML response with xml.etree.ElementTree.
+     Rate limit: ~3 req/sec; add time.sleep(0.34) between sequential calls.
+     arXiv IDs have format YYMM.NNNNN or YYMM.NNNNNN — preserve the full ID for links."
+  - "Semantic Scholar API: GET https://api.semanticscholar.org/graph/v1/paper/search
+     ?query={q}&limit={n}&fields=title,authors,year,abstract,citationCount,externalIds,openAccessPdf.
+     Rate limit: 100 req/5min for unauthenticated; pass S2_API_KEY header from env var
+     SEMANTIC_SCHOLAR_API_KEY if available for 1 req/sec. Handle HTTP 429 with exponential
+     backoff: wait ceil(60 / (100/5)) = 3 seconds initially, double on retry."
+  - "CrossRef API: GET https://api.crossref.org/works?query={q}&rows={n}.
+     Free with no key. Set User-Agent header to 'YourApp/1.0 (mailto:your@email.com)'
+     as required by CrossRef polite pool policy. Without polite pool header, requests
+     may be throttled without a 429 response."
+  - "DOI deduplication: after collecting results from all sources, normalise DOIs to
+     lowercase and deduplicate using a set. When the same paper appears from multiple
+     sources, merge by preferring: Semantic Scholar > CrossRef > arXiv for citation count."
+  - "Preprint vs. published detection: a paper is a preprint if it is sourced exclusively
+     from arXiv AND has no DOI matching a journal publisher prefix, OR if Semantic Scholar
+     returns publicationTypes containing 'JournalArticle'=False. Always set is_preprint
+     in the output object — never omit this field."
+  - "Citation formatting: implement APA 7th edition as the default. APA format:
+     Authors (Year). Title. Journal, Volume(Issue), Pages. DOI: https://doi.org/...
+     For BibTeX, use the DOI or arXiv ID as the cite key prefix. Use an LLM only for
+     Chicago author-date variant; all others should be rule-based to avoid hallucinated
+     page numbers or volume info."
+  - "Full-text PDF access: only attempt for arXiv papers (construct URL as
+     https://arxiv.org/pdf/{arxiv_id}.pdf). Do NOT attempt to bypass paywalls or access
+     Elsevier/Springer PDFs without valid credentials. If full_text_access=True but no
+     open-access URL is available, set pdf_url=null and log 'full_text_unavailable'."
+  - "Paid API upgrade — Scopus: requires SCOPUS_API_KEY env var.
+     Endpoint: https://api.elsevier.com/content/search/scopus?query={q}&count={n}.
+     Rate limit: 6 req/sec for institutional keys. Returns DOI, cited-by count, and
+     subject classifications not available in free APIs."
+  - "Literature review generation: pass paper titles and abstracts (not full text) to the
+     LLM. Wrap all paper content in <external_content> tags. Instruct the model to
+     synthesise themes, identify research gaps, and note conflicting findings. Limit input
+     to 20 papers maximum to stay within context budget."
+  - "Parallel querying: use concurrent.futures.ThreadPoolExecutor(max_workers=3) to query
+     all sources simultaneously. Cap each source timeout at 15 seconds with a requests
+     timeout param. Partial results from timed-out sources should be included in
+     rate_limit_warnings, not raise exceptions."
+
+common_failures:
+  - severity: HIGH
+    pattern: "Preprint paper cited as peer-reviewed publication, misleading the researcher"
+    mitigation: "Always set is_preprint flag; in formatted citations prepend '[Preprint]'
+      for arXiv-only results per APA 7th edition preprint citation format"
+  - severity: HIGH
+    pattern: "Semantic Scholar 429 rate limit causes entire pipeline to crash"
+    mitigation: "Catch HTTPError 429, wait using Retry-After header value if present,
+      otherwise use exponential backoff starting at 3s; max 3 retries before recording
+      'semantic_scholar' in rate_limit_warnings and continuing with other sources"
+  - severity: HIGH
+    pattern: "LLM hallucinates page numbers, volume, or issue in APA citations"
+    mitigation: "Use rule-based citation formatting for APA/MLA/BibTeX; only use LLM for
+      narrative summary, never for structured bibliographic data"
+  - severity: MEDIUM
+    pattern: "CrossRef polite pool throttling — slow responses that appear as timeouts"
+    mitigation: "Always include mailto: in User-Agent header; cache CrossRef responses
+      by DOI to avoid re-querying the same paper across runs"
+  - severity: MEDIUM
+    pattern: "Duplicate papers from multiple sources inflating result count"
+    mitigation: "Deduplicate by normalised DOI before returning; log dedup count in metadata"
+  - severity: LOW
+    pattern: "arXiv XML namespace breaks ElementTree parsing when API changes prefix"
+    mitigation: "Use namespace-agnostic XPath: './/{http://www.w3.org/2005/Atom}entry'
+      or strip namespaces with re.sub before parsing"
+
+# === 元数据 ===
+source: manual
+freshness_date: "2026-03-29"
+quality_score: 86.0
+usage_count: 0
+evidence_refs:
+  - "https://arxiv.org/help/api/user-manual"
+  - "https://api.semanticscholar.org/api-docs/"
+  - "https://github.com/CrossRef/rest-api-doc"
+  - "https://dev.elsevier.com/documentation/ScopusSearchAPI.wadl"
+  - "https://apastyle.apa.org/style-grammar-guidelines/references/examples/preprint-references"

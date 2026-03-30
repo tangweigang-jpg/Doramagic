@@ -1,0 +1,188 @@
+# 知识积木 v2 — Project Management Integration
+# 用途：跨平台任务创建/更新、Sprint 报告、状态同步，支持 GitHub/Trello/Linear/Jira 等
+
+# === 信封层（给系统看）===
+id: project-mgmt-v1
+name: Project Management Integration
+version: 1.0.0
+category:
+  - Project Management
+  - Productivity
+tags:
+  - github issues
+  - trello
+  - linear
+  - jira
+  - asana
+  - task management
+  - sprint report
+  - status sync
+  - webhook
+  - project tracking
+capability_type: poll
+data_source: github
+
+inputs:
+  platform:
+    type: enum
+    required: true
+    description: "Target project management platform"
+    enum_values:
+      - github
+      - trello
+      - linear
+      - jira
+      - asana
+      - monday
+  operation:
+    type: enum
+    required: true
+    description: "Operation to perform"
+    enum_values:
+      - create_task
+      - update_task
+      - list_tasks
+      - generate_sprint_report
+      - sync_status
+      - get_task
+  task_data:
+    type: text
+    required: false
+    default: "{}"
+    description: "JSON object with task fields; schema varies by operation and platform.
+      For create_task: {title, description, assignee, labels, due_date, priority}.
+      For update_task: {task_id, fields_to_update: {...}}.
+      For sync_status: {task_id, new_status, source_platform, target_platform}."
+    validation: "len(value) <= 8000"
+  project_id:
+    type: string
+    required: true
+    description: "Platform-specific project identifier: GitHub owner/repo, Trello board ID, Linear team ID, Jira project key"
+    validation: "0 < len(value) <= 256"
+  sprint_period_days:
+    type: integer
+    required: false
+    default: 14
+    description: "Sprint duration in days; used only for generate_sprint_report"
+    validation: "1 <= value <= 90"
+  webhook_secret:
+    type: string
+    required: false
+    default: ""
+    description: "Webhook signature secret for validating incoming webhook payloads; leave empty to skip validation"
+    validation: "len(value) <= 256"
+  paginate_all:
+    type: boolean
+    required: false
+    default: true
+    description: "Whether to follow pagination and retrieve all results (not just the first page). Disable for large projects to control latency."
+
+outputs:
+  result:
+    type: string
+    description: "JSON object with operation result; for create_task: {task_id, url}; for list_tasks: [{id, title, status, assignee, url}...]; for sprint_report: {completed, in_progress, blocked, velocity}"
+  tasks_fetched:
+    type: integer
+    description: "Number of tasks returned for list/report operations; 0 for create/update"
+  rate_limit_remaining:
+    type: integer
+    description: "Remaining API calls in current rate limit window; -1 if not reported by platform"
+  warnings:
+    type: string
+    description: "JSON array of non-fatal warnings, e.g. pagination truncation, status mapping approximations"
+
+requires: []
+conflicts_with: []
+compatible_with:
+  - telegram-notifier-v1
+  - data-reporting-v1
+  - customer-comms-v1
+
+# === 内容层（给 LLM 看）===
+core_capability: >
+  Integrate with project management platforms (GitHub Issues, Trello, Linear, Jira) to
+  create and update tasks, generate Sprint reports from completed/in-progress issues, and
+  synchronise task status across platforms with a normalised status mapping layer.
+
+constraints:
+  - "GitHub Issues API: base URL https://api.github.com. Auth via Authorization: Bearer
+     {GITHUB_TOKEN} from env var GITHUB_TOKEN. Rate limit: 5000 req/h for authenticated
+     users. List issues: GET /repos/{owner}/{repo}/issues?state=all&per_page=100.
+     Pagination: follow Link header 'rel=next' URL until absent; do NOT construct page
+     URLs manually as GitHub may change them."
+  - "Trello API: base URL https://api.trello.com/1. Auth via ?key={TRELLO_API_KEY}&token=
+     {TRELLO_TOKEN} query params from env vars TRELLO_API_KEY and TRELLO_TOKEN.
+     Rate limit: 300 req/10s per token. List cards: GET /boards/{id}/cards?fields=
+     id,name,idList,due,desc,idMembers. Batch card updates: PUT /cards/{id}."
+  - "Linear API: GraphQL endpoint https://api.linear.app/graphql. Auth via Authorization:
+     {LINEAR_API_KEY} from env var LINEAR_API_KEY. Free tier has no explicit rate limit
+     but enforce max 50 queries/min with a token bucket. Use GraphQL fragments to fetch
+     all needed fields in a single query rather than N+1 queries."
+  - "Status normalisation: implement a mapping layer between platform-specific status names
+     and the canonical set {todo, in_progress, in_review, blocked, done}. Example mapping:
+     GitHub (open→todo, closed→done), Trello (list name matching), Linear (state.type).
+     When mapping is ambiguous, preserve the original status and add a warning to the
+     warnings output."
+  - "Webhook validation: if webhook_secret is non-empty, validate the HMAC-SHA256
+     signature from the X-Hub-Signature-256 (GitHub), X-Trello-Webhook (Trello), or
+     Linear-Signature header. Use hmac.compare_digest() for timing-safe comparison.
+     Reject payloads with invalid signatures with HTTP 401."
+  - "Webhook deduplication: GitHub and Linear may deliver the same event multiple times.
+     Maintain a local dedup cache (TTL 60s) keyed by event_id or delivery_id header.
+     Use a simple dict with timestamp; evict entries older than 60s on each access."
+  - "Pagination: for list_tasks and generate_sprint_report, always follow all pages when
+     paginate_all=True. GitHub uses Link header; Trello uses ?before cursor; Linear uses
+     pageInfo.hasNextPage in GraphQL response. Log a warning in rate_limit_warnings if
+     pagination is truncated by rate limit before completion."
+  - "Batch operations: Jira supports bulk issue creation via POST /rest/api/3/issue/bulk
+     (max 50 per request). GitHub does NOT support bulk issue creation — loop with
+     individual POST /repos/{owner}/{repo}/issues and add 250ms sleep to respect secondary
+     rate limits."
+  - "Jira API (paid): base URL https://{domain}.atlassian.net/rest/api/3. Auth via
+     Basic base64(email:JIRA_API_TOKEN) from env var JIRA_API_TOKEN. Jira statuses are
+     project-specific — fetch /rest/api/3/project/{key}/statuses before mapping."
+  - "Sprint report generation: filter issues by closed_at within the sprint period window
+     (last sprint_period_days days). Count velocity as number of completed story-point-
+     bearing issues. For platforms without story points (Trello), use issue count as proxy
+     and note this in warnings."
+
+common_failures:
+  - severity: HIGH
+    pattern: "GitHub secondary rate limit triggered by rapid successive API calls in a loop"
+    mitigation: "Add time.sleep(0.25) between individual issue creation requests;
+      catch HTTP 403 with 'secondary rate limit' in body and back off 60 seconds"
+  - severity: HIGH
+    pattern: "Status sync conflict: two platforms updated the same task simultaneously,
+      later sync overwrites the more recent change"
+    mitigation: "Fetch current status before updating; compare updated_at timestamps;
+      if target was updated more recently than source, skip sync and add conflict warning"
+  - severity: HIGH
+    pattern: "Webhook duplicate processing: same event handled twice causing duplicate tasks"
+    mitigation: "Implement dedup cache keyed by delivery_id/event_id with 60s TTL;
+      return HTTP 200 immediately for duplicates without processing"
+  - severity: MEDIUM
+    pattern: "Pagination stops early — only first page retrieved for large backlogs"
+    mitigation: "Always check for Link header 'rel=next' (GitHub) or hasNextPage (GraphQL)
+      in every response; assert total count from API matches len(collected_results) if API
+      provides a total field"
+  - severity: MEDIUM
+    pattern: "Jira status names are project-specific; hardcoded status names cause
+      400 Bad Request on status transitions"
+    mitigation: "Always fetch /rest/api/3/project/{key}/statuses at the start of each
+      session and build the status ID map dynamically; never hardcode Jira status IDs"
+  - severity: LOW
+    pattern: "Trello API key/token exposed in server logs when query params are logged"
+    mitigation: "Use a requests.Session with a custom PreparedRequest hook to redact
+      ?key= and ?token= query params from log output"
+
+# === 元数据 ===
+source: manual
+freshness_date: "2026-03-29"
+quality_score: 85.0
+usage_count: 0
+evidence_refs:
+  - "https://docs.github.com/en/rest/issues/issues"
+  - "https://developer.atlassian.com/cloud/trello/rest/api-group-cards/"
+  - "https://developers.linear.app/docs/graphql/working-with-the-graphql-api"
+  - "https://developer.atlassian.com/cloud/jira/platform/rest/v3/api-group-issues/"
+  - "https://docs.github.com/en/rest/using-the-rest-api/best-practices-for-using-the-rest-api#dealing-with-secondary-rate-limits"

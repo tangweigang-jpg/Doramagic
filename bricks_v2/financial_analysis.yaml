@@ -1,0 +1,173 @@
+# 知识积木 v2 — 金融分析与投资追踪
+# 用途：监控股票/加密货币行情，分析财报，追踪投资组合
+
+# === 信封层（给系统看）===
+id: financial-analysis-v1
+name: 金融分析与投资追踪
+version: 1.0.0
+category:
+  - 金融
+  - 投资
+tags:
+  - 股票
+  - 加密货币
+  - 财报
+  - 投资组合
+  - Yahoo Finance
+  - Alpha Vantage
+  - CoinGecko
+  - Polygon
+capability_type: poll
+data_source: stock_api
+
+inputs:
+  symbols:
+    type: string
+    required: true
+    description: "逗号分隔的资产代码，如 'AAPL,MSFT,BTC-USD,ETH-USD'；
+      美股用 TICKER，加密货币用 TICKER-USD（yfinance 格式）"
+  asset_type:
+    type: enum
+    required: false
+    default: "auto"
+    description: "资产类型：auto=自动检测，stock=股票，crypto=加密货币；
+      自动检测规则：含 -USD/-BTC 后缀为加密货币，否则为股票"
+    enum_values:
+      - auto
+      - stock
+      - crypto
+  provider:
+    type: enum
+    required: false
+    default: "yfinance"
+    description: "数据提供商：yfinance=Yahoo Finance（免费无限），
+      alpha_vantage=Alpha Vantage（5 req/min 免费/500 req/day standard tier $50/mo），
+      coingecko=CoinGecko（30 req/min 免费）,
+      polygon=Polygon.io（$29/mo Starter）"
+    enum_values:
+      - yfinance
+      - alpha_vantage
+      - coingecko
+      - polygon
+  interval:
+    type: enum
+    required: false
+    default: "1d"
+    description: "数据粒度：1m/5m/15m/1h=分/小时线（yfinance 免费 tier 延迟 15 分钟），1d/1wk/1mo=日/周/月线"
+    enum_values:
+      - 1m
+      - 5m
+      - 15m
+      - 1h
+      - 1d
+      - 1wk
+      - 1mo
+  period:
+    type: string
+    required: false
+    default: "1mo"
+    description: "历史数据周期，如 '1d'/'5d'/'1mo'/'3mo'/'1y'/'5y'；
+      与 interval 组合：interval=1m 最多 period=7d（yfinance 限制）"
+  portfolio:
+    type: string
+    required: false
+    default: ""
+    description: "JSON 字符串格式的持仓，如 '{\"AAPL\": {\"shares\": 10, \"cost_basis\": 150.0}}'；
+      留空则只返回行情数据，不计算持仓盈亏"
+  alert_threshold_pct:
+    type: float
+    required: false
+    default: 5.0
+    description: "涨跌幅告警阈值（百分比），超过时在输出中标记告警；0 表示不告警"
+    validation: "0 <= value <= 50"
+
+outputs:
+  quotes:
+    type: string
+    description: "当前行情 JSON，格式：{symbol: {price, change_pct, volume, market_cap}}"
+  portfolio_summary:
+    type: string
+    description: "持仓盈亏摘要（仅 portfolio 非空时返回），格式：{symbol: {cost, current, pnl_pct}}"
+  alerts:
+    type: string
+    description: "触发告警的资产列表，格式：'TICKER: +/-X.XX% 超过阈值 Y%'，每行一条"
+  market_status:
+    type: string
+    description: "当前市场状态：'open'/'closed'/'pre-market'/'after-hours'（美股），'24h'（加密货币）"
+
+requires: []
+conflicts_with: []
+compatible_with:
+  - telegram-notifier-v1
+  - stock-alert-v1
+
+# === 内容层（给 LLM 看）===
+core_capability: >
+  通过 yfinance/Alpha Vantage/CoinGecko/Polygon 获取全球股票和加密货币行情，
+  计算持仓盈亏，检测价格告警，输出结构化行情摘要。
+
+constraints:
+  - "yfinance 使用方式（provider=yfinance）：
+     import yfinance as yf；
+     单只股票：ticker = yf.Ticker('AAPL'); info = ticker.fast_info；
+     批量获取：data = yf.download(symbols_list, period=period, interval=interval)；
+     fast_info 比 info 更快（无额外 API 调用），包含 lastPrice/marketCap/52WeekHigh/Low"
+  - "yfinance 免费 tier 数据延迟：日线及以上实时，分钟线/小时线延迟 15 分钟；
+     interval in ['1m','5m','15m','1h'] 时在输出中注明 'delayed 15min'"
+  - "Alpha Vantage 限流（免费 tier）：5 req/min，500 req/day；
+     批量查询多个 symbol 时，必须在每次请求后 sleep(12)（60s / 5 = 12s/req）；
+     超限返回 {'Note': 'Thank you for...'} 而非 HTTP 429，需检测 JSON key"
+  - "CoinGecko 免费 API（provider=coingecko）：30 req/min；
+     GET https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd&include_24hr_change=true；
+     注意：CoinGecko ID 与交易所 ticker 不同（BTC → bitcoin，ETH → ethereum），
+     需维护 ticker → coin_id 映射表或调用 /coins/list 接口"
+  - "交易时段检测（美股）：用 pytz 以 America/New_York 时区判断；
+     常规交易时段：工作日 09:30-16:00 ET；盘前：04:00-09:30；盘后：16:00-20:00；
+     非交易时段返回最后收盘价，market_status='closed'"
+  - "加密货币 24 小时交易：market_status 恒为 '24h'，不做交易时段过滤"
+  - "货币单位统一：所有价格输出以 USD 为基准；
+     非美元股票（港股 HKD、日股 JPY 等）需在 quotes 中注明原始货币和汇率；
+     汇率数据用 yf.Ticker('HKDUSD=X').fast_info.lastPrice 获取"
+  - "Polygon.io（provider=polygon）：需环境变量 POLYGON_API_KEY；
+     GET https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{from}/{to}?apiKey={key}；
+     Starter 套餐（$29/mo）包含实时延迟 15 分钟数据，Stocks Starter 含所有美股"
+  - "持仓盈亏计算：pnl_pct = (current_price - cost_basis) / cost_basis * 100；
+     避免浮点精度问题：用 round(value, 4) 而非直接比较"
+  - "停牌/退市检测：yfinance 返回 None 或空 DataFrame 时（delisted/suspended），
+     在 quotes 中标记 status='suspended'，不抛异常"
+
+common_failures:
+  - severity: HIGH
+    pattern: "Alpha Vantage 返回 {'Note': 'Thank you...'} 被误认为正常数据，导致后续计算 KeyError"
+    mitigation: "每次调用后检查 'Note' 或 'Information' key；
+      若存在则等待 60s 后重试，最多 3 次；超限记录日志并跳过该 symbol"
+  - severity: HIGH
+    pattern: "yfinance 在非交易时段（周末/节假日）返回空 DataFrame，导致 iloc[0] IndexError"
+    mitigation: "调用后立即检查 df.empty；为空时返回 market_status='closed' 和最后已知收盘价"
+  - severity: HIGH
+    pattern: "CoinGecko ticker 到 coin_id 映射错误，查询到错误币种价格（如 $BLOCK ≠ blocknet）"
+    mitigation: "优先用 /coins/list 接口做精确匹配；映射表本地缓存 24 小时（文件时间戳判断），
+      避免每次查询都全量拉取（接口返回 10000+ 条数据）"
+  - severity: MEDIUM
+    pattern: "汇率换算：港股数据中 yfinance 有时返回 HKD 价格，有时返回 USD，字段不稳定"
+    mitigation: "检查 ticker.fast_info.currency 字段，非 USD 时显式获取汇率换算；
+      若 currency 为 None，默认以 USD 处理并在日志中警告"
+  - severity: MEDIUM
+    pattern: "期权/ETF/指数代码格式与普通股票不同，yfinance 解析报错"
+    mitigation: "期权代码包含日期和行权价（如 AAPL231215C00150000），不在普通行情接口处理；
+      检测到期权代码格式时提示用户使用专用期权接口"
+  - severity: LOW
+    pattern: "Polygon.io 30 天试用期结束后 API key 失效，静默返回 403 而非明确错误"
+    mitigation: "检测 HTTP 403 响应，在告警中提示 'API key expired or invalid'；
+      自动降级到 yfinance 并记录降级日志"
+
+# === 元数据 ===
+source: manual
+freshness_date: "2026-03-29"
+quality_score: 82.0
+usage_count: 0
+evidence_refs:
+  - "https://github.com/ranaroussi/yfinance"
+  - "https://www.alphavantage.co/documentation/"
+  - "https://docs.coingecko.com/reference/simple-price"
+  - "https://polygon.io/docs/stocks/getting-started"

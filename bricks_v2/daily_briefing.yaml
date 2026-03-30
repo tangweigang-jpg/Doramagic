@@ -1,0 +1,129 @@
+# 知识积木 v2 — 每日简报与信息聚合
+# 用途：从多源（RSS、API、网页）聚合信息，生成摘要推送
+
+# === 信封层（给系统看）===
+id: daily-briefing-v1
+name: 每日简报与信息聚合
+version: 1.0.0
+category:
+  - 信息聚合
+  - 内容摘要
+tags:
+  - 简报
+  - NewsAPI
+  - RSS
+  - HackerNews
+  - feedparser
+  - 信息汇总
+  - 摘要
+capability_type: poll
+data_source: rss
+
+inputs:
+  sources:
+    type: text
+    required: true
+    description: "数据源列表，JSON 数组格式，每项含 type（rss/newsapi/hackernews）和 url 或参数；
+                  示例：[{\"type\":\"rss\",\"url\":\"https://feeds.reuters.com/reuters/topNews\"},
+                         {\"type\":\"hackernews\",\"limit\":20}]"
+  keywords:
+    type: text
+    required: false
+    default: ""
+    description: "关键词过滤，逗号分隔；空字符串表示不过滤"
+  max_items_per_source:
+    type: integer
+    required: false
+    default: 10
+    description: "每个数据源最多抓取的条目数"
+    validation: "1 <= value <= 50"
+  newsapi_key:
+    type: string
+    required: false
+    default: ""
+    description: "NewsAPI API Key；不填则仅使用免费源（HN Firebase + RSS）"
+  summary_max_length:
+    type: integer
+    required: false
+    default: 200
+    description: "每条摘要最大字符数，超出截断"
+    validation: "50 <= value <= 1000"
+  deduplicate:
+    type: boolean
+    required: false
+    default: true
+    description: "是否开启跨源去重（基于标题相似度 + URL 规范化）"
+
+outputs:
+  items:
+    type: "list[dict]"
+    description: "聚合后的条目列表，每项含 title/url/source/published/summary/score 字段"
+  item_count:
+    type: integer
+    description: "去重后的条目总数"
+  sources_failed:
+    type: "list[str]"
+    description: "本次失败的数据源标识列表，用于监控告警"
+
+requires: []
+conflicts_with: []
+compatible_with:
+  - telegram-notifier-v1
+
+# === 内容层（给 LLM 看）===
+core_capability: >
+  从 RSS（feedparser）、NewsAPI（requests）、HackerNews Firebase API（requests）多源并行
+  抓取信息，按关键词过滤后跨源去重，生成结构化摘要条目列表，供下游通知或报告积木消费。
+
+constraints:
+  - "RSS 源使用 feedparser 解析（import feedparser），HackerNews 用 Firebase API：
+     GET https://hacker-news.firebaseio.com/v0/topstories.json 获取 ID 列表，
+     再 GET https://hacker-news.firebaseio.com/v0/item/{id}.json 获取详情；
+     HN API 完全免费无限流，适合作为默认兜底源"
+  - "NewsAPI 免费账号限制：100 req/day，每次请求返回最多 100 条，仅有前 100 条可访问
+     （免费账号无法翻页）；Key 从环境变量 NEWSAPI_KEY 读取，不可硬编码；
+     API 端点：GET https://newsapi.org/v2/top-headlines?apiKey=KEY&pageSize=20"
+  - "NewsAPI 付费升级路径：Developer Plan $449/mo，250K req/month，支持全量搜索和全文内容；
+     本积木代码需在 newsapi_key 为空时优雅跳过 NewsAPI，不抛异常"
+  - "去重策略（按优先级）：1) URL 规范化后精确匹配；2) 标题 token 集合 Jaccard 相似度 >= 0.8
+     视为重复；3) 相同标题不同大小写；保留评分（HN score/NewsAPI relevance）较高的版本"
+  - "摘要生成：优先使用 feedparser entry.summary 或 NewsAPI description 字段，截断到
+     summary_max_length；HTML 标签用 html.parser 或 re.sub 去除，保留纯文本"
+  - "多源并行：使用 concurrent.futures.ThreadPoolExecutor(max_workers=5) 并行请求，
+     单源超时设为 10 秒（requests timeout=10）；某源失败不影响其他源，失败源记入 sources_failed"
+  - "RSS 编码处理：feedparser 自动处理编码，但 entry.summary 含 HTML 时需用
+     html.unescape() + 正则去标签；中文 feed 的 published 时区可能不标准，
+     解析失败时用 datetime.utcnow() 兜底"
+  - "Feedly API（付费升级选项）：需 OAuth 2.0，端点 GET https://cloud.feedly.com/v3/streams/contents；
+     本积木不直接集成，通过 sources 参数的 type='feedly' 扩展点预留"
+
+common_failures:
+  - severity: HIGH
+    pattern: "首次运行无历史记录时返回大量历史条目（RSS 可能含 100+ 历史条目），触发通知轰炸"
+    mitigation: "首次运行标记所有现有条目为已见（写入持久化去重存储），仅触发日志，不推送通知；
+                 第二次起才正常返回新条目"
+  - severity: HIGH
+    pattern: "NewsAPI 免费账号 100 req/day 耗尽后返回 429，未处理导致整体失败"
+    mitigation: "捕获 HTTP 429，标记 newsapi 源为限流状态，本轮跳过，记录日志；
+                 不影响 RSS 和 HN 源的正常运行"
+  - severity: MEDIUM
+    pattern: "RSS feed URL 返回 301/302 重定向，feedparser 不跟随导致解析空结果"
+    mitigation: "检查 feed.status，若为 301 则用重定向后 URL 重试并更新存储的 URL"
+  - severity: MEDIUM
+    pattern: "部分 RSS feed 的 summary 字段包含大量 HTML/JS 脚本，未清洗时摘要不可读"
+    mitigation: "用 re.sub(r'<[^>]+>', '', summary) 去除所有 HTML 标签后再截断"
+  - severity: LOW
+    pattern: "HN Firebase API 单 item 请求失败（网络抖动），导致部分条目详情缺失"
+    mitigation: "单 item 请求失败时用 title=str(item_id) 占位，link 指向 HN 页面，不中断整批"
+
+# === 元数据 ===
+source: manual
+freshness_date: "2026-03-29"
+quality_score: 80.0
+usage_count: 0
+evidence_refs:
+  - "https://newsapi.org/docs/endpoints/top-headlines"
+  - "https://hacker-news.firebaseio.com/v0/topstories.json"
+  - "https://github.com/HackerNews/API"
+  - "https://feedparser.readthedocs.io/en/latest/"
+  - "https://developer.feedly.com/v3/streams/"

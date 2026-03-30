@@ -1,0 +1,159 @@
+# 知识积木 v2 — 文档读写
+# 用途：读写 Google Docs、Notion、Markdown 文档
+
+# === 信封层（给系统看）===
+id: document-rw-v1
+name: 文档读写
+version: 1.0.0
+category:
+  - 文档
+  - 知识管理
+tags:
+  - Google Docs
+  - Notion
+  - Markdown
+  - Confluence
+  - batchUpdate
+  - block
+  - 富文本
+capability_type: transform
+data_source: null
+
+inputs:
+  provider:
+    type: enum
+    required: true
+    description: "文档服务商：google_docs（Google Docs API）、notion（Notion API）、
+                  markdown（本地或 URL Markdown 文件）"
+    enum_values:
+      - google_docs
+      - notion
+      - markdown
+  operation:
+    type: enum
+    required: true
+    description: "操作类型：read（读取内容）、write（追加内容）、replace（替换全文）、
+                  create（新建文档）"
+    enum_values:
+      - read
+      - write
+      - replace
+      - create
+  document_id:
+    type: string
+    required: false
+    default: ""
+    description: "文档 ID：Google Docs 为 URL 中的文档 ID 字段；Notion 为 page/database UUID；
+                  markdown 为文件路径或 URL；create 操作时留空"
+  content:
+    type: text
+    required: false
+    default: ""
+    description: "写入内容，Markdown 格式；积木负责转换为目标格式；read 操作时留空"
+  credentials_path:
+    type: string
+    required: false
+    default: ""
+    description: "Google Docs OAuth credentials.json 路径；Notion 填 API Key（从环境变量读取时留空）"
+  notion_token_env:
+    type: string
+    required: false
+    default: "NOTION_API_TOKEN"
+    description: "Notion API Token 的环境变量名"
+  parent_id:
+    type: string
+    required: false
+    default: ""
+    description: "create 操作时的父级 ID（Google Docs 用 Drive folder_id；Notion 用 parent page_id）"
+
+outputs:
+  content_text:
+    type: string
+    description: "read 操作返回的纯文本内容"
+  content_markdown:
+    type: string
+    description: "read 操作返回的 Markdown 格式内容（尽力转换）"
+  document_id:
+    type: string
+    description: "create 操作返回的新文档 ID"
+  document_url:
+    type: string
+    description: "文档的访问 URL"
+  char_count:
+    type: integer
+    description: "文档内容字符数（read/write 后）"
+
+requires: []
+conflicts_with: []
+compatible_with:
+  - telegram-notifier-v1
+  - daily-briefing-v1
+
+# === 内容层（给 LLM 看）===
+core_capability: >
+  通过 Google Docs API（batchUpdate + get）或 Notion API（blocks CRUD）读写文档内容，
+  支持 Markdown↔富文本双向转换，正确处理嵌套 block、权限错误和大文档分页。
+
+constraints:
+  - "Google Docs API 读取：GET https://docs.googleapis.com/v1/documents/{documentId}；
+     OAuth Scopes：只读用 'https://www.googleapis.com/auth/documents.readonly'，
+     写入用 'https://www.googleapis.com/auth/documents'；
+     返回的 body.content 是 StructuralElement 数组，需递归提取 paragraph.elements[].textRun.content"
+  - "Google Docs API 写入：必须用 batchUpdate 接口（不可直接 PUT body）；
+     追加文本用 insertText 请求：{'insertText': {'location': {'index': end_index}, 'text': content}}；
+     end_index 通过读取文档后取 body.content[-1].endIndex - 1 获得；
+     index 从 1 开始（不是 0），段落末尾 \\n 占一个 index 单位"
+  - "Google Docs batchUpdate 结构（关键）：
+     POST /v1/documents/{documentId}:batchUpdate；
+     Body: {'requests': [{'insertText': {...}}, {'updateParagraphStyle': {...}}]}；
+     requests 是数组，支持一次发送多个操作；索引变化是累积的，多个 insertText 时需按倒序插入"
+  - "Notion API 版本：必须在所有请求头加 'Notion-Version: 2022-06-28'；
+     读取页面内容：GET https://api.notion.com/v1/blocks/{page_id}/children；
+     返回分页结构，has_more=true 时需用 start_cursor 参数继续请求"
+  - "Notion Block 类型映射（Markdown → Notion）：
+     # 标题 → heading_1 block；## → heading_2；**粗体** → rich_text.annotations.bold；
+     - 列表项 → bulleted_list_item block；```代码``` → code block；
+     每个 block 的 rich_text 数组最多 100 个元素，超出需拆分为多个 block"
+  - "Notion Block 嵌套限制：最多 3 层嵌套（children of children of children）；
+     嵌套更深的内容需拍平后写入；读取时用递归 GET /blocks/{block_id}/children 展开"
+  - "Markdown↔富文本转换：写入前将 Markdown 解析为 AST（用 mistletoe 或 mistune 库），
+     再将 AST 节点映射为目标格式 block；直接字符串替换会导致嵌套格式错乱"
+  - "大文档处理：Google Docs 超过 100 万字符时 get 接口超时；
+     Notion 页面深层内容需多轮 API 调用（每次最多 100 个 block）；
+     两者均需分块读取，read 操作需设置 timeout=30 秒"
+
+common_failures:
+  - severity: HIGH
+    pattern: "Google Docs batchUpdate 中多个 insertText 的 index 未按倒序计算，
+              前插入操作使后续 index 偏移，导致内容插入位置错误"
+    mitigation: "多次插入时按文档 index 从大到小排序 requests，倒序插入；
+                 或每次操作后重新读取文档获取最新 index"
+  - severity: HIGH
+    pattern: "Notion API Token 无目标页面访问权限，返回 404 而非 403，难以与'页面不存在'区分"
+    mitigation: "捕获 404 时先检查 error.code == 'object_not_found'，
+                 在错误消息中同时提示'页面不存在或 Token 无权限访问'"
+  - severity: MEDIUM
+    pattern: "Notion 页面的 rich_text 字段超过 2000 字符限制，API 返回 400 body too large"
+    mitigation: "写入前将 content 按 1800 字符分割为多个 paragraph block，而非单个超长 block"
+  - severity: MEDIUM
+    pattern: "Google Docs 文档中含有内嵌图片/表格，递归提取 textRun 时跳过这些元素，
+              导致输出文本与原文档结构不符"
+    mitigation: "遇到 table/inlineObjectElement 元素时插入 '[表格]' 或 '[图片]' 占位符，
+                 并在 content_text 的开头追加提示 'Note: images/tables rendered as placeholders'"
+  - severity: LOW
+    pattern: "markdown 文件路径含中文或空格，open() 在某些系统环境下抛 FileNotFoundError"
+    mitigation: "路径统一用 pathlib.Path(document_id).expanduser().resolve() 处理，
+                 不依赖 os.path 字符串拼接"
+
+# === 元数据 ===
+source: manual
+freshness_date: "2026-03-29"
+quality_score: 84.0
+usage_count: 0
+evidence_refs:
+  - "https://developers.google.com/docs/api/reference/rest/v1/documents/batchUpdate"
+  - "https://developers.google.com/docs/api/reference/rest/v1/documents/get"
+  - "https://developers.notion.com/reference/get-block-children"
+  - "https://developers.notion.com/reference/patch-block-children"
+  - "https://developers.notion.com/reference/request-limits"
+  - "https://github.com/miyuchina/mistletoe"

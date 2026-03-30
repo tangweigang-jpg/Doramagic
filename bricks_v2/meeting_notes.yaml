@@ -1,0 +1,152 @@
+# 知识积木 v2 — 会议纪要自动化
+# 用途：将会议音频转录为文本，提取摘要与行动项，推送给指定渠道
+
+# === 信封层（给系统看）===
+id: meeting-notes-v1
+name: 会议纪要自动化
+version: 1.0.0
+category:
+  - 生产力
+  - 音频处理
+tags:
+  - 会议
+  - 转录
+  - 摘要
+  - 行动项
+  - whisper
+  - otter.ai
+  - assemblyai
+  - 说话人分离
+capability_type: transform
+data_source: filesystem
+
+inputs:
+  audio_path:
+    type: string
+    required: true
+    description: "本地音频文件路径，支持格式：WAV/MP3/M4A/OGG/FLAC"
+    validation: "audio_path.split('.')[-1].lower() in ['wav', 'mp3', 'm4a', 'ogg', 'flac']"
+  provider:
+    type: enum
+    required: false
+    default: "whisper"
+    description: "转录服务提供商：whisper=本地开源免费，otter=otter.ai（300 min/mo free），assemblyai=AssemblyAI（$0.37/h），deepgram=Deepgram（$0.25/h）"
+    enum_values:
+      - whisper
+      - otter
+      - assemblyai
+      - deepgram
+  whisper_model:
+    type: enum
+    required: false
+    default: "base"
+    description: "Whisper 本地模型大小，仅 provider=whisper 时生效；large 精度高但需 10GB+ RAM"
+    enum_values:
+      - tiny
+      - base
+      - small
+      - medium
+      - large
+  language:
+    type: string
+    required: false
+    default: "auto"
+    description: "音频语言代码，如 'en'/'zh'/'ja'；'auto' 表示自动检测；多语言混杂场景请设为主要语言"
+  diarization:
+    type: boolean
+    required: false
+    default: false
+    description: "是否启用说话人分离（diarization）；免费 Whisper 原生不支持，需配合 pyannote.audio；AssemblyAI/Deepgram 原生支持"
+  max_file_size_mb:
+    type: integer
+    required: false
+    default: 200
+    description: "允许处理的最大文件大小（MB）；AssemblyAI 限制 5GB，Deepgram 限制 2GB，Whisper 本地无限制"
+    validation: "1 <= value <= 5120"
+
+outputs:
+  transcript:
+    type: string
+    description: "完整转录文本，带时间戳（格式：[HH:MM:SS] 文本）"
+  summary:
+    type: string
+    description: "会议摘要，不超过 300 字"
+  action_items:
+    type: string
+    description: "行动项列表，格式：'负责人: 事项 (截止日期)'，每行一条"
+  speaker_segments:
+    type: string
+    description: "说话人分段结果（仅 diarization=true 时返回），格式：'Speaker_N [HH:MM:SS-HH:MM:SS]: 文本'"
+
+requires: []
+conflicts_with: []
+compatible_with:
+  - telegram-notifier-v1
+
+# === 内容层（给 LLM 看）===
+core_capability: >
+  将会议音频文件转录为结构化文本，通过 LLM 提取摘要和行动项，支持本地 Whisper 免费方案和
+  AssemblyAI/Deepgram 云端付费方案，可选说话人分离。
+
+constraints:
+  - "Whisper 本地方案：使用 openai-whisper 库（pip install openai-whisper），调用
+     whisper.load_model(model_size).transcribe(audio_path, language=lang)；
+     模型文件首次下载后缓存于 ~/.cache/whisper/，无需重复下载"
+  - "文件大小校验必须在调用 API 前完成：用 os.path.getsize(path) / (1024*1024) 检查；
+     超限时抛出 ValueError 而非让 API 返回 413"
+  - "AssemblyAI API 调用流程（provider=assemblyai）：
+     POST https://api.assemblyai.com/v2/upload 上传文件获取 upload_url，
+     POST https://api.assemblyai.com/v2/transcript 提交转录任务，
+     轮询 GET https://api.assemblyai.com/v2/transcript/{id} 直到 status=completed；
+     轮询间隔建议 3s，最大等待 30 分钟，超时则抛出 TimeoutError"
+  - "Deepgram API（provider=deepgram）：使用 deepgram-sdk（pip install deepgram-sdk），
+     调用 client.listen.prerecorded.v('1').transcribe_file()；
+     说话人分离需在 options 中设置 diarize=True"
+  - "otter.ai（provider=otter）：otter.ai 无官方公开 API，仅有非官方逆向接口，
+     生产环境不推荐；免费额度为 300 分钟/月，超出需付费"
+  - "说话人分离（diarization=True + provider=whisper）：需安装 pyannote.audio（需申请 HuggingFace token），
+     先用 pyannote 生成 speaker segments，再用 Whisper 转录各段；
+     注意 pyannote 需 GPU 才能实时处理"
+  - "行动项提取使用 LLM：将转录文本分段（每段 ≤4000 tokens）后调用 LLMAdapter，
+     prompt 中明确要求输出格式为 JSON 数组 [{owner, task, due_date}]；
+     合并所有段的结果去重后输出"
+  - "音频格式转换：M4A 需先用 ffmpeg 转为 WAV（subprocess.run(['ffmpeg', '-i', input, output])），
+     确保系统已安装 ffmpeg；若不可用降级到 pydub"
+  - "长会议（>2小时）必须分段处理：Whisper 单次建议不超过 30 分钟音频，
+     用 pydub.AudioSegment 按静音点切分，最终合并转录结果"
+
+common_failures:
+  - severity: HIGH
+    pattern: "背景噪音导致转录错误率超过 30%，尤其是餐厅/咖啡厅环境录音"
+    mitigation: "转录前用 noisereduce 库降噪（noisereduce.reduce_noise(y=audio, sr=rate)）；
+      或提示用户使用近场麦克风；无法降噪时在输出中标记置信度警告"
+  - severity: HIGH
+    pattern: "多语言混杂（如中英夹杂）时 Whisper 自动检测语言失败，整段翻译为单一语言"
+    mitigation: "language 参数设为主要语言而非 auto；在输出摘要前注明语言混杂问题；
+      AssemblyAI 的 language_detection 选项处理混杂语言更准确"
+  - severity: HIGH
+    pattern: "AssemblyAI 轮询超时：长音频（>1小时）处理时间超过 30 分钟"
+    mitigation: "最大等待时间调整为 60 分钟，轮询间隔 10s 而非 3s；
+      记录任务 ID 到本地文件，支持断点续查"
+  - severity: MEDIUM
+    pattern: "Whisper large 模型在 8GB RAM 机器上 OOM 崩溃"
+    mitigation: "内存不足时自动降级到 medium/small 模型；
+      检测方式：import psutil; psutil.virtual_memory().available"
+  - severity: MEDIUM
+    pattern: "文件名含非 ASCII 字符（中文路径）时 ffmpeg 命令失败"
+    mitigation: "所有临时文件写入 tempfile.mkdtemp() 下的 ASCII 路径，
+      原始文件先 shutil.copy 到临时路径再处理"
+  - severity: LOW
+    pattern: "说话人分离将背景音乐/噪音识别为独立说话人"
+    mitigation: "设置最小说话人段时长（≥5s），过滤短于阈值的伪说话人段"
+
+# === 元数据 ===
+source: manual
+freshness_date: "2026-03-29"
+quality_score: 78.0
+usage_count: 0
+evidence_refs:
+  - "https://github.com/openai/whisper"
+  - "https://www.assemblyai.com/docs/api-reference/transcripts/submit"
+  - "https://developers.deepgram.com/docs/pre-recorded-audio"
+  - "https://github.com/pyannote/pyannote-audio"

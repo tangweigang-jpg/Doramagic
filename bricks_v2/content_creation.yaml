@@ -1,0 +1,143 @@
+# 知识积木 v2 — 内容创作与多平台分发
+# 用途：从草稿生成多平台变体（Twitter/X、LinkedIn、Blog），定时发布
+
+# === 信封层（给系统看）===
+id: content-creation-v1
+name: 内容创作与多平台分发
+version: 1.0.0
+category:
+  - 内容创作
+  - 社交媒体
+tags:
+  - Twitter
+  - LinkedIn
+  - Blog
+  - Buffer
+  - Hootsuite
+  - 多平台
+  - 定时发布
+  - Markdown
+capability_type: transform
+data_source: twitter
+
+inputs:
+  draft_content:
+    type: text
+    required: true
+    description: "原始草稿内容，Markdown 格式或纯文本；长度不限，积木负责按平台截断/改写"
+    validation: "1 <= len(value) <= 50000"
+  target_platforms:
+    type: text
+    required: true
+    description: "目标平台列表，JSON 数组，支持：twitter、linkedin、blog；
+                  示例：[\"twitter\", \"linkedin\"]"
+  credentials:
+    type: text
+    required: true
+    description: "各平台认证凭据，JSON 对象；
+                  twitter：{\"bearer_token\":\"...\",\"api_key\":\"...\",\"api_secret\":\"...\",
+                            \"access_token\":\"...\",\"access_secret\":\"...\"};
+                  linkedin：{\"access_token\":\"...\",\"person_urn\":\"urn:li:person:...\"}；
+                  所有 token 从环境变量读取，此参数传变量名映射如 {\"twitter_bearer\": \"TW_BEARER_TOKEN\"}"
+  schedule_time:
+    type: string
+    required: false
+    default: ""
+    description: "定时发布时间，ISO 8601 格式（如 '2026-03-30T10:00:00+08:00'）；
+                  空字符串表示立即发布"
+  twitter_thread:
+    type: boolean
+    required: false
+    default: false
+    description: "Twitter 内容超过 280 字符时是否拆分为 Thread（串推）；
+                  false 时截断到 277 字符并追加 '...'"
+  image_urls:
+    type: text
+    required: false
+    default: "[]"
+    description: "要附带发布的图片 URL 列表，JSON 数组；每平台有最大图片数限制"
+
+outputs:
+  platform_posts:
+    type: "dict"
+    description: "各平台的最终发布内容，key 为平台名，value 含 content/char_count/status 字段"
+  published_ids:
+    type: "dict"
+    description: "各平台发布成功后的帖子 ID，key 为平台名；调度发布时为空"
+  scheduled:
+    type: boolean
+    description: "是否为定时任务（通过 Buffer/Hootsuite API 调度）"
+
+requires: []
+conflicts_with: []
+compatible_with:
+  - telegram-notifier-v1
+
+# === 内容层（给 LLM 看）===
+core_capability: >
+  将 Markdown 草稿按各平台字符限制改写并格式化，通过 Twitter/X API v2、LinkedIn API v2
+  直接发布或通过 Buffer API 定时调度，处理 OAuth 认证、图片上传和字符编码。
+
+constraints:
+  - "Twitter/X API v2 发推：POST https://api.twitter.com/2/tweets；
+     Free tier：1500 tweets/mo（约 50/天），15 req/15min；
+     认证用 OAuth 1.0a（User Context），需要 api_key + api_secret + access_token + access_secret；
+     用 tweepy 库（pip install tweepy）：client = tweepy.Client(...)；
+     字符限制：280 Unicode 字符（Twitter 计算方式：URL 固定算 23 字符）"
+  - "Twitter Thread 发布：第一条推文先发，获取 tweet_id，后续推文通过
+     reply.in_reply_to_tweet_id=tweet_id 串联；每条独立计费 rate limit"
+  - "LinkedIn API v2 发帖：POST https://api.linkedin.com/v2/ugcPosts；
+     认证：OAuth 2.0 Bearer Token，Scope 需包含 w_member_social；
+     字符限制：个人帖子 3000 字符，公司页面帖子 700 字符；
+     person_urn 格式：'urn:li:person:{profile_id}'，从 GET /v2/me 接口获取"
+  - "LinkedIn API 限制：免费个人账号受限（官方未公开具体数字），商业页面 API 申请需审核；
+     实际约 100-200 req/day；付费方案：Buffer API 封装（Basic $6/mo）、Hootsuite（$99/mo）"
+  - "Buffer API（定时调度）：POST https://api.bufferapp.com/1/updates/create.json；
+     需先创建 Buffer 账号关联各平台；scheduled_at 传 Unix timestamp；
+     免费套餐支持 3 个渠道，付费 Essentials $6/mo 支持更多"
+  - "Markdown 转各平台格式：Twitter/LinkedIn 不支持 Markdown；
+     转换时：**粗体** → 去掉符号保留文字（Twitter）或 Unicode 粗体字符（LinkedIn 技巧）；
+     [链接文字](url) → 保留 url，去掉 Markdown 语法；
+     Blog（Markdown → HTML）：用 markdown 库（pip install Markdown）"
+  - "图片发布（Twitter）：先用 POST https://upload.twitter.com/1.1/media/upload.json 上传，
+     获取 media_id，再在 tweets 请求 body 中加 media.media_ids；
+     支持格式：JPEG/PNG/GIF/WEBP；单图最大 5MB，GIF 最大 15MB；最多 4 张"
+  - "所有 token 必须从环境变量读取：os.environ[credentials[platform+'_token_env']]；
+     禁止将 token 写入日志；token 过期（401）时在 outputs 中返回 auth_error 而非抛异常"
+
+common_failures:
+  - severity: HIGH
+    pattern: "Twitter Free tier 超过 1500 tweets/mo 后返回 403 Forbidden，
+              错误信息含 'Usage cap exceeded'，与权限不足的 403 相同"
+    mitigation: "捕获 403 后检查 response.json()['detail'] 是否含 'Usage cap'，
+                 是则标记 twitter 为月额度耗尽，当月不再尝试；
+                 不可与权限类 403 混淆处理"
+  - severity: HIGH
+    pattern: "LinkedIn OAuth Access Token 有效期仅 60 天，到期后所有请求返回 401"
+    mitigation: "每次调用前检查 token 创建时间，距今 > 50 天时主动提示用户刷新；
+                 捕获 401 在 outputs 中返回 linkedin_auth_expired=True"
+  - severity: MEDIUM
+    pattern: "Twitter 字符计数使用 Twitter 的权重算法（URL=23字符），len() 计算结果偏大导致误截断"
+    mitigation: "用 tweepy.parsers 或 Twitter 官方字符计数库计算权重字符数；
+                 简化方案：先统计 URL 数量，替换为 23 字符占位后再计算总长"
+  - severity: MEDIUM
+    pattern: "LinkedIn 帖子含 emoji 时 Unicode 字符数与 LinkedIn 计数不一致，导致超限 422"
+    mitigation: "发布前用 len(content.encode('utf-16-le')) / 2 计算 UTF-16 长度，
+                 按 LinkedIn 的字符计数逻辑保守截断到 2900 字符"
+  - severity: LOW
+    pattern: "图片 URL 来自需要认证的 CDN，Twitter 上传时无法下载，返回 invalid_media"
+    mitigation: "先用 requests.get(image_url) 下载到内存/临时文件，再以二进制上传；
+                 禁止直接传 URL 给 Twitter 上传接口"
+
+# === 元数据 ===
+source: manual
+freshness_date: "2026-03-29"
+quality_score: 79.0
+usage_count: 0
+evidence_refs:
+  - "https://developer.twitter.com/en/docs/twitter-api/tweets/manage-tweets/api-reference/post-tweets"
+  - "https://developer.twitter.com/en/docs/twitter-api/rate-limits"
+  - "https://learn.microsoft.com/en-us/linkedin/marketing/community-management/shares/posts-api"
+  - "https://www.linkedin.com/developers/apps/new"
+  - "https://buffer.com/developers/api/updates"
+  - "https://docs.tweepy.org/en/stable/client.html#tweepy.Client.create_tweet"

@@ -1,0 +1,134 @@
+# 知识积木 v2 — 邮件自动化
+# 用途：邮件分类、摘要、自动回复草稿生成
+
+# === 信封层（给系统看）===
+id: email-automation-v1
+name: 邮件自动化
+version: 1.0.0
+category:
+  - 邮件
+  - 自动化
+tags:
+  - Gmail
+  - IMAP
+  - OAuth2
+  - 邮件分类
+  - 自动回复
+  - MIME
+  - 摘要
+capability_type: poll
+data_source: gmail
+
+inputs:
+  provider:
+    type: enum
+    required: false
+    default: "gmail"
+    description: "邮件服务商：gmail（OAuth 2.0）、imap（标准 IMAP，适用于其他邮件服务）"
+    enum_values:
+      - gmail
+      - imap
+  credentials_path:
+    type: string
+    required: true
+    description: "认证凭据路径：gmail 时为 OAuth credentials.json 文件路径；
+                  imap 时为含 host/port/user/password 的 JSON 配置文件路径"
+  token_path:
+    type: string
+    required: false
+    default: "~/.doramagic/gmail_token.json"
+    description: "Gmail OAuth token 缓存文件路径（imap 模式下忽略）"
+  max_emails:
+    type: integer
+    required: false
+    default: 20
+    description: "每次轮询最多处理的邮件数"
+    validation: "1 <= value <= 100"
+  filter_query:
+    type: string
+    required: false
+    default: "is:unread"
+    description: "Gmail 搜索语法过滤条件，如 'is:unread from:boss@company.com'；
+                  IMAP 模式下忽略此参数，使用 UNSEEN 标志"
+  generate_drafts:
+    type: boolean
+    required: false
+    default: false
+    description: "是否为需要回复的邮件生成草稿（调用 LLM）；true 时需要 LLMAdapter"
+
+outputs:
+  emails:
+    type: "list[dict]"
+    description: "处理后的邮件列表，每项含 id/subject/from/date/body_text/category/summary 字段"
+  email_count:
+    type: integer
+    description: "本次处理的邮件数量"
+  draft_ids:
+    type: "list[str]"
+    description: "生成草稿的 Gmail draft ID 列表（generate_drafts=false 时为空列表）"
+
+requires: []
+conflicts_with: []
+compatible_with:
+  - telegram-notifier-v1
+
+# === 内容层（给 LLM 看）===
+core_capability: >
+  通过 Gmail API（OAuth 2.0）或 IMAP（标准协议）获取未读邮件，解析 MIME 结构提取纯文本，
+  按规则分类（重要/订阅/垃圾）并生成摘要，可选调用 LLM 生成回复草稿写回 Gmail。
+
+constraints:
+  - "Gmail API 认证：使用 google-auth + google-api-python-client 库；
+     OAuth 2.0 Scopes 最小必需：['https://www.googleapis.com/auth/gmail.readonly',
+     'https://www.googleapis.com/auth/gmail.compose']（仅当 generate_drafts=True 才加 compose）；
+     token 用 google.oauth2.credentials.Credentials 缓存到 token_path，避免每次重新授权"
+  - "Gmail API 免费限制：15,000 quota units/day（读取邮件约 5 units/次，搜索约 10 units/次）；
+     每次轮询不超过 max_emails=20 时每天约消耗 100-200 units，远低于上限；
+     付费升级：Nylas API（$0.001/email），Workspace API 无此限制"
+  - "MIME 解析：用标准库 email.message_from_bytes() 解析原始邮件；
+     纯文本优先取 Content-Type=text/plain 部分；仅 HTML 时用 html.parser 提取文本；
+     附件不下载，仅记录 filename + size 到 attachments 字段"
+  - "HTML 邮件处理：用 BeautifulSoup(html, 'html.parser').get_text(separator=' ') 提取正文；
+     禁止用 re 直接解析 HTML（对 nested tags 不可靠）"
+  - "OAuth token 过期处理：token.expired 为 True 时用 token.refresh(Request()) 自动刷新；
+     refresh 失败（如 refresh_token 被撤销）时记录错误并提示用户重新授权，不抛未捕获异常"
+  - "邮件分类规则（按优先级）：1) 发件人在白名单 → 重要；2) 含 List-Unsubscribe 头 → 订阅；
+     3) SpamAssassin X-Spam-Score > 5 → 垃圾；4) 其余 → 待分类；
+     分类结果写入 email['category'] 字段，不修改 Gmail 标签（只读操作）"
+  - "草稿生成（generate_drafts=True）：仅对 category='重要' 且 subject 包含疑问词的邮件生成；
+     草稿通过 Gmail API users.drafts.create 接口写入；draft body 用 base64.urlsafe_b64encode 编码"
+  - "IMAP 模式：用 Python 标准库 imaplib，连接 IMAP4_SSL(host, port)；
+     搜索 b'UNSEEN' 获取未读邮件 UID 列表；fetch 使用 '(RFC822)' 格式；
+     处理完后不自动标记已读（尊重用户习惯），除非参数显式开启"
+
+common_failures:
+  - severity: HIGH
+    pattern: "Gmail OAuth token 的 refresh_token 被撤销（用户更改密码或撤销应用权限），
+              自动刷新失败导致整个积木报错"
+    mitigation: "捕获 google.auth.exceptions.RefreshError，清除本地 token 文件，
+                 在 outputs 中返回 auth_required=True 信号，上层 skill 提示用户重新授权"
+  - severity: HIGH
+    pattern: "邮件正文为纯 HTML 且含大量图片/跟踪像素，BeautifulSoup 提取文本为空或乱"
+    mitigation: "提取后检查 text.strip() 是否为空，空时回退到 subject 字段作为摘要来源"
+  - severity: MEDIUM
+    pattern: "附件较大的邮件（>25MB）通过 Gmail API fetch 时超时"
+    mitigation: "用 metadata format 先获取 metadata，body size > 10MB 时跳过 body 下载，
+                 记录警告 'email {id} body skipped: too large'"
+  - severity: MEDIUM
+    pattern: "IMAP 长连接超时断开，后续命令返回 IMAP4.error: EOF"
+    mitigation: "每次操作前重新建立连接（stateless 连接池模式），不复用连接对象"
+  - severity: LOW
+    pattern: "邮件 Date 头格式不标准（缺少时区或时区偏移量不规范），parsedate_to_datetime 抛 ValueError"
+    mitigation: "用 email.utils.parsedate() 兜底，仍失败时用 datetime.utcnow() 替代"
+
+# === 元数据 ===
+source: manual
+freshness_date: "2026-03-29"
+quality_score: 82.0
+usage_count: 0
+evidence_refs:
+  - "https://developers.google.com/gmail/api/reference/rest/v1/users.messages/list"
+  - "https://developers.google.com/gmail/api/reference/rest/v1/users.drafts/create"
+  - "https://developers.google.com/identity/protocols/oauth2/scopes#gmail"
+  - "https://github.com/googleapis/google-auth-library-python/blob/main/google/oauth2/credentials.py"
+  - "https://docs.python.org/3/library/imaplib.html"

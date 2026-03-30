@@ -1,0 +1,173 @@
+# 知识积木 v2 — 文件整理自动化
+# 用途：批量重命名文件、按规则分类整理、检测重复文件
+
+# === 信封层（给系统看）===
+id: file-organization-v1
+name: 文件整理自动化
+version: 1.0.0
+category:
+  - 文件管理
+  - 生产力
+tags:
+  - 文件整理
+  - 批量重命名
+  - 重复检测
+  - exiftool
+  - 元数据
+  - pathlib
+capability_type: transform
+data_source: filesystem
+
+inputs:
+  source_dir:
+    type: string
+    required: true
+    description: "待整理的源目录绝对路径，如 '/Users/user/Downloads'；必须是绝对路径"
+  target_dir:
+    type: string
+    required: true
+    description: "整理后目标目录绝对路径；不存在时自动创建；与 source_dir 可以相同（原地整理）"
+  operation:
+    type: enum
+    required: false
+    default: "organize"
+    description: "操作类型：organize=按规则分类，rename=批量重命名，dedup=重复检测，dry_run=只预览不执行"
+    enum_values:
+      - organize
+      - rename
+      - dedup
+      - dry_run
+  rename_pattern:
+    type: string
+    required: false
+    default: "{date}_{original}"
+    description: "重命名模板（operation=rename 时生效），支持变量：
+      {date}=文件修改日期(YYYYMMDD)，{exif_date}=EXIF拍摄日期，
+      {original}=原始文件名（不含扩展名），{index:04d}=序号，{ext}=扩展名"
+  organize_rules:
+    type: string
+    required: false
+    default: '{"images": [".jpg",".jpeg",".png",".gif",".webp"], "documents": [".pdf",".doc",".docx",".txt"], "videos": [".mp4",".mov",".avi",".mkv"], "audio": [".mp3",".wav",".m4a",".flac"]}'
+    description: "JSON 字符串格式的分类规则，key 为子目录名，value 为扩展名列表"
+  dedup_method:
+    type: enum
+    required: false
+    default: "hash"
+    description: "重复检测方式：hash=MD5/SHA256 完整比较（精确），
+      size_name=文件大小+文件名（快速），perceptual=感知哈希（图片相似度，需 imagehash 库）"
+    enum_values:
+      - hash
+      - size_name
+      - perceptual
+  conflict_policy:
+    type: enum
+    required: false
+    default: "skip"
+    description: "文件名冲突处理：skip=跳过（保留原文件），rename=自动加序号后缀，overwrite=覆盖（危险）"
+    enum_values:
+      - skip
+      - rename
+      - overwrite
+  follow_symlinks:
+    type: boolean
+    required: false
+    default: false
+    description: "是否跟随符号链接；false 时跳过符号链接文件，避免无限递归"
+  max_depth:
+    type: integer
+    required: false
+    default: 3
+    description: "目录遍历最大深度，避免大目录结构超时；-1 表示无限深度"
+    validation: "-1 <= value <= 20"
+
+outputs:
+  processed_count:
+    type: integer
+    description: "成功处理的文件数量"
+  skipped_count:
+    type: integer
+    description: "跳过的文件数量（冲突/权限/符号链接）"
+  duplicate_groups:
+    type: string
+    description: "重复文件组列表（仅 operation=dedup 返回），每组一行：'HASH: file1.txt, file2.txt'"
+  error_files:
+    type: string
+    description: "处理失败的文件列表，格式：'路径: 错误原因'，每行一条"
+  preview:
+    type: string
+    description: "操作预览（operation=dry_run 时返回），格式：'SOURCE → TARGET'，每行一条"
+
+requires: []
+conflicts_with: []
+compatible_with:
+  - telegram-notifier-v1
+
+# === 内容层（给 LLM 看）===
+core_capability: >
+  使用 Python pathlib 和 shutil 对指定目录进行批量文件整理，支持按扩展名分类、
+  按模板重命名（含 EXIF 元数据）、MD5/感知哈希重复检测，所有操作前可 dry_run 预览。
+
+constraints:
+  - "文件移动必须用 shutil.move() 而非 os.rename()：跨磁盘（如 Downloads→外置硬盘）时
+     os.rename() 报 OSError，shutil.move() 自动处理跨设备复制+删除"
+  - "文件名编码：必须在所有路径操作前对文件名执行 path.name.encode('utf-8', errors='replace').decode('utf-8')；
+     Windows NTFS 允许非 UTF-8 路径，macOS HFS+ 用 NFD 规范化，
+     统一用 unicodedata.normalize('NFC', filename) 处理"
+  - "符号链接安全：默认 follow_symlinks=False，用 path.is_symlink() 检测后跳过；
+     若 follow_symlinks=True 则用 set() 追踪已访问的真实路径（path.resolve()）防止循环"
+  - "权限检查：移动/删除前用 os.access(path, os.W_OK) 验证写权限；
+     无权限时记录到 error_files，继续处理下一文件，不终止整个操作"
+  - "EXIF 日期提取（rename_pattern 含 {exif_date}）：用 exiftool 命令行工具
+     subprocess.run(['exiftool', '-DateTimeOriginal', '-csv', path], capture_output=True)；
+     exiftool 不可用时降级到 path.stat().st_mtime；
+     EXIF 日期格式为 'YYYY:MM:DD HH:MM:SS'，需转换为 'YYYYMMDD'"
+  - "文件名冲突处理（conflict_policy=rename）：自动在文件名后加 _01/_02...序号；
+     检查目标路径是否存在用 target_path.exists()，不可假设操作原子性（并发整理时可能竞态）"
+  - "大目录遍历性能：使用 pathlib.Path.rglob('*') 而非 os.walk()；
+     单次遍历文件数 > 100000 时，必须分批处理（每批 1000 文件），批间 yield 让出控制权"
+  - "重复检测（dedup_method=hash）：读取文件时分块计算 MD5，避免大文件 OOM：
+     with open(f, 'rb') as fp: 循环 fp.read(8192) 更新 md5.update(chunk)；
+     相同 hash 视为完全重复，仅报告不自动删除（删除属于高危操作，留给用户确认）"
+  - "感知哈希（dedup_method=perceptual）：使用 imagehash 库（pip install imagehash），
+     imagehash.phash(Image.open(f)) 计算感知哈希；
+     仅对图片文件（MIME type image/*）执行，非图片跳过；
+     汉明距离 <= 8 视为相似（可配置）"
+  - "操作日志：每次整理完成后将操作记录写入 target_dir/.organize_log_YYYYMMDD_HHMMSS.json，
+     格式：{moved: [{from, to}], skipped: [{path, reason}], errors: [{path, error}]}"
+
+common_failures:
+  - severity: HIGH
+    pattern: "误删非重复文件：dedup 时因文件大小相同但内容不同被误标为重复"
+    mitigation: "dedup_method=hash 为默认值，size_name 仅作预筛选；
+      自动删除重复文件的操作必须有用户二次确认；积木本身只标记，不执行删除"
+  - severity: HIGH
+    pattern: "大目录（>50GB）整理时内存溢出：一次性加载所有文件路径到列表"
+    mitigation: "使用生成器而非列表：for path in source_dir.rglob('*') 逐文件处理；
+      不缓存全部路径，只在 dedup（需比较 hash）时构建 {hash: [paths]} 字典"
+  - severity: HIGH
+    pattern: "文件名冲突覆盖：target_path.exists() 返回 True 时直接 overwrite，导致原文件丢失"
+    mitigation: "conflict_policy 默认为 skip，overwrite 必须明确传参；
+      执行覆盖前将被覆盖文件备份到 .organize_trash/ 目录（保留 7 天）"
+  - severity: MEDIUM
+    pattern: "macOS .DS_Store 和 Thumbs.db 被当作普通文件处理，分类到 documents/"
+    mitigation: "硬编码跳过列表：['.DS_Store', 'Thumbs.db', 'desktop.ini', '.localized']；
+      以 . 开头的隐藏文件默认跳过（可通过 include_hidden=True 参数启用）"
+  - severity: MEDIUM
+    pattern: "exiftool 不在 PATH 中，subprocess.run() 抛 FileNotFoundError，整个积木崩溃"
+    mitigation: "先 shutil.which('exiftool') 检测可用性；
+      不可用时自动降级到 stat().st_mtime，并在 preview 中注明 'EXIF unavailable, using mtime'"
+  - severity: LOW
+    pattern: "符号链接指向已删除目标（dangling symlink），path.stat() 抛 FileNotFoundError"
+    mitigation: "检测符号链接时用 path.is_symlink() + try/except OSError；
+      dangling symlink 记录到 error_files，不终止整个整理流程"
+
+# === 元数据 ===
+source: manual
+freshness_date: "2026-03-29"
+quality_score: 80.0
+usage_count: 0
+evidence_refs:
+  - "https://docs.python.org/3/library/pathlib.html"
+  - "https://docs.python.org/3/library/shutil.html"
+  - "https://exiftool.org/exiftool_pod.html"
+  - "https://github.com/JohannesBuchner/imagehash"

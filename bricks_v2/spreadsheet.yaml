@@ -1,0 +1,170 @@
+# 知识积木 v2 — 电子表格处理
+# 用途：Excel/CSV/Google Sheets 数据清洗、公式生成、图表分析
+
+# === 信封层（给系统看）===
+id: spreadsheet-v1
+name: 电子表格处理
+version: 1.0.0
+category:
+  - 数据处理
+  - 生产力
+tags:
+  - Excel
+  - CSV
+  - Google Sheets
+  - 数据清洗
+  - 公式
+  - openpyxl
+  - pandas
+  - 表格
+capability_type: transform
+data_source: filesystem
+
+inputs:
+  file_path:
+    type: string
+    required: false
+    description: "本地文件路径（.xlsx/.xls/.csv/.ods）；与 sheet_id 二选一，不可同时为空"
+  sheet_id:
+    type: string
+    required: false
+    description: "Google Sheets 文档 ID（URL 中 /d/ 后的部分）；需配置 GOOGLE_SERVICE_ACCOUNT_JSON 环境变量"
+  sheet_name:
+    type: string
+    required: false
+    default: ""
+    description: "工作表名称；空字符串表示第一张工作表；Google Sheets 中为 Tab 名称"
+  operation:
+    type: enum
+    required: true
+    description: "操作类型：read=读取数据为 JSON，clean=数据清洗，formula=生成公式，analyze=统计摘要，write=写入数据"
+    enum_values:
+      - read
+      - clean
+      - formula
+      - analyze
+      - write
+  clean_rules:
+    type: string
+    required: false
+    default: '{"remove_empty_rows": true, "normalize_dates": true, "trim_whitespace": true, "remove_duplicates": false}'
+    description: "JSON 格式的清洗规则，仅 operation=clean 时生效"
+  formula_request:
+    type: string
+    required: false
+    default: ""
+    description: "自然语言公式需求，如 '计算B列的去年同期增长率'，仅 operation=formula 时生效；
+      LLM 会生成对应的 Excel 公式字符串"
+  data_json:
+    type: text
+    required: false
+    default: ""
+    description: "写入数据的 JSON 字符串（二维数组），仅 operation=write 时生效；
+      格式：[[row1col1, row1col2], [row2col1, row2col2]]"
+  target_cell:
+    type: string
+    required: false
+    default: "A1"
+    description: "写入起始单元格（operation=write），Excel A1 格式，如 'B3'"
+  max_rows:
+    type: integer
+    required: false
+    default: 10000
+    description: "最大读取行数，防止超大文件 OOM；0 表示不限制（慎用）"
+    validation: "0 <= value <= 1000000"
+
+outputs:
+  data:
+    type: string
+    description: "读取/清洗后的数据（operation=read/clean），JSON 格式：{columns: [...], rows: [[...]]}"
+  formula:
+    type: string
+    description: "生成的 Excel/Sheets 公式字符串（operation=formula），如 '=IFERROR(B2/OFFSET(B2,-12,0)-1,\"N/A\")'"
+  summary:
+    type: string
+    description: "统计摘要（operation=analyze），包含行数、列数、空值率、数值列均值/中位数/标准差"
+  modified_path:
+    type: string
+    description: "修改后的文件路径（operation=clean/write），原文件加 _cleaned/_updated 后缀"
+  warnings:
+    type: string
+    description: "处理过程中的数据质量警告，如编码问题、日期格式不一致、合并单元格等"
+
+requires: []
+conflicts_with: []
+compatible_with:
+  - telegram-notifier-v1
+  - knowledge-base-v1
+
+# === 内容层（给 LLM 看）===
+core_capability: >
+  使用 pandas 和 openpyxl 处理本地 Excel/CSV 文件，或通过 Google Sheets API 处理云端表格，
+  支持数据清洗、AI 公式生成、统计分析和数据写入。
+
+constraints:
+  - "文件读取优先级：.xlsx 用 openpyxl 引擎（pd.read_excel(engine='openpyxl')），
+     .xls 用 xlrd 引擎，.csv 先尝试 UTF-8 再 fallback GBK/GB2312/Latin-1；
+     编码检测用 chardet.detect(f.read(10240))['encoding']，不可硬编码编码格式"
+  - "CSV 编码乱码处理：检测失败时逐一尝试 ['utf-8', 'utf-8-sig', 'gbk', 'gb2312', 'latin-1']；
+     全部失败时用 errors='replace' 读取并在 warnings 中标注"
+  - "公式注入安全（CRITICAL）：CSV/Excel 中以 =、+、-、@ 开头的单元格值是潜在公式注入；
+     写入 Google Sheets 时必须对用户输入数据调用 sanitize：
+     value = \"'\" + str(value) if str(value).startswith(('=','+','-','@')) else value；
+     禁止将用户数据直接写入 cells 而不加前缀"
+  - "Google Sheets API（sheet_id 非空时）：
+     使用 google-api-python-client，scope=['https://www.googleapis.com/auth/spreadsheets']；
+     读取：GET spreadsheets/{id}/values/{range}；
+     写入：PUT spreadsheets/{id}/values/{range}，valueInputOption='USER_ENTERED'（允许公式）；
+     服务账号 JSON 从环境变量 GOOGLE_SERVICE_ACCOUNT_JSON 解析（json.loads），不从文件读取"
+  - "Google Sheets API 限流：免费套餐 300 req/min per project，60 req/min per user；
+     批量读写用 batchGet/batchUpdate 而非逐单元格请求；
+     遇到 429 时指数退避（初始 1s，最多 5 次）"
+  - "合并单元格处理（openpyxl）：ws.merged_cells 包含所有合并区域；
+     读取时必须解开合并：for merged_range in ws.merged_cells.ranges: ws.unmerge_cells(str(merged_range))；
+     解开后用左上角单元格的值填充整个区域，不可直接读取合并区域内的非左上角单元格（返回 None）"
+  - "日期格式统一化（clean_rules.normalize_dates=true）：
+     pd.to_datetime(col, infer_datetime_format=True, errors='coerce') 统一转为 datetime64；
+     转换失败的单元格变为 NaT，在 warnings 中报告原始值；
+     输出时格式化为 ISO 8601：dt.strftime('%Y-%m-%d')"
+  - "大文件内存控制（max_rows > 0）：用 pd.read_csv(chunksize=1000) 流式读取；
+     读取行数达到 max_rows 时停止并在 warnings 中注明截断；
+     openpyxl read_only 模式（load_workbook(file, read_only=True)）可减少 60% 内存占用"
+  - "公式生成（operation=formula）：调用 LLMAdapter 时在 system prompt 中声明目标是
+     生成 Excel/Google Sheets 兼容公式字符串；要求只输出公式本身（以 = 开头），不含解释；
+     公式中的列引用基于 sheet 实际的列头名称，先读取第一行作为上下文传给 LLM"
+
+common_failures:
+  - severity: HIGH
+    pattern: "CSV 公式注入：用户数据中含 '=SUM(A1:A100)' 被 Excel 当公式执行，触发安全漏洞"
+    mitigation: "写入前扫描所有单元格值，以特殊符号开头的加单引号前缀；
+      Google Sheets 写入用 valueInputOption='RAW' 代替 'USER_ENTERED'（禁止公式解析）"
+  - severity: HIGH
+    pattern: "openpyxl 读取合并单元格时，非左上角单元格返回 None，误认为空值被删除"
+    mitigation: "必须先解除合并再读取；detection：len(ws.merged_cells.ranges) > 0 时触发解合并流程"
+  - severity: HIGH
+    pattern: "GBK 编码 CSV 在 macOS/Linux 上 pd.read_csv() 报 UnicodeDecodeError，任务中断"
+    mitigation: "先用 chardet 检测编码；detection 置信度 < 0.8 时逐一尝试编码列表；
+      全部失败时 errors='replace' 兜底，并在 warnings 中标记受影响行号"
+  - severity: MEDIUM
+    pattern: "Excel 文件中日期存储为数字（serial date，如 44927 = 2023-01-01），pd 读取为浮点数"
+    mitigation: "对 float/int 列检查值域：1900-2100 年对应序列号 1-73050；
+      疑似日期列用 pd.to_datetime(col, unit='D', origin='1899-12-30') 转换"
+  - severity: MEDIUM
+    pattern: "Google Sheets API 429 限流：批量更新 100+ 行时触发，整个操作失败"
+    mitigation: "batchUpdate 每次最多 200 个单元格；超出时分批发送，批间 sleep(0.2)；
+      遇到 429 捕获 googleapiclient.errors.HttpError，退避后重试"
+  - severity: LOW
+    pattern: "openpyxl 修改含宏（.xlsm）文件后宏代码丢失"
+    mitigation: "检测到 .xlsm 后缀时在 warnings 中提示 'VBA macros will be lost'；
+      保存时改用 .xlsx 后缀；若必须保留宏，提示用户手动处理"
+
+# === 元数据 ===
+source: manual
+freshness_date: "2026-03-29"
+quality_score: 79.0
+usage_count: 0
+evidence_refs:
+  - "https://openpyxl.readthedocs.io/en/stable/usage.html"
+  - "https://developers.google.com/sheets/api/reference/rest/v4/spreadsheets.values/batchUpdate"
+  - "https://owasp.org/www-community/attacks/CSV_Injection"
+  - "https://pandas.pydata.org/docs/reference/api/pandas.read_excel.html"

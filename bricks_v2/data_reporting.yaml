@@ -1,0 +1,193 @@
+# 知识积木 v2 — Data Reporting
+# 用途：自动生成周报/月报，包含数据聚合、图表生成和格式化描述，支持多种输出后端
+
+# === 信封层（给系统看）===
+id: data-reporting-v1
+name: Data Reporting
+version: 1.0.0
+category:
+  - Analytics
+  - Reporting
+tags:
+  - weekly report
+  - monthly report
+  - data visualization
+  - matplotlib
+  - plotly
+  - google sheets
+  - metabase
+  - looker studio
+  - aggregation
+  - alt text
+capability_type: transform
+data_source: database
+
+inputs:
+  data_source_type:
+    type: enum
+    required: true
+    description: "Where the raw data comes from"
+    enum_values:
+      - csv_file
+      - json_file
+      - sqlite
+      - postgres
+      - google_sheets
+      - api_json
+  data_source_uri:
+    type: string
+    required: true
+    description: "Path or connection string to the data source; for google_sheets use the sheet ID"
+    validation: "len(value) <= 512"
+  report_period:
+    type: enum
+    required: true
+    description: "Reporting period granularity"
+    enum_values:
+      - daily
+      - weekly
+      - monthly
+      - quarterly
+  timezone:
+    type: string
+    required: false
+    default: "UTC"
+    description: "IANA timezone name for period boundary calculation, e.g. 'America/New_York', 'Asia/Tokyo'"
+    validation: "len(value) <= 64"
+  metrics:
+    type: text
+    required: true
+    description: "JSON array of metric definitions; each item: {\"name\": str, \"column\": str, \"aggregation\": \"sum|avg|count|max|min\"}"
+    validation: "len(value) <= 4000"
+  chart_type:
+    type: enum
+    required: false
+    default: "bar"
+    description: "Chart type for visualisation"
+    enum_values:
+      - bar
+      - line
+      - pie
+      - scatter
+      - table_only
+  output_format:
+    type: enum
+    required: false
+    default: "markdown"
+    description: "Output format for the report body"
+    enum_values:
+      - markdown
+      - html
+      - json
+      - pdf
+  include_chart_image:
+    type: boolean
+    required: false
+    default: true
+    description: "Whether to render and embed a chart image (PNG base64) in the output"
+
+outputs:
+  report_text:
+    type: string
+    description: "Formatted report body in the requested output_format"
+  chart_image_b64:
+    type: string
+    description: "Base64-encoded PNG chart image; empty string if include_chart_image=false or chart_type=table_only"
+  chart_alt_text:
+    type: string
+    description: "Accessibility alt text describing the chart content, suitable for screen readers and email clients"
+  period_start:
+    type: string
+    description: "ISO 8601 timestamp of the report period start (in the specified timezone)"
+  period_end:
+    type: string
+    description: "ISO 8601 timestamp of the report period end (in the specified timezone)"
+  data_row_count:
+    type: integer
+    description: "Number of rows used in the aggregation after period filtering"
+
+requires: []
+conflicts_with: []
+compatible_with:
+  - telegram-notifier-v1
+  - project-mgmt-v1
+  - customer-comms-v1
+
+# === 内容层（给 LLM 看）===
+core_capability: >
+  Load tabular data from the configured source, filter to the requested reporting period
+  using timezone-aware datetime boundaries, aggregate metrics, render a chart via matplotlib
+  or plotly, generate an LLM-written narrative summary, and produce a formatted report with
+  accessibility alt text.
+
+constraints:
+  - "Timezone alignment is mandatory: use zoneinfo.ZoneInfo(timezone) (Python 3.9+) to
+     compute period_start and period_end. NEVER use datetime.utcnow() — it returns naive
+     datetimes that silently drop timezone offsets and corrupt period boundaries."
+  - "Period boundary calculation: for 'weekly', use ISO week (Monday=start, Sunday=end).
+     For 'monthly', first day of month 00:00:00 to last day 23:59:59 in the local timezone.
+     Convert boundaries to UTC only when querying databases that store UTC timestamps."
+  - "Data loading: for CSV/JSON, use pandas read_csv/read_json with dtype inference disabled
+     for date columns; parse dates explicitly with pd.to_datetime(col, utc=True) then
+     convert to the target timezone. For Google Sheets, use the gspread library with service
+     account credentials from env var GOOGLE_SERVICE_ACCOUNT_JSON."
+  - "Aggregation: parse the metrics JSON array, group the DataFrame by period, and apply
+     the specified aggregation function. Validate each metric column exists before aggregating;
+     raise ValueError('column {col} not found') with the full column list for debuggability."
+  - "Chart rendering with matplotlib: use plt.switch_backend('Agg') BEFORE importing pyplot
+     to prevent GUI window creation in headless environments. Always call plt.close('all')
+     after saving to prevent memory leaks across multiple report runs."
+  - "Chart alt text: generate a concise alt text string describing the chart using an LLM
+     (e.g. 'Bar chart showing weekly revenue: week 1 $12k, week 2 $15k, week 3 $11k').
+     This is required for WCAG 2.1 compliance and email client accessibility."
+  - "Google Sheets Charts (free): generate a chart URL via the Sheets Charts API
+     (POST /v4/spreadsheets/{id}/charts). The chart is hosted by Google; embed the returned
+     URL rather than a base64 blob in HTML output."
+  - "Metabase (paid, self-hosted): POST /api/card to create a question, then GET
+     /api/card/{id}/query to retrieve results. Auth via METABASE_SECRET_KEY env var
+     (session token endpoint POST /api/session)."
+  - "Data source connection failures must be caught individually: if the data source is
+     unreachable, return {'report_text': '', 'error': 'datasource_unavailable', 'detail': str(e)}
+     rather than raising, so the calling pipeline can decide retry logic."
+  - "Never hard-code date literals in the aggregation logic. All date boundaries must derive
+     from the current UTC time plus the timezone offset. Tests must mock datetime.now() to
+     verify period boundary correctness."
+
+common_failures:
+  - severity: HIGH
+    pattern: "Period boundary off by one day due to naive datetime comparison"
+    mitigation: "Use zoneinfo-aware datetimes throughout; convert DB UTC timestamps to local
+      timezone before filtering with >= period_start and < period_end"
+  - severity: HIGH
+    pattern: "matplotlib GUI backend crashes in headless server environment"
+    mitigation: "Call matplotlib.use('Agg') before any other matplotlib import; add this
+      as the first line in the module, not inside a function"
+  - severity: HIGH
+    pattern: "Google Sheets API rate limit (100 req/100s) exceeded when generating many reports"
+    mitigation: "Batch all reads into a single sheet.get_all_values() call; never call
+      cell.value() in a loop"
+  - severity: MEDIUM
+    pattern: "Memory leak from matplotlib figures across multiple report generations"
+    mitigation: "Always call plt.close('all') after fig.savefig(); use figure context
+      manager with plt.figure() or explicitly del fig"
+  - severity: MEDIUM
+    pattern: "Aggregation silently drops rows with NaN in metric columns"
+    mitigation: "Log count of NaN rows before aggregation; include na_count in output
+      metadata so callers are aware of data quality issues"
+  - severity: LOW
+    pattern: "chart_alt_text is empty or generic ('a bar chart') failing accessibility audit"
+    mitigation: "Include actual metric values in the alt text; prompt the LLM with the
+      aggregated data JSON to generate a specific description"
+
+# === 元数据 ===
+source: manual
+freshness_date: "2026-03-29"
+quality_score: 84.0
+usage_count: 0
+evidence_refs:
+  - "https://matplotlib.org/stable/users/explain/figure/backends.html"
+  - "https://plotly.com/python/getting-started/"
+  - "https://docs.gspread.org/en/latest/user-guide.html"
+  - "https://www.metabase.com/docs/latest/api-documentation"
+  - "https://www.w3.org/TR/WCAG21/#non-text-content"
+  - "https://docs.python.org/3/library/zoneinfo.html"
