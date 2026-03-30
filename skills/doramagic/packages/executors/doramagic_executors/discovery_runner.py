@@ -44,7 +44,7 @@ class DiscoveryRunner:
                 # 中文描述仓库：无法用英文关键词做跨语言匹配，信任 GitHub 搜索排序。
                 # 用更高的 star 门槛（100）过滤低质量噪音，避免完全无关的小仓库混入。
                 sigs = candidate.quality_signals
-                stars = sigs.get("stars", 0) if isinstance(sigs, dict) else 0
+                stars = getattr(sigs, "stars", 0) or 0
                 if stars >= 100 or not ascii_terms:
                     filtered.append(candidate)
                 else:
