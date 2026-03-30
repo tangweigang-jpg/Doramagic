@@ -2,6 +2,14 @@
 
 All notable changes to Doramagic are documented in this file.
 
+## [12.3.2] - 2026-03-30
+
+### Fixes
+- `setup_packages_path()`: Fixed false-positive developer-layout detection when running inside `~/.openclaw/` with stale packages (checks for `pyproject.toml`/`Makefile` now)
+- `_brick_catalog_dir()`: Fixed path resolution priority — self-contained `bricks/` now checked before dev-layout path; added `DORAMAGIC_BRICKS_DIR` env override
+- Discovery relevance filter: Non-ASCII descriptions (Chinese repos) now bypass English keyword matching, trusting GitHub's own search ranking
+- Version footer: Dynamically reads version from `SKILL.md` instead of hardcoded `v12.1.2`
+
 ## [12.3.1] - 2026-03-29
 
 ### Fixes

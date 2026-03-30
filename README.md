@@ -26,7 +26,7 @@ export ANTHROPIC_API_KEY="your-key"
 
 ### Direct Stitch (no project needed)
 
-Doramagic v12.3.1 can generate skills directly from its 1076-brick knowledge library:
+Doramagic v12.3.2 can generate skills directly from its 1076-brick knowledge library:
 
 ```bash
 /dora Build a Telegram bot that monitors crypto prices with alerts
@@ -169,7 +169,7 @@ Doramagic supports 4 input types, each routed deterministically:
 | Domain Exploration | `/dora What design wisdom can I learn from PKM projects?` | Multi-project discovery + extraction |
 | Clarification | `/dora I need something for my team` | Asks clarifying questions first |
 
-## Key Features (v12.3.1)
+## Key Features (v12.3.2)
 
 - **Deterministic Routing DAG** -- 4 input paths with conditional edges
 - **Fan-out Extraction** -- Up to 3 isolated RepoWorkers in parallel
