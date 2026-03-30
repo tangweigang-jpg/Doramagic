@@ -26,7 +26,7 @@ export ANTHROPIC_API_KEY="your-key"
 
 ### Direct Stitch (no project needed)
 
-Doramagic v12.4.1 can generate skills directly from its 1076-brick knowledge library:
+Doramagic v12.4.2 can generate skills directly from its 7904+ brick knowledge library:
 
 ```bash
 /dora Build a Telegram bot that monitors crypto prices with alerts
@@ -34,7 +34,7 @@ Doramagic v12.4.1 can generate skills directly from its 1076-brick knowledge lib
 /dora 帮我做一个每日信息聚合推送的 skill
 ```
 
-This "brick stitch" path matches your intent against 49 knowledge categories and composes a skill in seconds (2 LLM calls), without needing a specific GitHub project.
+This "brick stitch" path matches your intent against 50 knowledge categories and composes a skill in seconds (2 LLM calls), without needing a specific GitHub project.
 
 ### Other install methods
 
@@ -169,7 +169,7 @@ Doramagic supports 4 input types, each routed deterministically:
 | Domain Exploration | `/dora What design wisdom can I learn from PKM projects?` | Multi-project discovery + extraction |
 | Clarification | `/dora I need something for my team` | Asks clarifying questions first |
 
-## Key Features (v12.4.1)
+## Key Features (v12.4.2)
 
 - **Deterministic Routing DAG** -- 4 input paths with conditional edges
 - **Fan-out Extraction** -- Up to 3 isolated RepoWorkers in parallel
@@ -177,8 +177,8 @@ Doramagic supports 4 input types, each routed deterministically:
 - **4-Tier Degraded Delivery** -- Users always receive output
 - **EventBus + Structured Logging** -- `run_events.jsonl` for observability
 - **Model-Agnostic** -- Works with any LLM (Claude, Gemini, GPT, Ollama)
-- **Knowledge Brick Direct Stitch** -- generate skills from 1076 pre-built knowledge bricks in seconds
-- **1076 Knowledge Bricks** across 49 domains aligned to ClawHub marketplace demand
+- **Knowledge Brick Direct Stitch** -- generate skills from 7904+ pre-built knowledge bricks in seconds
+- **7904+ Knowledge Bricks** across 50 domains (incl. new education_learning) aligned to ClawHub marketplace demand
 - **Causal Reasoning** -- synthesis produces "X because Y" insights, not just fact lists
 - **Fine-grained Progress** -- sub_progress events every 3-5 seconds during extraction
 

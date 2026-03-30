@@ -76,16 +76,17 @@ class CompileResult(BaseModel):
 
     success: bool
     code: str
+    constraint_prompt: str = ""  # 积木约束 prompt（供宿主 LLM 消费）
     intent: dict[str, Any]
     matched_bricks: list[str]
     constraint_count: int
     verification: VerificationResult
     warnings: list[str] = []
     # 交付物边界标注——让用户清楚工具能做什么、不能做什么
-    capabilities: list[str] = []       # 这个工具能做什么（从积木 core_capability 提取）
-    limitations: list[str] = []        # 这个工具不能做什么（HIGH 级失败模式）
-    risk_report: str = ""              # 风险/DSD 报告（聚合所有失败模式）
-    evidence_sources: list[str] = []   # 知识来源溯源（积木 evidence_refs）
+    capabilities: list[str] = []  # 这个工具能做什么（从积木 core_capability 提取）
+    limitations: list[str] = []  # 这个工具不能做什么（HIGH 级失败模式）
+    risk_report: str = ""  # 风险/DSD 报告（聚合所有失败模式）
+    evidence_sources: list[str] = []  # 知识来源溯源（积木 evidence_refs）
 
 
 class ClarifyResult(BaseModel):
@@ -95,12 +96,12 @@ class ClarifyResult(BaseModel):
     当前为单轮模式（生成问题列表 + 默认答案），后续支持真正的多轮对话。
     """
 
-    clarified_input: str           # 澄清后的完整需求描述
-    confirmation: str              # "我理解你需要：xxx，对吗？" 确认文本
-    questions_asked: list[str]     # 问过的问题列表
-    answers: list[str]             # 对应的回答（单轮模式下为默认选项）
-    intent: dict[str, Any]         # 解析的意图结构
-    ready_to_compile: bool         # 是否可以进入编译阶段
+    clarified_input: str  # 澄清后的完整需求描述
+    confirmation: str  # "我理解你需要：xxx，对吗？" 确认文本
+    questions_asked: list[str]  # 问过的问题列表
+    answers: list[str]  # 对应的回答（单轮模式下为默认选项）
+    intent: dict[str, Any]  # 解析的意图结构
+    ready_to_compile: bool  # 是否可以进入编译阶段
 
 
 class PersonalizationCompiler:
@@ -155,8 +156,10 @@ class PersonalizationCompiler:
         """
         # 加载用户画像，判断技术水平
         user_profile = self._load_user_profile(user_id)
-        profile_dict = user_profile if isinstance(user_profile, dict) else (
-            user_profile.model_dump() if hasattr(user_profile, "model_dump") else {}
+        profile_dict = (
+            user_profile
+            if isinstance(user_profile, dict)
+            else (user_profile.model_dump() if hasattr(user_profile, "model_dump") else {})
         )
         technical_level: str = profile_dict.get("technical_level", "unknown")
 
@@ -281,8 +284,8 @@ class PersonalizationCompiler:
             logger.warning("第 %d 次验证失败，准备重试：%s", attempt + 1, traceback_feedback[:200])
 
         # Step 7.5: 生成交付物边界标注
-        capabilities, limitations, risk_report, evidence_sources = (
-            self._build_delivery_boundary(bricks)
+        capabilities, limitations, risk_report, evidence_sources = self._build_delivery_boundary(
+            bricks
         )
 
         # Step 8: 更新用户画像
@@ -293,6 +296,7 @@ class PersonalizationCompiler:
         return CompileResult(
             success=verification.passed and bool(code.strip()),
             code=code,
+            constraint_prompt=constraint_prompt,
             intent=intent,
             matched_bricks=matched_brick_ids,
             constraint_count=constraint_count,
@@ -577,8 +581,10 @@ class PersonalizationCompiler:
 
         # 追加个性化约束
         personal_lines: list[str] = []
-        profile_dict = user_profile if isinstance(user_profile, dict) else (
-            user_profile.model_dump() if hasattr(user_profile, "model_dump") else {}
+        profile_dict = (
+            user_profile
+            if isinstance(user_profile, dict)
+            else (user_profile.model_dump() if hasattr(user_profile, "model_dump") else {})
         )
         if profile_dict.get("preferred_language") == "zh":
             personal_lines.append("- 用户界面和输出信息使用中文")
@@ -636,7 +642,8 @@ class PersonalizationCompiler:
 
         if traceback_feedback:
             user_content += (
-                f"\n\n上次生成的代码出现错误，请修复：\n<external_content>{traceback_feedback}</external_content>"
+                f"\n\n上次生成的代码出现错误，请修复："
+                f"\n<external_content>{traceback_feedback}</external_content>"
             )
 
         messages = [LLMMessage(role="user", content=user_content)]
@@ -663,24 +670,24 @@ class PersonalizationCompiler:
         data_source = intent.get("data_source", "unknown")
 
         template = (
-            f'#!/usr/bin/env python3\n'
+            f"#!/usr/bin/env python3\n"
             f'"""自动生成的工具脚本（降级模式）。\n\n'
-            f'能力类型: {capability}\n'
-            f'数据来源: {data_source}\n'
+            f"能力类型: {capability}\n"
+            f"数据来源: {data_source}\n"
             f'"""\n\n'
-            f'import time\n'
-            f'import logging\n\n'
-            f'logging.basicConfig(level=logging.INFO)\n'
-            f'logger = logging.getLogger(__name__)\n\n\n'
-            f'def main() -> None:\n'
+            f"import time\n"
+            f"import logging\n\n"
+            f"logging.basicConfig(level=logging.INFO)\n"
+            f"logger = logging.getLogger(__name__)\n\n\n"
+            f"def main() -> None:\n"
             f'    """主函数 — 请根据实际需求完善此脚本。"""\n'
             f'    logger.info("脚本启动，能力类型：{capability}，数据来源：{data_source}")\n'
-            f'    # TODO: 实现具体逻辑\n'
-            f'    raise NotImplementedError(\n'
+            f"    # TODO: 实现具体逻辑\n"
+            f"    raise NotImplementedError(\n"
             f'        "降级模式生成的模板，请配置 LLM 后重新编译或手动实现"\n'
-            f'    )\n\n\n'
+            f"    )\n\n\n"
             f'if __name__ == "__main__":\n'
-            f'    main()\n'
+            f"    main()\n"
         )
         return template
 
@@ -763,8 +770,21 @@ def _extract_keywords(text: str) -> list[str]:
     """
     # 去除常见停用词后提取有意义词
     stopwords = {
-        "的", "了", "和", "是", "在", "我", "有", "一个",
-        "需要", "一", "请", "帮我", "生成", "创建", "写",
+        "的",
+        "了",
+        "和",
+        "是",
+        "在",
+        "我",
+        "有",
+        "一个",
+        "需要",
+        "一",
+        "请",
+        "帮我",
+        "生成",
+        "创建",
+        "写",
     }
     # 提取中文词（2-6 字）和英文词（3-10 字）
     cn_words = re.findall(r"[\u4e00-\u9fff]{2,6}", text)

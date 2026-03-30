@@ -54,7 +54,7 @@ class InputRouter:
                 reasoning=f"found repo slug(s): {slugs[:3]}",
             )
 
-        if profile.confidence < 0.7:
+        if profile.confidence < 0.85:
             return RoutingDecision(
                 route="LOW_CONFIDENCE",
                 skip_discovery=False,

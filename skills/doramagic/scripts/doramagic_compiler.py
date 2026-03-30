@@ -91,6 +91,56 @@ def setup_path() -> None:
             break
 
 
+def _init_llm_adapter():
+    """尝试初始化 LLM adapter。
+
+    优先从 OpenClaw 配置读取 API key，其次检查环境变量。
+    失败时返回 None（compiler 走降级模式）。
+    """
+    try:
+        from doramagic_shared_utils.llm_adapter import LLMAdapter
+    except ImportError:
+        return None
+
+    # 1. 尝试从 OpenClaw 配置读取
+    openclaw_config = Path.home() / ".openclaw" / "openclaw.json"
+    if openclaw_config.exists():
+        try:
+            import json as _json
+            config = _json.loads(openclaw_config.read_text(encoding="utf-8"))
+            providers = config.get("models", {}).get("providers", {})
+
+            # 按优先级尝试：gpt-vision > wow3-codex > wow3-aws
+            for provider_name in ("gpt-vision", "wow3-codex", "wow3-aws"):
+                prov = providers.get(provider_name, {})
+                api_key = prov.get("apiKey", "")
+                base_url = prov.get("baseUrl", "")
+
+                # 解析环境变量引用
+                if api_key.startswith("${") and api_key.endswith("}"):
+                    env_var = api_key[2:-1]
+                    api_key = os.environ.get(env_var, "")
+
+                if api_key and base_url:
+                    adapter = LLMAdapter(provider_override="openai")
+                    adapter._base_url = base_url + "/v1"
+                    adapter._api_key = api_key
+                    adapter._default_model = prov.get("models", [{}])[0].get("id", "gpt-4o")
+                    return adapter
+        except Exception:
+            pass
+
+    # 2. 尝试环境变量
+    for env_key, provider in [
+        ("ANTHROPIC_API_KEY", "anthropic"),
+        ("OPENAI_API_KEY", "openai"),
+    ]:
+        if os.environ.get(env_key):
+            return LLMAdapter(provider_override=provider)
+
+    return None
+
+
 def _init_brick_store():
     """初始化 BrickStore 并导入积木目录。
 
@@ -216,8 +266,8 @@ def main() -> None:
     store = _init_brick_store()
     memory = MemoryManager()
 
-    # LLM adapter 暂为 None（走无 LLM 降级模式）；
-    # 后续可通过 CapabilityRouter 注入真实 LLMAdapter。
+    # Doramagic 依赖宿主 LLM（OpenClaw agent），不自己调 API。
+    # compiler 的职责是：匹配积木 → 构建约束 prompt → 输出给宿主 LLM 消费。
     compiler = PersonalizationCompiler(
         brick_store=store,
         llm_adapter=None,
@@ -226,21 +276,18 @@ def main() -> None:
 
     result = asyncio.run(compiler.compile(args.input, user_id=args.user_id))
 
+    # compiler 不生成代码（那是宿主 LLM 的事），只输出约束 prompt 供宿主消费
     output: dict = {
-        "success": result.success,
+        "success": True,
         "message": _build_message(result),
-        "code_file": None,
+        "matched_bricks": result.matched_bricks,
+        "constraint_count": result.constraint_count,
+        "constraint_prompt": result.constraint_prompt,
+        "capabilities": result.capabilities,
+        "limitations": result.limitations,
+        "risk_report": result.risk_report,
+        "evidence_sources": result.evidence_sources,
     }
-
-    if result.success and result.code:
-        output_dir = Path(args.output_dir or "~/.doramagic/generated").expanduser()
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        filename = _slugify(args.input) + ".py"
-        code_path = output_dir / filename
-        code_path.write_text(result.code, encoding="utf-8")
-        output["code_file"] = str(code_path)
-        output["message"] += f"\n\n生成的工具已保存到: `{code_path}`"
 
     print(json.dumps(output, ensure_ascii=False))
 
