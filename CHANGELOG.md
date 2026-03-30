@@ -2,6 +2,13 @@
 
 All notable changes to Doramagic are documented in this file.
 
+## [12.3.3] - 2026-03-30
+
+### Fixes
+- `_compile_one_section()`: Added 30s `asyncio.wait_for()` timeout — prevents pipeline from hanging indefinitely when LLM doesn't respond during Phase E compilation
+- Discovery relevance filter: Non-ASCII repos now checked against repo name (weak relevance), not blindly passed through — prevents irrelevant repos like `china-dictatorship` appearing in English learning results
+- `setup_packages_path()`: `DORAMAGIC_BRICKS_DIR` and `DORAMAGIC_SCRIPTS_DIR` now use explicit `os.environ[...]` assignment instead of `setdefault()` — prevents stale env values from previous sessions
+
 ## [12.3.2] - 2026-03-30
 
 ### Fixes

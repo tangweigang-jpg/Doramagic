@@ -92,15 +92,15 @@ def setup_packages_path() -> None:
             ):
                 sys.path.insert(0, str(pkg_dir))
 
-    # Set DORAMAGIC_BRICKS_DIR if bricks/ exists
+    # Set DORAMAGIC_BRICKS_DIR if bricks/ exists（显式覆盖，防止 shell 残留旧值）
     bricks_dir = runtime_root / "bricks"
     if bricks_dir.exists():
-        os.environ.setdefault("DORAMAGIC_BRICKS_DIR", str(bricks_dir))
+        os.environ["DORAMAGIC_BRICKS_DIR"] = str(bricks_dir)
 
     # Set DORAMAGIC_SCRIPTS_DIR if scripts/ exists
     scripts_dir = runtime_root / "scripts"
     if scripts_dir.exists():
-        os.environ.setdefault("DORAMAGIC_SCRIPTS_DIR", str(scripts_dir))
+        os.environ["DORAMAGIC_SCRIPTS_DIR"] = str(scripts_dir)
 
 
 def _auto_resolve_platform_rules(args) -> None:

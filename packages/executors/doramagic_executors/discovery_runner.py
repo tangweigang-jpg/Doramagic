@@ -36,14 +36,17 @@ class DiscoveryRunner:
 
         filtered = []
         relevance_terms = [term.lower() for term in (need.relevance_terms or need.keywords[:4])]
-        # 仅保留纯 ASCII 关键词用于匹配——混入中文关键词会因编码差异导致误过滤
         ascii_terms = [t for t in relevance_terms if t.isascii()]
         for candidate in candidates:
             searchable = f"{candidate.name} {candidate.contribution}".lower()
-            # 如果描述以非 ASCII（中文）为主，跳过关键词过滤，信任 GitHub 搜索排序
             non_ascii_ratio = sum(1 for c in searchable if ord(c) > 127) / max(len(searchable), 1)
             if non_ascii_ratio > 0.3:
-                filtered.append(candidate)
+                # 中文描述仓库：用 repo name 做弱相关检查（至少名字要和查询词沾边）
+                name_lower = candidate.name.lower()
+                if not ascii_terms or any(term in name_lower for term in ascii_terms if term):
+                    filtered.append(candidate)
+                else:
+                    excluded.append(candidate)
                 continue
             if ascii_terms and not any(term in searchable for term in ascii_terms if term):
                 excluded.append(candidate)

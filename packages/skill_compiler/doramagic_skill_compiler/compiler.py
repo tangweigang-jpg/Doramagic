@@ -1,7 +1,8 @@
-"""Section-split compiler and quality scoring for Doramagic v12.1.1."""
+"""Section-split compiler and quality scoring for Doramagic."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -201,17 +202,20 @@ async def _compile_one_section(
                 f"Write only the markdown for section `{heading}`.\n"
                 f"Use the following synthesis packet.\n\n{shared_packet}"
             )
-            response = await adapter.generate(
-                getattr(adapter, "_default_model", "default"),
-                [LLMMessage(role="user", content=prompt)],
-                max_tokens=900,
+            response = await asyncio.wait_for(
+                adapter.generate(
+                    getattr(adapter, "_default_model", "default"),
+                    [LLMMessage(role="user", content=prompt)],
+                    max_tokens=900,
+                ),
+                timeout=30,
             )
             content = response.content.strip()
             if content:
                 if not content.startswith(heading):
                     content = f"{heading}\n{content}"
                 return content
-        except Exception:
+        except (TimeoutError, Exception):
             pass
     return _section_fallback(key, heading, input_data)
 
