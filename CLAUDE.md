@@ -4,6 +4,12 @@
 
 ---
 
+## 开发前必读（CRITICAL）
+
+**`PRODUCT_CONSTITUTION.md`** — 产品宪法。记录不可动摇的产品原则、版本演进历史、已确定的技术决策。任何修改 Doramagic 的 AI agent 必须先读此文件，禁止遗漏已有功能。
+
+---
+
 ## 项目信息
 
 - **语言**: Python 3.12
