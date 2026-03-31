@@ -1,5 +1,7 @@
 # Doramagic
 
+English | [中文](./README_zh.md)
+
 [![CI](https://github.com/tangweigang-jpg/Doramagic/actions/workflows/ci.yml/badge.svg)](https://github.com/tangweigang-jpg/Doramagic/actions/workflows/ci.yml)
 
 > **"Don't teach the user what to do -- give them the tool."** -- Doramagic's design philosophy, inspired by Doraemon.
