@@ -2,6 +2,24 @@
 
 All notable changes to Doramagic are documented in this file.
 
+## [12.4.6] - 2026-03-30
+
+### Security
+- Fixed ClawHub security false positive: `eval()` regex pattern in `validator.py` now uses string concatenation to avoid triggering static scanners while preserving full detection capability
+
+### Documentation
+- SKILL.md fully translated to English for global users (previously mixed Chinese/English)
+
+## [12.4.5] - 2026-03-30
+
+### Documentation
+- Version bump to resolve ClawHub publish conflict following v12.4.4 translation
+
+## [12.4.4] - 2026-03-30
+
+### Documentation
+- SKILL.md fully translated to English — behavior specification, product soul, usage examples, and all section headers now in English for international users
+
 ## [12.4.3] - 2026-03-30
 
 ### Knowledge Library

@@ -5,7 +5,7 @@ description: >
   Doramagic matches knowledge bricks (constraints, failure patterns, API contracts),
   injects them into the host LLM, and produces production-grade tools.
   Triggers on: "dora", "doramagic", "help me build", "I need a tool"
-version: 12.4.3
+version: 12.4.6
 user-invocable: true
 license: MIT
 tags: [doramagic, personalization-compiler, tool-generation]
