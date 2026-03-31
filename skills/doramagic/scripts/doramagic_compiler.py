@@ -155,8 +155,8 @@ def _init_brick_store():
     store = BrickStore(fallback_dir=bricks_dir)
     store.init_db()
 
-    # 导入所有子目录（knowledge/bricks, knowledge/scenes, knowledge/api_catalog, knowledge/migrated）
-    for sub in ("", "bricks", "scenes", "api_catalog", "migrated"):
+    # 导入所有子目录（knowledge/bricks, knowledge/scenes, knowledge/api_catalog）
+    for sub in ("", "bricks", "scenes", "api_catalog"):
         d = bricks_dir / sub if sub else bricks_dir
         if d.exists():
             try:

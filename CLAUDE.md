@@ -39,10 +39,13 @@ make test       # pytest tests/ packages/
 
 ### Bricks 知识积木
 
-`bricks/` 目录存放 JSONL 知识积木文件：
+`knowledge/bricks/` 是唯一物理知识源（JSONL 积木文件）。
+根目录 `bricks/` 是指向 `knowledge/bricks/` 的符号链接（向后兼容）。
+
 - 每文件至少 15% 为 `knowledge_type: "failure"`（反模式）
 - 每条 brick 需要真实文档 URL 的 `evidence_refs`
 - 新增 brick 后更新 `packages/extraction/doramagic_extraction/brick_injection.py` 的框架映射
+- 直接编辑 `knowledge/bricks/*.jsonl`（或通过 bricks_v2/ 编译写入）
 
 ### 发布（完整流程，不可跳步）
 

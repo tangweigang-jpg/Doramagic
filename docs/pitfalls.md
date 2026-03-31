@@ -57,6 +57,12 @@
 - 不要在 setup_packages_path 的开发者布局检测中只判断 packages/ 和 skills/doramagic/ 是否存在（因为 ~/.openclaw/ 会同时含有旧版残留，应额外验证 pyproject.toml 或 Makefile 才算真正的开发目录，发现于 2026-03-29）
 - 不要在 _brick_catalog_dir 中把 skills/doramagic/bricks/ 路径排在 bricks/ 之前（因为安装模式下 skills/doramagic/ 不存在，会解析到错误路径；应优先检查 DORAMAGIC_BRICKS_DIR 环境变量，发现于 2026-03-29）
 - 不要在相关性过滤器中只用英文关键词匹配（因为 GitHub 返回的中文描述仓库会被误过滤；非 ASCII 字符占比高时应直接放行，信任 GitHub 搜索排序，发现于 2026-03-29）
+
+## 知识库结构
+
+- 不要把 bricks/、knowledge/bricks/、skills/doramagic/bricks/、skills/doramagic/knowledge/bricks/ 维护为独立物理副本（因为 4 份副本保证同步极难，brick_id 冲突修复后必须手动同步4次；正确做法是 knowledge/bricks/ 作为唯一物理副本，其余用符号链接，发现于 2026-03-31）
+- 不要往 knowledge/migrated/ 添加新知识（因为该目录是旧格式历史残留，已被 knowledge/bricks/ 覆盖，已于 2026-03-31 删除）
+- 修复 brick_id 冲突时不要只改一份副本（因为同一 JSONL 有 4 处物理副本，只改一处会在下次发布时被旧版覆盖，发现于 2026-03-31）
 - 不要在版本字符串中硬编码版本号（因为发版后容易忘记同步，应从 SKILL.md 或 pyproject.toml 动态读取，发现于 2026-03-29）
 
 ## 通用

@@ -2,8 +2,10 @@
 set -euo pipefail
 
 # ─── Doramagic: Package self-contained skill ─────────────────────
-# Copies packages/, bricks/, and config into skills/doramagic/
+# Copies packages/, knowledge/, and config into skills/doramagic/
 # so the skill works standalone when installed via cp -r.
+#
+# Knowledge source: knowledge/bricks/ (canonical, bricks/ is a symlink to it)
 #
 # Usage:
 #   ./scripts/release/package_skill.sh
@@ -51,12 +53,21 @@ for pkg in "${RUNTIME_PACKAGES[@]}"; do
     fi
 done
 
-# ─── Copy bricks/ ────────────────────────────────────────────────
+# ─── Copy knowledge/ (canonical source, replaces legacy bricks/) ─
+# knowledge/bricks/ is the single source of truth; root bricks/ is a symlink.
+rm -rf "$SKILL_DIR/knowledge"
+mkdir -p "$SKILL_DIR/knowledge"
+rsync -a \
+    --exclude='migrated/' \
+    "$PROJECT_ROOT/knowledge/" "$SKILL_DIR/knowledge/"
+BRICK_COUNT=$(cat "$SKILL_DIR/knowledge/bricks/"*.jsonl | wc -l | tr -d ' ')
+echo "  + knowledge/ ($BRICK_COUNT bricks in knowledge/bricks/)"
+
+# Keep legacy bricks/ populated for backward-compat code that resolves root/bricks/
 rm -rf "$SKILL_DIR/bricks"
 mkdir -p "$SKILL_DIR/bricks"
-cp "$PROJECT_ROOT/bricks/"*.jsonl "$SKILL_DIR/bricks/"
-BRICK_COUNT=$(cat "$SKILL_DIR/bricks/"*.jsonl | wc -l | tr -d ' ')
-echo "  + bricks/ ($BRICK_COUNT bricks)"
+cp "$PROJECT_ROOT/knowledge/bricks/"*.jsonl "$SKILL_DIR/bricks/"
+echo "  + bricks/ (backward-compat symlink target, $BRICK_COUNT entries)"
 
 # ─── Copy config files ───────────────────────────────────────────
 cp "$PROJECT_ROOT/platform_rules.json" "$SKILL_DIR/platform_rules.json"
