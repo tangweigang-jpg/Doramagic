@@ -83,8 +83,8 @@ def setup_path() -> None:
             ):
                 sys.path.insert(0, str(pkg_dir))
 
-    # 优先使用 bricks_v2（v13 积木库），回退到 bricks
-    for bricks_candidate in ("bricks_v2", "bricks"):
+    # 统一知识目录：knowledge/ > bricks_v2/ > bricks/（向后兼容）
+    for bricks_candidate in ("knowledge", "bricks_v2", "bricks"):
         bricks_dir = runtime_root / bricks_candidate
         if bricks_dir.exists():
             os.environ["DORAMAGIC_BRICKS_DIR"] = str(bricks_dir)
@@ -149,14 +149,14 @@ def _init_brick_store():
     """
     from doramagic_shared_utils.brick_store import BrickStore
 
-    bricks_dir_str = os.environ.get("DORAMAGIC_BRICKS_DIR", "bricks_v2")
+    bricks_dir_str = os.environ.get("DORAMAGIC_BRICKS_DIR", "knowledge")
     bricks_dir = Path(bricks_dir_str)
 
     store = BrickStore(fallback_dir=bricks_dir)
     store.init_db()
 
-    # 导入顶层 + migrated + api_catalog 子目录
-    for sub in ("", "migrated", "api_catalog"):
+    # 导入所有子目录（knowledge/bricks, knowledge/scenes, knowledge/api_catalog, knowledge/migrated）
+    for sub in ("", "bricks", "scenes", "api_catalog", "migrated"):
         d = bricks_dir / sub if sub else bricks_dir
         if d.exists():
             try:

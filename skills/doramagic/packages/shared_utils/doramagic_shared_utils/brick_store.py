@@ -452,13 +452,120 @@ class BrickStore:
         logger.info("从 YAML 导入积木：%s (%s)", brick.id, path)
         return brick
 
+    def import_from_jsonl(self, jsonl_path: str | Path) -> int:
+        """从 JSONL 文件导入积木（v1 格式自动转换为 v2）。
+
+        每行是一个 JSON 对象，包含 brick_id, domain_id, knowledge_type, statement 等字段。
+        自动映射为 BrickV2 schema 并写入数据库。
+
+        Args:
+            jsonl_path: JSONL 文件路径。
+
+        Returns:
+            成功导入的积木数量。
+        """
+        path = Path(jsonl_path)
+        if not path.exists():
+            raise FileNotFoundError(f"JSONL 文件不存在：{path}")
+
+        domain = path.stem  # 文件名作为领域标识
+        success_count = 0
+
+        with path.open(encoding="utf-8") as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    raw = json.loads(line)
+                    brick = self._v1_to_v2(raw, domain)
+                    self.upsert(brick)
+                    success_count += 1
+                except Exception as e:
+                    if line_num <= 3:  # 只对前几行记录警告，避免刷屏
+                        logger.debug("跳过 %s 第 %d 行：%s", path.name, line_num, e)
+
+        logger.info("从 JSONL 导入 %d 个积木：%s", success_count, path.name)
+        return success_count
+
+    @staticmethod
+    def _v1_to_v2(raw: dict, domain: str) -> "BrickV2":
+        """将 v1 JSONL 积木转换为 v2 BrickV2 对象。
+
+        映射规则：
+        - brick_id → id
+        - domain_id → category
+        - knowledge_type 决定内容放入 constraints 还是 common_failures
+        - statement → core_capability / constraints / common_failures（按类型分流）
+        - evidence_refs → evidence_refs（提取 URL）
+        """
+        from doramagic_contracts.brick_v2 import BrickV2, FailurePattern
+
+        brick_id = raw.get("brick_id", f"{domain}-{id(raw)}")
+        knowledge_type = raw.get("knowledge_type", "rationale")
+        statement = raw.get("statement", "")
+        tags = raw.get("tags", [])
+        confidence = raw.get("confidence", "medium")
+
+        # 提取 evidence_refs URL
+        evidence_refs: list[str] = []
+        for ref in raw.get("evidence_refs", []):
+            if isinstance(ref, dict):
+                url = ref.get("source_url") or ref.get("path", "")
+                if url:
+                    evidence_refs.append(url)
+            elif isinstance(ref, str):
+                evidence_refs.append(ref)
+
+        # 按 knowledge_type 分流内容
+        constraints: list[str] = []
+        common_failures: list[FailurePattern] = []
+        core_capability = ""
+
+        if knowledge_type == "failure":
+            common_failures.append(FailurePattern(
+                severity="MEDIUM" if confidence == "medium" else "HIGH",
+                pattern=statement,
+                mitigation="",
+            ))
+        elif knowledge_type in ("capability",):
+            core_capability = statement
+        else:
+            # constraint, rationale, assembly_pattern, pattern, procedure, interface
+            constraints.append(statement)
+
+        quality = 70.0 if confidence == "high" else 50.0
+
+        return BrickV2(
+            id=brick_id,
+            name=brick_id,
+            version="1.0.0",
+            category=[domain],
+            tags=tags,
+            capability_type="transform",
+            data_source=None,
+            inputs={},
+            outputs={},
+            requires=[],
+            conflicts_with=[],
+            compatible_with=[],
+            core_capability=core_capability,
+            constraints=constraints,
+            common_failures=common_failures,
+            source="community",
+            freshness_date="2026-03-30",
+            quality_score=quality,
+            usage_count=0,
+            evidence_refs=evidence_refs,
+        )
+
     def import_dir(self, dir_path: str | Path) -> int:
-        """批量导入目录下所有 YAML 积木（.yaml / .yml）。
+        """批量导入目录下所有积木文件（YAML + JSONL）。
 
         跳过校验失败的文件并记录警告，不中断整批导入。
 
         Args:
-            dir_path: 包含 YAML 积木文件的目录。
+            dir_path: 包含积木文件的目录。
 
         Returns:
             成功导入的积木数量。
@@ -467,15 +574,25 @@ class BrickStore:
         if not base.is_dir():
             raise NotADirectoryError(f"目录不存在：{base}")
 
-        yaml_files = sorted(base.glob("*.yaml")) + sorted(base.glob("*.yml"))
         success_count = 0
 
+        # YAML 文件
+        yaml_files = sorted(base.glob("*.yaml")) + sorted(base.glob("*.yml"))
         for yaml_file in yaml_files:
             try:
                 self.import_from_yaml(yaml_file)
                 success_count += 1
             except (FileNotFoundError, ValueError, yaml.YAMLError) as e:
                 logger.warning("跳过文件 %s：%s", yaml_file.name, e)
+
+        # JSONL 文件
+        jsonl_files = sorted(base.glob("*.jsonl"))
+        for jsonl_file in jsonl_files:
+            try:
+                count = self.import_from_jsonl(jsonl_file)
+                success_count += count
+            except Exception as e:
+                logger.warning("跳过 JSONL 文件 %s：%s", jsonl_file.name, e)
 
         logger.info("批量导入完成：%d / %d 个文件成功", success_count, len(yaml_files))
         return success_count

@@ -1,10 +1,11 @@
 ---
 name: dora
 description: >
-  Doramagic: 个性化工具编译器 — 用户说出需求，Doramagic 基于 7904+ 块知识积木（含 2223 条失败模式）
-  生成生产级工具，自动验证并交付第一个真实结果。
-  Triggers on: "dora", "doramagic", "帮我做", "我需要一个工具"
-version: 12.4.2
+  Personalization compiler for AI terminals. Describe what you need in plain language,
+  Doramagic matches knowledge bricks (constraints, failure patterns, API contracts),
+  injects them into the host LLM, and produces production-grade tools.
+  Triggers on: "dora", "doramagic", "help me build", "I need a tool"
+version: 12.4.3
 user-invocable: true
 license: MIT
 tags: [doramagic, personalization-compiler, tool-generation]
@@ -21,7 +22,7 @@ metadata: {"openclaw":{"emoji":"🪄","skillKey":"dora","category":"builder","re
 
 1. **交付结果，不交付工具** — 用户看到的是"已经在工作了"，不是代码、不是配置文件。代码/SKILL/积木对用户不可见。
 2. **有立场的专家** — 替用户做选择，不列选项推卸责任。永远推荐最优方案，不说"你可以选择 A 或 B"。
-3. **能力显性（工厂透明）** — 告诉用户你在做什么（"正在从 7904+ 块知识中匹配..."），暗默能力 = 不信任。
+3. **能力显性（工厂透明）** — 告诉用户你在做什么（"正在从知识库中匹配最相关的约束..."），暗默能力 = 不信任。
 4. **知识溯源** — 给出的建议要能追溯到来源积木和证据引用。
 5. **完整交付** — 不交付半成品。scope 可以小，但工作必须完整，明标边界（能做什么、不能做什么）。
 6. **注入能力，不强加流程** — 生成的工具是知识专家，不是固定步骤执行器。
@@ -193,7 +194,7 @@ python3 {baseDir}/scripts/doramagic_main.py --input "/dora-status" --run-dir ~/.
 ### 过程可见
 - 每个阶段要告诉用户你在做什么（工厂透明），例如：
   - "正在分析你的需求..."
-  - "正在从 7904+ 块知识中匹配最相关的约束..."
+  - "正在从知识库中匹配最相关的约束..."
   - "找到了 5 个相关积木，31 条约束。正在生成工具..."
   - "正在验证生成的代码..."
   - "完成！"

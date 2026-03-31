@@ -92,10 +92,12 @@ def setup_packages_path() -> None:
             ):
                 sys.path.insert(0, str(pkg_dir))
 
-    # Set DORAMAGIC_BRICKS_DIR if bricks/ exists（显式覆盖，防止 shell 残留旧值）
-    bricks_dir = runtime_root / "bricks"
-    if bricks_dir.exists():
-        os.environ["DORAMAGIC_BRICKS_DIR"] = str(bricks_dir)
+    # Set DORAMAGIC_BRICKS_DIR（统一知识目录，向后兼容）
+    for candidate in ("knowledge", "bricks_v2", "bricks"):
+        bricks_dir = runtime_root / candidate
+        if bricks_dir.exists():
+            os.environ["DORAMAGIC_BRICKS_DIR"] = str(bricks_dir)
+            break
 
     # Set DORAMAGIC_SCRIPTS_DIR if scripts/ exists
     scripts_dir = runtime_root / "scripts"

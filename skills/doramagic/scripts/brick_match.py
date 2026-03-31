@@ -50,9 +50,11 @@ def setup_path() -> None:
                 if str(pkg_dir) not in sys.path:
                     sys.path.insert(0, str(pkg_dir))
 
-    bricks_dir = runtime_root / "bricks"
-    if bricks_dir.exists():
-        os.environ["DORAMAGIC_BRICKS_DIR"] = str(bricks_dir)
+    for candidate in ("knowledge", "bricks_v2", "bricks"):
+        bricks_dir = runtime_root / candidate
+        if bricks_dir.exists():
+            os.environ["DORAMAGIC_BRICKS_DIR"] = str(bricks_dir)
+            break
 
 
 def main() -> None:
@@ -70,11 +72,18 @@ def main() -> None:
         print(json.dumps({"error": f"无法导入 BrickStore：{e}", "bricks": [], "brick_count": 0}))
         sys.exit(1)
 
-    # 初始化 BrickStore，fallback_dir 指向 bricks_v2/
+    # 初始化 BrickStore，fallback_dir 指向 knowledge/
     runtime_root = Path(os.environ.get("DORAMAGIC_ROOT", ""))
-    fallback_dir: Path | None = runtime_root / "bricks_v2"
-    if fallback_dir and not fallback_dir.exists():
-        alt = Path(__file__).resolve().parents[1] / "bricks"
+    fallback_dir: Path | None = None
+    for candidate in ("knowledge", "bricks_v2", "bricks"):
+        d = runtime_root / candidate
+        if d.exists():
+            fallback_dir = d
+            break
+    if fallback_dir is None:
+        alt = Path(__file__).resolve().parents[1] / "knowledge"
+        if not alt.exists():
+            alt = Path(__file__).resolve().parents[1] / "bricks"
         fallback_dir = alt if alt.exists() else None
 
     store = BrickStore(fallback_dir=fallback_dir)

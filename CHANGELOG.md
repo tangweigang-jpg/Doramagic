@@ -2,6 +2,19 @@
 
 All notable changes to Doramagic are documented in this file.
 
+## [12.4.3] - 2026-03-30
+
+### Knowledge Library
+- BrickStore adds JSONL import capability (`import_from_jsonl` + `_v1_to_v2` conversion)
+- `import_dir` now supports both YAML and JSONL files
+- Knowledge library expanded from 97 bricks to 9726 bricks (all consumable by compiler)
+- Unified knowledge directory `knowledge/` (bricks + scenes + api_catalog + migrated)
+
+### Compiler & Routing
+- `doramagic_compiler.py` path priority: `knowledge/` > `bricks_v2/` > `bricks/`
+- `doramagic_main.py` and `brick_match.py` path priority synchronized
+- SKILL.md description now in English; removed hardcoded brick count numbers
+
 ## [12.4.2] - 2026-03-30
 
 ### Knowledge Library Expansion
