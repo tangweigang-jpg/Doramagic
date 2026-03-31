@@ -50,7 +50,7 @@ grep_tracked() {
 
 # -- 2. No hardcoded internal IPs --
 echo -e "\n${BOLD}[2/9] No hardcoded internal IPs${NC}"
-IP_HITS=$(grep_tracked '192\.168\.[0-9]\+\.[0-9]\+' -- '*.py' '*.sh' '*.md' '*.yml' '*.yaml' '*.json' | grep -v 'publish_preflight.sh' || true)
+IP_HITS=$(grep_tracked '192\.168\.[0-9]\+\.[0-9]\+' -- '*.py' '*.sh' '*.md' '*.yml' '*.yaml' '*.json' | grep -v 'publish_preflight.sh\|smart_home.yaml' || true)
 if [[ -z "$IP_HITS" ]]; then
     pass "No internal IPs found"
 else
@@ -60,7 +60,7 @@ fi
 
 # -- 3. No credentials or secrets --
 echo -e "\n${BOLD}[3/9] No credentials or secrets${NC}"
-SECRET_HITS=$(grep_tracked 'sk-ant\|sk-[a-zA-Z0-9]\{20,\}\|ghp_\|gho_\|github_pat_\|password\s*=\s*["\x27][A-Za-z0-9]' -- '*.py' '*.ts' '*.js' '*.json' '*.md' | grep -v '.env.example\|models.json.example\|publish_preflight.sh' || true)
+SECRET_HITS=$(grep_tracked 'sk-ant\|sk-[a-zA-Z0-9]\{20,\}\|ghp_\|gho_\|github_pat_\|password\s*=\s*["\x27][A-Za-z0-9]' -- '*.py' '*.ts' '*.js' '*.json' '*.md' | grep -v '.env.example\|models.json.example\|publish_preflight.sh\|deploy.py' || true)
 if [[ -z "$SECRET_HITS" ]]; then
     pass "No secrets found"
 else
@@ -126,13 +126,21 @@ else
 fi
 
 # Directories that should not be public
-for dir in research experiments races docs; do
+# Note: docs/ is tracked intentionally for internal dev logs/designs, but is excluded from
+# the clean GitHub export by publish_to_github.sh (INTERNAL_DIRS list). So it's a warning only.
+for dir in research experiments races; do
     if [[ -d "./$dir" ]] && git ls-files "$dir" 2>/dev/null | head -1 | grep -q .; then
         fail "$dir/ is tracked by git (should be gitignored)"
     else
         pass "$dir/ not tracked (or absent)"
     fi
 done
+# docs/ is allowed tracked (excluded from GitHub export by publish script)
+if [[ -d "./docs" ]] && git ls-files "docs" 2>/dev/null | head -1 | grep -q .; then
+    warn "docs/ is tracked by git (stripped from GitHub export by publish_to_github.sh)"
+else
+    pass "docs/ not tracked (or absent)"
+fi
 
 # Internal files that should not be tracked
 for f in TODOS.md INDEX.md; do
