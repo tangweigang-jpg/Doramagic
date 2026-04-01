@@ -2,6 +2,36 @@
 
 All notable changes to Doramagic are documented in this file.
 
+## [13.1.0] - 2026-04-01
+
+### Architecture (BREAKING)
+- Converted skill package from self-contained 215-file / 5.6MB bundle to 12-file / 96KB thin shell
+- Python code now distributed via pip package (`pip install doramagic`) instead of manual copy
+- Knowledge bricks bundled as package_data, discovered via `importlib.resources`
+- Merged `/dora-match` + `/dora-build` into `references/compile-flow.md`
+- Inlined `/dora-status` into main `/dora` router
+- Only `/dora-extract` remains as a standalone sub-skill
+
+### Added
+- `doramagic_product/cli.py`: standalone CLI entry point (`doramagic --version`)
+- `metadata.openclaw.install` in SKILL.md for automatic pip dependency installation
+- `importlib.resources` fallback in `runtime_paths.py` for bricks discovery
+- Platform check for `os.fork()` (Windows not supported for async mode)
+- Path traversal protection in `_build_status_payload` (run_id format validation)
+- MIT-0 LICENSE and `.clawhubignore` in skill package
+
+### Changed
+- `flow_controller.py`: replaced `Path(__file__).parents[2]` hack with standard import
+- `doramagic_product/__init__.py`: lazy import to avoid broken pipeline.py dependency
+- `platform_rules.json`: `exec` moved from `allowed_tools` to `optional_tools`
+- `pyproject.toml`: added hatchling multi-package build config, CLI entry point, optional deps (llm, data)
+
+### Removed
+- `skills/doramagic/packages/` — manual copy no longer needed
+- `skills/doramagic/knowledge/` — bundled in pip package
+- 8 unused scripts (brick_match, community_signals, deploy, etc.)
+- `SKILL-dora-build.md`, `SKILL-dora-match.md`, `SKILL-dora-status.md`
+
 ## [13.0.0] - 2026-03-31
 
 ### Architecture (BREAKING)
