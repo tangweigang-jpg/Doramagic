@@ -160,6 +160,9 @@ def test_all_pass_returns_pass(tmp_path: Path) -> None:
         "Conflict Resolution",
         "License",
         "Dark Trap Scan",
+        "Code Syntax",
+        "Import Feasibility",
+        "Complexity",
     }
 
 
@@ -380,3 +383,53 @@ def test_dark_trap_scan_cron_in_body_is_warning_not_blocking(tmp_path: Path) -> 
     assert dark_trap.severity == "warning"
     # Overall should still be PASS (warning doesn't block)
     assert result.data.status == "PASS"
+
+
+def test_complexity_blocks_oversized_skill(tmp_path: Path) -> None:
+    """A SKILL.md with >80 body lines must trigger a blocking Complexity failure."""
+    bundle = _write_valid_bundle(tmp_path)
+    # Overwrite skill with an excessively long body
+    long_body = "\n".join(f"Line {i}: do something." for i in range(100))
+    Path(bundle.skill_md_path).write_text(
+        "---\n"
+        "skillKey: calorie-tracker\n"
+        "allowed-tools:\n"
+        "  - exec\n"
+        "  - read\n"
+        "  - write\n"
+        "---\n"
+        f"# Oversized Skill\n\n{long_body}\n",
+        encoding="utf-8",
+    )
+
+    result = run_validation(_validation_input(bundle))
+
+    assert result.data is not None
+    complexity = next(c for c in result.data.checks if c.name == "Complexity")
+    assert not complexity.passed
+    assert complexity.severity == "blocking"
+    assert result.data.status == "REVISE"
+
+
+def test_complexity_ignores_headings_in_code_blocks(tmp_path: Path) -> None:
+    """Headings inside fenced code blocks must not be counted."""
+    bundle = _write_valid_bundle(tmp_path)
+    # Skill with many # inside code blocks but few real headings
+    code_block = "```python\n" + "\n".join(f"# comment {i}" for i in range(20)) + "\n```"
+    Path(bundle.skill_md_path).write_text(
+        "---\n"
+        "skillKey: calorie-tracker\n"
+        "allowed-tools:\n"
+        "  - exec\n"
+        "  - read\n"
+        "  - write\n"
+        "---\n"
+        f"# My Skill\n\n## Step 1\n\n{code_block}\n",
+        encoding="utf-8",
+    )
+
+    result = run_validation(_validation_input(bundle))
+
+    assert result.data is not None
+    complexity = next(c for c in result.data.checks if c.name == "Complexity")
+    assert complexity.passed  # code block comments should not inflate heading count

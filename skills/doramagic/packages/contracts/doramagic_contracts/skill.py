@@ -100,6 +100,9 @@ class ValidationCheck(BaseModel):
         "Conflict Resolution",
         "License",
         "Dark Trap Scan",
+        "Code Syntax",
+        "Import Feasibility",
+        "Complexity",
     ]
     passed: bool
     severity: Literal["blocking", "warning"]

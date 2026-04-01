@@ -341,6 +341,183 @@ def _check_dark_trap_scan(skill_md: str, limitations_md: str, readme_md: str) ->
     )
 
 
+def _check_code_syntax(skill_md: str) -> ValidationCheck:
+    """Validate Python code blocks via ast.parse — blocking severity.
+
+    Only true SyntaxErrors are blocking; runtime-trap warnings are informational.
+    """
+    from doramagic_executors.quality_gate import _check_code_health
+
+    _, all_issues = _check_code_health(skill_md)
+    syntax_errors = [e for e in all_issues if not e.startswith("[warn]")]
+    return ValidationCheck(
+        name="Code Syntax",
+        passed=len(syntax_errors) == 0,
+        severity="blocking",
+        details=syntax_errors,
+    )
+
+
+def _check_import_feasibility(skill_md: str) -> ValidationCheck:
+    """Check that imported packages in code blocks are known to be available.
+
+    Uses a whitelist of Python stdlib + common third-party packages available
+    in the OpenClaw runtime. Severity is warning (does not block delivery).
+    """
+    _KNOWN_STDLIB = frozenset(
+        {
+            "abc",
+            "argparse",
+            "ast",
+            "asyncio",
+            "base64",
+            "collections",
+            "contextlib",
+            "copy",
+            "csv",
+            "dataclasses",
+            "datetime",
+            "decimal",
+            "enum",
+            "functools",
+            "glob",
+            "hashlib",
+            "html",
+            "http",
+            "importlib",
+            "inspect",
+            "io",
+            "itertools",
+            "json",
+            "logging",
+            "math",
+            "operator",
+            "os",
+            "pathlib",
+            "pickle",
+            "platform",
+            "pprint",
+            "queue",
+            "random",
+            "re",
+            "secrets",
+            "shutil",
+            "signal",
+            "socket",
+            "sqlite3",
+            "string",
+            "struct",
+            "subprocess",
+            "sys",
+            "tempfile",
+            "textwrap",
+            "threading",
+            "time",
+            "traceback",
+            "typing",
+            "unittest",
+            "urllib",
+            "uuid",
+            "warnings",
+            "xml",
+            "zipfile",
+            "locale",
+            "calendar",
+            "zoneinfo",
+        }
+    )
+    _KNOWN_THIRD_PARTY = frozenset(
+        {
+            "anthropic",
+            "openai",
+            "requests",
+            "httpx",
+            "aiohttp",
+            "pydantic",
+            "yfinance",
+            "telegram",
+            "feedparser",
+            "bs4",
+            "beautifulsoup4",
+            "lxml",
+            "numpy",
+            "pandas",
+            "schedule",
+            "apscheduler",
+            "slack_sdk",
+            "tweepy",
+            "dotenv",
+            "rich",
+            "click",
+            "typer",
+        }
+    )
+    known = _KNOWN_STDLIB | _KNOWN_THIRD_PARTY
+
+    code_blocks = re.findall(r"```python\n(.*?)```", skill_md, re.DOTALL)
+    unknown: list[str] = []
+    for block in code_blocks:
+        for line in block.splitlines():
+            stripped = line.strip()
+            if not (stripped.startswith("import ") or stripped.startswith("from ")):
+                continue
+            m = re.match(r"(?:import|from)\s+([a-zA-Z_][a-zA-Z0-9_]*)", stripped)
+            if m and m.group(1) not in known:
+                unknown.append(m.group(1))
+
+    unique = sorted(set(unknown))
+    return ValidationCheck(
+        name="Import Feasibility",
+        passed=len(unique) == 0,
+        severity="warning",
+        details=[f"Unknown package: {pkg} (not in OpenClaw known packages)" for pkg in unique],
+    )
+
+
+def _check_complexity(body: str) -> ValidationCheck:
+    """Block SKILL.md that is too complex for reliable host-LLM execution.
+
+    Thresholds based on gstack research: successful skills have <=80 body lines
+    and <=6 headings.  Exceeding these increases the chance that the host LLM
+    takes shortcuts and skips critical steps.
+    """
+    MAX_BODY_LINES = 80
+    MAX_HEADINGS = 6
+
+    lines = body.strip().splitlines()
+    body_line_count = len(lines)
+
+    # Count only Markdown headings, excluding # inside fenced code blocks
+    in_code_block = False
+    heading_count = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            continue
+        if not in_code_block and stripped.startswith("#"):
+            heading_count += 1
+
+    issues: list[str] = []
+    if body_line_count > MAX_BODY_LINES:
+        issues.append(
+            f"SKILL.md body has {body_line_count} lines (max {MAX_BODY_LINES}). "
+            "Move domain constraints to references/ or scripts/."
+        )
+    if heading_count > MAX_HEADINGS:
+        issues.append(
+            f"SKILL.md has {heading_count} headings (max {MAX_HEADINGS}). "
+            "Split into multiple single-responsibility skills."
+        )
+
+    return ValidationCheck(
+        name="Complexity",
+        passed=len(issues) == 0,
+        severity="blocking",
+        details=issues,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Revise instruction generator
 # ---------------------------------------------------------------------------
@@ -389,6 +566,11 @@ def _revise_instructions(checks: list[ValidationCheck]) -> list[str]:
                 elif check.name == "Conflict Resolution":
                     instructions.append(
                         "Resolve all conflict markers (<<<<<<, >>>>>>, UNRESOLVED) before delivery."
+                    )
+                elif check.name == "Code Syntax":
+                    instructions.append(
+                        "Fix Python syntax errors in code blocks. "
+                        "Run ast.parse() locally to verify each code block compiles."
                     )
                 else:
                     instructions.append(f"Fix {check.name} issue: {detail}")
@@ -453,6 +635,9 @@ def run_validation(input_data: ValidationInput) -> ModuleResultEnvelope[Validati
         _check_conflict_resolution(skill_content, limitations_content),  # type: ignore[arg-type]
         _check_license(provenance_content),  # type: ignore[arg-type]
         _check_dark_trap_scan(skill_content, limitations_content, readme_content),  # type: ignore[arg-type]
+        _check_code_syntax(skill_content),  # type: ignore[arg-type]
+        _check_import_feasibility(skill_content),  # type: ignore[arg-type]
+        _check_complexity(body),  # type: ignore[arg-type]
     ]
 
     # --- Determine report status ---

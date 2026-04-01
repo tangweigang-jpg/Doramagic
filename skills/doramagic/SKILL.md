@@ -1,11 +1,16 @@
 ---
 name: dora
 description: >
-  Your AI Doraemon — describe a problem, get a working tool forged from 10,000+
-  knowledge bricks. Use when: "help me build", "I need a tool", "dora", "doramagic"
-version: 13.1.0
+  Doramagic: 你的 AI 哆啦A梦 — 说出需求，从 10,000+ 知识砖块中锻造可用工具。
+  Triggers on: "dora", "doramagic", "帮我做", "我需要一个", "帮我生成".
+version: 13.2.0
 user-invocable: true
 license: MIT-0
+tags: [doramagic, knowledge-extraction, skill-generation, tool-forge]
+hooks:
+  PreToolUse:
+    - matcher: "Write"
+      command: "bash {baseDir}/scripts/check-bricks-matched.sh"
 metadata:
   openclaw:
     emoji: "🪄"
@@ -13,57 +18,49 @@ metadata:
     category: builder
     requires:
       bins: [python3, git]
-    install:
-      - kind: uv
-        package: "doramagic @ git+https://github.com/tangweigang-jpg/Doramagic.git@v13.1.0"
-        bins: [doramagic]
 ---
 
-# Doramagic — Router
+# Doramagic — Tool Forge
 
-IRON LAW: DO NOT START WORKING WITHOUT CLARIFYING THE REQUIREMENT FIRST.
-Complete Socratic dialogue and get user confirmation before routing.
+IRON LAW: 先运行编译器，再交付。绝不跳过积木匹配直接生成代码。
 
 ---
 
-## Step 1: Detect Intent
+## Step 1: Run the Compiler
 
-| User Input | Intent | Action |
-|------------|--------|--------|
-| Contains `github.com/` URL | Extract | Route to `/dora-extract` |
-| Contains "extract soul" / "提取灵魂" | Extract | Route to `/dora-extract` |
-| `/dora-status` | Status | Run status query (Step 4) |
-| Everything else | Compile | Proceed to Step 2 |
-
-## Step 2: Socratic Dialogue (Compile intent only)
-
-- Max 2 questions per round, multiple choice only
-- Technical specifics present → skip to confirmation
-- Everyday language → 2-3 rounds of guiding questions
-
-Confirm: "I understand you need: [requirement]. Correct?" Wait for confirmation.
-
-## Step 3: Route (Compile)
+Tell the user: "正在从 10,000+ 知识砖块中匹配你的需求..."
 
 ```bash
-mkdir -p ~/.doramagic/sessions
-cat > ~/.doramagic/sessions/latest.json << 'EOF'
-{"requirement": "{confirmed requirement}", "phase": "clarified"}
-EOF
+python3 {baseDir}/scripts/doramagic_main.py --input "{user_request}" --run-dir ~/clawd/doramagic/runs/
 ```
 
-Read `references/compile-flow.md` and follow the Match → Build flow.
+The script handles everything automatically:
+- Socratic dialogue (requirement clarification)
+- Brick matching (knowledge base lookup)
+- Constraint injection
+- Code generation with quality gates
 
-## Step 4: Status Query
+If the script returns `"needs_clarification": true`, show the questions to the user and wait for answers. Then resume:
 
 ```bash
-python3 {baseDir}/scripts/doramagic_main.py --input "/dora-status" --run-dir ~/.doramagic/runs/
+python3 {baseDir}/scripts/doramagic_main.py --continue {run_id} --input "{user_answer}" --run-dir ~/clawd/doramagic/runs/
 ```
 
-Show `message` to user. Do NOT modify anything.
+## Step 2: Deliver Results
+
+Show the `message` field from the script output to the user. Do not rewrite or paraphrase it.
+
+If the output includes code, present it with:
+1. What the tool does (1-2 sentences)
+2. The code
+3. How to save and run
+4. Required environment variables
+
+If the output is a dialogue protocol (learning/practice), start the session immediately.
 
 ## Rules
 
-- Respond in user's language. Never show JSON or code.
-- Do NOT skip Socratic dialogue. Do NOT list options — make recommendations.
-- Delegate: bricks → compile-flow, extraction → /dora-extract, status → Step 4.
+- Reply in the user's language
+- Do NOT generate code yourself — always use the compiler output
+- Do NOT skip Step 1 — the hook will block you if you try
+- Do NOT call /dora-extract from here (that's a separate skill)
