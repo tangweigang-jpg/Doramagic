@@ -28,7 +28,7 @@ export ANTHROPIC_API_KEY="your-key"
 
 ### Direct Stitch (no project needed)
 
-Doramagic v13.1.0 can generate skills directly from its expanded knowledge library:
+Doramagic v13.3.1 can generate skills directly from its expanded knowledge library:
 
 ```bash
 /dora Build a Telegram bot that monitors crypto prices with alerts
@@ -171,7 +171,7 @@ Doramagic supports 4 input types, each routed deterministically:
 | Domain Exploration | `/dora What design wisdom can I learn from PKM projects?` | Multi-project discovery + extraction |
 | Clarification | `/dora I need something for my team` | Asks clarifying questions first |
 
-## Key Features (v13.1.0)
+## Key Features (v13.3.1)
 
 - **Deterministic Routing DAG** -- 4 input paths with conditional edges
 - **Fan-out Extraction** -- Up to 3 isolated RepoWorkers in parallel
