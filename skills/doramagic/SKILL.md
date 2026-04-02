@@ -3,7 +3,7 @@ name: dora
 description: >
   Doramagic: 你的 AI 哆啦A梦 — 说出需求，从 10,000+ 知识砖块中锻造可用工具。
   Triggers on: "dora", "doramagic", "帮我做", "我需要一个", "帮我生成".
-version: 13.3.1
+version: 13.3.2
 user-invocable: true
 license: MIT-0
 tags: [doramagic, knowledge-extraction, skill-generation, tool-forge]

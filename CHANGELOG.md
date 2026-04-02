@@ -2,6 +2,11 @@
 
 All notable changes to Doramagic are documented in this file.
 
+## [13.3.2] - 2026-04-02
+
+### Fixed
+- Remove `exec` from `platform_rules.json` allowed_tools — fixes Telegram exec approval timeout
+
 ## [13.3.1] - 2026-04-02
 
 ### Architecture (BREAKING)
