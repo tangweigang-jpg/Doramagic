@@ -2,6 +2,40 @@
 
 All notable changes to Doramagic are documented in this file.
 
+## [13.3.1] - 2026-04-02
+
+### Architecture (BREAKING)
+- Removed exec dependency from `/dora` skill — now pure prompt + tool-use (Read/Write only)
+- Replaced 4-scaffold external file pattern with inline template embedded in SKILL.md
+- Skill no longer requires `python3` or `git` binaries on host
+- Generated output: single SKILL.md file (was 4 separate files)
+
+### Added
+- `references/brick-catalog.md`: 50-domain catalog for LLM domain selection
+- `references/bricks/*.md`: enriched summaries with PATTERNS + RATIONALE sections (was failure-only)
+- `references/scaffold-tool.md`: standalone scaffold for file generation
+- `scripts/dev/generate_brick_summaries.py`: summary generation tool
+- Inline output template in SKILL.md — eliminates external scaffold read failure
+- Graceful degradation: if write fails, content displayed directly to user
+
+### Changed
+- `SKILL.md`: complete rewrite — 73 lines, 3-step flow (select → read → generate)
+- `flow_controller.py`: added `phase_gate` parameter + `resume()` method for async split
+- `doramagic_main.py`: async mode now runs PHASE_A sync then forks (fixes clarification compatibility)
+- `quality_gate.py`: fixed `self._bus` → `self._event_bus` (Codex-discovered bug)
+- Brick summaries expanded from 13 lines (failure/constraint only) to 23 lines (+ patterns/rationale)
+
+### Removed
+- `hooks.PreToolUse` in SKILL.md (was exec-dependent)
+- `requires.bins: [python3, git]` from SKILL.md metadata
+- `SKILL-dora-build.md`, `SKILL-dora-match.md`, `SKILL-dora-status.md` (exec-dependent sub-skills)
+
+### Fixed
+- `{baseDir}` not interpolated in SKILL.md body — switched to absolute paths
+- `read` tool resolves relative to workspace root, not skill dir — now uses `~/.openclaw/workspace/skills/dora/`
+- Sonnet fabricating domain names — explicit "only use catalog domains" instruction
+- exec `mkdir -p` blocked by approval — write tool auto-creates directories
+
 ## [13.1.0] - 2026-04-01
 
 ### Architecture (BREAKING)

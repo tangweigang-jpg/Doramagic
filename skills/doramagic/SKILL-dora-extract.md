@@ -3,7 +3,7 @@ name: dora-extract
 description: >
   Extract the "soul" of a GitHub project — design philosophy, failure patterns,
   and community wisdom. Use when given a GitHub URL or asked to "extract soul".
-version: 13.1.0
+version: 13.3.1
 user-invocable: true
 license: MIT-0
 metadata:
