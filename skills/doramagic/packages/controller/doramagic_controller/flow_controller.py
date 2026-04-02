@@ -91,7 +91,18 @@ class FlowController:
         self._run_log: list[dict[str, Any]] = []
         self._capability_router = build_capability_router()
 
-    async def run(self, user_input: str = "", resume_run_id: str | None = None) -> ControllerState:
+    async def run(
+        self,
+        user_input: str = "",
+        resume_run_id: str | None = None,
+        phase_gate: Phase | None = None,
+    ) -> ControllerState:
+        """Run the pipeline.
+
+        Args:
+            phase_gate: If set, pause after this phase completes (state is saved).
+                        Caller can later call ``resume()`` to continue.
+        """
         if resume_run_id:
             self._state = load_state(self._run_dir)
             if self._state is None:
@@ -114,18 +125,29 @@ class FlowController:
         if not resume_run_id:
             await self._progress(status="started", message=build_plan_preview())
 
-        while self._state.phase not in (
-            Phase.DONE,
-            Phase.DEGRADED,
-            Phase.ERROR,
-            Phase.PHASE_A_CLARIFY,
-        ):
+        await self._run_loop(phase_gate=phase_gate)
+        return self._state
+
+    async def resume(self) -> ControllerState:
+        """Continue pipeline from the current in-memory state (after a phase_gate pause)."""
+        await self._run_loop()
+        return self._state
+
+    async def _run_loop(self, phase_gate: Phase | None = None) -> None:
+        terminal = {Phase.DONE, Phase.DEGRADED, Phase.ERROR, Phase.PHASE_A_CLARIFY}
+
+        while self._state.phase not in terminal:
             current = self._state.phase
             await self._step()
             if self._state.phase == current:
                 self._state.phase = Phase.ERROR
                 self._state.degradation_log.append(f"Phase stuck at {current.value}")
                 break
+            # Phase completed — check gate
+            if phase_gate and current == phase_gate and self._state.phase not in terminal:
+                save_state(self._state, self._run_dir)
+                write_run_log(self._run_log, self._run_dir)
+                return
 
         save_state(self._state, self._run_dir)
         write_run_log(self._run_log, self._run_dir)
@@ -139,7 +161,6 @@ class FlowController:
             )
         elif self._state.phase == Phase.ERROR:
             self._emit("run_failed", "run failed", status="error")
-        return self._state
 
     # ------------------------------------------------------------------
     # Phase execution
@@ -285,6 +306,53 @@ class FlowController:
             )
         if coverage:
             self._state.phase_artifacts["brick_coverage"] = coverage
+
+        # --- Brick Stitch quality preflight (P0-2) ---
+        if skill_text:
+            from doramagic_executors.quality_gate import score_quality
+
+            pre_score = score_quality(skill_text)
+            self._state.phase_artifacts["brick_stitch_quality"] = {
+                "total": pre_score["total"],
+                "code_health": pre_score.get("code_health", 100.0),
+                "code_errors": pre_score.get("code_errors", []),
+            }
+            self._event_bus.emit(
+                "brick_stitch_preflight",
+                f"BrickStitch preflight score: {pre_score['total']:.1f}/100",
+                phase="BRICK_STITCH",
+                meta={
+                    "total": pre_score["total"],
+                    "code_errors": pre_score.get("code_errors", []),
+                },
+            )
+            if pre_score["total"] < 40:
+                self._enter_degraded(
+                    f"BrickStitch quality pre-check failed: {pre_score['total']:.1f}/100",
+                    "draft_skill",
+                )
+                return
+
+        # Supply synthesis_bundle stub for Validator consumption
+        self._state.phase_artifacts.setdefault(
+            "synthesis_bundle",
+            {
+                "consensus": [],
+                "conflicts": [],
+                "unique_knowledge": [],
+                "selected_knowledge": [],
+                "excluded_knowledge": [],
+                "open_questions": [],
+                "compile_ready": True,
+                "global_theses": [],
+                "common_why": [],
+                "divergences": [],
+                "source_provenance_matrix": {},
+                "unknowns": [],
+                "compile_brief_by_section": {},
+                "brick_stitch_mode": True,
+            },
+        )
 
         self._transition(Phase.PHASE_F)
 

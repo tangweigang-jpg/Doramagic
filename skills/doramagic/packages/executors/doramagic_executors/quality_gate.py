@@ -1,17 +1,23 @@
-"""Quality gate -- 5-dimension scoring 5-dimension scoring for skill quality assessment.
+"""Quality gate -- 6-dimension scoring for skill quality assessment.
 
 Dimensions (100-point scale):
-  Coverage    (30%) -- required sections present, workflow depth, anti-pattern depth
-  Evidence    (25%) -- evidence markers, attribution in knowledge section
-  DSD Health  (20%) -- specific vs generic language ratio
-  WHY Density (15%) -- ratio of sentences containing causal reasoning
-  Substance   (10%) -- vocabulary richness, minimum length
+  Coverage     (27%) -- required sections present, workflow depth, anti-pattern depth
+  Evidence     (23%) -- evidence markers, attribution in knowledge section
+  DSD Health   (18%) -- specific vs generic language ratio
+  Code Health  (12%) -- Python syntax validity, runtime trap detection
+  WHY Density  (12%) -- ratio of sentences containing causal reasoning
+  Substance    (8%)  -- vocabulary richness, minimum length
 
 Pass threshold: 60 points.
+
+v13.2 changes (2026-04-01):
+  - Added Code Health dimension (P0-1 of Eval-Driven Quality Improvement)
+  - Adjusted weights to accommodate new dimension
 """
 
 from __future__ import annotations
 
+import ast as _ast
 import re
 
 _REQUIRED_HEADINGS = [
@@ -27,6 +33,54 @@ _WHY_RE = re.compile(
 _GENERIC_RE = re.compile(
     r"\b(best practice|industry standard|scalable solution|robust system)\b", re.I
 )
+
+# --- Code Health helpers ---
+_SKIP_MARKERS = frozenset({"# pseudocode", "# example", "# conceptual", "# 伪代码", "# 示例"})
+
+
+def _check_code_health(skill_md: str) -> tuple[float, list[str]]:
+    """Parse all ```python code blocks in SKILL.md and return (score 0-100, error_list).
+
+    Rules:
+    - No python blocks → (100.0, [])  (don't penalise pure-doc skills)
+    - Blocks starting with a skip marker comment are skipped
+    - Each SyntaxError: -25 points (min 0)
+    - Common runtime traps detected via heuristics: -10 points each
+    """
+    code_blocks = re.findall(r"```python\n(.*?)```", skill_md, re.DOTALL)
+    if not code_blocks:
+        return 100.0, []
+
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    for i, block in enumerate(code_blocks):
+        first_line = block.strip().split("\n")[0].strip().lower() if block.strip() else ""
+        if first_line in _SKIP_MARKERS:
+            continue
+
+        # 1. AST syntax check
+        try:
+            _ast.parse(block)
+        except SyntaxError as e:
+            errors.append(f"block_{i + 1}:L{e.lineno}: SyntaxError: {e.msg}")
+            continue
+
+        # 2. Common runtime trap heuristics
+        if re.search(r"\.replace\(\s*day\s*=\s*\w+\.day\s*\+\s*1\s*\)", block):
+            warnings.append(f"block_{i + 1}: month-end date overflow risk (day+1 crashes on 31st)")
+        if re.search(r"market_close\s*=\s*(2[4-9]|[3-9]\d)", block):
+            warnings.append(f"block_{i + 1}: market-hours constant exceeds 23 (max hour value)")
+        if re.search(r"timezone\s*=\s*timezone\.utc", block) and re.search(
+            r"(?:HOUR|hour|Hour)\s*=\s*[5-9]\b", block
+        ):
+            warnings.append(
+                f"block_{i + 1}: UTC timezone with local-time hour reference — may need conversion"
+            )
+
+    penalty = len(errors) * 25.0 + len(warnings) * 15.0
+    score = max(0.0, 100.0 - penalty)
+    return score, errors + [f"[warn] {w}" for w in warnings]
 
 
 def score_quality(skill_md: str) -> dict:
@@ -113,9 +167,18 @@ def score_quality(skill_md: str) -> dict:
         sub_raw -= 20
     sub_raw = max(0, min(100, sub_raw))
 
-    # --- Total ---
+    # --- Code Health (12%) ---
+    code_raw, code_errors = _check_code_health(skill_md)
+
+    # --- Total (6 dimensions) ---
     total = round(
-        cov_raw * 0.30 + ev_raw * 0.25 + dsd_raw * 0.20 + why_raw * 0.15 + sub_raw * 0.10, 1
+        cov_raw * 0.27
+        + ev_raw * 0.23
+        + dsd_raw * 0.18
+        + code_raw * 0.12
+        + why_raw * 0.12
+        + sub_raw * 0.08,
+        1,
     )
 
     if present < 3:
@@ -126,6 +189,7 @@ def score_quality(skill_md: str) -> dict:
         "coverage": round(cov_raw, 1),
         "evidence": round(ev_raw, 1),
         "dsd_health": round(dsd_raw, 1),
+        "code_health": round(code_raw, 1),
         "why_density": round(why_raw, 1),
         "substance": round(sub_raw, 1),
     }
@@ -146,6 +210,7 @@ def score_quality(skill_md: str) -> dict:
         "weakest_dimension": min(dimension_scores, key=dimension_scores.get),
         "repair_plan": repair_plan,
         "repairable": repairable,
+        "code_errors": code_errors,
         **dimension_scores,
     }
 
@@ -160,6 +225,7 @@ def _map_weakest_to_section(scores: dict[str, float]) -> str | None:
         "coverage": "workflow",
         "evidence": "knowledge",
         "dsd_health": "role",
+        "code_health": "workflow",
         "why_density": "knowledge",
         "substance": "knowledge",
     }

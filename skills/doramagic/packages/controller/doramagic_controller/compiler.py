@@ -28,7 +28,8 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 # 最多匹配的积木数量
-_MAX_BRICKS = 5
+# v13.2: 从 5 提升到 15，覆盖多领域需求（单需求通常涉及 3-4 个积木类别）
+_MAX_BRICKS = 15
 
 # 沙箱验证超时（秒）
 _SYNTAX_CHECK_TIMEOUT = 5
@@ -240,7 +241,7 @@ class PersonalizationCompiler:
 
         # Step 3: 匹配积木
         _emit("正在从知识库匹配相关积木...", 0.30)
-        bricks = self._match_bricks(intent)
+        bricks = await self._match_bricks(intent, user_input=user_input)
         matched_brick_ids = [b.id for b in bricks]
         logger.info("匹配积木 %d 个：%s", len(bricks), matched_brick_ids)
 
@@ -512,46 +513,183 @@ class PersonalizationCompiler:
     # Step 3: 匹配积木
     # -------------------------------------------------------------------------
 
-    def _match_bricks(self, intent: dict[str, Any]) -> list[Any]:
-        """匹配相关积木。
+    # knowledge_type → priority (lower = more important)
+    _TYPE_PRIORITY: dict[str, int] = {  # noqa: RUF012
+        "failure": 0,
+        "constraint": 1,
+        "rationale": 2,
+        "assembly_pattern": 3,
+        "pattern": 3,
+        "procedure": 3,
+        "capability": 4,
+        "interface": 5,
+    }
 
-        结合关键词全文搜索和能力类型过滤，合并去重，最多返回 _MAX_BRICKS 个。
+    # 中文→英文高频同义词表（与 brick_injection 框架映射对齐）
+    _SYNONYM_MAP: dict[str, list[str]] = {  # noqa: RUF012
+        "监控": ["monitor", "watch", "poll"],
+        "股票": ["stock", "equity", "financial_trading"],
+        "通知": ["notify", "alert", "messaging_integration"],
+        "加密货币": ["crypto", "coin", "financial_trading"],
+        "可观测性": ["observability", "langfuse", "logging"],
+        "数据库": ["database", "sql", "sqlalchemy", "django"],
+        "认证": ["auth", "oauth", "security_auth"],
+        "爬虫": ["crawler", "scraper", "web_browsing"],
+        "定时": ["cron", "schedule", "periodic"],
+        "部署": ["deploy", "cicd", "cicd_devops"],
+        "邮件": ["email", "mail", "email_automation"],
+        "学习": ["learning", "education", "education_learning"],
+        "英语": ["english", "language", "education_learning"],
+        "天气": ["weather", "forecast", "api_integration"],
+        "日报": ["briefing", "digest", "info_aggregation"],
+        "笔记": ["note", "obsidian", "obsidian_logseq", "domain_pkm"],
+    }
+
+    async def _match_bricks(self, intent: dict[str, Any], user_input: str = "") -> list[Any]:
+        """匹配相关积木 — 三通道粗召回 + 融合精排 + 同域限流。
+
+        通道 1: FTS5 关键词搜索（+ 同义词扩展）
+        通道 2: 能力类型过滤
+        通道 3: LLM 语义类别匹配（条件触发：候选<8 或域多样性<2）
+
+        v13.2 changes:
+          - 复用 BrickStitcher 的 match_brick_categories（P0-1）
+          - 双闸门成本控制：仅在召回不足时触发 LLM
+          - 同义词扩展提升跨语言召回
+          - 同域 diversity cap 防止单域霸占名额
 
         Args:
             intent: 解析后的意图字典。
+            user_input: 原始用户输入文本（用于语义匹配）。
 
         Returns:
-            按相关性排序的 BrickV2 列表。
+            按质量排序的 BrickV2 列表（failure 优先，跨域均衡）。
         """
+        from collections import defaultdict
+
         capability_type: str = intent.get("capability_type", "")
         data_source: str | None = intent.get("data_source")
         keywords: list[str] = intent.get("keywords", [])
 
         seen_ids: set[str] = set()
-        results: list[Any] = []
+        candidates: list[Any] = []
 
         def _add(bricks: list[Any]) -> None:
             for b in bricks:
-                if b.id not in seen_ids and len(results) < _MAX_BRICKS:
+                if b.id not in seen_ids:
                     seen_ids.add(b.id)
-                    results.append(b)
+                    candidates.append(b)
 
-        # 1. 关键词全文搜索（每个关键词单独搜索，取前 3 个）
-        for kw in keywords[:4]:
+        # --- 同义词扩展 ---
+        expanded_kw: list[str] = []
+        seen_kw: set[str] = set()
+        for kw in keywords:
+            if kw not in seen_kw:
+                seen_kw.add(kw)
+                expanded_kw.append(kw)
+            kw_lower = kw.lower()
+            for trigger, syns in self._SYNONYM_MAP.items():
+                if trigger in kw_lower or kw_lower in trigger:
+                    for s in syns:
+                        if s not in seen_kw:
+                            seen_kw.add(s)
+                            expanded_kw.append(s)
+
+        # --- 通道 1: FTS5 关键词搜索（扩展后） ---
+        lexical_hits = 0
+        for kw in expanded_kw[:10]:
             try:
-                _add(self.brick_store.search(kw, limit=3))
+                found = self.brick_store.search(kw, limit=5)
+                _add(found)
+                lexical_hits += len(found)
             except Exception as e:
                 logger.debug("关键词搜索失败（%s）：%s", kw, e)
 
-        # 2. 能力类型过滤
-        if capability_type and len(results) < _MAX_BRICKS:
+        # --- 通道 2: 能力类型过滤 ---
+        if capability_type:
             try:
                 cap_bricks = self.brick_store.search_by_capability(capability_type, data_source)
                 _add(cap_bricks)
             except Exception as e:
                 logger.debug("能力类型搜索失败：%s", e)
 
-        return results
+        # --- 通道 3: LLM 语义类别匹配（双闸门触发） ---
+        semantic_hits = 0
+        categories_seen = {
+            (getattr(b, "category", None) or ["unknown"])[0]
+            if isinstance(getattr(b, "category", None), list)
+            else getattr(b, "domain_id", "unknown")
+            for b in candidates
+        }
+        # 双闸门：候选不足 OR (域少于 2 且候选也不多)
+        # 修复 Codex review: 单域但候选充足时不触发（避免过度调用）
+        gate_open = len(candidates) < 8 or (len(categories_seen) < 2 and len(candidates) < 12)
+
+        if gate_open and self.llm_adapter is not None and user_input:
+            try:
+                from doramagic_executors.brick_stitcher import (
+                    match_brick_categories,
+                )
+
+                # NOTE: match_brick_categories uses adapter.chat() (sync)
+                # internally. In single-compile mode this is fine, but for
+                # concurrent compilation it should be refactored to use
+                # adapter.generate() (async). See Codex review P1.
+                cat_matches = await match_brick_categories(
+                    intent=user_input,
+                    domain=capability_type or "general",
+                    adapter=self.llm_adapter,
+                )
+                for cm in cat_matches:
+                    if cm.relevance >= 5:
+                        try:
+                            sem_bricks = self.brick_store.search(cm.domain_id, limit=4)
+                            _add(sem_bricks)
+                            semantic_hits += len(sem_bricks)
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.debug("语义类别匹配失败：%s", e)
+
+        # --- 融合精排: type_priority 排序 ---
+        candidates.sort(
+            key=lambda b: self._TYPE_PRIORITY.get(getattr(b, "knowledge_type", None) or "", 99)
+        )
+
+        # --- 同域 diversity cap + failure 配额 ---
+        # 修复 Codex review: failure 也有配额（每域最多 2 个），
+        # 防止大量 failure 砖块挤掉可执行约束
+        per_domain: dict[str, int] = defaultdict(int)
+        failure_per_domain: dict[str, int] = defaultdict(int)
+        selected: list[Any] = []
+        for b in candidates:
+            domain = (
+                (getattr(b, "category", None) or ["unknown"])[0]
+                if isinstance(getattr(b, "category", None), list)
+                else getattr(b, "domain_id", "unknown")
+            )
+            kt = getattr(b, "knowledge_type", "") or ""
+            if kt == "failure":
+                if failure_per_domain[domain] >= 2:
+                    continue
+                failure_per_domain[domain] += 1
+            elif per_domain[domain] >= 3:
+                continue
+            selected.append(b)
+            per_domain[domain] += 1
+            if len(selected) >= _MAX_BRICKS:
+                break
+
+        logger.info(
+            "brick_match_metrics lexical=%d semantic=%d domains=%d gate=%s total=%d",
+            lexical_hits,
+            semantic_hits,
+            len(per_domain),
+            "open" if gate_open else "closed",
+            len(selected),
+        )
+
+        return selected
 
     # -------------------------------------------------------------------------
     # Step 4: 构建约束 prompt
@@ -564,15 +702,37 @@ class PersonalizationCompiler:
     ) -> tuple[str, int]:
         """将积木约束 + 用户画像合并为 system prompt 文本。
 
+        v13.2 changes:
+          - failure 类型砖块前置 CRITICAL 标签
+          - 约束按优先级分段：CRITICAL → IMPORTANT → REFERENCE
+
         Args:
-            bricks: 匹配到的 BrickV2 列表。
+            bricks: 匹配到的 BrickV2 列表（已按 knowledge_type 排序）。
             user_profile: 用户画像字典。
 
         Returns:
             (约束文本, 注入的约束条数) 元组。
         """
-        brick_ids = [b.id for b in bricks]
-        constraint_text = self.brick_store.to_prompt_constraints(brick_ids)
+        # 分层构建约束：failure 标注为 CRITICAL
+        critical_ids = [
+            b.id for b in bricks if getattr(b, "knowledge_type", None) in ("failure", "constraint")
+        ]
+        other_ids = [b.id for b in bricks if b.id not in set(critical_ids)]
+
+        sections: list[str] = []
+        if critical_ids:
+            critical_text = self.brick_store.to_prompt_constraints(critical_ids)
+            header = "⚠️ 【CRITICAL — 必须遵守，违反会导致运行时错误】"
+            sections.append(header + "\n" + critical_text)
+        if other_ids:
+            other_text = self.brick_store.to_prompt_constraints(other_ids)
+            sections.append("【REFERENCE — 最佳实践建议】\n" + other_text)
+
+        if sections:
+            constraint_text = "\n\n".join(sections)
+        else:
+            all_ids = [b.id for b in bricks]
+            constraint_text = self.brick_store.to_prompt_constraints(all_ids)
 
         # 统计约束条数（每行以 "- " 开头视为一条约束）
         constraint_count = sum(
@@ -592,6 +752,20 @@ class PersonalizationCompiler:
             personal_lines.append("- 代码风格简洁，添加充分的中文注释，方便初学者理解")
         if not profile_dict.get("preferred_tools"):
             personal_lines.append("- 尽量减少第三方依赖，优先使用标准库")
+
+        # v1.2: 注入 UserContext 环境信息
+        user_ctx = profile_dict.get("user_context") or {}
+        if isinstance(user_ctx, dict):
+            if user_ctx.get("timezone"):
+                personal_lines.append(
+                    f"- 用户时区: {user_ctx['timezone']}，所有定时功能和时间显示使用此时区"
+                )
+            if user_ctx.get("location_hint"):
+                personal_lines.append(
+                    f"- 用户位置: {user_ctx['location_hint']}，天气/地理相关功能使用此位置"
+                )
+            if user_ctx.get("locale"):
+                personal_lines.append(f"- 用户语言区域: {user_ctx['locale']}")
 
         if personal_lines:
             personal_section = "\n【个性化约束】\n" + "\n".join(personal_lines)

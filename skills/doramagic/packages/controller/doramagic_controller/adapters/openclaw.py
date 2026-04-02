@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 from doramagic_contracts.adapter import ClarificationRequest, ProgressUpdate
+from doramagic_contracts.base import UserContext
 from doramagic_contracts.skill import PlatformRules
 
 
@@ -92,6 +93,31 @@ class OpenClawAdapter:
                     storage_prefix="~/clawd/",
                 )
         return self._platform_rules
+
+    def infer_user_context(self) -> UserContext:
+        """Infer user context from system environment.
+
+        Fields that cannot be determined are left as None.
+        """
+        import locale as _locale
+        import platform as _platform
+        from datetime import datetime
+
+        try:
+            tz_name = str(datetime.now().astimezone().tzinfo)
+        except Exception:
+            tz_name = None
+
+        try:
+            loc = _locale.getdefaultlocale()[0]
+        except Exception:
+            loc = None
+
+        return UserContext(
+            timezone=tz_name,
+            locale=loc,
+            os_platform=_platform.system().lower(),
+        )
 
     def get_concurrency_limit(self) -> int:
         return 3  # OpenClaw max 5 agents, controller=1, reserve 1 for Agent Loop

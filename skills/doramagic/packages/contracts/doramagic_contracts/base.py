@@ -61,10 +61,28 @@ class SearchDirection(BaseModel):
     priority: Priority
 
 
+class UserContext(BaseModel):
+    """用户运行环境上下文 — 由平台适配器注入，SkillCompiler 消费。
+
+    v1 设计原则：所有字段 Optional，零破坏性，平台不支持的字段留 None。
+    """
+
+    schema_version: str = "dm.user-context.v1"
+    timezone: str | None = None  # IANA format, e.g. "Asia/Bangkok"
+    locale: str | None = None  # BCP-47, e.g. "zh-CN"
+    location_hint: str | None = None  # natural language, e.g. "Chiang Mai, Thailand"
+    os_platform: str | None = None  # "darwin" / "linux" / "win32"
+    preferred_language: str | None = None  # "python" / "typescript" / "bash"
+    technical_level: str | None = None  # "beginner" / "intermediate" / "expert"
+    time_budget_minutes: int | None = None
+    preferences: dict[str, str] = {}
+
+
 class NeedProfile(BaseModel):
     """用户需求结构化表示 — Phase A 输出，驱动整个管线。
 
     v1.1: 新增 LLM 生成的搜索优化字段（Optional，向后兼容）。
+    v1.2: 新增 user_context（平台适配器注入）。
     """
 
     schema_version: str = "dm.need-profile.v1"
@@ -82,6 +100,8 @@ class NeedProfile(BaseModel):
     confidence: float = Field(default=0.8, ge=0, le=1)
     questions: list[str] = []
     max_projects: int = Field(default=3, ge=1, le=3)
+    # v1.2: user runtime context (injected by platform adapter)
+    user_context: UserContext | None = None
 
 
 class RoutingDecision(BaseModel):
