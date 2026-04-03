@@ -85,6 +85,10 @@ class CrystalSection(StrEnum):
     ARCHITECTURE = "architecture"
     PROTOCOLS = "protocols"
     EVIDENCE = "evidence"
+    # v1.2 三段式配方
+    CODE_SKELETON = "code_skeleton"
+    HARD_CONSTRAINTS = "hard_constraints"
+    ACCEPTANCE_CRITERIA = "acceptance_criteria"
 
 
 class RelationType(StrEnum):
