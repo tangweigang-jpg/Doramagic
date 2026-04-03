@@ -74,14 +74,26 @@ async def auto_link(
         max_tokens=500,
     )
 
+    # 有效的候选 ID 集合（用于校验 LLM 输出）
+    valid_ids = {c.id for c in candidates}
+
     try:
         result = parse_llm_json(response.content)
         relations = []
         for r in result.get("relations", []):
+            target_id = r["target_id"]
+            # 校验 target_id 存在于候选列表（LLM 可能幻觉不存在的 ID）
+            if target_id not in valid_ids:
+                logger.warning(
+                    "跳过幻觉 target_id: %s (judgment=%s)",
+                    target_id,
+                    new_judgment.id,
+                )
+                continue
             relations.append(
                 Relation(
                     type=RelationType(r["type"]),
-                    target_id=r["target_id"],
+                    target_id=target_id,
                     description=r["description"],
                 )
             )

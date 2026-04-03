@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from doramagic_judgment_schema.types import (
     ConsensusLevel,
@@ -167,8 +168,10 @@ async def extract_judgments(
 
             scope_level = CATEGORY_TO_SCOPE.get(category, ScopeLevel.DOMAIN)
 
+            # 用时间戳前缀避免跨运行 ID 碰撞
+            run_ts = int(time.time()) % 100000
             judgment = Judgment(
-                id=f"{domain}-{layer_initial}-{id_counter + i:03d}",
+                id=f"{domain}-{layer_initial}-{run_ts}{id_counter + i:03d}",
                 core=JudgmentCore(
                     when=raw_item.get("when", ""),
                     modality=Modality(raw_item.get("modality", "should")),

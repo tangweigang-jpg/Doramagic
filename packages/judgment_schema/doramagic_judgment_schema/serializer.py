@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
+import logging
+import os
 from pathlib import Path
 
 from .types import Judgment, Relation
+
+logger = logging.getLogger(__name__)
 
 
 class JudgmentStore:
@@ -26,25 +31,36 @@ class JudgmentStore:
     def _load_all(self) -> None:
         """从 JSONL 文件加载所有判断到内存。"""
         for jsonl_file in self.domains_dir.glob("*.jsonl"):
-            for line in jsonl_file.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                judgment = Judgment.model_validate_json(line)
-                self._index(judgment)
+            self._load_file(jsonl_file)
 
         # 加载 universal
         universal_path = self.base_path / "universal.jsonl"
         if universal_path.exists():
-            for line in universal_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
+            self._load_file(universal_path)
+
+    def _load_file(self, path: Path) -> None:
+        """加载单个 JSONL 文件，跳过损坏行。"""
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
                 judgment = Judgment.model_validate_json(line)
                 self._index(judgment)
+            except Exception:
+                logger.warning("跳过损坏的 JSONL 行: %s:%d", path, i)
 
     def _index(self, judgment: Judgment) -> None:
-        """将判断加入内存索引。"""
+        """将判断加入内存索引。防止重复 ID 污染 domain_index。"""
+        is_update = judgment.id in self._judgments
+        if is_update:
+            # 清理旧的 domain_index 条目
+            old = self._judgments[judgment.id]
+            for domain in old.scope.domains:
+                id_list = self._domain_index.get(domain, [])
+                if judgment.id in id_list:
+                    id_list.remove(judgment.id)
+
         self._judgments[judgment.id] = judgment
         for domain in judgment.scope.domains:
             self._domain_index.setdefault(domain, []).append(judgment.id)
@@ -86,7 +102,7 @@ class JudgmentStore:
         return result
 
     def store(self, judgment: Judgment) -> None:
-        """写入一颗判断。追加到对应的 JSONL 文件 + 更新内存索引。"""
+        """写入一颗判断。原子追加到 JSONL 文件 + 更新内存索引。"""
         # 幂等：content_hash 查重
         for existing in self._judgments.values():
             if existing.hash == judgment.hash and existing.id != judgment.id:
@@ -99,10 +115,17 @@ class JudgmentStore:
         else:
             file_path = self.domains_dir / f"{primary_domain}.jsonl"
 
-        # 追加写入
+        # 原子追加写入：file locking + fsync
         file_path.parent.mkdir(parents=True, exist_ok=True)
+        data = judgment.model_dump_json(exclude_none=True) + "\n"
         with open(file_path, "a", encoding="utf-8") as f:
-            f.write(judgment.model_dump_json(exclude_none=True) + "\n")
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
         # 更新内存索引
         self._index(judgment)

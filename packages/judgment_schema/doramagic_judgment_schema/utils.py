@@ -32,8 +32,8 @@ def parse_llm_json(raw_text: str) -> Any:
         except json.JSONDecodeError:
             pass
 
-    # 策略3：找到第一个 [ 或 { 开始的子串
-    for start_char, end_char in [("[", "]"), ("{", "}")]:
+    # 策略3：找到第一个 { 或 [ 开始的子串（优先对象，因为 LLM 通常返回 JSON 对象）
+    for start_char, end_char in [("{", "}"), ("[", "]")]:
         start_idx = text.find(start_char)
         if start_idx >= 0:
             # 从后往前找对应的闭合括号
