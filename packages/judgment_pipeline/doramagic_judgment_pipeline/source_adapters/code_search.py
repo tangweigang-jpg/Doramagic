@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
-import time
 
 import httpx
 
@@ -177,7 +177,7 @@ class CodeSearchAdapter(BaseAdapter):
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code == 403:
                         logger.warning("Code Search 限流，等待后重试: %s", pattern["query_term"])
-                        time.sleep(delay * 2)
+                        await asyncio.sleep(delay * 2)
                         try:
                             search_results = await self._search_code(client, query, max_per_pattern)
                         except Exception:
@@ -251,7 +251,7 @@ class CodeSearchAdapter(BaseAdapter):
                         )
                     )
 
-                time.sleep(delay)
+                await asyncio.sleep(delay)
 
         logger.info("CodeSearchAdapter 采集完成: %s/%s → %d 条记录", owner, repo, len(records))
         return records

@@ -201,7 +201,7 @@ async def extract_doc_judgments(
     )
 
     try:
-        raw_judgments = parse_llm_json(response.text)
+        raw_judgments = parse_llm_json(response.content)
     except ValueError as e:
         logger.warning("文档提取 LLM 输出无法解析: %s (record=%s)", e, record.source_id)
         return []

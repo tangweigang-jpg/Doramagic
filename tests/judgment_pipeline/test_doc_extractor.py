@@ -13,7 +13,7 @@ from doramagic_judgment_pipeline.source_adapters.base import RawExperienceRecord
 
 class MockLLMResponse:
     def __init__(self, text: str):
-        self.text = text
+        self.content = text
 
 
 class MockLLMAdapter:

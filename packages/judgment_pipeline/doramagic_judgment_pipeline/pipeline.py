@@ -274,31 +274,24 @@ async def run_full_pipeline(
     max_tokens: int | None = None,
 ) -> FullPipelineResult:
     """三层完整采集流水线。"""
-    import asyncio
-
     result = FullPipelineResult()
 
-    issue_task = asyncio.create_task(
-        run_pipeline(
-            github_token=github_token,
-            target=issue_target,
-            domain=domain,
-            judgments_path=judgments_path,
-            adapter=adapter,
-        )
+    # 顺序执行避免并发写入竞态（两条流水线共享 JudgmentStore）
+    result.issue_result = await run_pipeline(
+        github_token=github_token,
+        target=issue_target,
+        domain=domain,
+        judgments_path=judgments_path,
+        adapter=adapter,
     )
-    doc_task = asyncio.create_task(
-        run_doc_pipeline(
-            github_token=github_token,
-            target=doc_target,
-            domain=domain,
-            judgments_path=judgments_path,
-            adapter=adapter,
-            model=model,
-        )
+    result.doc_result = await run_doc_pipeline(
+        github_token=github_token,
+        target=doc_target,
+        domain=domain,
+        judgments_path=judgments_path,
+        adapter=adapter,
+        model=model,
     )
-
-    result.issue_result, result.doc_result = await asyncio.gather(issue_task, doc_task)
     result.total_stored = (result.issue_result.stored if result.issue_result else 0) + (
         result.doc_result.stored if result.doc_result else 0
     )
