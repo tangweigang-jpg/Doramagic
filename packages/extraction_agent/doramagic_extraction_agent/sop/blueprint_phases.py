@@ -1987,16 +1987,23 @@ def build_blueprint_phases_v5(
             try:
                 import json as _json
 
-                parsed_raw = _json.loads(raw)
+                # Try JSON first, then YAML (MiniMax often outputs YAML-like
+                # JSON with unquoted keys like `behavior: "..."`)
+                parsed_raw = None
+                try:
+                    parsed_raw = _json.loads(raw)
+                except _json.JSONDecodeError:
+                    parsed_raw = _yaml.safe_load(raw)
+
                 if isinstance(parsed_raw, dict) and "stages" in parsed_raw:
                     logger.info(
-                        "bp_assemble: L3 recovery — parsed raw JSON (%d stages)",
+                        "bp_assemble: L3 recovery — parsed raw output (%d stages)",
                         len(parsed_raw.get("stages", [])),
                     )
                     # Skip Pydantic validation, build blueprint directly
                     result = None  # sentinel: use parsed_raw below
                 else:
-                    raise ValueError("No 'stages' key in parsed JSON")
+                    raise ValueError("No 'stages' key in parsed output")
             except Exception as parse_exc:
                 logger.warning(
                     "bp_assemble: L3 recovery failed (%s) — cannot assemble",
