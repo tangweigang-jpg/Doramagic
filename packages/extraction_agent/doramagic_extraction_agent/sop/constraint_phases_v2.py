@@ -14,6 +14,7 @@ Phase flow:
   con_synthesize → con_enrich → con_dedup → con_ingest → con_postprocess →
   con_validate
 """
+
 from __future__ import annotations
 
 import json
@@ -73,7 +74,9 @@ def _read_artifact_json(run_dir: Path, artifact_name: str) -> list[dict[str, Any
                 artifact_name,
             )
             return [data]
-        logger.warning("Artifact %s is not a JSON array, got %s", artifact_name, type(data).__name__)
+        logger.warning(
+            "Artifact %s is not a JSON array, got %s", artifact_name, type(data).__name__
+        )
         return []
     except json.JSONDecodeError as exc:
         logger.warning("Failed to parse artifact %s: %s", artifact_name, exc)
@@ -203,7 +206,10 @@ async def _con_load_context_handler(state: AgentState, repo_path: Path) -> Phase
 
     logger.info(
         "Blueprint loaded: %s — %d stages, %d edges, %d business_decisions",
-        bp.get("id", "?"), n_stages, n_edges, n_bds,
+        bp.get("id", "?"),
+        n_stages,
+        n_edges,
+        n_bds,
     )
 
     return PhaseResult(
@@ -304,32 +310,40 @@ async def _con_build_manifest_handler(state: AgentState, repo_path: Path) -> Pha
                         continue
                     result = subdom.get("result", {})
                     if isinstance(result, dict) and result.get("fail", 0) > 0:
-                        audit_fail_items.append({
-                            "category": f"subdomain_{subdom.get('name', 'unknown')}",
-                            "name": subdom.get("name", ""),
-                            **result,
-                        })
+                        audit_fail_items.append(
+                            {
+                                "category": f"subdomain_{subdom.get('name', 'unknown')}",
+                                "name": subdom.get("name", ""),
+                                **result,
+                            }
+                        )
             elif category == "critical_findings" and isinstance(items, list):
                 # Each item: {item, severity, type, disposition, stage, evidence}
                 # These are the most actionable fail items — always include.
                 for finding in items:
                     if isinstance(finding, dict):
-                        audit_fail_items.append({
-                            "category": "critical_finding",
-                            **finding,
-                        })
+                        audit_fail_items.append(
+                            {
+                                "category": "critical_finding",
+                                **finding,
+                            }
+                        )
             elif isinstance(items, list):
                 for item in items:
                     if isinstance(item, dict) and item.get("fail", 0) > 0:
-                        audit_fail_items.append({
-                            "category": category,
-                            **item,
-                        })
+                        audit_fail_items.append(
+                            {
+                                "category": category,
+                                **item,
+                            }
+                        )
             elif isinstance(items, dict) and items.get("fail", 0) > 0:
-                audit_fail_items.append({
-                    "category": category,
-                    **items,
-                })
+                audit_fail_items.append(
+                    {
+                        "category": category,
+                        **items,
+                    }
+                )
     elif isinstance(audit_summary, list):
         for item in audit_summary:
             if isinstance(item, dict) and item.get("fail", 0) > 0:
@@ -340,8 +354,12 @@ async def _con_build_manifest_handler(state: AgentState, repo_path: Path) -> Pha
         len(audit_fail_items),
         sum(1 for x in audit_fail_items if x.get("category") == "critical_finding"),
         sum(1 for x in audit_fail_items if x.get("category", "").startswith("subdomain_")),
-        sum(1 for x in audit_fail_items if x.get("category") not in ("critical_finding",)
-            and not x.get("category", "").startswith("subdomain_")),
+        sum(
+            1
+            for x in audit_fail_items
+            if x.get("category") not in ("critical_finding",)
+            and not x.get("category", "").startswith("subdomain_")
+        ),
     )
 
     # --- Evidence files ---
@@ -381,7 +399,8 @@ async def _con_build_manifest_handler(state: AgentState, repo_path: Path) -> Pha
     artifacts_dir = Path(state.run_dir) / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     (artifacts_dir / "coverage_manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8",
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
     summary = (
@@ -436,9 +455,8 @@ def _build_stage_extract_message_v2(
                 + "\n".join(f"  - {e}" for e in evidence_refs[:10])
             )
         elif evidence_files:
-            evidence_hint = (
-                "\n\nEvidence files from blueprint:\n"
-                + "\n".join(f"  - {e}" for e in evidence_files[:10])
+            evidence_hint = "\n\nEvidence files from blueprint:\n" + "\n".join(
+                f"  - {e}" for e in evidence_files[:10]
             )
 
         msg = (
@@ -455,7 +473,7 @@ def _build_stage_extract_message_v2(
         all_stage_ids = manifest.get("stage_ids", [])
         msg += "## IMPORTANT: stage_ids 白名单\n"
         msg += f"本次提取的 stage ID 是: `{stage_id}`\n"
-        msg += f"所有约束的 stage_ids 字段必须只使用这个值: [\"{stage_id}\"]\n"
+        msg += f'所有约束的 stage_ids 字段必须只使用这个值: ["{stage_id}"]\n'
         msg += f"蓝图所有合法 stage IDs: {json.dumps(all_stage_ids, ensure_ascii=False)}\n"
         msg += "禁止使用任何不在上述列表中的 stage ID（如 technical_indicator、risk_management 等自造名称）。\n\n"
 
@@ -499,19 +517,15 @@ def _build_edges_extract_message_v2(
         edges = _get_edges_from_blueprint(blueprint)
         edges_block = (
             yaml.dump(edges, allow_unicode=True, default_flow_style=False)
-            if edges else "(no edges defined)"
+            if edges
+            else "(no edges defined)"
         )
 
         # Stage name lookup from manifest
         stages_manifest = manifest.get("stages", {})
-        stage_names = {
-            sid: info.get("name", "") for sid, info in stages_manifest.items()
-        }
+        stage_names = {sid: info.get("name", "") for sid, info in stages_manifest.items()}
         if not stage_names:
-            stage_names = {
-                s.get("id", ""): s.get("name", "")
-                for s in blueprint.get("stages", [])
-            }
+            stage_names = {s.get("id", ""): s.get("name", "") for s in blueprint.get("stages", [])}
 
         return (
             f"## Blueprint: {bp_id} — {bp_name}\n"
@@ -554,11 +568,13 @@ def _build_global_extract_message_v2(
 
         global_block = (
             yaml.dump(global_contracts, allow_unicode=True, default_flow_style=False)
-            if global_contracts else "(no global_contracts defined)"
+            if global_contracts
+            else "(no global_contracts defined)"
         )
         nsf_block = (
             "\n".join(f"  - {item}" for item in not_suitable_for)
-            if not_suitable_for else "(none listed)"
+            if not_suitable_for
+            else "(none listed)"
         )
 
         return (
@@ -594,9 +610,9 @@ def _build_global_extract_message_v2(
 
 
 _DERIVE_CHUNK_SIZE = 10  # max BDs per Instructor call — 20 was too large,
-                         # causing 10K+ output tokens and frequent timeouts
+# causing 10K+ output tokens and frequent timeouts
 _DERIVE_CHUNK_TIMEOUT = 600  # 10 min per chunk — must cover L1 (≤300s httpx read)
-                             # + L2 freeform fallback (≤300s long_timeout)
+# + L2 freeform fallback (≤300s long_timeout)
 
 
 def _build_derive_user_message(
@@ -615,8 +631,7 @@ def _build_derive_user_message(
     ]
     if chunk_index is not None and total_chunks is not None:
         parts.append(
-            f"## Batch {chunk_index + 1}/{total_chunks} "
-            "(process ONLY the decisions listed below)\n"
+            f"## Batch {chunk_index + 1}/{total_chunks} (process ONLY the decisions listed below)\n"
         )
     parts.append("## Business Decisions by Type\n")
 
@@ -667,7 +682,8 @@ def _chunk_bds(
     if skipped:
         logger.info(
             "_chunk_bds: filtered %d T-type BDs, %d remaining",
-            skipped, len(tagged),
+            skipped,
+            len(tagged),
         )
 
     if not tagged:
@@ -721,16 +737,22 @@ async def _derive_single_chunk(
     Returns (result, tokens, error_msg).
     """
     import asyncio as _asyncio
+
     from .constraint_schemas_v2 import DeriveExtractionResult, RawFallback
 
     bd_count = sum(len(bds) for bds in bds_chunk.values())
     user_msg = _build_derive_user_message(
-        bds_chunk, blueprint_id,
-        chunk_index=chunk_index, total_chunks=total_chunks,
+        bds_chunk,
+        blueprint_id,
+        chunk_index=chunk_index,
+        total_chunks=total_chunks,
     )
     logger.info(
         "con_derive chunk %d/%d: %d BDs, %d chars",
-        chunk_index + 1, total_chunks, bd_count, len(user_msg),
+        chunk_index + 1,
+        total_chunks,
+        bd_count,
+        len(user_msg),
     )
 
     try:
@@ -740,21 +762,24 @@ async def _derive_single_chunk(
                 user_msg,
                 DeriveExtractionResult,
                 max_retries=2,  # Allow 1 schema-correction retry (fast, ~seconds);
-                                # retries=1 caused 5/6 L3 fallback in R9
+                # retries=1 caused 5/6 L3 fallback in R9
             ),
             timeout=_DERIVE_CHUNK_TIMEOUT,
         )
-    except _asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning(
             "con_derive chunk %d/%d: timed out after %ds",
-            chunk_index + 1, total_chunks, _DERIVE_CHUNK_TIMEOUT,
+            chunk_index + 1,
+            total_chunks,
+            _DERIVE_CHUNK_TIMEOUT,
         )
         return None, 0, f"chunk {chunk_index + 1}/{total_chunks} timed out"
 
     if isinstance(result, RawFallback):
         logger.warning(
             "con_derive chunk %d/%d: L3 fallback",
-            chunk_index + 1, total_chunks,
+            chunk_index + 1,
+            total_chunks,
         )
         return None, tokens, f"chunk {chunk_index + 1}/{total_chunks} L3 fallback"
 
@@ -785,8 +810,10 @@ def _accumulate_derive_result(
 def _count_derive_result(result: Any) -> int:
     """Count total constraints in a DeriveExtractionResult."""
     return (
-        len(result.rc_constraints) + len(result.ba_constraints)
-        + len(result.m_constraints) + len(result.b_constraints)
+        len(result.rc_constraints)
+        + len(result.ba_constraints)
+        + len(result.m_constraints)
+        + len(result.b_constraints)
         + len(result.missing_gap_pairs) * 2
     )
 
@@ -825,15 +852,14 @@ async def _con_derive_v2_handler(state: AgentState, repo_path: Path) -> PhaseRes
         return PhaseResult(
             phase_name="con_derive",
             status="completed",
-            final_text=(
-                f"All {total_bds} BDs are T-type (filtered) "
-                "— nothing to derive"
-            ),
+            final_text=(f"All {total_bds} BDs are T-type (filtered) — nothing to derive"),
         )
 
     logger.info(
         "con_derive: %d BDs split into %d chunks (chunk_size=%d)",
-        total_bds, len(chunks), _DERIVE_CHUNK_SIZE,
+        total_bds,
+        len(chunks),
+        _DERIVE_CHUNK_SIZE,
     )
 
     # Run chunks sequentially (MiniMax rate limits)
@@ -844,7 +870,11 @@ async def _con_derive_v2_handler(state: AgentState, repo_path: Path) -> PhaseRes
 
     for i, chunk in enumerate(chunks):
         result, tokens, err = await _derive_single_chunk(
-            agent, chunk, state.blueprint_id, i, len(chunks),
+            agent,
+            chunk,
+            state.blueprint_id,
+            i,
+            len(chunks),
         )
         total_tokens += tokens
 
@@ -853,15 +883,17 @@ async def _con_derive_v2_handler(state: AgentState, repo_path: Path) -> PhaseRes
             continue
 
         _accumulate_derive_result(
-            result, all_derived,
-            totals := [total_rc, total_ba, total_m, total_b,
-                       total_gap, total_skipped],
+            result,
+            all_derived,
+            totals := [total_rc, total_ba, total_m, total_b, total_gap, total_skipped],
         )
         total_rc, total_ba, total_m, total_b, total_gap, total_skipped = totals
 
         logger.info(
             "con_derive chunk %d/%d: +%d constraints",
-            i + 1, len(chunks), _count_derive_result(result),
+            i + 1,
+            len(chunks),
+            _count_derive_result(result),
         )
 
     # --- Failover: retry failed chunks with fallback agent ---
@@ -870,43 +902,45 @@ async def _con_derive_v2_handler(state: AgentState, repo_path: Path) -> PhaseRes
     if failed_chunks and fallback_agent:
         fb_model = getattr(fallback_agent, "_model_id", "fallback")
         logger.warning(
-            "con_derive: %d chunk(s) failed on primary — "
-            "retrying with fallback model %s",
-            len(failed_chunks), fb_model,
+            "con_derive: %d chunk(s) failed on primary — retrying with fallback model %s",
+            len(failed_chunks),
+            fb_model,
         )
         for i, chunk in failed_chunks:
             result, tokens, err = await _derive_single_chunk(
-                fallback_agent, chunk, state.blueprint_id,
-                i, len(chunks),
+                fallback_agent,
+                chunk,
+                state.blueprint_id,
+                i,
+                len(chunks),
             )
             total_tokens += tokens
             if err:
-                retried_chunks.append(
-                    f"chunk {i + 1}/{len(chunks)} failover: {err}"
-                )
+                retried_chunks.append(f"chunk {i + 1}/{len(chunks)} failover: {err}")
                 continue
             _accumulate_derive_result(
-                result, all_derived,
-                totals := [total_rc, total_ba, total_m, total_b,
-                           total_gap, total_skipped],
+                result,
+                all_derived,
+                totals := [total_rc, total_ba, total_m, total_b, total_gap, total_skipped],
             )
-            (total_rc, total_ba, total_m, total_b,
-             total_gap, total_skipped) = totals
+            (total_rc, total_ba, total_m, total_b, total_gap, total_skipped) = totals
             logger.info(
                 "con_derive chunk %d/%d (fallback): +%d constraints",
-                i + 1, len(chunks), _count_derive_result(result),
+                i + 1,
+                len(chunks),
+                _count_derive_result(result),
             )
     elif failed_chunks:
         retried_chunks = [
-            f"chunk {i + 1}/{len(chunks)} failed (no fallback)"
-            for i, _ in failed_chunks
+            f"chunk {i + 1}/{len(chunks)} failed (no fallback)" for i, _ in failed_chunks
         ]
 
     # Write artifact (even partial results are useful)
     artifacts_dir = Path(state.run_dir) / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     (artifacts_dir / "constraints_derived.json").write_text(
-        json.dumps(all_derived, ensure_ascii=False, indent=2), encoding="utf-8",
+        json.dumps(all_derived, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
     summary = (
@@ -988,7 +1022,9 @@ async def _con_audit_v2_handler(state: AgentState, repo_path: Path) -> PhaseResu
 
     blueprint_path_str = getattr(state, "blueprint_path", "")
     user_msg = _build_audit_user_message(
-        audit_fail_items, state.blueprint_id, Path(blueprint_path_str),
+        audit_fail_items,
+        state.blueprint_id,
+        Path(blueprint_path_str),
     )
 
     from .constraint_schemas_v2 import AuditConstraintResult, RawFallback
@@ -1003,7 +1039,8 @@ async def _con_audit_v2_handler(state: AgentState, repo_path: Path) -> PhaseResu
         artifacts_dir = Path(state.run_dir) / "artifacts"
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         (artifacts_dir / "constraints_audit_raw.txt").write_text(
-            result.text, encoding="utf-8",
+            result.text,
+            encoding="utf-8",
         )
         return PhaseResult(
             phase_name="con_audit",
@@ -1018,7 +1055,8 @@ async def _con_audit_v2_handler(state: AgentState, repo_path: Path) -> PhaseResu
     artifacts_dir = Path(state.run_dir) / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     (artifacts_dir / "constraints_audit.json").write_text(
-        json.dumps(audit_constraints, ensure_ascii=False, indent=2), encoding="utf-8",
+        json.dumps(audit_constraints, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
     summary = (
@@ -1042,7 +1080,7 @@ async def _con_audit_v2_handler(state: AgentState, repo_path: Path) -> PhaseResu
 
 async def _con_extract_resources_handler(state: AgentState, repo_path: Path) -> PhaseResult:
     """Extract resource inventory (dependencies, APIs, infrastructure)."""
-    from .constraint_resources import extract_resources  # noqa: PLC0415
+    from .constraint_resources import extract_resources
 
     agent = state.extra.get("agent")
     manifest = _get_manifest(state)
@@ -1094,7 +1132,9 @@ async def _con_synthesize_handler(state: AgentState, repo_path: Path) -> PhaseRe
             if old_ids and old_ids != [sid]:
                 logger.debug(
                     "Forced stage_ids %s → [%s] in %s",
-                    old_ids, sid, artifact_name,
+                    old_ids,
+                    sid,
+                    artifact_name,
                 )
             merged.append(item)
         logger.debug("Synthesize: %d items from %s", len(items), artifact_name)
@@ -1143,7 +1183,8 @@ async def _con_synthesize_handler(state: AgentState, repo_path: Path) -> PhaseRe
     artifacts_dir = run_dir / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     (artifacts_dir / "constraints_merged.json").write_text(
-        json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8",
+        json.dumps(merged, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
     summary = (
@@ -1190,19 +1231,22 @@ async def _con_enrich_handler(state: AgentState, repo_path: Path) -> PhaseResult
     from .constraint_enrich import enrich_constraints
 
     enriched_list, patch_stats = enrich_constraints(
-        merged_list, bp, manifest, commit_hash,
+        merged_list,
+        bp,
+        manifest,
+        commit_hash,
     )
 
     # Write enriched artifact
     artifacts_dir = run_dir / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     (artifacts_dir / "constraints_enriched.json").write_text(
-        json.dumps(enriched_list, ensure_ascii=False, indent=2), encoding="utf-8",
+        json.dumps(enriched_list, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
-    summary = (
-        f"Enriched {len(enriched_list)} constraints — "
-        + ", ".join(f"{k}={v}" for k, v in patch_stats.items())
+    summary = f"Enriched {len(enriched_list)} constraints — " + ", ".join(
+        f"{k}={v}" for k, v in patch_stats.items()
     )
     logger.info("con_enrich: %s", summary)
 
@@ -1220,7 +1264,7 @@ async def _con_enrich_handler(state: AgentState, repo_path: Path) -> PhaseResult
 
 async def _con_constraint_synthesis_handler(state: AgentState, repo_path: Path) -> PhaseResult:
     """Run Instructor-based kind rebalance on merged constraints."""
-    from .constraint_synthesis import run_constraint_synthesis  # noqa: PLC0415
+    from .constraint_synthesis import run_constraint_synthesis
 
     agent = state.extra.get("agent")
     if not agent:
@@ -1293,11 +1337,13 @@ async def _con_dedup_handler(state: AgentState, repo_path: Path) -> PhaseResult:
 
     try:
         from doramagic_constraint_pipeline.blueprint_loader import load_blueprint
+
         blueprint = load_blueprint(Path(blueprint_path_str))
     except (ValueError, KeyError, ImportError) as exc:
         logger.warning("Strict load_blueprint failed (%s), building minimal blueprint", exc)
         blueprint = _build_minimal_parsed_blueprint(
-            Path(blueprint_path_str), state,
+            Path(blueprint_path_str),
+            state,
         )
 
     from doramagic_constraint_schema.types import TargetScope
@@ -1321,13 +1367,19 @@ async def _con_dedup_handler(state: AgentState, repo_path: Path) -> PhaseResult:
         edge_ids = raw.get("edge_ids", [])
 
         constraint = _raw_to_constraint(
-            raw, constraint_id, blueprint,
-            scope, stage_ids, edge_ids,
+            raw,
+            constraint_id,
+            blueprint,
+            scope,
+            stage_ids,
+            edge_ids,
         )
         if constraint is not None:
             constraints.append(constraint)
         else:
-            errors.append(f"Item {i}: _raw_to_constraint returned None for when={raw.get('when', '?')!r}")
+            errors.append(
+                f"Item {i}: _raw_to_constraint returned None for when={raw.get('when', '?')!r}"
+            )
 
     if not constraints:
         return PhaseResult(
@@ -1340,14 +1392,13 @@ async def _con_dedup_handler(state: AgentState, repo_path: Path) -> PhaseResult:
     dedup_result = dedup_constraints(constraints)
 
     # Write deduped artifact as list of dicts
-    deduped_dicts = [
-        json.loads(c.model_dump_json()) for c in dedup_result.unique
-    ]
+    deduped_dicts = [json.loads(c.model_dump_json()) for c in dedup_result.unique]
 
     artifacts_dir = run_dir / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     (artifacts_dir / "constraints_deduped.json").write_text(
-        json.dumps(deduped_dicts, ensure_ascii=False, indent=2), encoding="utf-8",
+        json.dumps(deduped_dicts, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
     summary = (
@@ -1374,7 +1425,6 @@ def _build_minimal_parsed_blueprint(
     Mirrors the fallback logic from constraint_phases.py con_ingest.
     """
     from doramagic_constraint_pipeline.blueprint_loader import (
-        GlobalContract,
         ParsedBlueprint,
         ParsedEdge,
         ParsedStage,
@@ -1403,15 +1453,17 @@ def _build_minimal_parsed_blueprint(
     edges = []
     for j, e in enumerate(raw_edges if isinstance(raw_edges, list) else []):
         if isinstance(e, dict):
-            edges.append(ParsedEdge(
-                id=e.get("id", f"edge_{j}"),
-                from_stage=e.get("from", e.get("from_stage", "")),
-                to_stage=e.get("to", e.get("to_stage", "")),
-                data=e.get("data", e.get("label", "")),
-                edge_type=e.get("edge_type", "data_flow"),
-                required=True,
-                condition=None,
-            ))
+            edges.append(
+                ParsedEdge(
+                    id=e.get("id", f"edge_{j}"),
+                    from_stage=e.get("from", e.get("from_stage", "")),
+                    to_stage=e.get("to", e.get("to_stage", "")),
+                    data=e.get("data", e.get("label", "")),
+                    edge_type=e.get("edge_type", "data_flow"),
+                    required=True,
+                    condition=None,
+                )
+            )
 
     return ParsedBlueprint(
         id=bp_raw.get("id", state.blueprint_id),
@@ -1467,13 +1519,15 @@ async def _con_ingest_v2_handler(state: AgentState, repo_path: Path) -> PhaseRes
     if blueprint_path_str:
         try:
             from doramagic_constraint_pipeline.blueprint_loader import load_blueprint
+
             _bp = load_blueprint(Path(blueprint_path_str))
             valid_stage_ids = list(_bp.stage_ids)
             valid_edge_ids = list(_bp.edge_ids)
         except Exception as _bp_exc:
             logger.warning(
                 "con_ingest: could not load blueprint for business validation (%s) — "
-                "skipping scope/evidence checks", _bp_exc,
+                "skipping scope/evidence checks",
+                _bp_exc,
             )
 
     # Validate via Pydantic + business rules and collect valid constraints
@@ -1499,7 +1553,8 @@ async def _con_ingest_v2_handler(state: AgentState, repo_path: Path) -> PhaseRes
                 errors.extend(vr.errors)
                 logger.warning(
                     "con_ingest: business validation failed for %s: %s",
-                    item.get("when", "?"), vr.errors,
+                    item.get("when", "?"),
+                    vr.errors,
                 )
                 continue
 
@@ -1569,16 +1624,16 @@ async def _con_postprocess_v2_handler(state: AgentState, repo_path: Path) -> Pha
         )
 
     output_dir_str = getattr(state, "output_dir", "")
-    if output_dir_str:
-        output_path = Path(output_dir_str) / "constraints.jsonl"
-    else:
-        output_path = Path(run_dir_str) / "output" / "constraints.jsonl"
+    base = Path(output_dir_str) if output_dir_str else Path(run_dir_str) / "output"
+    output_path = base / "LATEST.jsonl"
+    if not output_path.exists():
+        output_path = base / "constraints.jsonl"  # legacy fallback
 
     if not output_path.exists():
         return PhaseResult(
             phase_name="con_postprocess",
             status="error",
-            error=f"constraints.jsonl not found at {output_path} — run con_ingest first",
+            error=f"constraints not found at {base} — run con_ingest first",
         )
 
     # Load constraints from JSONL
@@ -1599,7 +1654,8 @@ async def _con_postprocess_v2_handler(state: AgentState, repo_path: Path) -> Pha
 
     logger.info(
         "Loaded %d constraints for post-processing (%d parse errors)",
-        len(constraints), parse_errors,
+        len(constraints),
+        parse_errors,
     )
 
     # Apply P0-P5 rules in-place
@@ -1648,16 +1704,16 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
         )
 
     output_dir_str = getattr(state, "output_dir", "")
-    if output_dir_str:
-        output_path = Path(output_dir_str) / "constraints.jsonl"
-    else:
-        output_path = Path(run_dir_str) / "output" / "constraints.jsonl"
+    base = Path(output_dir_str) if output_dir_str else Path(run_dir_str) / "output"
+    output_path = base / "LATEST.jsonl"
+    if not output_path.exists():
+        output_path = base / "constraints.jsonl"  # legacy fallback
 
     if not output_path.exists():
         return PhaseResult(
             phase_name="con_validate",
             status="error",
-            error=f"constraints.jsonl not found at {output_path}",
+            error=f"constraints not found at {base}",
         )
 
     # Parse JSONL for analysis
@@ -1729,7 +1785,9 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
     # Fix #8: SOP specifies coverage of all 5 kinds, not just 3.
     kind_coverage = len(by_kind)
     if kind_coverage < 5:
-        hard_issues.append(f"QG-02 FAIL: kind_coverage={kind_coverage} < 5 — kinds: {list(by_kind.keys())}")
+        hard_issues.append(
+            f"QG-02 FAIL: kind_coverage={kind_coverage} < 5 — kinds: {list(by_kind.keys())}"
+        )
     else:
         logger.info("QG-02 PASS: kind_coverage=%d >= 5", kind_coverage)
 
@@ -1748,9 +1806,7 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
         ag_count = by_kind.get("architecture_guardrail", 0)
         dr_ag_pct = (dr_count + ag_count) / total * 100
         if dr_ag_pct < 60.0:
-            hard_issues.append(
-                f"QG-04 FAIL: dr+ag={dr_count + ag_count} ({dr_ag_pct:.1f}%) < 60%"
-            )
+            hard_issues.append(f"QG-04 FAIL: dr+ag={dr_count + ag_count} ({dr_ag_pct:.1f}%) < 60%")
         else:
             logger.info("QG-04 PASS: dr+ag=%d (%.1f%%) >= 60%%", dr_count + ag_count, dr_ag_pct)
 
@@ -1766,7 +1822,9 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
         else:
             logger.info(
                 "QG-09 PASS: fatal_checkable_threshold=%d/%d (%.1f%%) >= 30%%",
-                fatal_checkable_with_vt, fatal_checkable_total, fc_vt_pct,
+                fatal_checkable_with_vt,
+                fatal_checkable_total,
+                fc_vt_pct,
             )
 
     # ----- Warnings (QG-05 to QG-08) -----
@@ -1929,7 +1987,8 @@ def build_constraint_phases_v2(
     _original_manifest_handler = _con_build_manifest_handler
 
     async def _manifest_with_agent_injection(
-        state: AgentState, repo_path: Path,
+        state: AgentState,
+        repo_path: Path,
     ) -> PhaseResult:
         """Wrapper: inject agent into state.extra, then run manifest builder."""
         if agent is not None:
@@ -1999,8 +2058,12 @@ def build_constraint_phases_v2(
                 system_prompt=prompts_v2.CON_STAGE_V2_SYSTEM,
                 initial_message_builder=_build_stage_extract_message_v2(stage, bp, blueprint_path),
                 allowed_tools=[
-                    "read_file", "grep_codebase", "list_dir",
-                    "write_artifact", "get_artifact", "get_skeleton",
+                    "read_file",
+                    "grep_codebase",
+                    "list_dir",
+                    "write_artifact",
+                    "get_artifact",
+                    "get_skeleton",
                 ],
                 max_iterations=60,
                 required_artifacts=[f"constraints_{stage_id}.json"],
@@ -2023,8 +2086,12 @@ def build_constraint_phases_v2(
             system_prompt=prompts_v2.CON_EDGE_V2_SYSTEM,
             initial_message_builder=_build_edges_extract_message_v2(bp, blueprint_path),
             allowed_tools=[
-                "read_file", "grep_codebase", "list_dir",
-                "write_artifact", "get_artifact", "get_skeleton",
+                "read_file",
+                "grep_codebase",
+                "list_dir",
+                "write_artifact",
+                "get_artifact",
+                "get_skeleton",
             ],
             max_iterations=60,
             required_artifacts=["constraints_edges.json"],
@@ -2046,8 +2113,12 @@ def build_constraint_phases_v2(
             system_prompt=prompts_v2.CON_GLOBAL_V2_SYSTEM,
             initial_message_builder=_build_global_extract_message_v2(bp, blueprint_path),
             allowed_tools=[
-                "read_file", "grep_codebase", "list_dir",
-                "write_artifact", "get_artifact", "get_skeleton",
+                "read_file",
+                "grep_codebase",
+                "list_dir",
+                "write_artifact",
+                "get_artifact",
+                "get_skeleton",
             ],
             max_iterations=60,
             required_artifacts=["constraints_global.json"],
@@ -2068,7 +2139,8 @@ def build_constraint_phases_v2(
 
         # Closure wrapper ensures agents are injected every run (survives resume)
         async def _derive_with_agent_injection(
-            state: AgentState, repo_path: Path,
+            state: AgentState,
+            repo_path: Path,
             _agent: Any = agent,
             _fb_agent: Any = fallback_agent,
         ) -> PhaseResult:
@@ -2108,7 +2180,8 @@ def build_constraint_phases_v2(
         extract_phase_names.append(audit_phase_name)
 
         async def _audit_with_agent_injection(
-            state: AgentState, repo_path: Path,
+            state: AgentState,
+            repo_path: Path,
             _agent: Any = agent,
         ) -> PhaseResult:
             if _agent is not None:

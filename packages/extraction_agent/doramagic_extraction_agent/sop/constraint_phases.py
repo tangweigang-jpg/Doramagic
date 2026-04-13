@@ -14,6 +14,7 @@ Key design decisions:
 - Output goes to _runs/{bp_id}/output/constraints.jsonl — no merge into global
   knowledge/constraints/domains/finance.jsonl.
 """
+
 from __future__ import annotations
 
 import json
@@ -59,7 +60,9 @@ def _read_artifact_json(run_dir: Path, artifact_name: str) -> list[dict[str, Any
         data = json.loads(text)
         if isinstance(data, list):
             return data
-        logger.warning("Artifact %s is not a JSON array, got %s", artifact_name, type(data).__name__)
+        logger.warning(
+            "Artifact %s is not a JSON array, got %s", artifact_name, type(data).__name__
+        )
         return []
     except json.JSONDecodeError as exc:
         logger.warning("Failed to parse artifact %s: %s", artifact_name, exc)
@@ -149,7 +152,10 @@ async def _con_load_context_handler(state: AgentState, repo_path: Path) -> Phase
 
     logger.info(
         "Blueprint loaded: %s — %d stages, %d edges, %d business_decisions",
-        bp.get("id", "?"), n_stages, n_edges, n_bds,
+        bp.get("id", "?"),
+        n_stages,
+        n_edges,
+        n_bds,
     )
 
     return PhaseResult(
@@ -205,13 +211,23 @@ async def _con_ingest_handler(state: AgentState, repo_path: Path) -> PhaseResult
     except (ValueError, KeyError) as e:
         logger.warning("Strict load_blueprint failed (%s), falling back to minimal loader", e)
         bp_raw_fallback = _load_blueprint_yaml(blueprint_path)
-        from doramagic_constraint_pipeline.blueprint_loader import ParsedBlueprint, ParsedStage, ParsedEdge, GlobalContract
+        from doramagic_constraint_pipeline.blueprint_loader import (
+            ParsedBlueprint,
+            ParsedEdge,
+            ParsedStage,
+        )
+
         stages_fb = [
             ParsedStage(
-                id=s.get("id", f"stage_{i}"), name=s.get("name", ""), order=s.get("order", i),
-                responsibility=s.get("responsibility", ""), interface=s.get("interface", {}),
-                replaceable_points=[], pseudocode_example="",
-                design_decisions=[], acceptance_hints=[],
+                id=s.get("id", f"stage_{i}"),
+                name=s.get("name", ""),
+                order=s.get("order", i),
+                responsibility=s.get("responsibility", ""),
+                interface=s.get("interface", {}),
+                replaceable_points=[],
+                pseudocode_example="",
+                design_decisions=[],
+                acceptance_hints=[],
             )
             for i, s in enumerate(bp_raw_fallback.get("stages", []))
         ]
@@ -222,24 +238,30 @@ async def _con_ingest_handler(state: AgentState, repo_path: Path) -> PhaseResult
         edges_fb = []
         for j, e in enumerate(raw_edges if isinstance(raw_edges, list) else []):
             if isinstance(e, dict):
-                edges_fb.append(ParsedEdge(
-                    id=e.get("id", f"edge_{j}"),
-                    from_stage=e.get("from", e.get("from_stage", "")),
-                    to_stage=e.get("to", e.get("to_stage", "")),
-                    data=e.get("data", e.get("label", "")),
-                    edge_type=e.get("edge_type", "data_flow"),
-                    required=True, condition=None,
-                ))
+                edges_fb.append(
+                    ParsedEdge(
+                        id=e.get("id", f"edge_{j}"),
+                        from_stage=e.get("from", e.get("from_stage", "")),
+                        to_stage=e.get("to", e.get("to_stage", "")),
+                        data=e.get("data", e.get("label", "")),
+                        edge_type=e.get("edge_type", "data_flow"),
+                        required=True,
+                        condition=None,
+                    )
+                )
         blueprint = ParsedBlueprint(
             id=bp_raw_fallback.get("id", state.blueprint_id),
             name=bp_raw_fallback.get("name", ""),
             domain=state.domain,  # always use state.domain (string), not blueprint's (may be list)
             version=bp_raw_fallback.get("version", "1.0.0"),
-            stages=stages_fb, edges=edges_fb,
-            global_contracts=[], evidence={},
+            stages=stages_fb,
+            edges=edges_fb,
+            global_contracts=[],
+            evidence={},
             applicability=bp_raw_fallback.get("applicability", {}),
             source=bp_raw_fallback.get("source", {}),
-            not_suitable_for=[], raw=bp_raw_fallback,
+            not_suitable_for=[],
+            raw=bp_raw_fallback,
         )
 
     # Collect artifact names to ingest.
@@ -338,11 +360,17 @@ async def _con_ingest_handler(state: AgentState, repo_path: Path) -> PhaseResult
 
             constraint_id = f"{domain}-C-{constraint_counter:03d}"
             constraint = _raw_to_constraint(
-                raw, constraint_id, blueprint,
-                effective_scope, effective_stage_ids, effective_edge_ids,
+                raw,
+                constraint_id,
+                blueprint,
+                effective_scope,
+                effective_stage_ids,
+                effective_edge_ids,
             )
             if constraint is None:
-                errors.append(f"{artifact_name}: _raw_to_constraint returned None for {raw.get('when', '?')!r}")
+                errors.append(
+                    f"{artifact_name}: _raw_to_constraint returned None for {raw.get('when', '?')!r}"
+                )
                 continue
 
             vr = validate_constraint(
@@ -416,17 +444,17 @@ async def _con_postprocess_handler(state: AgentState, repo_path: Path) -> PhaseR
             error="state.run_dir is not set",
         )
 
-    # Find constraints.jsonl — check output_dir first, then run_dir/output/
+    # Find constraints file — prefer LATEST.jsonl (v6 naming), fall back to constraints.jsonl
     output_dir_str = getattr(state, "output_dir", "")
-    if output_dir_str:
-        output_path = Path(output_dir_str) / "constraints.jsonl"
-    else:
-        output_path = Path(run_dir_str) / "output" / "constraints.jsonl"
+    base = Path(output_dir_str) if output_dir_str else Path(run_dir_str) / "output"
+    output_path = base / "LATEST.jsonl"
+    if not output_path.exists():
+        output_path = base / "constraints.jsonl"  # legacy fallback
     if not output_path.exists():
         return PhaseResult(
             phase_name="con_postprocess",
             status="error",
-            error=f"constraints.jsonl not found at {output_path} — run con_ingest first",
+            error=f"constraints not found at {base} — run con_ingest first",
         )
 
     # Load constraints from JSONL
@@ -445,7 +473,11 @@ async def _con_postprocess_handler(state: AgentState, repo_path: Path) -> PhaseR
             logger.warning("Failed to parse constraint line: %s", exc)
             parse_errors += 1
 
-    logger.info("Loaded %d constraints for post-processing (%d parse errors)", len(constraints), parse_errors)
+    logger.info(
+        "Loaded %d constraints for post-processing (%d parse errors)",
+        len(constraints),
+        parse_errors,
+    )
 
     # Apply P0-P5 rules in-place
     _postprocess_constraints(constraints)
@@ -482,15 +514,15 @@ async def _con_validate_handler(state: AgentState, repo_path: Path) -> PhaseResu
         )
 
     output_dir_str = getattr(state, "output_dir", "")
-    if output_dir_str:
-        output_path = Path(output_dir_str) / "constraints.jsonl"
-    else:
-        output_path = Path(run_dir_str) / "output" / "constraints.jsonl"
+    base = Path(output_dir_str) if output_dir_str else Path(run_dir_str) / "output"
+    output_path = base / "LATEST.jsonl"
+    if not output_path.exists():
+        output_path = base / "constraints.jsonl"  # legacy fallback
     if not output_path.exists():
         return PhaseResult(
             phase_name="con_validate",
             status="error",
-            error=f"constraints.jsonl not found at {output_path}",
+            error=f"constraints not found at {base}",
         )
 
     # Count by kind
@@ -519,7 +551,9 @@ async def _con_validate_handler(state: AgentState, repo_path: Path) -> PhaseResu
     # Check 2: kind_coverage >= 3
     kind_coverage = len(by_kind)
     if kind_coverage < 3:
-        issues.append(f"FAIL kind_coverage={kind_coverage} < 3 — kinds present: {list(by_kind.keys())}")
+        issues.append(
+            f"FAIL kind_coverage={kind_coverage} < 3 — kinds present: {list(by_kind.keys())}"
+        )
     else:
         logger.info("QG kind_coverage: %d >= 3 PASS", kind_coverage)
 
@@ -545,13 +579,13 @@ async def _con_validate_handler(state: AgentState, repo_path: Path) -> PhaseResu
         else:
             logger.info(
                 "QG dr+ag: %d (%.1f%%) >= 60%% PASS",
-                dr_count + ag_count, dr_ag_pct,
+                dr_count + ag_count,
+                dr_ag_pct,
             )
 
     gate_passed = len(issues) == 0
-    summary = (
-        f"total={total} by_kind={by_kind} — "
-        + ("ALL QUALITY CHECKS PASSED" if gate_passed else f"{len(issues)} issue(s): {issues}")
+    summary = f"total={total} by_kind={by_kind} — " + (
+        "ALL QUALITY CHECKS PASSED" if gate_passed else f"{len(issues)} issue(s): {issues}"
     )
 
     level = logging.INFO if gate_passed else logging.WARNING
@@ -647,12 +681,14 @@ def _build_edges_extract_message(
         # Filter to well-formed edge dicts only.
         edges = [e for e in edges if isinstance(e, dict)]
 
-        edges_block = yaml.dump(edges, allow_unicode=True, default_flow_style=False) if edges else "(no edges defined)"
+        edges_block = (
+            yaml.dump(edges, allow_unicode=True, default_flow_style=False)
+            if edges
+            else "(no edges defined)"
+        )
 
         # Build a quick stage name lookup
-        stage_names = {
-            s.get("id", ""): s.get("name", "") for s in blueprint.get("stages", [])
-        }
+        stage_names = {s.get("id", ""): s.get("name", "") for s in blueprint.get("stages", [])}
 
         return (
             f"Blueprint: {bp_id} — {bp_name}\n"
@@ -663,14 +699,14 @@ def _build_edges_extract_message(
             f"## Stage Names Reference\n"
             + "\n".join(f"  {sid}: {sname}" for sid, sname in stage_names.items())
             + "\n\n"
-            f"## Instructions\n\n"
-            f"1. For each edge, identify the upstream and downstream stages.\n"
-            f"2. Use read_file and grep_codebase to examine how data flows between stages.\n"
-            f"3. Extract cross-stage constraints: data format constraints, ordering/timing "
-            f"constraints, data integrity constraints, type conversion constraints.\n"
-            f"4. target_scope must be 'edge'; populate edge_ids with the edge ID.\n"
-            f"5. When done, call write_artifact(name='constraints_edges.json') "
-            f"with a JSON array of constraint objects.\n"
+            "## Instructions\n\n"
+            "1. For each edge, identify the upstream and downstream stages.\n"
+            "2. Use read_file and grep_codebase to examine how data flows between stages.\n"
+            "3. Extract cross-stage constraints: data format constraints, ordering/timing "
+            "constraints, data integrity constraints, type conversion constraints.\n"
+            "4. target_scope must be 'edge'; populate edge_ids with the edge ID.\n"
+            "5. When done, call write_artifact(name='constraints_edges.json') "
+            "with a JSON array of constraint objects.\n"
         )
 
     return builder
@@ -692,11 +728,13 @@ def _build_global_extract_message(
 
         global_block = (
             yaml.dump(global_contracts, allow_unicode=True, default_flow_style=False)
-            if global_contracts else "(no global_contracts defined)"
+            if global_contracts
+            else "(no global_contracts defined)"
         )
         nsf_block = (
             "\n".join(f"  - {item}" for item in not_suitable_for)
-            if not_suitable_for else "(none listed)"
+            if not_suitable_for
+            else "(none listed)"
         )
 
         return (
@@ -825,8 +863,11 @@ def build_constraint_phases(blueprint_id: str, blueprint_path: Path) -> list[Pha
                 system_prompt=prompts.CON_STAGE_SYSTEM,
                 initial_message_builder=_build_stage_extract_message(stage, blueprint_path, bp),
                 allowed_tools=[
-                    "read_file", "grep_codebase", "list_dir",
-                    "write_artifact", "get_artifact",
+                    "read_file",
+                    "grep_codebase",
+                    "list_dir",
+                    "write_artifact",
+                    "get_artifact",
                 ],
                 # 5 kinds × ~20 iterations each
                 max_iterations=100,
@@ -844,8 +885,11 @@ def build_constraint_phases(blueprint_id: str, blueprint_path: Path) -> list[Pha
             system_prompt=prompts.CON_EDGE_SYSTEM,
             initial_message_builder=_build_edges_extract_message(bp, blueprint_path),
             allowed_tools=[
-                "read_file", "grep_codebase", "list_dir",
-                "write_artifact", "get_artifact",
+                "read_file",
+                "grep_codebase",
+                "list_dir",
+                "write_artifact",
+                "get_artifact",
             ],
             max_iterations=60,
             depends_on=["con_load_context"],
@@ -862,8 +906,11 @@ def build_constraint_phases(blueprint_id: str, blueprint_path: Path) -> list[Pha
             system_prompt=prompts.CON_GLOBAL_SYSTEM,
             initial_message_builder=_build_global_extract_message(bp, blueprint_path),
             allowed_tools=[
-                "read_file", "grep_codebase", "list_dir",
-                "write_artifact", "get_artifact",
+                "read_file",
+                "grep_codebase",
+                "list_dir",
+                "write_artifact",
+                "get_artifact",
             ],
             max_iterations=60,
             depends_on=["con_load_context"],
@@ -935,8 +982,7 @@ def build_constraint_phases(blueprint_id: str, blueprint_path: Path) -> list[Pha
         Phase(
             name="con_validate",
             description=(
-                "Step 5: Quality gate — total>=80, kind_coverage>=3, "
-                "claim_boundary>=5%, dr+ag>=60%"
+                "Step 5: Quality gate — total>=80, kind_coverage>=3, claim_boundary>=5%, dr+ag>=60%"
             ),
             system_prompt="",
             initial_message_builder=lambda s, r: "",

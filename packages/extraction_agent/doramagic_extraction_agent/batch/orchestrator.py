@@ -1,4 +1,5 @@
 """Batch orchestrator — runs extraction jobs with bounded parallelism."""
+
 from __future__ import annotations
 
 import asyncio
@@ -14,7 +15,6 @@ from ..core.context_manager import ContextManager
 from ..core.model_router import ModelRouter, ModelSpec, build_model_router
 from ..core.tool_registry import ToolRegistry
 from ..sop.blueprint_phases import (
-    build_blueprint_phases,
     build_blueprint_phases_v4,
     build_blueprint_phases_v5,
 )
@@ -167,7 +167,7 @@ class BatchOrchestrator:
                         "; ".join(result.errors) or "unknown failure",
                     )
                 return result
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 error_msg = f"{type(exc).__name__}: {exc}"
                 logger.exception("Unhandled error for %s", job.blueprint_id)
                 tracker.fail_job(job.blueprint_id, error_msg)
@@ -201,9 +201,7 @@ class BatchOrchestrator:
         )
 
         # Fallback models
-        fallback_specs = [
-            ModelSpec(**fb) for fb in config.fallback_models
-        ]
+        fallback_specs = [ModelSpec(**fb) for fb in config.fallback_models]
         fallback = fallback_specs[0] if fallback_specs else None
 
         # Phase overrides
@@ -281,8 +279,14 @@ class BatchOrchestrator:
 
         # 3. Create components
         checkpoint = CheckpointManager(run_dir)
+        # Derive repo_slug for versioned directory naming (e.g. finance-bp-009--zvt)
+        repo_slug = ""
+        if job.repo_path:
+            repo_slug = Path(job.repo_path).name
+        elif job.repo_url:
+            repo_slug = job.repo_url.rstrip("/").split("/")[-1].replace(".git", "")
         output_dir = self._root / "knowledge" / "sources" / job.domain / job.blueprint_id
-        output_mgr = OutputManager(output_dir, job.blueprint_id)
+        output_mgr = OutputManager(output_dir, job.blueprint_id, repo_slug=repo_slug)
 
         # 4. Load or create state — only resume if config.resume=True (Fix 2)
         if self._config.resume:
@@ -305,11 +309,14 @@ class BatchOrchestrator:
             repo_name = job.repo_url.rstrip("/").split("/")[-1].replace(".git", "")
             local_repo = self._root / "repos" / repo_name
             if not local_repo.exists():
-                import subprocess  # noqa: PLC0415
+                import subprocess
+
                 logger.info("Cloning %s to %s", job.repo_url, local_repo)
                 subprocess.run(
                     ["git", "clone", "--depth", "1", job.repo_url, str(local_repo)],
-                    check=True, capture_output=True, text=True,
+                    check=True,
+                    capture_output=True,
+                    text=True,
                 )
             repo_path_str = str(local_repo)
         elif not repo_path_str:
@@ -318,7 +325,7 @@ class BatchOrchestrator:
 
         state.repo_path = repo_path_str
         state.run_dir = str(run_dir)
-        state.output_dir = str(output_dir)
+        state.output_dir = str(output_mgr.output_dir)  # uses slug-suffixed path
 
         # Override repo_path from job if explicitly provided (supports re-runs
         # pointing at a different clone location)
@@ -343,8 +350,7 @@ class BatchOrchestrator:
         # Register index tools when blueprint OR constraint v2 phases need them.
         # get_skeleton is used by constraint v2 extract phases even with skip_blueprint.
         need_index_tools = (not job.skip_blueprint) or (
-            not job.skip_constraint
-            and self._config.constraint_version == "v2"
+            not job.skip_constraint and self._config.constraint_version == "v2"
         )
 
         if need_index_tools:
@@ -376,7 +382,8 @@ class BatchOrchestrator:
 
         # Build model router for failover support
         model_router, agent_factory = self._build_model_router(
-            registry, checkpoint,
+            registry,
+            checkpoint,
         )
 
         errors: list[str] = []
@@ -386,12 +393,17 @@ class BatchOrchestrator:
             state.current_pipeline = "blueprint"
             if self._config.blueprint_version == "v5":
                 bp_phases = build_blueprint_phases_v5(
-                    job.blueprint_id, agent=agent,
+                    job.blueprint_id,
+                    agent=agent,
                 )
             else:
                 bp_phases = build_blueprint_phases_v4(job.blueprint_id)
             bp_executor = SOPExecutor(
-                bp_phases, agent, checkpoint, state, repo_path,
+                bp_phases,
+                agent,
+                checkpoint,
+                state,
+                repo_path,
                 model_router=model_router,
                 agent_factory=agent_factory,
             )
@@ -406,6 +418,7 @@ class BatchOrchestrator:
             # Also validate the YAML is parseable
             if not bp_failed and bp_output.exists():
                 import yaml as _yaml
+
                 try:
                     _yaml.safe_load(bp_output.read_text())
                 except _yaml.YAMLError as e:
@@ -416,8 +429,7 @@ class BatchOrchestrator:
                 if bp_result.failed_phase:
                     error_msg = (
                         f"Blueprint pipeline failed at phase "
-                        f"'{bp_result.failed_phase}': "
-                        + "; ".join(bp_result.errors)
+                        f"'{bp_result.failed_phase}': " + "; ".join(bp_result.errors)
                     )
                     logger.error(error_msg)
                     errors.append(error_msg)
@@ -442,23 +454,33 @@ class BatchOrchestrator:
                     output_dir=str(output_mgr.output_dir),
                 )
         else:
-            logger.info("Skipping blueprint pipeline for %s (skip_blueprint=True)", job.blueprint_id)
+            logger.info(
+                "Skipping blueprint pipeline for %s (skip_blueprint=True)", job.blueprint_id
+            )
             # Fix 3: set blueprint_path so constraint phases can find the blueprint
             bp_path = output_mgr.output_dir / "blueprint.yaml"
             if not bp_path.exists():
                 # Also check the canonical knowledge/ location
-                bp_path = self._root / "knowledge" / "blueprints" / job.domain / f"{job.blueprint_id}.yaml"
+                bp_path = (
+                    self._root
+                    / "knowledge"
+                    / "blueprints"
+                    / job.domain
+                    / f"{job.blueprint_id}.yaml"
+                )
             if bp_path.exists():
                 state.blueprint_path = str(bp_path)
                 logger.info("skip_blueprint: resolved blueprint_path=%s", state.blueprint_path)
                 # Extract commit_hash from blueprint YAML for P7 enrichment
                 if not state.commit_hash:
                     import yaml
+
                     try:
                         bp_data = yaml.safe_load(bp_path.read_text(encoding="utf-8"))
                         state.commit_hash = (
                             bp_data.get("source", {}).get("commit_hash", "")
-                            if isinstance(bp_data, dict) else ""
+                            if isinstance(bp_data, dict)
+                            else ""
                         )
                         if state.commit_hash:
                             logger.info("skip_blueprint: commit_hash=%s", state.commit_hash[:7])
@@ -489,9 +511,11 @@ class BatchOrchestrator:
             # Import dynamically to avoid circular deps at module load time
             try:
                 if self._config.constraint_version == "v2":
-                    from ..sop.constraint_phases_v2 import build_constraint_phases_v2  # noqa: PLC0415
+                    from ..sop.constraint_phases_v2 import (
+                        build_constraint_phases_v2,
+                    )
                 else:
-                    from ..sop.constraint_phases import build_constraint_phases  # noqa: PLC0415
+                    from ..sop.constraint_phases import build_constraint_phases
             except ImportError:
                 logger.warning(
                     "constraint_phases module not found; skipping constraint pipeline for %s",
@@ -509,7 +533,9 @@ class BatchOrchestrator:
                         if fb_spec and fb_spec.model_id != self._config.llm_model:
                             fb_agent = agent_factory(fb_spec)
                     con_phases = build_constraint_phases_v2(
-                        job.blueprint_id, bp_path, agent,
+                        job.blueprint_id,
+                        bp_path,
+                        agent,
                         fallback_agent=fb_agent,
                     )
                 else:
@@ -517,7 +543,11 @@ class BatchOrchestrator:
                 # v2 has 14+ parallel phases; limit concurrency to avoid API rate limits
                 max_par = 4 if self._config.constraint_version == "v2" else 5
                 con_executor = SOPExecutor(
-                    con_phases, agent, checkpoint, state, repo_path,
+                    con_phases,
+                    agent,
+                    checkpoint,
+                    state,
+                    repo_path,
                     model_router=model_router,
                     agent_factory=agent_factory,
                     max_parallel=max_par,
@@ -526,8 +556,7 @@ class BatchOrchestrator:
                 if con_result.failed_phase:
                     error_msg = (
                         f"Constraint pipeline failed at phase "
-                        f"'{con_result.failed_phase}': "
-                        + "; ".join(con_result.errors)
+                        f"'{con_result.failed_phase}': " + "; ".join(con_result.errors)
                     )
                     logger.error(error_msg)
                     errors.append(error_msg)
@@ -588,7 +617,7 @@ class BatchOrchestrator:
         Returns:
             A ready-to-use :class:`LLMAdapter` instance.
         """
-        import os  # noqa: PLC0415
+        import os
 
         adapter = LLMAdapter(provider_override="anthropic")
         adapter._default_model = self._config.llm_model
