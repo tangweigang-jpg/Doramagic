@@ -720,7 +720,10 @@ class ExtractionAgent:
         # --- L1: Instructor structured output ---
         # Skip L1 for models known to be incompatible with Instructor
         # (thinking mode + tool_choice=required conflict, never succeeds)
-        _skip_l1 = any(tag in self._model_id.lower() for tag in ("glm-5", "glm-4", "deepseek"))
+        _skip_l1 = any(
+            tag in self._model_id.lower()
+            for tag in ("glm-5", "glm-4", "deepseek", "minimax")
+        )
 
         # Outer transport-layer retry loop: 529/429/5xx are retried here with
         # exponential back-off so Instructor never gets a chance to fast-retry

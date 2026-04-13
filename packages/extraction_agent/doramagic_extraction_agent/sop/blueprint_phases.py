@@ -2646,10 +2646,22 @@ def build_blueprint_phases_v5(
             f"Each decision MUST have file:line(function) evidence format."
         )
 
+        # Use lightweight CoverageGapResult instead of full BDExtractionResult
+        # to avoid type_summary/missing_gaps validation failures on MiniMax.
+        from .schemas_v5 import CoverageGapResult as _CGR
+
+        _gap_system = (
+            "You are a business decision extractor. Extract decisions from "
+            "uncovered code directories. Return a JSON object with a single "
+            "'decisions' array. Each decision needs: id, content, type "
+            "(T/B/BA/DK/RC/M), rationale (>=40 chars), evidence "
+            "(file:line(function)), stage, status."
+        )
+
         result, tokens = await agent.run_structured_call(
-            prompts_v5.SYNTHESIS_V5_STEP1_SYSTEM,
+            _gap_system,
             gap_prompt,
-            BDExtractionResult,
+            _CGR,
             max_tokens=32768,
         )
 

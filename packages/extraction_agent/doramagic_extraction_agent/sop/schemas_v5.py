@@ -84,17 +84,27 @@ class BusinessDecision(BaseModel):
 
     @field_validator("evidence")
     @classmethod
-    def evidence_must_not_be_empty(cls, v: str) -> str:
-        """Ensure evidence is non-empty. Format enforcement is deferred to enrich P5.
+    def evidence_format_check(cls, v: str) -> str:
+        """Validate evidence format: prefer file:line(fn), accept file:line.
 
-        The enrich pipeline (P5) does deterministic evidence format normalization
-        (file:line(fn) triple). At schema validation time, we only reject empty
-        strings to avoid blocking valid business content from L1.5 salvage or
-        L2 freeform paths where the model may use varied evidence formats.
+        Guides the LLM to produce well-formatted evidence at generation time
+        (front-feed) rather than relying solely on P5 post-hoc cleanup.
+        Accepts:
+          - file.py:123(function_name)   — ideal
+          - file.py:123-456(fn)          — line range
+          - file.py:123                  — acceptable (P5 will enrich)
+          - N/A:0(see_rationale)         — sentinel for missing evidence
+          - Any non-empty string         — tolerated for L2 freeform compat
+
+        This validator is intentionally lenient: it normalizes but never
+        rejects non-empty evidence.  Strict format enforcement would break
+        L2 freeform salvage where the model produces varied formats.
+        Quality is enforced downstream by P5 (normalization) and P5.5
+        (deterministic AST verification).
         """
         if not v or not v.strip():
             raise ValueError("evidence must not be empty")
-        return v
+        return v.strip()
 
 
 class BDExtractionResult(BaseModel):
@@ -163,6 +173,19 @@ class BDExtractionResult(BaseModel):
             if not valid_pattern.match(key):
                 raise ValueError(f"type_summary key {key!r} is not a valid BD type code")
         return self
+
+
+class CoverageGapResult(BaseModel):
+    """Lightweight extraction result for coverage-gap backfill.
+
+    Uses a minimal schema (just a decision list) instead of the full
+    BDExtractionResult — avoids type_summary/missing_gaps validation
+    failures that cause MiniMax to degrade to L3 on every run.
+    """
+
+    decisions: list[BusinessDecision] = Field(
+        description="Supplementary BDs extracted from uncovered directories",
+    )
 
 
 class UseCase(BaseModel):
