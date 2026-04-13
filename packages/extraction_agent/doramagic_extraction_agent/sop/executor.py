@@ -9,6 +9,7 @@ Implements three layers of output reliability (v3 Batch A):
 3. **Blocking Gate**: Phases with ``blocking=True`` halt the pipeline if their
    required artifacts are still missing after auto-save and retry.
 """
+
 from __future__ import annotations
 
 import json
@@ -48,6 +49,18 @@ def _extract_json(
             return None
         if require_type and not isinstance(data, require_type):
             return None
+        # Reject JSON Schema definitions that MiniMax echoes back when
+        # the schema hint is injected into the L2 prompt. These contain
+        # "$defs" or top-level "properties"+"type"="object" — they are
+        # schema metadata, not data instances.
+        if isinstance(data, dict) and ("$defs" in data or "$ref" in data):
+            return None
+        if (
+            isinstance(data, dict)
+            and data.get("type") == "object"
+            and "properties" in data
+        ):
+            return None
         return data
 
     # Strategy 1: entire text is JSON
@@ -59,7 +72,7 @@ def _extract_json(
         pass
 
     # Strategy 2: fenced code blocks (largest first)
-    blocks = re.findall(r'```(?:json)?\s*\n(.*?)```', text, re.DOTALL)
+    blocks = re.findall(r"```(?:json)?\s*\n(.*?)```", text, re.DOTALL)
     for block in sorted(blocks, key=len, reverse=True):
         try:
             result = _accept(json.loads(block))
@@ -81,7 +94,7 @@ def _extract_json(
             # Find the matching close from the end of string
             end = text.rfind(close_ch, start + 1)
             if end > start:
-                candidates.append(text[start:end + 1])
+                candidates.append(text[start : end + 1])
             pos = start + 1
         # Try longest candidates first
         for candidate in sorted(candidates, key=len, reverse=True):
@@ -103,7 +116,7 @@ def _extract_yaml(text: str) -> dict | None:
     import yaml
 
     # Strategy 1: fenced YAML block
-    blocks = re.findall(r'```(?:ya?ml)?\s*\n(.*?)```', text, re.DOTALL)
+    blocks = re.findall(r"```(?:ya?ml)?\s*\n(.*?)```", text, re.DOTALL)
     for block in sorted(blocks, key=len, reverse=True):
         try:
             data = yaml.safe_load(block)
@@ -272,18 +285,14 @@ class SOPExecutor:
         for phase in self._phases:
             unknown = set(phase.depends_on) - phase_names
             if unknown:
-                raise ValueError(
-                    f"Phase '{phase.name}' has unknown dependencies: {unknown}"
-                )
+                raise ValueError(f"Phase '{phase.name}' has unknown dependencies: {unknown}")
         # Simple cycle detection via topological sort
         visited: set[str] = set()
         temp: set[str] = set()
 
         def visit(name: str) -> None:
             if name in temp:
-                raise ValueError(
-                    f"Circular dependency detected involving '{name}'"
-                )
+                raise ValueError(f"Circular dependency detected involving '{name}'")
             if name in visited:
                 return
             temp.add(name)
@@ -312,8 +321,7 @@ class SOPExecutor:
                 group: list[Phase] = [phase]
                 j = i + 1
                 while (
-                    j < len(self._phases)
-                    and self._phases[j].parallel_group == phase.parallel_group
+                    j < len(self._phases) and self._phases[j].parallel_group == phase.parallel_group
                 ):
                     group.append(self._phases[j])
                     j += 1
@@ -358,10 +366,7 @@ class SOPExecutor:
         Returns "continue" or "break".
         """
         # Skip already-completed phases
-        pending = [
-            p for p in group
-            if not self._state.is_phase_completed(p.name)
-        ]
+        pending = [p for p in group if not self._state.is_phase_completed(p.name)]
         for p in group:
             if self._state.is_phase_completed(p.name):
                 logger.info("Skipping completed phase: %s", p.name)
@@ -372,10 +377,7 @@ class SOPExecutor:
 
         # Check dependencies for all pending phases
         for phase in pending:
-            unmet = [
-                dep for dep in phase.depends_on
-                if not self._state.is_phase_completed(dep)
-            ]
+            unmet = [dep for dep in phase.depends_on if not self._state.is_phase_completed(dep)]
             if unmet:
                 error = f"Phase {phase.name!r} has unmet dependencies: {unmet}"
                 logger.error(error)
@@ -391,12 +393,14 @@ class SOPExecutor:
         names = [p.name for p in pending]
         logger.info(
             "Starting parallel group: %s (%d phases)",
-            ", ".join(names), len(pending),
+            ", ".join(names),
+            len(pending),
         )
 
         # Run phases concurrently with bounded parallelism to avoid API rate limits.
         # Default max_parallel=5 keeps request volume manageable for most providers.
         import asyncio
+
         max_parallel = getattr(self, "_max_parallel", 5)
         sem = asyncio.Semaphore(max_parallel)
 
@@ -408,7 +412,8 @@ class SOPExecutor:
         if len(pending) > max_parallel:
             logger.info(
                 "Parallel group has %d phases, limiting to %d concurrent",
-                len(pending), max_parallel,
+                len(pending),
+                max_parallel,
             )
         phase_results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -426,9 +431,7 @@ class SOPExecutor:
                     return "break"
                 else:
                     # Non-blocking phase exception: log and continue
-                    result.errors.append(
-                        f"{error_msg} (non-blocking, skipped)"
-                    )
+                    result.errors.append(f"{error_msg} (non-blocking, skipped)")
                     self._checkpoint.save_state(self._state)
                     continue
 
@@ -451,10 +454,7 @@ class SOPExecutor:
             return "continue"
 
         # 2. Check dependencies
-        unmet = [
-            dep for dep in phase.depends_on
-            if not self._state.is_phase_completed(dep)
-        ]
+        unmet = [dep for dep in phase.depends_on if not self._state.is_phase_completed(dep)]
         if unmet:
             error = f"Phase {phase.name!r} has unmet dependencies: {unmet}"
             logger.error(error)
@@ -483,13 +483,15 @@ class SOPExecutor:
         return outcome
 
     async def _execute_single_phase(
-        self, phase: Phase,
+        self,
+        phase: Phase,
     ) -> PhaseResult | Exception:
         """Execute a phase and return result or exception."""
         try:
             if not phase.requires_llm and phase.python_handler is not None:
                 return await phase.python_handler(
-                    self._state, self._repo_path,
+                    self._state,
+                    self._repo_path,
                 )
             return await self._run_agentic_phase_with_failover(phase)
         except Exception as exc:
@@ -512,15 +514,16 @@ class SOPExecutor:
             # Output Contract: verify required artifacts
             if phase.required_artifacts:
                 missing = self._check_required_artifacts(
-                    phase, artifacts_dir, phase_result,
+                    phase,
+                    artifacts_dir,
+                    phase_result,
                 )
                 if missing and phase.blocking:
-                    error = (
-                        f"Blocking artifacts missing: {missing}"
-                    )
+                    error = f"Blocking artifacts missing: {missing}"
                     logger.error(
                         "Phase %r: %s — pipeline halted",
-                        phase.name, error,
+                        phase.name,
+                        error,
                     )
                     self._state.mark_phase_failed(phase.name, error)
                     result.failed_phase = phase.name
@@ -533,17 +536,13 @@ class SOPExecutor:
             # Mark completed
             artifacts: list[str] = []
             if artifacts_dir.exists():
-                artifacts = [
-                    f.name for f in artifacts_dir.iterdir() if f.is_file()
-                ]
+                artifacts = [f.name for f in artifacts_dir.iterdir() if f.is_file()]
             self._state.mark_phase_completed(
                 phase.name,
                 iterations=phase_result.iterations,
                 tokens=phase_result.total_tokens,
                 artifacts=artifacts,
-                transition_reason=(
-                    f"completed after {phase_result.iterations} iterations"
-                ),
+                transition_reason=(f"completed after {phase_result.iterations} iterations"),
             )
             result.completed_phases.append(phase.name)
         else:
@@ -553,20 +552,15 @@ class SOPExecutor:
             # required artifact was already written, treat as completed.
             # This happens when the model writes the artifact then tries
             # to do one more exploration round before being cut off.
-            if (
-                phase_result.status == "max_iterations"
-                and phase.required_artifacts
-            ):
+            if phase_result.status == "max_iterations" and phase.required_artifacts:
                 artifacts_dir = self._checkpoint.artifacts_dir
                 all_present = all(
-                    (artifacts_dir / a).is_file()
-                    and (artifacts_dir / a).stat().st_size > 0
+                    (artifacts_dir / a).is_file() and (artifacts_dir / a).stat().st_size > 0
                     for a in phase.required_artifacts
                 )
                 if all_present:
                     logger.info(
-                        "Phase %r hit iteration cap but artifacts present — "
-                        "promoting to completed",
+                        "Phase %r hit iteration cap but artifacts present — promoting to completed",
                         phase.name,
                     )
                     # Re-process as completed
@@ -583,7 +577,8 @@ class SOPExecutor:
                 # Non-blocking phase failure: mark as skipped, continue pipeline
                 logger.warning(
                     "Phase %r failed (%s) but is non-blocking — skipping",
-                    phase.name, error_detail,
+                    phase.name,
+                    error_detail,
                 )
                 self._state.mark_phase_failed(phase.name, error_detail)
                 result.errors.append(
@@ -598,10 +593,7 @@ class SOPExecutor:
             # Blocking phase failure: halt pipeline
             self._state.mark_phase_failed(phase.name, error_detail)
             result.failed_phase = phase.name
-            result.errors.append(
-                f"Phase {phase.name!r}: {phase_result.status}"
-                f" — {error_detail}"
-            )
+            result.errors.append(f"Phase {phase.name!r}: {phase_result.status} — {error_detail}")
             result.total_tokens += phase_result.total_tokens
             result.total_iterations += phase_result.iterations
             self._checkpoint.save_state(self._state)
@@ -613,18 +605,20 @@ class SOPExecutor:
         # Quality gate
         if phase.quality_gate is not None:
             gate_ok, gate_detail = phase.quality_gate(
-                self._state, self._repo_path,
+                self._state,
+                self._repo_path,
             )
             result.quality_gate_results[phase.name] = (gate_ok, gate_detail)
             level = logging.INFO if gate_ok else logging.WARNING
             logger.log(
-                level, "Quality gate %s: %s — %s",
-                phase.name, "PASS" if gate_ok else "FAIL", gate_detail,
+                level,
+                "Quality gate %s: %s — %s",
+                phase.name,
+                "PASS" if gate_ok else "FAIL",
+                gate_detail,
             )
             if not gate_ok:
-                result.errors.append(
-                    f"Quality gate {phase.name!r} FAIL: {gate_detail}"
-                )
+                result.errors.append(f"Quality gate {phase.name!r} FAIL: {gate_detail}")
 
         # Checkpoint
         self._checkpoint.save_state(self._state)
@@ -649,7 +643,8 @@ class SOPExecutor:
         agent_loop) are not eligible for failover.
         """
         initial_msg = phase.initial_message_builder(
-            self._state, self._repo_path,
+            self._state,
+            self._repo_path,
         )
 
         # Determine which agent to use (primary)
@@ -678,15 +673,15 @@ class SOPExecutor:
         if not self._is_failover_eligible(phase_result):
             logger.info(
                 "Phase %r failed with %r — not eligible for failover",
-                phase.name, phase_result.status,
+                phase.name,
+                phase_result.status,
             )
             return phase_result
 
         # --- Failover attempt ---
         primary_spec = self._model_router.get_primary(phase.name)
         logger.warning(
-            "Phase %r: primary model %s failed (%s) — "
-            "failing over to %s",
+            "Phase %r: primary model %s failed (%s) — failing over to %s",
             phase.name,
             primary_spec.model_id,
             phase_result.status,
@@ -702,7 +697,8 @@ class SOPExecutor:
                     stale.unlink()
                     logger.info(
                         "Phase %r: removed stale artifact %r before failover",
-                        phase.name, artifact_name,
+                        phase.name,
+                        artifact_name,
                     )
 
         fallback_agent = self._get_or_create_agent(fallback_spec)
@@ -722,12 +718,8 @@ class SOPExecutor:
         fallback_result = PhaseResult(
             phase_name=fallback_result.phase_name,
             status=fallback_result.status,
-            iterations=(
-                phase_result.iterations + fallback_result.iterations
-            ),
-            total_tokens=(
-                phase_result.total_tokens + fallback_result.total_tokens
-            ),
+            iterations=(phase_result.iterations + fallback_result.iterations),
+            total_tokens=(phase_result.total_tokens + fallback_result.total_tokens),
             final_text=fallback_result.final_text,
             error=fallback_result.error,
         )
@@ -735,12 +727,14 @@ class SOPExecutor:
         if fallback_result.status == "completed":
             logger.info(
                 "Phase %r: failover to %s succeeded",
-                phase.name, fallback_spec.model_id,
+                phase.name,
+                fallback_spec.model_id,
             )
         else:
             logger.error(
                 "Phase %r: failover to %s also failed: %s",
-                phase.name, fallback_spec.model_id,
+                phase.name,
+                fallback_spec.model_id,
                 fallback_result.error,
             )
 
@@ -757,9 +751,10 @@ class SOPExecutor:
 
         primary_spec = self._model_router.get_primary(phase.name)
         logger.warning(
-            "Phase %r: %s completed without artifact — "
-            "failing over to %s",
-            phase.name, primary_spec.model_id, fallback_spec.model_id,
+            "Phase %r: %s completed without artifact — failing over to %s",
+            phase.name,
+            primary_spec.model_id,
+            fallback_spec.model_id,
         )
 
         # Clean stale artifacts
@@ -773,7 +768,8 @@ class SOPExecutor:
         self._state.mark_phase_running(phase.name)
 
         initial_msg = phase.initial_message_builder(
-            self._state, self._repo_path,
+            self._state,
+            self._repo_path,
         )
         return await fallback_agent.run_phase(
             phase_name=phase.name,
@@ -810,7 +806,9 @@ class SOPExecutor:
             err = (phase_result.error or "").lower()
             # Context overflow: switching models won't help
             overflow_patterns = (
-                "context", "prompt is too long", "too many tokens",
+                "context",
+                "prompt is too long",
+                "too many tokens",
                 "maximum context length",
             )
             return not any(p in err for p in overflow_patterns)
@@ -840,23 +838,28 @@ class SOPExecutor:
 
             # Attempt auto-save from the LLM's final response text
             logger.warning(
-                "Phase %r: required artifact %r not found — "
-                "attempting auto-save from response",
-                phase.name, artifact_name,
+                "Phase %r: required artifact %r not found — attempting auto-save from response",
+                phase.name,
+                artifact_name,
             )
             saved = self._auto_save_artifact(
-                artifact_name, phase_result.final_text, artifacts_dir,
+                artifact_name,
+                phase_result.final_text,
+                artifacts_dir,
             )
             if saved:
                 logger.info(
                     "Phase %r: auto-saved %r (%d bytes)",
-                    phase.name, artifact_name, artifact_path.stat().st_size,
+                    phase.name,
+                    artifact_name,
+                    artifact_path.stat().st_size,
                 )
             else:
                 logger.error(
                     "Phase %r: could not auto-save %r — "
                     "LLM response did not contain extractable content",
-                    phase.name, artifact_name,
+                    phase.name,
+                    artifact_name,
                 )
                 still_missing.append(artifact_name)
 
@@ -905,10 +908,13 @@ class SOPExecutor:
             data = _extract_yaml(response_text)
             if data is not None:
                 import yaml
+
                 artifact_path.write_text(
                     yaml.dump(
-                        data, allow_unicode=True,
-                        default_flow_style=False, sort_keys=False,
+                        data,
+                        allow_unicode=True,
+                        default_flow_style=False,
+                        sort_keys=False,
                     ),
                     encoding="utf-8",
                 )
