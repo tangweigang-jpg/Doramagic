@@ -411,10 +411,13 @@ class BatchOrchestrator:
 
             # Check if blueprint extraction succeeded: failed_phase OR missing output artifact
             bp_failed = bp_result.failed_phase is not None
-            bp_output = output_mgr.output_dir / "blueprint.yaml"
+            # v6 naming: check LATEST.yaml symlink first, fall back to blueprint.yaml
+            bp_output = output_mgr.output_dir / "LATEST.yaml"
+            if not bp_output.exists():
+                bp_output = output_mgr.output_dir / "blueprint.yaml"  # legacy
             if not bp_failed and not bp_output.exists():
                 bp_failed = True
-                errors.append("Blueprint assembly did not produce output/blueprint.yaml")
+                errors.append("Blueprint assembly did not produce LATEST.yaml or blueprint.yaml")
             # Also validate the YAML is parseable
             if not bp_failed and bp_output.exists():
                 import yaml as _yaml
