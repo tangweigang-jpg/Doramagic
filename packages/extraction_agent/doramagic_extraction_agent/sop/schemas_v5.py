@@ -114,9 +114,11 @@ class BDExtractionResult(BaseModel):
         description="All extracted business decisions (present + missing)",
     )
     type_summary: dict[str, int] = Field(
+        default_factory=dict,
         description="Count of decisions per type, e.g. {'B': 5, 'B/BA': 3, 'M': 2}",
     )
     missing_gaps: list[BusinessDecision] = Field(
+        default_factory=list,
         description="Subset of decisions with status='missing' — things the code should have but doesn't",
     )
 
