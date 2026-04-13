@@ -1717,7 +1717,7 @@ def build_blueprint_phases_v5(
             raw = _re.sub(r"\n?```\s*$", "", raw)
 
             recovered = None
-            # Try JSON then YAML
+            # Try JSON → YAML → truncated JSON recovery
             try:
                 recovered = json.loads(raw)
             except (json.JSONDecodeError, ValueError):
@@ -1725,6 +1725,20 @@ def build_blueprint_phases_v5(
                     recovered = _recover_yaml.safe_load(raw)
                 except Exception:
                     pass
+            # Truncated JSON recovery: MiniMax often hits max_tokens
+            # mid-output, leaving incomplete JSON. Find the last complete
+            # object and close the structure.
+            if recovered is None:
+                last_complete = raw.rfind("},")
+                if last_complete > 0:
+                    try:
+                        recovered = json.loads(raw[:last_complete + 1] + "\n  ]\n}")
+                        logger.info(
+                            "Synthesis L3: recovered %d items from truncated JSON",
+                            len(recovered.get("decisions", [])),
+                        )
+                    except (json.JSONDecodeError, ValueError):
+                        pass
 
             if isinstance(recovered, dict) and "decisions" in recovered:
                 # Build BDExtractionResult with lenient BD parsing
