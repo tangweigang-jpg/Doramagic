@@ -927,9 +927,21 @@ class ExtractionAgent:
 
                 from doramagic_extraction_agent.sop.executor import _extract_json
 
-                extracted = _extract_json(raw_text, require_type=dict)
+                # Accept both dict and list — MiniMax often returns lists
+                # without the wrapper object (e.g. [{uc1}] instead of
+                # {"use_cases": [{uc1}]}).
+                extracted = _extract_json(raw_text)
                 if extracted is None:
                     raise ValueError("_extract_json returned None")
+
+                # If extracted is a list, try wrapping it in the model's
+                # first list field
+                if isinstance(extracted, list):
+                    for fn, fi in response_model.model_fields.items():
+                        origin = getattr(fi.annotation, "__origin__", None)
+                        if origin is list:
+                            extracted = {fn: extracted}
+                            break
 
                 validated = response_model.model_validate(extracted)
                 logger.info(
@@ -978,30 +990,29 @@ class ExtractionAgent:
             import re as _re
             import yaml as _yaml_recover
 
-            cleaned = fallback_text.strip()
-            cleaned = _re.sub(r"^```(?:json|yaml)?\s*\n?", "", cleaned)
-            cleaned = _re.sub(r"\n?```\s*$", "", cleaned)
+            from doramagic_extraction_agent.sop.executor import _extract_json as _l3_extract
 
-            parsed = None
-            # Try 1: JSON
-            try:
-                parsed = json.loads(cleaned)
-            except (json.JSONDecodeError, ValueError):
-                pass
-            # Try 2: YAML
+            # Use _extract_json first (handles fences, prose, bracket scan)
+            parsed = _l3_extract(fallback_text)
+
+            # Fallback: strip fences + try YAML + truncated JSON
             if parsed is None:
+                cleaned = fallback_text.strip()
+                cleaned = _re.sub(r"^```(?:json|yaml)?\s*\n?", "", cleaned)
+                cleaned = _re.sub(r"\n?```\s*$", "", cleaned)
                 try:
                     parsed = _yaml_recover.safe_load(cleaned)
                 except Exception:
                     pass
-            # Try 3: Truncated JSON (max_tokens cutoff)
-            if parsed is None:
-                last_complete = cleaned.rfind("},")
-                if last_complete > 0:
-                    try:
-                        parsed = json.loads(cleaned[:last_complete + 1] + "\n  ]\n}")
-                    except (json.JSONDecodeError, ValueError):
-                        pass
+                if parsed is None:
+                    last_complete = cleaned.rfind("},")
+                    if last_complete > 0:
+                        try:
+                            parsed = json.loads(
+                                cleaned[:last_complete + 1] + "\n  ]\n}"
+                            )
+                        except (json.JSONDecodeError, ValueError):
+                            pass
 
             if isinstance(parsed, (dict, list)):
                 # Strategy A: direct validation (parsed is the correct shape)
