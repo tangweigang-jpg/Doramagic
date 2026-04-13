@@ -3309,7 +3309,7 @@ def build_blueprint_phases_v5(
                 "get_artifact",
                 "write_artifact",
             ],
-            max_iterations=30,
+            max_iterations=50,  # increased from 30 — MiniMax sometimes over-explores
             depends_on=["worker_arch"],
             parallel_group="workers",
             blocking=True,

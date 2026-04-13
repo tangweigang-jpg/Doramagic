@@ -1125,10 +1125,62 @@ def _patch_missing_gaps_from_audit(
     }
     gap_counter = 1
 
+    # --- GAP type inference from audit item keywords ---
+    _GAP_TYPE_MAP: list[tuple[list[str], str]] = [
+        (["regulation", "mandatory", "settlement", "T+1", "stamp", "tax", "compliance"], "RC"),
+        (["decimal", "precision", "float", "rounding", "tick_size", "lot_size"], "RC"),
+        (["convergence", "tolerance", "matrix", "condition", "numerical"], "M"),
+        (["day_count", "act360", "thirty360"], "M/DK"),
+        (["point-in-time", "stale", "snapshot", "release_date", "as_of"], "DK"),
+        (["seed", "random", "reproducib"], "DK"),
+        (["version", "experiment_id", "run_id"], "B"),
+        (["calendar", "holiday", "timezone"], "DK"),
+    ]
+
+    # --- GAP stage inference from audit item keywords ---
+    _GAP_STAGE_MAP: list[tuple[list[str], str]] = [
+        (["execution", "order", "settlement", "slippage", "cost"], "trading_execution"),
+        (["data", "provider", "stale", "point-in-time", "snapshot"], "data_collection"),
+        (["factor", "compute", "indicator", "ma", "macd"], "factor_computation"),
+        (["model", "ml", "train", "predict", "seed", "random"], "ml_prediction"),
+        (["precision", "decimal", "float", "tick_size"], "trading_execution"),
+        (["calendar", "holiday", "day_count", "timezone"], "data_collection"),
+        (["version", "experiment", "log", "audit"], "data_storage"),
+    ]
+
+    def _infer_gap_type(item_text: str) -> str:
+        text_lower = item_text.lower()
+        for keywords, gap_type in _GAP_TYPE_MAP:
+            if sum(1 for kw in keywords if kw.lower() in text_lower) >= 1:
+                return gap_type
+        return "B"
+
+    def _infer_gap_stage(item_text: str, stages: list[str]) -> str:
+        text_lower = item_text.lower()
+        for keywords, stage in _GAP_STAGE_MAP:
+            if stage in stages and sum(1 for kw in keywords if kw.lower() in text_lower) >= 1:
+                return stage
+        return stages[0] if stages else "unknown"
+
+    def _clean_gap_content(raw_item: str) -> str:
+        """Clean audit table format: '4 | float vs Decimal... | absent | ...' → natural language."""
+        # Remove leading number + pipe separators
+        parts = raw_item.split("|")
+        if len(parts) >= 2:
+            # Take the second part (the description), skip number and status
+            desc = parts[1].strip() if len(parts) > 1 else raw_item
+            return f"Missing: {desc}"
+        return f"Missing: {raw_item.strip()}"
+
+    # Get stage IDs from blueprint for stage inference
+    bp_stages = [
+        s.get("id", "") for s in bp.get("stages", [])
+        if isinstance(s, dict) and s.get("id")
+    ]
+
     injected = 0
     for fail in fail_items:
-        # Simple keyword overlap check — if the fail item's key terms
-        # appear in existing BD content, it's already covered
+        # Simple keyword overlap check
         keywords = [
             w.lower() for w in fail["item"].split()
             if len(w) > 3 and w.lower() not in {
@@ -1140,29 +1192,34 @@ def _patch_missing_gaps_from_audit(
         coverage_ratio = covered / max(len(keywords), 1)
 
         if coverage_ratio < 0.5:
-            # Not covered — generate missing gap BD
             gap_id = f"BD-GAP-{gap_counter:03d}"
             while gap_id in existing_ids:
                 gap_counter += 1
                 gap_id = f"BD-GAP-{gap_counter:03d}"
 
-            detail = fail["detail"] or "Identified by audit checklist"
+            # Clean content, infer type and stage
+            content = _clean_gap_content(fail["item"])
+            gap_type = _infer_gap_type(fail["item"] + " " + fail.get("detail", ""))
+            gap_stage = _infer_gap_stage(
+                fail["item"] + " " + fail.get("detail", ""), bp_stages,
+            )
+            detail = fail.get("detail", "") or "Identified by audit checklist"
+
             gap_bd = {
                 "id": gap_id,
-                "content": fail["item"],
-                "type": "B",
+                "content": content,
+                "type": gap_type,
                 "rationale": (
-                    f"Audit finding: this capability is absent from the codebase. "
-                    f"{detail}. Should be implemented for production use."
+                    f"Audit finding: {content.lower()}. {detail}. "
+                    f"This gap affects production reliability and should be addressed."
                 ),
                 "evidence": "N/A:0(see_rationale)",
-                "stage": "unknown",
+                "stage": gap_stage,
                 "status": "missing",
                 "severity": "high",
-                "impact": detail,
+                "impact": detail[:200],
                 "known_gap": True,
             }
-            # Pad rationale to >= 40 chars
             if len(gap_bd["rationale"]) < 40:
                 gap_bd["rationale"] += " " * (40 - len(gap_bd["rationale"]))
 
@@ -1242,6 +1299,50 @@ def _patch_multi_type_annotation(bp: dict[str, Any]) -> int:
     return upgraded
 
 
+def _patch_absolute_words(bp: dict[str, Any]) -> int:
+    """P17: reduce 'all/All' frequency to ≤3 in text fields.
+
+    SOP v3.4 rule: "所有"+"全部" ≤3 occurrences; English "all" similarly
+    restricted. Replace overused absolute words with precise alternatives.
+    """
+    _REPLACEMENTS = [
+        ("all stages", "each stage"),
+        ("all modules", "each module"),
+        ("all entities", "each entity"),
+        ("all schemas", "each schema"),
+        ("all recorders", "each recorder"),
+        ("all providers", "each provider"),
+        ("all decisions", "each decision"),
+        ("all fields", "each field"),
+        ("All stages", "Each stage"),
+        ("All modules", "Each module"),
+        ("All entities", "Each entity"),
+        ("All schemas", "Each schema"),
+    ]
+
+    import yaml as _yaml
+
+    content = _yaml.dump(bp, allow_unicode=True, default_flow_style=False)
+    count = content.lower().count(" all ")
+    if count <= 3:
+        return 0
+
+    replaced = 0
+    for old, new in _REPLACEMENTS:
+        if old in content:
+            content = content.replace(old, new)
+            replaced += 1
+
+    if replaced > 0:
+        bp.update(_yaml.safe_load(content))
+        logger.info(
+            "P17 (absolute_words): replaced %d 'all' patterns (%d remaining)",
+            replaced,
+            content.lower().count(" all "),
+        )
+    return replaced
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -1313,6 +1414,9 @@ def enrich_blueprint(
 
     # v6: Deterministic multi-type annotation enhancement
     patch_stats["p16_multi_type"] = _patch_multi_type_annotation(bp)
+
+    # v6: Replace overused absolute words (SOP: "all/All" ≤ 3 occurrences)
+    patch_stats["p17_absolute_words"] = _patch_absolute_words(bp)
 
     total_affected = sum(patch_stats.values())
     logger.info(

@@ -1089,6 +1089,7 @@ class TestEnrichBlueprint:
             "p14_resource_injection",
             "p15_missing_gaps",
             "p16_multi_type",
+            "p17_absolute_words",
         }
         # v6: p5_5_evidence_verify is conditional (requires repo_path)
         actual_keys = set(patch_stats.keys())
