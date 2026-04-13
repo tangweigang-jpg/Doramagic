@@ -1689,20 +1689,158 @@ def build_blueprint_phases_v5(
             )
 
         # Step 1: Extract BD list + classify types
-        step1_msg = _build_step1_message(
-            worker_arch,
-            worker_workflow,
-            worker_math,
-            state,
-            worker_arch_deep=worker_arch_deep,
+        # Split into two calls to reduce output size and validation errors.
+        # Call A: architecture (arch + arch_deep) → structural/design BDs
+        # Call B: workflow + math → business/algorithm BDs
+        # Each call produces ~30-40 BDs instead of ~80, halving truncation
+        # risk and validation error count.
+
+        step1a_msg = _build_step1_message(
+            worker_arch, "", "", state, worker_arch_deep=worker_arch_deep,
         )
-        step1_result, tokens1 = await agent.run_structured_call(
+        step1b_msg = _build_step1_message(
+            "", worker_workflow, worker_math, state,
+        )
+
+        # Run both calls (sequential to avoid MiniMax rate limits)
+        step1a_result, tokens1a = await agent.run_structured_call(
             prompts_v5.SYNTHESIS_V5_STEP1_SYSTEM,
-            step1_msg,
+            step1a_msg,
             BDExtractionResult,
         )
-        total_tokens += tokens1
+        total_tokens += tokens1a
 
+        step1b_result, tokens1b = await agent.run_structured_call(
+            prompts_v5.SYNTHESIS_V5_STEP1_SYSTEM,
+            step1b_msg,
+            BDExtractionResult,
+        )
+        total_tokens += tokens1b
+
+        # Merge results from both calls
+        all_decisions: list[BusinessDecision] = []
+        all_missing: list[BusinessDecision] = []
+
+        for result_part, label in [
+            (step1a_result, "arch"),
+            (step1b_result, "workflow"),
+        ]:
+            if isinstance(result_part, RawFallback):
+                # L3 recovery for this half
+                (artifacts_dir / f"synthesis_v5_{label}_raw.txt").write_text(
+                    result_part.text, encoding="utf-8",
+                )
+                import re as _re
+                import yaml as _recover_yaml
+
+                raw = result_part.text.strip()
+                raw = _re.sub(r"^```(?:json|yaml)?\s*\n?", "", raw)
+                raw = _re.sub(r"\n?```\s*$", "", raw)
+
+                recovered = None
+                try:
+                    recovered = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    try:
+                        recovered = _recover_yaml.safe_load(raw)
+                    except Exception:
+                        pass
+                if recovered is None:
+                    last_complete = raw.rfind("},")
+                    if last_complete > 0:
+                        try:
+                            recovered = json.loads(
+                                raw[:last_complete + 1] + "\n  ]\n}"
+                            )
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+
+                if isinstance(recovered, dict) and "decisions" in recovered:
+                    for bd_raw in recovered["decisions"]:
+                        if not isinstance(bd_raw, dict) or "content" not in bd_raw:
+                            continue
+                        bd_raw.setdefault("id", f"BD-{len(all_decisions)+1:03d}")
+                        bd_raw.setdefault("type", "B")
+                        bd_raw.setdefault("stage", "unknown")
+                        bd_raw.setdefault("status", "present")
+                        rat = bd_raw.get("rationale", bd_raw.get("content", ""))
+                        if len(rat) < 40:
+                            rat = rat + " " * (40 - len(rat))
+                        bd_raw["rationale"] = rat
+                        if not bd_raw.get("evidence"):
+                            bd_raw["evidence"] = "N/A:0(see_rationale)"
+                        try:
+                            bd = BusinessDecision.model_validate(bd_raw)
+                            all_decisions.append(bd)
+                            if bd.status == "missing":
+                                all_missing.append(bd)
+                        except Exception:
+                            try:
+                                bd = BusinessDecision(
+                                    id=bd_raw["id"],
+                                    content=str(bd_raw.get("content", "")),
+                                    type=bd_raw.get("type", "B"),
+                                    rationale=rat,
+                                    evidence=bd_raw.get("evidence", "N/A:0(see_rationale)"),
+                                    stage=bd_raw.get("stage", "unknown"),
+                                )
+                                all_decisions.append(bd)
+                            except Exception:
+                                pass
+                    logger.info(
+                        "Synthesis Step 1 (%s): L3 recovery — %d BDs",
+                        label, len(all_decisions),
+                    )
+                else:
+                    logger.warning(
+                        "Synthesis Step 1 (%s): L3 recovery failed — no decisions",
+                        label,
+                    )
+            else:
+                # L2 or L3 universal recovery succeeded
+                all_decisions.extend(result_part.decisions)
+                all_missing.extend(result_part.missing_gaps)
+                logger.info(
+                    "Synthesis Step 1 (%s): %d decisions",
+                    label, len(result_part.decisions),
+                )
+
+        if not all_decisions:
+            return PhaseResult(
+                phase_name="bp_synthesis_v5",
+                status="error",
+                total_tokens=total_tokens,
+                error="Synthesis Step 1: both calls returned no decisions",
+            )
+
+        # Deduplicate by content similarity (different workers may find same decision)
+        seen_content: set[str] = set()
+        deduped: list[BusinessDecision] = []
+        for bd in all_decisions:
+            key = bd.content[:50].lower().strip()
+            if key not in seen_content:
+                seen_content.add(key)
+                deduped.append(bd)
+
+        # Re-number IDs sequentially
+        for i, bd in enumerate(deduped):
+            bd.id = f"BD-{i+1:03d}"
+
+        missing_deduped = [bd for bd in deduped if bd.status == "missing"]
+        step1_result = BDExtractionResult(
+            decisions=deduped,
+            missing_gaps=missing_deduped,
+        )
+
+        logger.info(
+            "Synthesis Step 1 merged: %d decisions (%d deduped from %d), %d missing gaps",
+            len(deduped),
+            len(all_decisions) - len(deduped),
+            len(all_decisions),
+            len(missing_deduped),
+        )
+
+        # --- Step 1 L3 recovery is no longer needed here (handled per-call above) ---
         if isinstance(step1_result, RawFallback):
             # L3 recovery: parse raw text for BD JSON (same pattern as Assembly)
             (artifacts_dir / "synthesis_v5_raw.txt").write_text(
