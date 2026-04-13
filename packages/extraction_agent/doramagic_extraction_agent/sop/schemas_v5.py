@@ -169,11 +169,27 @@ class BDExtractionResult(BaseModel):
 
     @model_validator(mode="after")
     def check_type_summary_keys(self) -> BDExtractionResult:
-        """Ensure type_summary keys are valid BD type codes."""
+        """Clean type_summary: remove invalid keys instead of rejecting.
+
+        MiniMax L2 freeform often produces non-standard keys like
+        'RC_missing', 'missing', 'interaction'. Rejecting causes L2→L3
+        degradation. Instead, silently drop invalid keys — type_summary
+        is reconstructable from the decisions list downstream.
+        """
         valid_pattern = re.compile(r"^(T|B|BA|DK|RC|M)(/(?:T|B|BA|DK|RC|M))*$")
-        for key in self.type_summary:
-            if not valid_pattern.match(key):
-                raise ValueError(f"type_summary key {key!r} is not a valid BD type code")
+        invalid_keys = [k for k in self.type_summary if not valid_pattern.match(k)]
+        if invalid_keys:
+            import logging as _logging
+
+            _logging.getLogger(__name__).warning(
+                "type_summary: dropped %d invalid keys: %s",
+                len(invalid_keys),
+                invalid_keys,
+            )
+        self.type_summary = {
+            k: v for k, v in self.type_summary.items()
+            if valid_pattern.match(k)
+        }
         return self
 
 

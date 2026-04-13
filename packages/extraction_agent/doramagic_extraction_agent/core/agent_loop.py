@@ -64,6 +64,55 @@ _TRANSPORT_ERROR_MARKERS = ("529", "429", "500", "502", "503", "overloaded", "ov
 _TOKEN_BUDGET_WARN = 60_000  # warn level: soft budget
 _TOKEN_BUDGET_MAX = 120_000  # error level: hard budget
 
+
+# ---------------------------------------------------------------------------
+# L2 example instance builder
+# ---------------------------------------------------------------------------
+
+
+def _build_example_instance(model: type[BaseModel]) -> dict[str, Any]:
+    """Build a placeholder JSON instance from a Pydantic model.
+
+    Produces a concrete "form to fill in" instead of a JSON Schema definition.
+    MiniMax M2.7 echoes back schema definitions ($defs, $ref) but reliably
+    fills in concrete examples.
+    """
+    result: dict[str, Any] = {}
+    for name, field_info in model.model_fields.items():
+        annotation = field_info.annotation
+        # Unwrap Optional
+        origin = getattr(annotation, "__origin__", None)
+        args = getattr(annotation, "__args__", ())
+
+        if annotation is str or annotation == str:
+            result[name] = f"<{name}>"
+        elif annotation is int or annotation == int:
+            result[name] = 0
+        elif annotation is float or annotation == float:
+            result[name] = 0.0
+        elif annotation is bool or annotation == bool:
+            result[name] = False
+        elif origin is list or (hasattr(annotation, "__origin__") and str(origin) == "typing.List"):
+            # list[X] → [example_of_X]
+            item_type = args[0] if args else str
+            if isinstance(item_type, type) and issubclass(item_type, BaseModel):
+                result[name] = [_build_example_instance(item_type)]
+            else:
+                result[name] = [f"<{name}_item>"]
+        elif origin is dict:
+            result[name] = {f"<key>": f"<value>"}
+        elif isinstance(annotation, type) and issubclass(annotation, BaseModel):
+            result[name] = _build_example_instance(annotation)
+        else:
+            # Fallback for Optional, Literal, Union, etc.
+            if field_info.default is not None and field_info.default is not ...:
+                result[name] = field_info.default
+            elif field_info.default_factory is not None:
+                result[name] = field_info.default_factory()
+            else:
+                result[name] = f"<{name}>"
+    return result
+
 # ---------------------------------------------------------------------------
 # Convergence detection (Diminishing Returns)
 # ---------------------------------------------------------------------------
@@ -839,19 +888,31 @@ class ExtractionAgent:
                     l15_exc,
                 )
 
-        # --- L2: Free-form call with schema hint + _extract_json + model_validate ---
-        # Inject the schema description into the user message so the model
-        # knows what structure to produce even without Instructor tool enforcement.
+        # --- L2: Free-form call with example instance + _extract_json + model_validate ---
+        # Inject a concrete JSON EXAMPLE (not the schema definition) so the
+        # model sees "a form to fill in" rather than "metadata to echo back".
+        # MiniMax M2.7 frequently echoes raw model_json_schema() output
+        # ($defs, $ref, properties) instead of producing data instances.
         schema_hint = ""
         try:
-            schema_json = json.dumps(response_model.model_json_schema(), indent=2)
+            example = _build_example_instance(response_model)
+            example_json = json.dumps(example, indent=2, ensure_ascii=False)
+            # List required field names for explicit instruction
+            required_fields = [
+                name for name, f in response_model.model_fields.items()
+                if f.is_required()
+            ]
             schema_hint = (
                 f"\n\n## REQUIRED OUTPUT FORMAT\n"
-                f"Return a single JSON object matching this schema (no markdown fences):\n"
-                f"```json\n{schema_json}\n```\n"
+                f"Return a single JSON object with EXACTLY this structure. "
+                f"Replace the placeholder values with real extracted data:\n"
+                f"```json\n{example_json}\n```\n"
+                f"CRITICAL: Return actual DATA, NOT a JSON Schema definition. "
+                f"Do NOT include $defs, $ref, or 'properties' keys.\n"
+                f"Required fields: {', '.join(required_fields)}\n"
             )
         except Exception:
-            pass  # Schema extraction failed; proceed without hint
+            pass  # Example generation failed; proceed without hint
 
         raw_text = ""
         l2_message = user_message + schema_hint if schema_hint else user_message
