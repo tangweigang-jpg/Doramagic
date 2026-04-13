@@ -584,8 +584,12 @@ class BatchOrchestrator:
                 job.blueprint_id,
             )
 
-        # 9. Write manifest
-        output_mgr.write_manifest(
+        # 9. Write manifest — reload from disk to preserve version entries
+        #    added by _finalize_handler's OutputManager during the pipeline.
+        final_mgr = OutputManager(
+            output_mgr.output_dir, job.blueprint_id, repo_slug=repo_slug
+        )
+        final_mgr.write_manifest(
             blueprint_id=job.blueprint_id,
             domain=job.domain,
             commit_hash=state.commit_hash,
