@@ -359,7 +359,10 @@ def _repair_yaml(content: str) -> str:
 
 
 async def _finalize_handler(state: AgentState, repo_path: Path) -> PhaseResult:
-    """Repair YAML if needed, then promote blueprint from artifacts to output directory."""
+    """Repair YAML, then promote blueprint with versioned naming.
+
+    v6 naming: ``{bp_id}--{repo_slug}/blueprint.v{N}.yaml`` + LATEST symlink.
+    """
     from ..state.output import OutputManager
 
     run_dir = Path(state.run_dir) if state.run_dir else repo_path.parent
@@ -405,7 +408,7 @@ async def _finalize_handler(state: AgentState, repo_path: Path) -> PhaseResult:
             parsed[new_key] = parsed.pop(old_key)
             logger.info("bp_finalize: renamed field '%s' -> '%s'", old_key, new_key)
 
-    # Ensure source.projects exists — Fix 6: guard against source: null or source: [...]
+    # Ensure source.projects exists
     parsed_source = parsed.get("source")
     if not isinstance(parsed_source, dict):
         parsed_source = {}
@@ -418,16 +421,81 @@ async def _finalize_handler(state: AgentState, repo_path: Path) -> PhaseResult:
         parsed_source["projects"] = [repo] if repo else []
         logger.info("bp_finalize: populated source.projects=[%r] from repo path", repo)
 
-    content = _yaml.dump(parsed, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    content = _yaml.dump(
+        parsed, allow_unicode=True, default_flow_style=False, sort_keys=False
+    )
 
     # Write repaired YAML back to artifacts (for debugging)
     bp_file.write_text(content)
 
-    # Write to the final output directory (knowledge/sources/{domain}/{bp_id}/)
+    # Derive repo_slug from repo path (e.g. "repos/zvt" → "zvt")
+    repo_slug = Path(state.repo_path).name if state.repo_path else ""
+
+    # Build version metadata from artifacts
+    version_meta: dict[str, Any] = {
+        "commit_hash": state.commit_hash or parsed_source.get("commit_hash", ""),
+        "sop_version": parsed.get("sop_version", "3.4"),
+        "agent_version": "v6",
+        "llm_model": getattr(state, "llm_model", ""),
+    }
+
+    # Load evaluator report and quality gate if available
+    eval_path = artifacts_dir / "evaluation_report.json"
+    if eval_path.exists():
+        try:
+            import json as _json
+
+            eval_data = _json.loads(eval_path.read_text(encoding="utf-8"))
+            version_meta["evaluator"] = {
+                "score": eval_data.get("score", 0),
+                "evaluated": eval_data.get("evaluated_count", 0),
+                "passed": eval_data.get("pass_count", 0),
+                "issues": len(eval_data.get("issues", [])),
+                "recommendation": eval_data.get("recommendation", ""),
+            }
+        except Exception:
+            pass
+
+    qg_path = artifacts_dir / "quality_gate_result.json"
+    if qg_path.exists():
+        try:
+            import json as _json
+
+            version_meta["quality_gate"] = _json.loads(
+                qg_path.read_text(encoding="utf-8")
+            )
+        except Exception:
+            pass
+
+    # Compute stats from parsed blueprint
+    bds = parsed.get("business_decisions", [])
+    non_t = [b for b in bds if isinstance(b, dict) and b.get("type", "T") != "T"]
+    missing = [b for b in bds if isinstance(b, dict) and b.get("status") == "missing"]
+    version_meta["stats"] = {
+        "stages": len(parsed.get("stages", [])),
+        "business_decisions": len(bds),
+        "non_t_decisions": len(non_t),
+        "missing_gaps": len(missing),
+        "known_use_cases": len(parsed.get("known_use_cases", [])),
+        "global_contracts": len(parsed.get("global_contracts", [])),
+    }
+
+    # Write to versioned output directory
     output_path = Path(state.output_dir) if state.output_dir else run_dir / "output"
-    output_mgr = OutputManager(output_path, state.blueprint_id)
-    output_mgr.write_blueprint(content)
-    state.blueprint_path = str(output_mgr.output_dir / "blueprint.yaml")
+    output_mgr = OutputManager(output_path, state.blueprint_id, repo_slug=repo_slug)
+    bp_path = output_mgr.write_blueprint(content, version_meta=version_meta)
+
+    # Also update manifest top-level fields
+    output_mgr.write_manifest(
+        blueprint_id=state.blueprint_id,
+        domain=state.domain or "finance",
+        commit_hash=version_meta["commit_hash"],
+        llm_model=version_meta.get("llm_model", ""),
+        blueprint_stats=version_meta.get("stats"),
+        quality_gates=version_meta.get("quality_gate"),
+    )
+
+    state.blueprint_path = str(bp_path)
     logger.info("bp_finalize: promoted blueprint to %s", state.blueprint_path)
     return PhaseResult(phase_name="bp_finalize", status="completed", iterations=0)
 

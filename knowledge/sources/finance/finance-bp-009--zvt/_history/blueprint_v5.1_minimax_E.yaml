@@ -1,0 +1,1802 @@
+id: finance-bp-009
+name: ZVT Chinese Stock Trading System
+version: 1.0.0
+source:
+  repository: https://github.com/zvtvz/zvt
+  commit_hash: f971f00c2181bc7d7fb7987a7875d4ec5960881a
+  path: repos/zvt
+  projects:
+  - https://github.com/zvtvz/zvt
+sop_version: '3.4'
+applicability:
+  domain: Chinese A-share Stock Market Quantitative Trading
+  task_type:
+  - Technical Factor Analysis
+  - Fundamental Factor Analysis
+  - Multi-timeframe Trading Strategy
+  - Machine Learning Prediction
+  - Backtesting and Simulation
+  - Real-time Trading
+  description: 'ZVT is a modular quantitative trading system designed for Chinese
+    A-share stocks.
+
+    It provides data recording, factor computation, strategy development, backtesting,
+
+    and trading execution capabilities with support for multiple data providers and
+
+    technical/fundamental analysis.
+
+    '
+  prerequisites:
+  - Python 3.8+
+  - Market data provider credentials (joinquant, eastmoney, sina, etc.)
+  - Understanding of Chinese stock market T+1 trading rules
+  - Familiarity with technical indicators (MACD, MA, Bollinger Bands)
+  not_suitable_for:
+  - High-frequency trading (HFT) strategies
+  - Intraday tick-level trading without proper slippage modeling
+  - Strategies ignoring regulatory constraints (T+1, limit up/down, stamp tax)
+stages:
+- id: data_collection
+  name: Data Collection
+  order: 1
+  responsibility: DataRecorder
+  interface: 'Recorders collect market data from providers (joinquant, em, sina, etc.)
+
+    and persist to storage. Data includes OHLCV, fundamental data, money flow,
+
+    dragon/tiger list, and actor holdings.
+
+    '
+  replaceable_points:
+  - Custom data recorders for new providers
+  - Custom domain schemas for new asset types
+  design_decisions:
+  - BD-021: Default adjustment type hfq (post-adjusted) for accurate backtesting
+  - BD-045: Data recording schedule at 15:30 (stock), 16:30 (news), 18:00 (dragon/tiger)
+  - BD-047: 2-second sleep between API calls for rate limiting
+  - BD-048: ignore_delist=True, ignore_st=False (keep ST stocks)
+  required_methods:
+  - name: record()
+    description: Main recording loop that fetches and persists data
+    evidence: src/zvt/contract/recorder.py:476-510
+  - name: run()
+    description: Starts the recording process
+    evidence: src/zvt/contract/recorder.py:476
+  - name: evaluate()
+    description: Evaluates if recording is needed
+    evidence: src/zvt/contract/recorder.py:477
+  key_behaviors:
+  - behavior: Chronological order preservation
+    description: Each entity's data must be saved in chronological order
+    evidence: src/zvt/contract/recorder.py:476-510
+  - behavior: MultiIndex structure [entity_id, timestamp]
+    description: All internal DataFrames use 2-level MultiIndex
+    evidence: src/zvt/utils/pd_utils.py:84-91
+  acceptance_hints: '- Data is persisted with correct OHLCV format
+
+    - Adjustment types (hfq/qfq) are properly applied
+
+    - Provider-specific quirks are handled
+
+    '
+- id: factor_computation
+  name: Factor Computation
+  order: 2
+  responsibility: Factor
+  interface: 'Factors transform raw price data into trading signals. Technical factors
+    include
+
+    MACD, Moving Averages, Bollinger Bands. Fundamental factors include ROE, revenue
+
+    growth, cash flow ratios. Factors output filter_result (boolean) or score_result
+    (0-1).
+
+    '
+  replaceable_points:
+  - Custom Transformers for factor transformation
+  - Custom Accumulators for stateful factor computation
+  - Custom Factor implementations
+  design_decisions:
+  - BD-001: MACD slow=26, fast=12, signal=9
+  - BD-002: Bollinger Band window=20, window_dev=2
+  - BD-003: Golden/Dead cross pattern with live_count transitions [-5, 1]
+  - BD-004: Bull market condition diff>0 AND dea>0 (dual positive)
+  - BD-005: KeepBullFactor requires 10 consecutive bull periods
+  - BD-006: Default MA windows Fibonacci [5, 10, 34, 55, 89, 144, 120, 250]
+  - BD-007: CrossMaFactor ma5>ma10 AND ma10>ma20 for long trend
+  - BD-011: Volume MA window=30 periods
+  - BD-012: TopBottomTransformer 20-day rolling window
+  - BD-013: FallBelowTransformer window=10, interval=3
+  - BD-014: QuantileScorer 7 discrete score levels
+  - BD-015: RankScorer uses percentile ranking across entities
+  - BD-016: GoodCompanyFactor thresholds ROE>=2%, growth>=5%
+  - BD-017: GoodCompanyFactor period multipliers year=x4, season3=x3, half_year=x2
+  - BD-018: GoodCompanyFactor window='1095d', count=8 quarters
+  - BD-019: Risky company filters revenue growth<-10%, profit growth<-10%
+  - BD-040: EMA with adjust=False for MACD calculation
+  - BD-041: MA distance (MA5-MA10)/close for trend strength
+  - BD-042: Area calculation segmented cumulative for trend magnitude
+  - BD-043: MaStatsAccumulator acc_window=250, windows=[5,10], vol_windows=[30]
+  - BD-044: Live/dead tracking live=diff>dea, bull=diff>0 AND dea>0
+  - BD-055: Factor compute pipeline order enforced
+  - BD-058: Accumulator window=1 by default (stateless)
+  - BD-059: Result DataFrame must contain filter_result or score_result
+  - BD-061: ZenAccumulator requires exactly 11 k-lines for first fenxing
+  - BD-062: Zen zhongshu detection requires exactly 4 bi points
+  required_methods:
+  - name: compute()
+    description: Main factor computation pipeline
+    evidence: src/zvt/contract/factor.py:434-449
+  - name: compute_factor()
+    description: Computes factor values from transformed data
+    evidence: src/zvt/contract/factor.py:434
+  - name: compute_result()
+    description: Generates result_df with filter_result or score_result
+    evidence: src/zvt/contract/factor.py:438
+  key_behaviors:
+  - behavior: Pipeline order enforcement
+    description: pre_compute -> do_compute -> compute_factor -> compute_result ->
+      after_compute
+    evidence: src/zvt/contract/factor.py:434-449
+  - behavior: Result column contract
+    description: ALL factors MUST produce filter_result or score_result
+    evidence: src/zvt/utils/pd_utils.py:16-21
+  acceptance_hints: '- Factors produce valid filter_result or score_result columns
+
+    - MA/MACD calculations match expected values
+
+    - Factor results are consistent across different time periods
+
+    '
+- id: strategy_development
+  name: Strategy Development
+  order: 3
+  responsibility: StockTrader
+  interface: 'Traders combine factors, apply position control, and generate trading
+    signals.
+
+    Strategies can use single or multiple factor levels (daily, weekly). Traders
+
+    support both backtesting and live trading modes.
+
+    '
+  replaceable_points:
+  - Custom trading logic via on_time, on_trading_signals overrides
+  - Custom position control (long_position_control, short_position_control)
+  - Custom factor filtering via on_factor_targets_filtered
+  design_decisions:
+  - BD-022: Trading costs 0.1% buy, 0.1% sell, 0.1% slippage
+  - BD-023: Default profit threshold 3% take-profit, -30% stop-loss
+  - BD-024: Fund holding change thresholds +5% buy, -50% sell
+  - BD-025: DragonTigerFactor filter dep1 == '机构专用'
+  - BD-026: Entity pool intersection of top 30% volume AND top 30% fund holdings
+  - BD-027: Multi-level trading weekly+daily MACD combination
+  - BD-028: 40-day rolling windows with -50 day backshift
+  - BD-029: BullAndUpFactor turnover 400M RMB, turnover_rate 2%
+  - BD-056: Factor levels processed in ascending order with final decision at minimum
+      level
+  - BD-057: Default trading level LEVEL_1DAY (daily)
+  required_methods:
+  - name: init_factors()
+    description: Initializes factors for the trading strategy
+    evidence: examples/trader/macd_day_trader.py:19-35
+  - name: on_time()
+    description: Time-based trading logic callback
+    evidence: examples/trader/follow_ii_trader.py:15-43
+  - name: handle_factor_targets()
+    description: Processes factor outputs and generates trading decisions
+    evidence: src/zvt/trader/trader.py:404-432
+  key_behaviors:
+  - behavior: Multi-timeframe factor processing
+    description: Factors at different levels are cached and combined at minimum level
+    evidence: src/zvt/trader/trader.py:404-432
+  - behavior: Signal generation
+    description: Trading signals generated from factor results with position control
+    evidence: src/zvt/trader/trader.py:1-50
+  acceptance_hints: '- Strategies generate actionable trading signals
+
+    - Position limits are respected
+
+    - Multiple factor levels are properly combined
+
+    '
+- id: backtesting
+  name: Backtesting
+  order: 4
+  responsibility: SimAccountService
+  interface: 'SimAccountService simulates trading with realistic cost modeling and
+
+    position management. It tracks portfolio value, calculates returns,
+
+    and generates performance reports.
+
+    '
+  replaceable_points:
+  - Custom cost models
+  - Custom risk management rules
+  - Custom performance metrics
+  design_decisions:
+  - BD-022: Trading costs 0.1% buy, 0.1% sell, 0.1% slippage
+  - BD-023: Default profit threshold 3% take-profit, -30% stop-loss
+  - BD-039: Profit rate (all_value - input_money) / input_money
+  - BD-067: Limit up/down handling [MISSING]
+  - BD-068: Stamp tax 0.05% on sell [MISSING]
+  - BD-076: Transaction cost model calibration [MISSING]
+  required_methods:
+  - name: handle_trading_signal()
+    description: Processes trading signals and executes simulated trades
+    evidence: src/zvt/trader/sim_account.py:180-195
+  - name: get_current_account()
+    description: Calculates current account value and profit rate
+    evidence: src/zvt/trader/sim_account.py:294-295
+  - name: long_position_control()
+    description: Manages long position sizing and risk
+    evidence: src/zvt/trader/trader.py:310-330
+  key_behaviors:
+  - behavior: Cost calculation
+    description: Commissions and slippage applied to each trade
+    evidence: src/zvt/trader/sim_account.py:34-36
+  - behavior: Position management
+    description: Tracks open positions and calculates unrealized P&L
+    evidence: src/zvt/trader/sim_account.py:180-195
+  acceptance_hints: '- Backtest results are reproducible
+
+    - Costs are accurately calculated
+
+    - Performance metrics are correctly computed
+
+    '
+- id: ml_prediction
+  name: Machine Learning Prediction
+  order: 5
+  responsibility: MLMachine
+  interface: 'MLMachine provides supervised learning for stock prediction. It builds
+
+    features from market data, generates labels, trains models, and produces
+
+    predictions. Supports classification and regression tasks.
+
+    '
+  replaceable_points:
+  - Custom feature engineering
+  - Custom label generation
+  - Custom model architectures
+  design_decisions:
+  - BD-033: Relative performance quantiles best>=0.9, ordinary>=0.5, poor>=0
+  - BD-034: ML prediction horizon 20 trading days
+  - BD-035: ML features MA windows [5, 10, 120, 250] with StandardScaler
+  - BD-036: ML label methods 'raw', 'change', 'behavior_cls'
+  - BD-037: ML train/test split at predict_start_timestamp (default 2021-06-01)
+  - BD-038: SGDClassifier/SGDRegressor max_iter=1000, tol=1e-3
+  - BD-063: ML pipeline fixed sequence build_kdata->build_feature->build_label->split_data->train->predict
+  required_methods:
+  - name: build_feature()
+    description: Constructs features from market data
+    evidence: src/zvt/ml/ml.py:223
+  - name: build_label()
+    description: Generates labels for supervised learning
+    evidence: src/zvt/ml/ml.py:137-156
+  - name: split_data()
+    description: Temporal split for train/test separation
+    evidence: src/zvt/ml/ml.py:54,78,113-119
+  - name: train()
+    description: Trains the ML model
+    evidence: src/zvt/ml/ml.py:89
+  - name: predict()
+    description: Generates predictions
+    evidence: src/zvt/ml/ml.py:89
+  key_behaviors:
+  - behavior: Temporal split prevention
+    description: Strict temporal split prevents look-ahead bias
+    evidence: src/zvt/ml/ml.py:54,78,113-119
+  - behavior: Feature scaling
+    description: StandardScaler normalizes features to zero mean and unit variance
+    evidence: src/zvt/ml/ml.py:223
+  acceptance_hints: '- ML pipeline produces valid predictions
+
+    - No look-ahead bias in training/test split
+
+    - Feature engineering matches factor definitions
+
+    '
+- id: reporting
+  name: Reporting and Notifications
+  order: 6
+  responsibility: Informer
+  interface: 'Reporting generates periodic summaries of market conditions, strategy
+
+    performance, and trading opportunities. Notifications can be sent via
+
+    email, WeChat, or other channels.
+
+    '
+  replaceable_points:
+  - Custom report templates
+  - Custom notification channels
+  - Custom report scheduling
+  design_decisions:
+  - BD-020: Report date lookback 130 days for financial data freshness
+  - BD-046: Error retry up to 10 retries with 3-minute sleep
+  - BD-052: Top tags monthly top 30 stocks filtered to cap<10B
+  - BD-053: Main line tags get priority in reporting
+  required_methods:
+  - name: inform()
+    description: Sends notification with report content
+    evidence: examples/report_utils.py:61-100
+  key_behaviors:
+  - behavior: Report generation
+    description: Generates formatted reports from market data and strategy results
+    evidence: examples/report_utils.py:61-100
+  - behavior: Risk identification
+    description: Identifies risky companies based on financial metrics
+    evidence: examples/reports/__init__.py:22-68
+  acceptance_hints: '- Reports are generated on schedule
+
+    - Notifications are delivered successfully
+
+    - Risky companies are correctly identified
+
+    '
+data_flow:
+  edges:
+  - from: data_collection
+    to: factor_computation
+    description: Raw market data feeds into factor computation
+  - from: factor_computation
+    to: strategy_development
+    description: Factor signals feed into trading strategy
+  - from: strategy_development
+    to: backtesting
+    description: Trading signals are simulated in backtesting
+  - from: data_collection
+    to: ml_prediction
+    description: Historical data used for ML training
+  - from: ml_prediction
+    to: strategy_development
+    description: ML predictions can inform trading decisions
+  - from: backtesting
+    to: reporting
+    description: Performance reports generated from backtest results
+  - from: strategy_development
+    to: reporting
+    description: Trading signals reported to users
+global_contracts:
+  data_structure:
+  - All internal DataFrames MUST use 2-level MultiIndex [entity_id, timestamp]
+  - K-Line data MUST contain OHLCV columns
+  - Factor results MUST contain filter_result or score_result columns
+  factor_computation:
+  - Factor pipeline order MUST be: pre_compute -> do_compute -> compute_factor ->
+      compute_result -> after_compute
+  - All factors MUST return result_df with required columns
+  trading_execution:
+  - Trading signals MUST pass through position control before execution
+  - Multi-level factors MUST be processed in ascending order
+  ml_pipeline:
+  - Train/test split MUST be temporal (no look-ahead bias)
+  - Features MUST be scaled using StandardScaler for SGD models
+  data_collection:
+  - Data MUST be recorded in chronological order per entity
+  - Multiple providers can serve same schema for redundancy
+business_decisions:
+- id: BD-001
+  type: M/DK
+  content: 'MACD parameters: slow=26, fast=12, signal=9 (standard parameters for momentum/trend
+    detection)'
+  rationale: Standard MACD parameters are widely used in Chinese stock markets based
+    on historical backtesting. Fast=12 represents half-month, Slow=26 represents month,
+    Signal=9 approximates one trading week. These specific values assume market cycles
+    align with calendar months. This breaks when trading calendar diverges significantly
+    from lunar months or when high-frequency trading dominates intraday price discovery.
+  evidence: src/zvt/factors/algorithm.py:30(macd)
+  stage: factor/technical/macd
+  alternative_considered: Considered adaptive MACD parameters that adjust to volatility
+    regimes, but chose fixed parameters because they provide consistent cross-sectional
+    comparison and avoid overfitting to historical periods.
+- id: BD-002
+  type: M/DK
+  content: 'Bollinger Band parameters: window=20, window_dev=2 for volatility-adjusted
+    price channels'
+  rationale: Standard 20-period lookback with 2 standard deviations captures approximately
+    95% of price movement assuming normal distribution. Industry standard uses 20/2
+    as de facto default across Bloomberg, TradingView, and most quant platforms. This
+    approach breaks when price returns exhibit fat tails (kurtosis > 3) or when volatility
+    is regime-switching, as the fixed bandwidth misidentifies boundaries.
+  evidence: examples/factors/boll_factor.py:13(BollTransformer.transform_one)
+  stage: factor/technical/bollinger
+  alternative_considered: Considered ATR-based bands for dynamic bandwidth, but chose
+    standard deviation because it enables cross-stock comparison and matches practitioner
+    expectations.
+- id: BD-003
+  type: B/BA
+  content: 'Golden/Dead cross pattern: live_count transitions from <=-5 to >=1 for
+    MACD signal detection'
+  rationale: 'Pattern [-5, 1] requires 5+ consecutive periods in dead cross territory
+    before switching to live. This assumes that sustained bearish periods followed
+    by reversal indicate stronger signals than simple crossovers. Industry practice
+    varies: some use 2-3 periods, others use 9-13. This approach breaks in choppy
+    markets where MACD oscillates frequently, causing extended dead count periods
+    and missed opportunities.'
+  evidence: src/zvt/factors/macd/macd_factor.py:47(LiveOrDeadFactor)
+  stage: factor/technical/macd
+  alternative_considered: Considered simple diff>dea crossover without count filter,
+    but chose [-5,1] to reduce whipsaws from short-lived crosses common in high-volatility
+    A-share market.
+- id: BD-004
+  type: M/BA
+  content: 'Bull market condition: diff>0 AND dea>0 (dual positive) for trend confirmation'
+  rationale: BullFactor uses dual positive condition (both diff and dea above zero)
+    which is a stronger trend confirmation than diff>dea alone. This assumes both
+    the short and long EMAs being positive indicates more sustained bullish momentum.
+    This approach is more conservative than diff>dea crossover, filtering out weaker
+    signals. It breaks in early-stage rallies where diff turns positive before dea.
+  evidence: src/zvt/factors/macd/macd_factor.py:25(BullFactor)
+  stage: factor/technical/macd
+  alternative_considered: Considered diff>dea crossover alone, but dual positive requirement
+    reduces false signals at cost of missing early trend entries.
+- id: BD-005
+  type: B/BA
+  content: 'KeepBullFactor: 10 consecutive bull periods required (keep_window=10,
+    logical AND)'
+  rationale: Requires 10 consecutive periods of bull market (diff>0 AND dea>0) before
+    signal confirmation. This assumes sustained bullishness must be consistent, filtering
+    out short-term fluctuations as noise. Industry practice for trend confirmation
+    varies from 3-20 periods depending on timeframe. This approach breaks in sideways
+    markets where brief bull periods don't sustain, causing extended waiting periods.
+  evidence: src/zvt/factors/macd/macd_factor.py:31(KeepBullFactor)
+  stage: factor/technical/macd
+  alternative_considered: Considered shorter window (5 periods) for faster signals,
+    but chose 10 for weekly-level analysis where short-term noise is higher.
+- id: BD-006
+  type: M/DK
+  content: 'Default MA windows: Fibonacci [5, 10, 34, 55, 89, 144, 120, 250]'
+  rationale: 'Fibonacci sequence combined with commonly used 120 and 250-day MAs (half-year
+    and full-year trading days). This assumes Fibonacci numbers have predictive value
+    for price movements. Industry practice varies: some use Fibonacci exclusively,
+    others use round numbers (20, 50, 200). This breaks when Fibonacci levels coincide
+    with support/resistance from non-Fibonacci-based institutional trading.'
+  evidence: src/zvt/factors/ma/ma_factor.py:57(MaFactor.__init__)
+  stage: factor/technical/ma
+  alternative_considered: Considered simple powers of 2 (8, 16, 32, 64, 128, 256),
+    but chose Fibonacci for practitioner alignment and Chinese market convention.
+- id: BD-007
+  type: M/BA
+  content: 'CrossMaFactor: ma5>ma10 AND ma10>ma20 AND ascending chain for long trend'
+  rationale: Longest window must be lowest and shortest must be highest - classic
+    'ma多头排列' pattern. This assumes that when all MAs are in ascending order, it confirms
+    a strong uptrend. AND logic reduces false positives compared to OR combinations.
+    This breaks when MAs compress together during low-volatility consolidation, creating
+    no signal.
+  evidence: src/zvt/factors/ma/ma_factor.py:94(CrossMaFactor.compute_result)
+  stage: factor/technical/ma
+  alternative_considered: Considered partial alignment (ma5>ma10 only), but chose
+    full chain for stronger trend confirmation in momentum strategies.
+- id: BD-008
+  type: B/DK
+  content: 'Volume breakout threshold: volume > 2x volume MA for momentum confirmation'
+  rationale: 2x threshold ensures genuine volume surge, not just normal daily variation.
+    Industry practice ranges from 1.5x to 3x depending on market volatility. This
+    assumes volume expansion confirms price movement. This approach breaks when market-wide
+    volume increases (bull market sessions) cause false signals on lagging stocks.
+  evidence: src/zvt/factors/ma/ma_factor.py:207(VolumeUpMaFactor.compute_result)
+  stage: factor/technical/volume
+  alternative_considered: Considered adaptive threshold based on historical volume
+    volatility, but chose fixed 2x for simplicity and consistent cross-stock comparison.
+- id: BD-009
+  type: B/BA
+  content: 'Price breakout range: within 15% above MA250, within 10% above other MAs'
+  rationale: Allows for stocks that have recently broken out without requiring exact
+    MA touch. 15% for MA250 is wider to accommodate longer-term trends. Industry practice
+    uses various percentages (5-20%) based on volatility. This assumes breakout must
+    be close to MA but not necessarily on it. This breaks when stocks gap significantly
+    above MA after news events.
+  evidence: src/zvt/factors/ma/ma_factor.py:192(VolumeUpMaFactor.compute_result)
+  stage: factor/technical/breakout
+  alternative_considered: Considered tighter 5% threshold, but chose wider range to
+    capture stocks in early breakout phase without missing opportunities.
+- id: BD-010
+  type: B/BA
+  content: 'Post-break holding period: up_intervals=40 with ffill fill method'
+  rationale: 40-interval forward fill means stock remains selected for up to 40 trading
+    days after initial breakout signal. This reduces excessive turnover and captures
+    trending moves. Industry practice varies from 10-60 days for momentum strategies.
+    Assumes momentum persists after initial breakout. This breaks in mean-reversion
+    markets where breakout signals fail.
+  evidence: src/zvt/factors/ma/ma_factor.py:221(VolumeUpMaFactor.compute_result)
+  stage: factor/technical/hold
+  alternative_considered: Considered trailing stop for dynamic exit, but chose fixed
+    40-interval for simpler backtesting and predictable turnover.
+- id: BD-011
+  type: M/DK
+  content: 'Volume MA window: 30 periods for stable baseline'
+  rationale: 30-day volume average provides stable baseline for volume comparisons.
+    Common in Chinese A-share market for identifying abnormal trading activity. This
+    assumes monthly average smooths daily noise. This breaks when trading patterns
+    change structurally (e.g., market maker changes, HFT increase).
+  evidence: src/zvt/factors/ma/ma_factor.py:146(VolumeUpMaFactor.__init__)
+  stage: factor/technical/volume
+  alternative_considered: Considered shorter 10-day or longer 60-day window, but chose
+    30 for balance between noise reduction and responsiveness.
+- id: BD-012
+  type: M/DK
+  content: 'TopBottomTransformer: 20-day rolling window for support-resistance level
+    detection'
+  rationale: 20-day rolling window captures recent trading range. Used for identifying
+    support and resistance levels. Industry standard for short-term S/R uses 5-30
+    days depending on trading style. This assumes historical highs/lows within this
+    window define future boundaries. This breaks in trending markets where S/R levels
+    shift rapidly.
+  evidence: src/zvt/factors/ma/top_bottom_factor.py:18(TopBottomTransformer.__init__)
+  stage: factor/technical/support_resistance
+  alternative_considered: Considered adaptive window based on volatility, but chose
+    fixed 20 for consistency and practitioner alignment.
+- id: BD-013
+  type: B/BA
+  content: 'FallBelowTransformer: window=10 (MA period), interval=3 (consecutive days
+    below MA)'
+  rationale: 3 consecutive days closing below 10-day MA generates sell signal. This
+    avoids false signals from single-day dips while remaining responsive. Classic
+    '断头铡刀' pattern detection, assuming sustained below-MA closes indicate trend change.
+    This breaks in volatile stocks with frequent gap opens/closes below MA.
+  evidence: src/zvt/factors/transformers.py:56(FallBelowTransformer.transform)
+  stage: factor/technical/sell_signal
+  alternative_considered: Considered single-day close below MA for faster response,
+    but chose 3-day requirement to reduce whipsaws in noisy markets.
+- id: BD-014
+  type: M/BA
+  content: 'QuantileScorer: 7 discrete score levels [0, 0.1, 0.3, 0.5, 0.7, 0.9, 1.0]'
+  rationale: 7 discrete score levels based on distribution of factor values at each
+    timestamp. Sorted in descending order so higher percentiles get higher scores.
+    This assumes quantile boundaries capture meaningful thresholds. This breaks when
+    factor distribution is highly skewed or bimodal, causing inappropriate bucketing.
+  evidence: src/zvt/factors/algorithm.py:312(QuantileScorer)
+  stage: factor/scoring
+  alternative_considered: Considered continuous 0-1 scoring, but chose discrete levels
+    for clearer signal separation and simpler threshold-based decisions.
+- id: BD-015
+  type: M/BA
+  content: RankScorer uses percentile ranking across entities at each timestamp
+  rationale: Percentile rank for relative comparison assumes cross-sectional comparison
+    is meaningful. No extreme outliers skewing results and sufficient sample size.
+    Industry standard for cross-sectional factor models. This enables relative factor
+    comparison across stocks. This breaks when universe is very small (<30 stocks)
+    or when all stocks move together.
+  evidence: src/zvt/factors/algorithm.py:141(RankScorer.score)
+  stage: factor/scoring
+  alternative_considered: Considered absolute scoring with z-score normalization,
+    but chose percentile ranking for robustness to outliers and market regime changes.
+- id: BD-016
+  type: B/DK
+  content: 'GoodCompanyFactor fundamental thresholds: ROE>=2%, revenue growth>=5%,
+    profit growth>=5%, cash flow ratios, current ratio>=1, debt-to-asset<=50%'
+  rationale: Fundamental quality filter combining profitability, growth, cash flow
+    quality, and financial health. Conservative standards for A-share blue chips.
+    Thresholds assume these specific values represent acceptable quality companies.
+    Industry practice for quality screens varies by market cap and sector. This breaks
+    when sector-specific norms differ significantly.
+  evidence: src/zvt/factors/fundamental/finance_factor.py:99(GoodCompanyFactor.__init__)
+  stage: factor/fundamental/valuation
+  alternative_considered: Considered sector-relative thresholds, but chose absolute
+    values for simplicity and consistent cross-sector comparison.
+- id: BD-017
+  type: M/BA
+  content: 'GoodCompanyFactor period multipliers: year=x4, season3=x3, half_year=x2
+    for annualization'
+  rationale: Quarterly financial data annualized by multiplier for YoY comparisons.
+    Year-end gets 4x (full year), Q3 gets 3x (three quarters), half-year gets 2x.
+    This assumes linear scaling is valid for fundamental metrics. This breaks for
+    seasonal businesses where Q4 is disproportionately large or small.
+  evidence: src/zvt/factors/fundamental/finance_factor.py:174(GoodCompanyFactor.compute_factor)
+  stage: factor/fundamental/period_adjustment
+  alternative_considered: Considered rolling 4-quarter sum, but chose multiplier approach
+    for immediate comparability to annual figures.
+- id: BD-018
+  type: B/BA
+  content: GoodCompanyFactor window='1095d' (3 years), count=8 quarters for consistency
+    check
+  rationale: Company must pass quality filter in 8 out of most recent 12 quarters
+    (3 years). This ensures consistent fundamental quality, not just one-time beats.
+    Assumes sustained performance matters more than temporary improvement. Industry
+    practice for quality screens uses 2-5 year windows. This breaks for turnarounds
+    and cyclicals.
+  evidence: src/zvt/factors/fundamental/finance_factor.py:124(GoodCompanyFactor.__init__)
+  stage: factor/fundamental/consistency
+  alternative_considered: Considered 4-quarter (1 year) consistency, but chose 3-year
+    window to filter out temporary improvements and ensure structural quality.
+- id: BD-019
+  type: B/DK
+  content: 'Risky company filters: revenue growth<-10%, profit growth<-10%, current_ratio<0.7,
+    quick_ratio<0.5, high receivables+inventory+goodwill>total_equity'
+  rationale: Identifies companies with deteriorating fundamentals and poor financial
+    health in A-share market. Combines income statement decline with balance sheet
+    issues and cash flow quality. Domain-specific red flags for Chinese accounting
+    context. Industry practice for financial distress models varies. This breaks for
+    asset-light businesses with different working capital patterns.
+  evidence: examples/reports/__init__.py:22(risky_company)
+  stage: factor/fundamental/risk
+  alternative_considered: Considered Altman Z-score model, but chose simpler thresholds
+    aligned with Chinese accounting standards and A-share market characteristics.
+- id: BD-020
+  type: B/DK
+  content: 'Report date lookback: 130 days for financial data freshness'
+  rationale: 130 days (~4 months) ensures coverage of most recent quarterly financial
+    report. In China, reports are typically released within 30 days of quarter end,
+    so 130 days covers Q4 (released by April) through Q1 data. Assumes standard release
+    schedule holds. This breaks around Chinese New Year when some late reports arrive.
+  evidence: examples/reports/__init__.py:24(risky_company)
+  stage: data/freshness
+  alternative_considered: Considered shorter 90-day window, but chose 130 to ensure
+    Q4 reports released in April are captured for strategies rebalancing at year-start.
+- id: BD-021
+  type: B/DK
+  content: 'Default adjustment type: hfq (后复权/post-adjusted) for Chinese stocks'
+  rationale: Chinese stocks use post-adjustment (hfq) by default, assuming split and
+    dividend adjustments are necessary for accurate analysis. Backtesting should use
+    adjusted prices for realistic simulation. Post-adjustment is preferred in China
+    over pre-adjustment (qfq) because it maintains continuity at historical splits.
+    This breaks for very old data where adjustment factors become unreliable.
+  evidence: src/zvt/api/kdata.py:149(default_adjust_type)
+  stage: data/adjustment
+  alternative_considered: Considered pre-adjusted (qfq) which is more intuitive for
+    current prices, but chose hfq for accurate return calculation across historical
+    splits.
+- id: BD-022
+  type: B/BA
+  content: 'Trading costs: 0.1% buy cost, 0.1% sell cost, 0.1% slippage (total 0.3%
+    round-trip)'
+  rationale: Total trading friction = 0.3% per round-trip. Assumes costs are symmetric
+    and constant percentage. This affects minimum holding period profitability, high-frequency
+    strategy viability, and factor signal decay rate. Industry practice varies from
+    0.1-0.5% for retail to institutional-grade execution. This breaks for large orders
+    where market impact exceeds fixed slippage.
+  evidence: src/zvt/trader/sim_account.py:34(SimAccountService.__init__)
+  stage: trading/cost
+  alternative_considered: Considered tiered costs based on order size, but chose flat
+    rate for simplicity and conservative backtest assumptions.
+- id: BD-023
+  type: B/BA
+  content: 'Default profit threshold: 3% take-profit, -30% stop-loss'
+  rationale: 'High tolerance for drawdown (30% loss allowed) with modest profit targets
+    reflects momentum/trend-following strategy assumption. This assumes stocks can
+    recover from significant drawdowns and that 3% capture is reasonable. Industry
+    practice varies by strategy type: mean-reversion uses tighter 1-2% targets, trend-following
+    uses wider 10%+ targets. This breaks in markets with frequent limit moves.'
+  evidence: src/zvt/trader/trader.py:44(Trader.__init__)
+  stage: trading/risk
+  alternative_considered: Considered trailing stop for dynamic exit, but chose fixed
+    thresholds for simpler backtesting and consistent signal generation.
+- id: BD-024
+  type: B/DK
+  content: 'Fund holding change thresholds: +5% for buy signal, -50% for sell signal'
+  rationale: 'Asymmetric thresholds: small increase (+5%) triggers buy (follows institutional
+    accumulation), large decrease (-50%) triggers sell (institutional distribution
+    is more significant). Different from momentum due to lagging quarterly data. Domain
+    assumption about institutional behavior. This breaks when fund reporting is delayed
+    or when institutional activity is noise.'
+  evidence: examples/trader/follow_ii_trader.py:33(FollowIITrader.on_time)
+  stage: trading/signal
+  alternative_considered: Considered symmetric thresholds, but chose asymmetric approach
+    reflecting that institutional selling (redemption pressure) is more decisive than
+    buying.
+- id: BD-025
+  type: B/DK
+  content: 'DragonTigerFactor filter: dep1 == ''机构专用'' (institutional-only dealers)'
+  rationale: 龙虎榜 (Dragon and Tiger list) includes both institutional and retail trading
+    seats. Filtering to '机构专用' captures institutional flow which is considered more
+    informed. Domain knowledge about Chinese market microstructure. This breaks when
+    retail seats also have institutional flow (common with online brokers).
+  evidence: examples/trader/dragon_and_tiger_trader.py:23(DragonTigerFactor.__init__)
+  stage: factor/market_structure
+  alternative_considered: Considered including all seats, but filtered to institutional-only
+    to reduce noise from retail-driven price movements.
+- id: BD-026
+  type: B/BA
+  content: 'Entity pool: intersection of top 30% by volume AND top 30% by fund holdings'
+  rationale: Intersection creates focused pool of liquid stocks with institutional
+    interest. Both criteria must be met (AND) rather than OR, creating smaller but
+    higher-conviction universe. Assumes liquidity and institutional interest together
+    indicate quality. This breaks when stock is liquid but institutionally abandoned
+    (distressed or speculative).
+  evidence: examples/trader/keep_run_trader.py:54(MultipleLevelTrader)
+  stage: trading/filtering
+  alternative_considered: Considered union (OR) for larger universe, but chose intersection
+    for higher-quality signals at cost of smaller opportunity set.
+- id: BD-027
+  type: B/BA
+  content: 'Multi-level trading: combining LEVEL_1WEEK GoldCrossFactor with LEVEL_1DAY
+    GoldCrossFactor'
+  rationale: Weekly level provides trend direction (entry only in uptrend), daily
+    level provides timing. Both must agree on signal direction. This multi-timeframe
+    approach reduces false signals. Industry practice in multi-timeframe analysis
+    varies timeframe pairs. Assumes higher timeframe trend should dominate. This breaks
+    in volatile transitions between trends.
+  evidence: examples/trader/macd_week_and_day_trader.py:16(MultipleLevelTrader.init_factors)
+  stage: trading/multi_timeframe
+  alternative_considered: Considered LEVEL_1MONTH + LEVEL_1DAY for longer trends,
+    but chose weekly+daily for balance between signal quality and turnover.
+- id: BD-028
+  type: B/BA
+  content: 'Trading time interval: 40-day rolling windows with -50 day backshift for
+    MACD computation'
+  rationale: 40-day intervals with 50-day buffer ensures sufficient lookback data
+    for MACD calculations. Prevents look-ahead bias and allows incremental backtesting.
+    Assumes 50 days provides adequate historical data for MACD convergence. This breaks
+    when testing on very short historical periods (<100 days).
+  evidence: examples/trader/keep_run_trader.py:19(MultipleLevelTrader.init_factors)
+  stage: trading/backtest
+  alternative_considered: Considered longer 100-day backshift for conservative lookback,
+    but chose 50-day to avoid excessive data waste in incremental backtesting.
+- id: BD-029
+  type: B/DK
+  content: 'BullAndUpFactor turnover threshold: 400M RMB, turnover_rate 2%'
+  rationale: Filters out low-liquidity stocks to ensure trades are executable. 400M
+    turnover (about $56M) is reasonable minimum for A-share market. 2% daily turnover
+    rate indicates active trading. Domain assumption about minimum liquidity requirements.
+    This breaks for small-cap momentum strategies that intentionally target illiquid
+    stocks.
+  evidence: examples/factors/tech_factor.py:44(BullAndUpFactor.__init__)
+  stage: factor/technical/liquidity_filter
+  alternative_considered: Considered higher 1B threshold for institutional-grade liquidity,
+    but chose 400M to maintain access to mid-cap momentum opportunities.
+- id: BD-030
+  type: B/BA
+  content: 'Top performers: top_count=50, turnover>=100M, turnover_rate>=2%, periods
+    1-20 days'
+  rationale: Filters by liquidity first then ranks by performance. Iterates through
+    periods 1-20 to find consistently strong performers. 50 stocks per period provides
+    diversification. Assumes consistency across periods indicates true performance.
+    This breaks when market regime changes (outperformance becomes underperformance).
+  evidence: src/zvt/api/stats.py:72(get_top_performance_entities_by_periods)
+  stage: api/selector
+  alternative_considered: Considered longer periods (60-250 days) for trend confirmation,
+    but chose 1-20 day range for momentum-oriented short-term strategy.
+- id: BD-031
+  type: B/BA
+  content: 'Top volume entities: pct=0.1 (top 10%), method=avg (average turnover over
+    period)'
+  rationale: Uses average (mean) rather than total or latest turnover to smooth single-day
+    anomalies. Top 10% ensures focus on most liquid stocks. Assumes method=avg is
+    more stable than sum which would favor longer periods. This breaks when liquidity
+    is concentrated in single-day events (index rebalancing, stock additions).
+  evidence: src/zvt/api/stats.py:360(get_top_volume_entities)
+  stage: api/selector
+  alternative_considered: Considered median for robustness to outliers, but chose
+    mean for wider adoption and practitioner alignment.
+- id: BD-032
+  type: M/BA
+  content: 'Performance calculation: change=(end-start)/abs(start), avg, or sum method'
+  rationale: Simple percentage change is standard in Chinese markets. abs(start) handles
+    zero-start cases. Average and sum methods available for volume/turnover metrics.
+    Assumes simple returns are appropriate for this market. This breaks for leveraged
+    products and for periods with large dividends.
+  evidence: src/zvt/api/stats.py:485(get_top_entities)
+  stage: api/metrics
+  alternative_considered: Considered log returns for compoundability, but chose simple
+    returns for intuitive interpretation and practitioner alignment.
+- id: BD-033
+  type: M/BA
+  content: 'Relative performance quantiles: best>=0.9, ordinary>=0.5, poor>=0'
+  rationale: 'Three-tier performance classification: ''best'' means outperforming
+    90% of peers, ''ordinary'' means outperforming 50%, ''poor'' means positive return.
+    Strict inequality ensures unambiguous boundaries. Assumes these percentiles capture
+    meaningful performance tiers. This breaks when market-wide movements make all
+    stocks positive or negative simultaneously.'
+  evidence: src/zvt/ml/lables.py:13(RelativePerformance)
+  stage: ml/labeling
+  alternative_considered: Considered quintile (5-tile) classification, but chose three-tier
+    for simpler ML labels and interpretable business output.
+- id: BD-034
+  type: B/BA
+  content: 'ML prediction horizon: 20 trading days (approximately one month)'
+  rationale: 20 trading days represents approximately one month. Long enough to capture
+    meaningful trends but short enough to be actionable. Applied uniformly across
+    classification and regression tasks. Assumes this horizon balances signal quality
+    with actionability. This breaks for very short-alpha strategies (intraday) or
+    long-horizon fundamental strategies (quarterly).
+  evidence: src/zvt/ml/ml.py:55(MLMachine.__init__,build_label)
+  stage: ml/labeling
+  alternative_considered: Considered 5-day horizon for faster signals, but chose 20
+    days to reduce noise and transaction costs from excessive trading.
+- id: BD-035
+  type: M/DK
+  content: 'ML features: MA windows [5, 10, 120, 250] with StandardScaler preprocessing'
+  rationale: Moving averages at multiple timeframes capture short-term momentum and
+    long-term trend. StandardScaler normalizes features to zero mean and unit variance,
+    essential for SGD-based models. Domain assumption about relevant timeframes. This
+    breaks when markets exhibit regime-dependent factor relevance.
+  evidence: src/zvt/ml/ml.py:223(MaStockMLMachine.build_feature)
+  stage: ml/feature_engineering
+  alternative_considered: Considered more MAs (20, 30, 60) for richer features, but
+    chose sparse set for faster training and reduced overfitting.
+- id: BD-036
+  type: B/BA
+  content: 'ML label methods: ''raw'' (future price), ''change'' (pct change), ''behavior_cls''
+    (binary up/down based on return>0)'
+  rationale: 'Three label strategies: raw regression for price prediction, pct_change
+    for relative performance, binary classification for directional prediction. Assumes
+    return>0 threshold for behavior_cls appropriately separates up/down behavior.
+    This breaks when returns cluster near zero with high volatility.'
+  evidence: src/zvt/ml/ml.py:29(MLMachine.build_label)
+  stage: ml/labeling
+  alternative_considered: Considered quantile-based labeling (top 20% vs bottom 20%),
+    but chose simple >0 for interpretability and alignment with trading decisions.
+- id: BD-037
+  type: B/BA
+  content: 'ML train/test split: temporal split at predict_start_timestamp (default
+    2021-06-01)'
+  rationale: Strict temporal split prevents look-ahead bias. Training data ends before
+    prediction period begins. Default split at mid-2021 is natural market cycle boundary.
+    Assumes point-in-time split is sufficient for model validation. This breaks when
+    market regimes shift significantly (COVID crash, policy changes).
+  evidence: src/zvt/ml/ml.py:54(MLMachine.split_data)
+  stage: ml/training_pipeline
+  alternative_considered: Considered expanding window or walk-forward validation,
+    but chose single temporal split for simplicity and speed of backtesting.
+- id: BD-038
+  type: M/BA
+  content: 'SGDClassifier/SGDRegressor: max_iter=1000, tol=1e-3 with StandardScaler'
+  rationale: 1000 iterations with 1e-3 tolerance is standard sklearn default for SGD.
+    Adequate for convergence on this feature space without excessive computation.
+    StandardScaler ensures gradient descent convergence. This breaks when features
+    have extreme scale differences not handled by scaling.
+  evidence: examples/ml/sgd.py:11(sgd_classification,sgd_regressor)
+  stage: ml/model_config
+  alternative_considered: Considered adaptive learning rate or early stopping, but
+    chose fixed defaults for simplicity and reproducibility.
+- id: BD-039
+  type: M
+  content: 'SimAccountService profit rate: (all_value - input_money) / input_money'
+  rationale: Simple return rate calculation. Assumes initial capital is appropriate
+    denominator, returns are simple (not compounded), no cash flow timing effects.
+    This is standard portfolio return calculation in practitioner tools. This breaks
+    when cash flows are significant (deposits/withdrawals during period).
+  evidence: src/zvt/trader/sim_account.py:294(SimAccountService.get_current_account)
+  stage: trading/performance
+  alternative_considered: Considered IRR (internal rate of return) for time-weighted
+    returns, but chose simple return for clarity and alignment with broker statements.
+- id: BD-040
+  type: M/BA
+  content: EMA with adjust=False (Welsch's m-exponential weighting) for MACD calculation
+  rationale: adjust=False uses exponentially weighted mean with span parameter, giving
+    more weight to recent prices without traditional adjustment. Standard Chinese
+    market approach for MACD. Assumes recent prices are more relevant. This breaks
+    when historical prices contain information not captured by exponential weighting.
+  evidence: src/zvt/factors/algorithm.py:20(ema)
+  stage: factor/technical/ema
+  alternative_considered: Considered adjust=True (standard EMA with multiplier), but
+    chose adjust=False for alignment with common Chinese market indicators.
+- id: BD-041
+  type: M
+  content: 'MaStatsAccumulator distance: (MA5-MA10)/close for trend strength'
+  rationale: MA Crossover Distance Ratio. Distance proportional to trend momentum,
+    normalized by price for comparability across stocks. This enables cross-period
+    and cross-stock comparison of trend strength. This is mathematical definition
+    without business assumption.
+  evidence: src/zvt/factors/ma/ma_stats_factor.py:50(MaStatsAccumulator.acc_one)
+  stage: factor/stateful/ma_stats
+- id: BD-042
+  type: M/BA
+  content: 'Area calculation: segmented cumulative area under curve for trend magnitude'
+  rationale: Area cumulates signed distance between MA5 and MA10 within each trend
+    segment. Area magnitude proportional to trend strength. Assumes segment isolation
+    is meaningful and negative area represents bearish. This breaks when MA crossover
+    frequency is very high (noisy market).
+  evidence: src/zvt/factors/ma/ma_stats_factor.py:53(MaStatsAccumulator.acc_one)
+  stage: factor/stateful/ma_stats
+  alternative_considered: Considered unsigned area (absolute value) for momentum strength
+    only, but chose signed area to distinguish bull from bear momentum.
+- id: BD-043
+  type: M/DK
+  content: 'MaStatsAccumulator: acc_window=250, windows=[5,10], vol_windows=[30]'
+  rationale: 250-day accumulation window provides enough historical data for all MAs.
+    5 and 10-day windows capture short-term MA cross dynamics. 30-day volume MA provides
+    volume trend context. Domain-specific window choices. This breaks when testing
+    on markets with different trading day conventions.
+  evidence: src/zvt/factors/ma/ma_stats_factor.py:25(MaStatsAccumulator.__init__)
+  stage: factor/stateful/ma_stats
+  alternative_considered: Considered longer MA windows (20, 60) for broader trend
+    capture, but chose short windows for responsiveness in short-term strategy.
+- id: BD-044
+  type: M/BA
+  content: 'Live/dead tracking: live=diff>dea, bull=diff>0 AND dea>0, live_count increments
+    within consecutive same-sign runs'
+  rationale: Live count tracks consecutive periods diff above dea. Bull requires both
+    positive. Cumsum-based groupby isolates consecutive runs. Assumes sustained crossing
+    matters more than individual crossovers. This breaks when diff/dea oscillation
+    is very frequent.
+  evidence: src/zvt/factors/algorithm.py:58(macd)
+  stage: factor/technical/macd_state
+  alternative_considered: Considered exponentially-weighted count for recency bias,
+    but chose simple count for interpretability.
+- id: BD-045
+  type: B/DK
+  content: 'Data recording schedule: 15:30 for stock data, 16:30 for news, 18:00 for
+    dragon/tiger data'
+  rationale: Timestamps chosen to allow exchange data to settle after market close
+    (15:00 for Chinese markets). Dragon/tiger data (龙虎榜) published later, so 18:00.
+    News at 16:30 captures after-hours news. Domain-specific timing for Chinese markets.
+    This breaks when data providers change publication times or markets extend trading
+    hours.
+  evidence: examples/data_runner/kdata_runner.py:32(BackgroundScheduler)
+  stage: scheduler/timing
+  alternative_considered: Considered polling approach (continuous checking), but chose
+    fixed schedule for predictability and reduced API load.
+- id: BD-046
+  type: B/BA
+  content: 'Error retry: up to 10 retries with 3-minute sleep (180 seconds) for report
+    generation'
+  rationale: 10 retries with 3-minute sleep accommodates transient network or API
+    issues common in fetching market data. After 10 failures (30 minutes total), email
+    alert sent. Assumes failures are transient and retry is worth waiting. This breaks
+    when failures are structural (API permanently down, wrong credentials).
+  evidence: examples/report_utils.py:142(report_targets)
+  stage: pipeline/retry
+  alternative_considered: Considered exponential backoff (1, 2, 4, 8 minutes), but
+    chose fixed 3-minute sleep for simplicity and predictable maximum wait time.
+- id: BD-047
+  type: B/BA
+  content: 'Data recording sleeping time: 2 seconds between API calls'
+  rationale: Rate limiting to avoid overwhelming data provider APIs. 2 seconds balances
+    speed with not getting blocked. Sleeping_time parameter is configurable per recorder.
+    Assumes 2 seconds is sufficient rate limit. This breaks when API rate limits change
+    or when parallel recording is needed.
+  evidence: examples/data_runner/kdata_runner.py:44(run_data_recorder)
+  stage: data_collection/rate_limiting
+  alternative_considered: Considered adaptive rate limiting based on 429 responses,
+    but chose fixed sleep for predictability.
+- id: BD-048
+  type: B/DK
+  content: 'Entity filter defaults: ignore_delist=True, ignore_st=False (keep ST stocks),
+    ignore_new_stock=False'
+  rationale: 'Delisted stocks excluded because no longer tradeable. ST stocks kept
+    because still tradeable with high volatility. New stocks kept for comprehensive
+    coverage. Domain-specific: A-share ST stocks have special trading rules. This
+    breaks when ST rules change (restructuring, delisting criteria).'
+  evidence: examples/data_runner/kdata_runner.py:34(get_entity_ids_by_filter)
+  stage: data/filtering
+  alternative_considered: Considered excluding ST stocks to avoid high-volatility
+    speculative plays, but kept them for comprehensive coverage including special
+    situation strategies.
+- id: BD-049
+  type: T
+  content: 'Log rotation: maxBytes=524288000 (500MB), backupCount=10'
+  rationale: Application-wide logging for debugging and production monitoring. 500MB
+    per file balances storage usage with ability to retain historical logs. Technical
+    decision that doesn't affect business output.
+  evidence: src/zvt/__init__.py:42(init_log)
+  stage: infrastructure/logging
+- id: BD-050
+  type: T
+  content: 'Directory structure: data/, resources/, tmp/, ui/, logs/ as mandatory
+    subdirectories'
+  rationale: Separation ensures data, resources, temp files, UI results, and logs
+    don't conflict. Each has specific purpose. Technical infrastructure decision that
+    doesn't affect trading outcomes.
+  evidence: src/zvt/__init__.py:85(init_env)
+  stage: infrastructure/paths
+- id: BD-051
+  type: T
+  content: Pandas chained_assignment=raise to fail fast on ambiguous operations
+  rationale: Enforced to prevent silent data corruption from chained assignment operations.
+    Technical decision that ensures data integrity but doesn't affect business output.
+  evidence: src/zvt/__init__.py:66(global_pandas_config)
+  stage: infrastructure/pandas_config
+- id: BD-052
+  type: B/DK
+  content: 'Top tags: monthly top 30 stocks by performance, filtered to cap<10B (90%
+    concentration)'
+  rationale: Monthly top-30 performers capture market leadership. Small-cap focus
+    (90% under 10B market cap) reflects A-share market characteristic where smaller
+    stocks tend to outperform. Domain assumption about market dynamics. This breaks
+    when market leadership shifts to large-caps (index-driven rallies).
+  evidence: examples/research/top_tags.py:7(top_tags)
+  stage: research/tagging
+  alternative_considered: Considered larger universe (top 100), but chose 30 for manageable
+    reporting and focus on true leaders.
+- id: BD-053
+  type: B/DK
+  content: 'Group stocks by tag: main_line tags get priority in reporting, special
+    ''北交所'' tag handled separately'
+  rationale: Main line (主线) stocks identified as market leaders get group name in
+    EastMoney. Unknown tags and '北交所' (Beijing Stock Exchange) get special handling.
+    Domain-specific reporting structure for Chinese market. This breaks when new exchanges
+    or tags are introduced.
+  evidence: examples/report_utils.py:61(inform)
+  stage: reporting/organization
+  alternative_considered: Considered flat reporting without tag grouping, but chose
+    hierarchical approach for actionable market intelligence.
+- id: BD-054
+  type: B/DK
+  content: 'Risky company: accounts_receivable > net_profit / 2 as threshold'
+  rationale: Companies where AR exceeds half of net profit may have aggressive revenue
+    recognition or poor collection. Red flag for earnings quality in Chinese accounting
+    context. Domain-specific financial distress indicator. This breaks for businesses
+    with inherently long collection periods (construction, government contracts).
+  evidence: examples/reports/__init__.py:48(risky_company)
+  stage: factor/fundamental/quality
+  alternative_considered: Considered days sales outstanding (DSO) metric, but chose
+    AR/profit ratio for simplicity and immediate calculation.
+- id: BD-055
+  type: M/BA
+  content: 'Factor compute pipeline order: pre_compute() -> do_compute() -> compute_factor()
+    -> compute_result() -> after_compute()'
+  rationale: Framework mandates this specific ordering. Breaking it breaks the pipe_df
+    -> factor_df -> result_df transformation chain. The contract assumes this sequence
+    is necessary for proper factor computation. This breaks when custom factors don't
+    implement required methods.
+  evidence: src/zvt/contract/factor.py:434(compute)
+  stage: factor/pipeline
+  alternative_considered: Considered flexible pipeline with configurable order, but
+    chose fixed sequence for predictability and reduced error surface.
+- id: BD-056
+  type: B/BA
+  content: Factor levels must be processed in ascending order with final decision
+    at minimum level
+  rationale: System caches factor outputs at each level, then combines at minimum
+    level for trading decisions. Trader level must equal minimum factor level. Assumes
+    multi-timeframe factors need specific combining logic. This breaks when factor
+    levels don't align with trader expectations.
+  evidence: src/zvt/trader/trader.py:404(handle_factor_targets)
+  stage: trading/multi_timeframe
+  alternative_considered: Considered parallel factor processing, but chose sequential
+    ascending order for consistent state management.
+- id: BD-057
+  type: B/BA
+  content: 'Default trading level: LEVEL_1DAY (daily-level analysis and trading)'
+  rationale: System defaults to daily-level analysis and trading. Assumes intraday
+    data is optional, backtesting defaults to end-of-day signals, real-time mode expects
+    daily close for profit calculation. This breaks for intraday strategies that need
+    tick or minute-level execution.
+  evidence: src/zvt/contract/__init__.py:26(LEVEL_1DAY)
+  stage: trading/level
+  alternative_considered: Considered LEVEL_1MONTH as conservative default, but chose
+    LEVEL_1DAY for broader applicability to short-term strategies.
+- id: BD-058
+  type: M
+  content: Accumulator window=1 by default (stateless processing)
+  rationale: Default assumes stateless processing. Window of 1 means no historical
+    state accumulation, making Accumulators behave like stateless Transformers by
+    default. Mathematical choice about state management. This is a framework design
+    decision.
+  evidence: src/zvt/contract/factor.py:83(Accumulator.__init__)
+  stage: factor/stateful
+- id: BD-059
+  type: B/BA
+  content: Result DataFrame must contain either filter_result or score_result columns
+  rationale: ALL factors MUST produce result_df containing filter_result (boolean)
+    or score_result (float 0-1). get_targets() and TargetSelector rely on these columns.
+    Assumes this contract is necessary for factor integration. This breaks when custom
+    factors don't produce required columns.
+  evidence: src/zvt/utils/pd_utils.py:16(is_filter_result_df)
+  stage: factor/contract
+  alternative_considered: Considered duck typing with any numeric columns, but chose
+    explicit contract for clear interface and better error messages.
+- id: BD-060
+  type: M/BA
+  content: 'Internal DataFrames must use 2-level MultiIndex: [entity_id, timestamp]'
+  rationale: ALL internal DataFrames must use MultiIndex with entity_id at level 0
+    and timestamp at level 1. Breaking this structure fails group_by_entity_id calls,
+    TargetSelector accumulation, and visualization. Mathematical structural assumption.
+    This breaks when data comes from sources with different index structures.
+  evidence: src/zvt/utils/pd_utils.py:84(is_normal_df)
+  stage: data/structure
+  alternative_considered: Considered flat index with entity_id/timestamp columns,
+    but chose MultiIndex for efficient groupby operations and memory efficiency.
+- id: BD-061
+  type: B/DK
+  content: ZenAccumulator requires exactly 11 k-lines to establish first fenxing pattern
+  rationale: 缠论 (Chan Theory) implementation requires 11 k-lines for first fenxing
+    pattern before stateful processing. This is a hard constraint of the mathematical
+    theory being implemented. Domain-specific algorithmic requirement. This breaks
+    when insufficient historical data is available.
+  evidence: src/zvt/factors/zen/base_factor.py:296(handle_first_fenxing)
+  stage: factor/zen
+  alternative_considered: Considered adaptive window based on volatility, but chose
+    fixed 11 k-lines for alignment with classical 缠论 interpretation.
+- id: BD-062
+  type: B/DK
+  content: 'Zen zhongshu detection: exactly 4 bi points required for pivot calculation'
+  rationale: 4-point zhongshu detection is hard constraint embedded in the algorithm.
+    Computes intersection of ranges from exactly 4 bi points. Domain-specific requirement
+    from 缠论 theory. This breaks when market exhibits non-standard patterns not matching
+    the theory.
+  evidence: src/zvt/factors/zen/base_factor.py:116(compute_zongshu_range)
+  stage: factor/zen
+  alternative_considered: Considered flexible point count, but chose 4 for mathematical
+    completeness of zhongshu definition.
+- id: BD-063
+  type: B/BA
+  content: 'ML pipeline: fixed sequence build_kdata->build_feature->build_label->split_data->train->predict'
+  rationale: Fixed sequence that cannot be reordered. split_data() assumes predict_start_timestamp
+    is between start and end. Assumes this sequence is necessary for proper ML pipeline
+    execution. This breaks when custom workflows need different ordering.
+  evidence: src/zvt/ml/ml.py:89(MLMachine.split_data)
+  stage: ml/pipeline
+  alternative_considered: Considered flexible DAG-based pipeline, but chose fixed
+    sequence for simplicity and reduced error surface.
+- id: BD-064
+  type: M/BA
+  content: 'Recorder state machine: run()->evaluate()->record()->generate_domain()->persist()'
+  rationale: Recording loop enforces specific sequence. Each entity's data must be
+    saved in chronological order. Assumes this contract is necessary for data integrity.
+    This breaks when data providers deliver out-of-order records.
+  evidence: src/zvt/contract/recorder.py:476(TimeSeriesDataRecorder.record)
+  stage: recorder/pipeline
+  alternative_considered: Considered event-driven recording, but chose state machine
+    for predictable execution order.
+- id: BD-065
+  type: B/DK
+  content: 'K-Line OHLCV contract: technical factors expect standard kdata with OHLC
+    columns'
+  rationale: Technical factors expect kdata with open, close, high, low, volume, turnover,
+    turnover_rate. Standard Chinese market data format. Domain-specific data structure
+    assumption. This breaks when using non-standard data sources with different column
+    names.
+  evidence: src/zvt/factors/technical_factor.py:42(TechnicalFactor.__init__)
+  stage: factor/technical
+  alternative_considered: Considered flexible column mapping, but chose fixed schema
+    for simplicity and direct compatibility with common data providers.
+- id: BD-066
+  type: RC/DK
+  content: T+1 trading constraint for A-share stocks (same-day buy cannot be sold)
+  rationale: 'A-share market T+1 rule: shares purchased on day T cannot be sold until
+    T+1. This is a regulatory requirement in Chinese stock market codified in Securities
+    Law Article 106. The code must enforce this constraint for realistic backtesting.
+    NOT explicitly implemented - this is a MISSING GAP.'
+  evidence: src/zvt/domain/meta/stock.py:18(TradableEntity.get_trading_t)
+  stage: trading/constraint
+  status: missing
+  known_gap: true
+  severity: critical
+  impact: 'Backtests will show unrealistic liquidity as same-day round-trip trades
+    are executed. This is the #1 source of overestimated returns in A-share backtesting.'
+- id: BD-067
+  type: RC/DK
+  content: 'Limit up/down (涨跌停) handling: stocks hitting limit cannot be bought/sold'
+  rationale: A-share limit up (10% for normal stocks, 5% for ST) means no execution
+    possible at limit price. This is a regulatory constraint preventing price movement
+    beyond daily limit. Current code likely fills orders at limit price. NOT explicitly
+    implemented - this is a MISSING GAP.
+  evidence: src/zvt/trader/sim_account.py:180(handle_trading_signal)
+  stage: trading/execution
+  status: missing
+  known_gap: true
+  severity: critical
+  impact: Backtests will show execution at limit-up prices which is impossible in
+    real trading. Causes significant overestimation of strategy returns around market
+    turning points.
+- id: BD-068
+  type: RC/DK
+  content: 'Stamp tax (印花税): 0.05% on sell side only (2023 rate)'
+  rationale: Chinese stamp tax is 0.05% charged only on sell transactions per PRC
+    Stamp Tax Law. Current cost model uses symmetric 0.1% buy and 0.1% sell, ignoring
+    this asymmetric regulatory tax. NOT explicitly modeled - this is a MISSING GAP.
+  evidence: src/zvt/trader/sim_account.py:34(SimAccountService.__init__)
+  stage: trading/cost
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Sell-side costs are understated. For high-turnover strategies, this causes
+    meaningful overstatement of net returns.
+- id: BD-069
+  type: B/DK
+  content: 'Dividend/bonus stock handling: ex-rights and ex-dividend date processing'
+  rationale: When stocks go ex-dividend or ex-rights, prices adjust and holdings may
+    include new shares (bonus) or cash (dividend). Current adjustment type handling
+    may not properly account for these events. This is a MISSING GAP identified in
+    documentation context.
+  evidence: src/zvt/domain/fundamental/dividend.py:18(DividendFinancing)
+  stage: data/adjustment
+  status: missing
+  known_gap: true
+  severity: medium
+  impact: Long-term holding strategies may show incorrect returns around dividend
+    payment dates. Rights issues may not be properly reflected in portfolio value.
+- id: BD-070
+  type: B/DK
+  content: 'Index constituent adjustment handling: historical composition matters
+    for survivorship bias'
+  rationale: Index components change over time (e.g., CSI 300). Using current constituents
+    for historical backtest creates survivorship bias. Historical point-in-time composition
+    should be used. NOT explicitly handled - MISSING GAP identified from documentation.
+  evidence: src/zvt/domain/meta/index.py:25(Index)
+  stage: data/filtering
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Strategies that use index constituents will show inflated returns because
+    delisted/removed stocks are excluded from historical analysis.
+- id: BD-071
+  type: B/DK
+  content: 'Suspension (停牌) handling: stocks can be suspended from trading for extended
+    periods'
+  rationale: A-share stocks can be suspended for days to months. During suspension,
+    factors may still compute on stale prices, and orders cannot execute. Current
+    code may not handle this. NOT explicitly modeled - MISSING GAP.
+  evidence: src/zvt/domain/meta/stock.py:18(TradableEntity.in_trading_time)
+  stage: trading/execution
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Strategies may generate signals for suspended stocks that cannot be executed,
+    leading to tracking error and position drift in real trading.
+- id: BD-072
+  type: B/BA
+  content: Market impact and slippage model for order execution
+  rationale: Current slippage is fixed 0.1% regardless of order size. Real market
+    impact depends on order size relative to average daily volume. Liquidity-constrained
+    execution not modeled. MISSING GAP.
+  evidence: src/zvt/trader/sim_account.py:180(handle_trading_signal)
+  stage: trading/execution
+  status: missing
+  known_gap: true
+  severity: medium
+  impact: Large orders in small-cap stocks will show unrealistic execution prices.
+    Strategies may appear profitable in backtest but fail in live trading due to market
+    impact.
+- id: BD-073
+  type: RC/DK
+  content: 'Short selling constraint: T+0 borrow/return cycle for margin accounts'
+  rationale: Short selling in A-shares has specific margin requirements and borrowing
+    constraints per CSRC margin trading regulations. The short_position_control()
+    function exists but may not properly model borrow availability. MISSING GAP.
+  evidence: src/zvt/trader/trader.py:310(short_position_control)
+  stage: trading/constraint
+  status: missing
+  known_gap: true
+  severity: medium
+  impact: Short strategies may show unrealistic short availability and borrowing costs,
+    leading to execution failures in live trading.
+- id: BD-074
+  type: B/BA
+  content: 'Multi-provider data consistency validation: no cross-provider reconciliation'
+  rationale: ZVT supports multiple data providers (em, joinquant, eastmoney, sina)
+    for the same entity types. The documentation states 'one schema can have multiple
+    providers, providing system stability' as a core principle. However, no cross-provider
+    validation exists - discrepancies between providers are silently accepted. MISSING
+    GAP.
+  evidence: src/zvt/domain/meta/stock.py:1(Stock)
+  stage: data/quality
+  status: missing
+  known_gap: true
+  severity: medium
+  impact: Strategies may produce different results depending on which provider is
+    used. Data quality issues from one provider may propagate to trading decisions
+    without detection.
+- id: BD-075
+  type: B/BA
+  content: 'Strategy validation and backtest debugging tooling: correctness not verified'
+  rationale: The documentation states ZVT aims for 'correctness is obvious' but provides
+    no built-in strategy validation, assertion framework, or backtest debugging tools.
+    Users must manually verify strategy logic. MISSING GAP identified from project
+    philosophy.
+  evidence: src/zvt/trader/trader.py:1(Trader)
+  stage: trading/validation
+  status: missing
+  known_gap: true
+  severity: medium
+  impact: Complex strategies may have subtle bugs (signal leakage, look-ahead bias,
+    calculation errors) that are difficult to detect without dedicated validation
+    tooling.
+- id: BD-076
+  type: B/DK
+  content: 'Transaction cost model calibration: flat rate ignores market regime effects'
+  rationale: Current cost model uses fixed 0.1% commission regardless of market conditions.
+    In practice, bid-ask spread, market impact, and execution quality vary significantly
+    between bull and bear markets. MISSING GAP derived from BD-022.
+  evidence: src/zvt/trader/sim_account.py:34(SimAccountService.__init__)
+  stage: trading/cost
+  status: missing
+  known_gap: true
+  severity: medium
+  impact: Strategies optimized under low-cost bull market conditions may underperform
+    significantly when costs increase in volatile markets.
+- id: BD-INT-001
+  type: B/BA
+  content: 'INTERACTION: [BD-035] × [BD-043] → ML features MA250 requires pre_load_days
+    >= 250 for correct calculation, but no enforcement exists. MaStatsAccumulator
+    defaults to acc_window=250 but ML machine uses different feature windows [5, 10,
+    120, 250].'
+  rationale: The MA250 in ML features (BD-035) requires sufficient historical warmup
+    data to compute correctly, but neither the ML pipeline nor the data loading explicitly
+    enforces this. MaStatsAccumulator (BD-043) uses acc_window=250 as default but
+    ML uses only [5, 10, 120, 250] as features - a subset that omits 34, 55, 89, 144.
+    This creates inconsistent warmup requirements across the codebase. This breaks
+    when backtests run on periods < 250 trading days, producing incorrect MA250 values
+    that corrupt ML training features.
+  evidence: src/zvt/ml/ml.py:223(MaStockMLMachine.build_feature)
+  stage: cross_stage
+- id: BD-INT-002
+  type: RC/B
+  content: 'INTERACTION: [BD-066] × [BD-023] → T+1 constraint AMPLIFIES stop-loss
+    losses in limit-down scenarios. Stop-loss order placed at -30% can only execute
+    next day (T+1), and in limit-down market, next-day open may be far below trigger
+    price.'
+  rationale: 'The missing T+1 constraint (BD-066) directly contradicts the stop-loss
+    logic (BD-023). When stop-loss triggers at -30%, the order cannot execute same
+    day. If the stock hits limit-down (cannot be sold at any price), the order queues
+    for T+1. At T+1 open, if another limit-down occurs, the actual loss far exceeds
+    the intended 30%. This is the #1 source of overestimated returns in A-share backtesting
+    - stop-loss appears to work but fails exactly when most needed (fast-moving bear
+    markets). The amplification occurs because BD-067 (limit up/down) is also missing,
+    compounding the execution failure.'
+  evidence: src/zvt/trader/trader.py:44(Trader.__init__)
+  stage: cross_stage
+- id: BD-INT-003
+  type: RC/B
+  content: 'INTERACTION: [BD-022] × [BD-068] × [BD-076] → RISK CASCADE: Symmetric
+    0.1% cost model + missing stamp tax + flat rate ignoring regime = systematic backtest
+    overstatement. Combined effect underestimates sell costs by 0.15% (stamp tax)
+    × turnover + regime-adjusted spread.'
+  rationale: 'Three cost-related decisions combine to systematically overestimate
+    returns. BD-022 models symmetric 0.1% buy/sell costs. BD-068 reveals stamp tax
+    (0.05% on sell only) is missing, so actual sell cost is 0.15% not 0.1%. BD-076
+    adds that fixed costs ignore market regime - in volatile markets, actual execution
+    costs spike. The cumulative effect: backtest net returns are overstated by potentially
+    0.15-0.5% per round-trip for high-turnover strategies. This affects profitability
+    calculations, signal decay rates, and minimum holding period decisions. The cascade
+    amplifies for momentum strategies with frequent rebalancing.'
+  evidence: src/zvt/trader/sim_account.py:34(SimAccountService.__init__)
+  stage: cross_stage
+- id: BD-INT-004
+  type: B/BA
+  content: 'INTERACTION: [BD-004] × [BD-005] × [BD-044] → BullFactor requires diff>0
+    AND dea>0 (BD-004) for 10 consecutive periods (BD-005), but MACD live tracking
+    only checks diff>dea (BD-044). Internal state tracking and BullFactor logic use
+    inconsistent bull definitions.'
+  rationale: 'BullFactor (BD-004) uses dual positive condition (diff>0 AND dea>0)
+    as stronger confirmation. KeepBullFactor (BD-005) requires 10 consecutive bull
+    periods. But MACD algorithm (BD-044) tracks live_count based on simple diff>dea
+    crossover. This creates a contradiction: BullFactor might signal bull even when
+    MACD live_count hasn''t incremented (because diff<0 but still above dea). Conversely,
+    MACD live status could show bullish while BullFactor hasn''t triggered. The AND
+    logic in BullFactor is more conservative but inconsistent with how live_count
+    is incremented. This breaks in early-stage rallies where diff turns positive before
+    dea - BullFactor misses these while MACD live_count captures them.'
+  evidence: src/zvt/factors/macd/macd_factor.py:25(src)
+  stage: cross_stage
+- id: BD-INT-005
+  type: B/BA
+  content: 'INTERACTION: [BD-070] × [BD-074] × [BD-037] → RISK CASCADE: No index constituent
+    validation (BD-074) + no survivorship bias handling (BD-070) + ML temporal split
+    uses potentially corrupted historical data (BD-037). Strategy may train/validate
+    on non-existent historical constituents.'
+  rationale: 'Index constituent changes over time (BD-070 is missing). Multi-provider
+    data has no reconciliation (BD-074 is missing). ML training uses temporal split
+    at 2021-06-01 (BD-037) but the training data may include stocks that weren''t
+    actually index constituents when the historical data was generated. The cascade:
+    (1) data provider may use current constituents for historical backfill, (2) no
+    cross-validation detects this discrepancy, (3) ML model trains on inflated historical
+    performance of stocks that would have been removed from index, (4) model deploys
+    expecting similar performance but faces real-world delisting/suspension risk.
+    This is a systemic survivorship bias that affects both factor computation and
+    ML training.'
+  evidence: src/zvt/ml/ml.py:54(src)
+  stage: cross_stage
+- id: BD-INT-006
+  type: M/DK
+  content: 'INTERACTION: [BD-006] × [BD-035] → Hidden dependency: Default MA windows
+    [5,10,34,55,89,144,120,250] in MaFactor differs from ML feature windows [5,10,120,250].
+    Fibonacci MAs 34,55,89,144 used in factors but not in ML, creating feature-factor
+    misalignment.'
+  rationale: 'MaFactor (BD-006) defaults to Fibonacci MA windows [5,10,34,55,89,144,120,250]
+    based on practitioner convention. ML features (BD-035) use only [5,10,120,250]
+    - a sparse subset that omits 34,55,89,144. The strategy uses factors with one
+    MA set but ML predicts with another. This creates hidden dependency: factor signals
+    use Fibonacci levels that ML model never sees. Signals generated at MA34/55/89/144
+    support/resistance cannot be predicted by a model trained only on MA5/10/120/250
+    features. This breaks when Fibonacci levels are actual support/resistance (which
+    is assumed in factor design), causing systematic blind spots in ML predictions.'
+  evidence: src/zvt/factors/ma/ma_factor.py:57(src)
+  stage: cross_stage
+- id: BD-INT-007
+  type: B/BA
+  content: 'INTERACTION: [BD-027] × [BD-056] × [BD-028] → Multi-level trading with
+    weekly+daily (BD-027) requires factor levels processed in ascending order (BD-056)
+    and sufficient backshift for warmup (BD-028). 50-day backshift may be insufficient
+    for weekly-level MACD convergence.'
+  rationale: MultipleLevelTrader (BD-027) combines LEVEL_1WEEK and LEVEL_1DAY factors.
+    Factor processing requires ascending order (BD-056) with final decision at minimum
+    level. Backshift is 50 days (BD-028) stated as 'sufficient for MACD convergence'.
+    However, weekly data requires at least 4-5 weeks of daily data to compute one
+    weekly bar meaningfully. If backshift is 50 days and MACD needs 26+ periods for
+    slow EMA, the weekly-level MACD may not have converged properly. This breaks when
+    backtesting starts close to historical boundary - weekly factors show incomplete
+    patterns while daily factors show full history. Signal generation becomes inconsistent
+    across timeframes.
+  evidence: examples/trader/macd_week_and_day_trader.py:16(src)
+  stage: cross_stage
+known_use_cases:
+- name: MACD Day Trading Strategy
+  source: examples/trader/macd_day_trader.py
+  type: single_factor_strategy
+  business_problem: 'Implements a simple momentum trading strategy using MACD golden
+    cross/dead cross
+
+    signals on daily level. Targets stocks with strong momentum characteristics.
+
+    '
+  intent_keywords:
+  - macd
+  - golden cross
+  - momentum
+  - daily trading
+  - technical indicator
+  negative_keywords:
+  - fundamental
+  - weekly
+  - multi-factor
+  - risk management
+  disambiguation: 'This is a single-factor, single-timeframe strategy. Not suitable
+    for
+
+    multi-factor portfolios or long-term investment.
+
+    '
+  data_domain: technical_analysis/daily/stock
+- name: Multi-level Bull Trend Trading
+  source: examples/trader/keep_run_trader.py
+  type: multi_factor_multi_timeframe_strategy
+  business_problem: 'Combines weekly BullFactor with daily GoldCrossFactor. Uses entity
+    pool filtering
+
+    (top 30% volume AND top 30% fund holdings) to focus on liquid institutional names.
+
+    Implements rolling 40-day backtesting windows.
+
+    '
+  intent_keywords:
+  - multi-timeframe
+  - weekly daily combination
+  - bull trend
+  - fund flow
+  - liquidity filter
+  negative_keywords:
+  - single timeframe
+  - short selling
+  - intraday
+  disambiguation: 'This is a multi-timeframe strategy with stock pool filtering. Best
+    for
+
+    medium-term momentum in liquid stocks.
+
+    '
+  data_domain: technical_analysis/multi_timeframe/stock
+- name: Dragon and Tiger List Trading
+  source: examples/trader/dragon_and_tiger_trader.py
+  type: market_structure_strategy
+  business_problem: 'Follows institutional flow from Dragon and Tiger List (龙虎榜) data.
+
+    Filters for institutional-only dealers (机构专用) to capture informed trading.
+
+    '
+  intent_keywords:
+  - dragon tiger list
+  - institutional flow
+  - 龙虎榜
+  - 机构专用
+  - market microstructure
+  negative_keywords:
+  - fundamental analysis
+  - technical indicators
+  - momentum
+  disambiguation: 'Uses market microstructure data rather than price-based signals.
+
+    Focuses on institutional trading patterns.
+
+    '
+  data_domain: market_structure/institutional_flow/stock
+- name: Fund Holdings Following Strategy
+  source: examples/trader/follow_ii_trader.py
+  type: institutional_signal_strategy
+  business_problem: 'Follows fund holding changes reported in quarterly disclosures.
+    Buy when
+
+    fund holding ratio increases >5%, sell when decreases >50%.
+
+    '
+  intent_keywords:
+  - fund holding
+  - institutional investor
+  - quarterly report
+  - 机构重仓
+  - ii following
+  negative_keywords:
+  - technical analysis
+  - intraday
+  - market microstructure
+  disambiguation: 'Uses fundamental/institutional data with quarterly frequency.
+
+    Not suitable for high-frequency or short-term trading.
+
+    '
+  data_domain: fundamental/institutional/stock
+- name: Bollinger Band Trading
+  source: examples/factors/boll_factor.py
+  type: technical_factor
+  business_problem: 'Uses Bollinger Bands (20-period, 2 standard deviations) to identify
+
+    mean reversion opportunities. Buy when price touches lower band, sell
+
+    when touches upper band.
+
+    '
+  intent_keywords:
+  - bollinger bands
+  - volatility
+  - mean reversion
+  - support resistance
+  - band touch
+  negative_keywords:
+  - momentum
+  - trend following
+  - fundamental
+  disambiguation: 'This is a volatility-based mean reversion strategy. Different from
+
+    momentum strategies that follow trends.
+
+    '
+  data_domain: technical_analysis/volatility/stock
+- name: Bull and Up Technical Factor
+  source: examples/factors/tech_factor.py
+  type: composite_technical_factor
+  business_problem: 'Combines MACD bull signal with liquidity filters (turnover >
+    400M,
+
+    turnover_rate > 2%) and MA alignment. Filters out illiquid stocks
+
+    and requires sustained bullish trend.
+
+    '
+  intent_keywords:
+  - macd bull
+  - liquidity filter
+  - moving average alignment
+  - turnover threshold
+  - sustained trend
+  negative_keywords:
+  - fundamental
+  - short selling
+  - mean reversion
+  disambiguation: 'Combines multiple technical conditions with liquidity filter.
+
+    Best for trending, liquid stocks.
+
+    '
+  data_domain: technical_analysis/composite/stock
+- name: Good Company Fundamental Selector
+  source: examples/factors/fundamental_selector.py
+  type: fundamental_filter
+  business_problem: 'Screens for quality companies using fundamental metrics: high
+    ROE,
+
+    strong cash flow, low receivables, sustainable growth. Combines
+
+    with dividend yield and balance sheet health.
+
+    '
+  intent_keywords:
+  - fundamental screening
+  - quality factor
+  - roe
+  - cash flow
+  - balance sheet
+  - dividend
+  negative_keywords:
+  - technical analysis
+  - momentum
+  - short selling
+  disambiguation: 'Long-only fundamental strategy focused on quality. Not suitable
+    for
+
+    short-term trading or technical traders.
+
+    '
+  data_domain: fundamental/quality/stock
+- name: Machine Learning Classification
+  source: examples/ml/sgd.py
+  type: ml_classification
+  business_problem: 'Uses SGDClassifier with StandardScaler to predict stock direction
+
+    (up/down) based on MA features. 20-day prediction horizon with
+
+    temporal train/test split.
+
+    '
+  intent_keywords:
+  - machine learning
+  - classification
+  - sgd
+  - standard scaler
+  - price prediction
+  negative_keywords:
+  - regression
+  - fundamental features
+  - reinforcement learning
+  disambiguation: 'Binary classification for directional prediction. Different from
+
+    regression for price prediction or ranking problems.
+
+    '
+  data_domain: ml/classification/stock
+- name: Machine Learning Regression
+  source: examples/ml/sgd.py
+  type: ml_regression
+  business_problem: 'Uses SGDRegressor with StandardScaler to predict future stock
+    prices
+
+    based on MA features. 20-day prediction horizon.
+
+    '
+  intent_keywords:
+  - machine learning
+  - regression
+  - sgd
+  - price prediction
+  - future price
+  negative_keywords:
+  - classification
+  - fundamental features
+  - reinforcement learning
+  disambiguation: 'Regression for absolute price prediction. Different from classification
+
+    (direction) or change-based labels.
+
+    '
+  data_domain: ml/regression/stock
+- name: Risky Company Screening
+  source: examples/reports/__init__.py
+  type: risk_analysis
+  business_problem: 'Identifies risky companies using multiple red flags: declining
+    revenue,
+
+    profit warnings, poor liquidity ratios, high receivables/inventory/goodwill
+
+    relative to equity, aggressive revenue recognition.
+
+    '
+  intent_keywords:
+  - risk screening
+  - financial distress
+  - red flags
+  - fraud detection
+  - balance sheet quality
+  negative_keywords:
+  - momentum
+  - technical analysis
+  - growth investing
+  disambiguation: 'Risk screening for avoiding bad stocks. Can be used as blacklist
+
+    or negative filter in combination with positive screens.
+
+    '
+  data_domain: fundamental/risk/stock
+- name: Top Tags Research
+  source: examples/research/top_tags.py
+  type: market_research
+  business_problem: 'Analyzes monthly top-performing stocks to identify market leadership
+    patterns.
+
+    Filters for small-cap dominance (90% under 10B market cap) to understand
+
+    where market alpha originates.
+
+    '
+  intent_keywords:
+  - top performers
+  - market leadership
+  - small cap
+  - sector rotation
+  - monthly analysis
+  negative_keywords:
+  - trading signals
+  - risk management
+  - execution
+  disambiguation: 'Research tool for understanding market patterns, not a trading
+    signal generator.
+
+    Used for hypothesis generation and strategy development.
+
+    '
+  data_domain: research/performance/stock
+- id: UC-012
+  name: Volume Breakout Strategy
+  source: examples/factors/ma/ma_factor.py (VolumeUpMaFactor)
+  type: technical_momentum_strategy
+  business_problem: 'Identifies stocks breaking out with high volume (2x volume MA)
+    and price
+
+    within 15% of MA250. Holds positions for up to 40 trading days after
+
+    breakout signal.
+
+    '
+  intent_keywords:
+  - volume breakout
+  - momentum
+  - MA250
+  - trend continuation
+  - breakout trading
+  negative_keywords:
+  - mean reversion
+  - short selling
+  - fundamental
+  disambiguation: 'Momentum breakout strategy focusing on volume confirmation.
+
+    Suitable for trending markets.
+
+    '
+  data_domain: technical_analysis/volume/stock
+- id: UC-013
+  name: MA Cross Strategy
+  source: src/zvt/factors/ma/ma_factor.py (CrossMaFactor)
+  type: technical_trend_strategy
+  business_problem: 'Classic MA多头排列 (ascending MA chain) pattern: ma5 > ma10 > ma20.
+
+    Confirms strong uptrend when shortest MA is highest and longest is lowest.
+
+    '
+  intent_keywords:
+  - moving average crossover
+  - ma多头排列
+  - ascending chain
+  - trend confirmation
+  - gold cross
+  negative_keywords:
+  - mean reversion
+  - range trading
+  - fundamental
+  disambiguation: 'Trend-following strategy that requires all MAs in correct order.
+
+    Works best in strong trending markets.
+
+    '
+  data_domain: technical_analysis/trend/stock
+- id: UC-014
+  name: Chan Theory (缠论) Trading
+  source: src/zvt/factors/zen/zen_factor.py
+  type: advanced_technical_strategy
+  business_problem: 'Implements 缠论 (Chan Theory) for precise pattern recognition including
+
+    fenxing (turning points), bi (笔/笔形), zhongshu (中枢/accumulation range),
+
+    and 3-drive patterns.
+
+    '
+  intent_keywords:
+  - 缠论
+  - chan theory
+  - fenxing
+  - zhongshu
+  - bi
+  - chinese technical analysis
+  negative_keywords:
+  - western indicators
+  - fundamental
+  - simple strategies
+  disambiguation: 'Advanced technical analysis requiring deep domain knowledge.
+
+    Not suitable for beginners or simple strategy development.
+
+    '
+  data_domain: technical_analysis/advanced/stock
+audit_checklist_summary:
+  sop_version: '3.4'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  - A_STOCK
+  - PRC
+  - RSK
+  - CRD
+  - DAT
+  note: Auto-generated by bp_enrich; detailed audit pending Batch C worker_audit
+relations:
+- target: 同子领域蓝图
+  type: pending
+  description: 暂无同子领域参照，待批量提取后补充
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
