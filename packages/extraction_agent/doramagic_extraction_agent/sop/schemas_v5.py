@@ -52,10 +52,10 @@ class BusinessDecision(BaseModel):
         if "stage" not in data:
             data["stage"] = "unknown"
         return data
+
     type: str = Field(
         description=(
-            "T/B/BA/DK/RC/M or multi-type like B/BA, M/DK. "
-            "Use '/' to separate multiple types."
+            "T/B/BA/DK/RC/M or multi-type like B/BA, M/DK. Use '/' to separate multiple types."
         ),
         pattern=r"^(T|B|BA|DK|RC|M)(/(?:T|B|BA|DK|RC|M))*$",
     )
@@ -151,8 +151,7 @@ class BDExtractionResult(BaseModel):
         for gap in self.missing_gaps:
             if gap.status != "missing":
                 raise ValueError(
-                    f"missing_gaps entry {gap.id!r} has status={gap.status!r}, "
-                    "expected 'missing'"
+                    f"missing_gaps entry {gap.id!r} has status={gap.status!r}, expected 'missing'"
                 )
         return self
 
@@ -162,9 +161,7 @@ class BDExtractionResult(BaseModel):
         valid_pattern = re.compile(r"^(T|B|BA|DK|RC|M)(/(?:T|B|BA|DK|RC|M))*$")
         for key in self.type_summary:
             if not valid_pattern.match(key):
-                raise ValueError(
-                    f"type_summary key {key!r} is not a valid BD type code"
-                )
+                raise ValueError(f"type_summary key {key!r} is not a valid BD type code")
         return self
 
 
@@ -175,9 +172,17 @@ class UseCase(BaseModel):
     name: str = Field(description="Short descriptive name")
     source: str = Field(description="Source file path, e.g. examples/trader/macd_day_trader.py")
     uc_type: Literal[
-        "trading_strategy", "screening", "data_pipeline", "monitoring",
-        "live_trading", "reporting", "research_analysis", "ml_prediction",
-        "builtin_factor", "extension_example", "complete_strategy",
+        "trading_strategy",
+        "screening",
+        "data_pipeline",
+        "monitoring",
+        "live_trading",
+        "reporting",
+        "research_analysis",
+        "ml_prediction",
+        "builtin_factor",
+        "extension_example",
+        "complete_strategy",
     ] = Field(description="Use case type category")
     business_problem: str = Field(description="What business problem this example solves")
     intent_keywords: list[str] = Field(
@@ -221,6 +226,7 @@ class QualityGateResult(BaseModel):
 
 class InterfacePort(BaseModel):
     """A single input or output port in a stage interface."""
+
     name: str
     description: str
     schema_hint: str | None = None
@@ -229,6 +235,7 @@ class InterfacePort(BaseModel):
 
 class MethodSpec(BaseModel):
     """A required method in a stage interface."""
+
     name: str = Field(description="Class.method or function name, e.g. 'Factor.compute'")
     description: str = Field(description="What this method does")
     evidence: str = Field(default="", description="file:line(fn) reference")
@@ -236,6 +243,7 @@ class MethodSpec(BaseModel):
 
 class KeyBehavior(BaseModel):
     """An observable behavior of a stage."""
+
     behavior: str = Field(description="Short behavior name, e.g. 'Entity-level isolation'")
     description: str = Field(description="Detailed description of the behavior")
     evidence: str = Field(default="", description="file:line(fn) reference")
@@ -243,14 +251,20 @@ class KeyBehavior(BaseModel):
 
 class ReplaceableOption(BaseModel):
     """A concrete option for a replaceable point."""
+
     name: str
     traits: list[str] = Field(default_factory=list, description="Key traits of this option")
-    fit_for: list[str] = Field(default_factory=list, description="Scenarios this option is good for")
-    not_fit_for: list[str] = Field(default_factory=list, description="Scenarios this option is NOT good for")
+    fit_for: list[str] = Field(
+        default_factory=list, description="Scenarios this option is good for"
+    )
+    not_fit_for: list[str] = Field(
+        default_factory=list, description="Scenarios this option is NOT good for"
+    )
 
 
 class ReplaceablePoint(BaseModel):
     """An extension point where users can swap implementations."""
+
     name: str = Field(description="Extension point name, e.g. 'storage_backend'")
     description: str = Field(default="", description="What can be replaced")
     options: list[ReplaceableOption] = Field(default_factory=list)
@@ -259,6 +273,7 @@ class ReplaceablePoint(BaseModel):
 
 class BlueprintStage(BaseModel):
     """A single pipeline stage extracted from architecture analysis."""
+
     id: str = Field(description="snake_case unique stage ID, e.g. 'data_collection'")
     name: str = Field(description="Human-readable stage name")
     order: int = Field(ge=1, description="Execution order (strictly increasing)")
@@ -292,6 +307,7 @@ class BlueprintStage(BaseModel):
 
 class DataFlowEdge(BaseModel):
     """A data flow edge between two stages."""
+
     from_stage: str
     to_stage: str
     data: str = Field(description="What data flows through this edge")
@@ -299,6 +315,7 @@ class DataFlowEdge(BaseModel):
 
 class BlueprintAssembleResult(BaseModel):
     """Complete blueprint structure — Instructor-enforced output contract."""
+
     name: str = Field(description="Project name")
     applicability: dict[str, Any] = Field(
         description="Domain, task_type, description, prerequisites, not_suitable_for",
@@ -317,7 +334,7 @@ class BlueprintAssembleResult(BaseModel):
     )
 
     @model_validator(mode="after")
-    def check_stage_orders_unique(self) -> "BlueprintAssembleResult":
+    def check_stage_orders_unique(self) -> BlueprintAssembleResult:
         orders = [s.order for s in self.stages]
         if len(orders) != len(set(orders)):
             dupes = [o for o in orders if orders.count(o) > 1]
@@ -325,7 +342,7 @@ class BlueprintAssembleResult(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def check_data_flow_references(self) -> "BlueprintAssembleResult":
+    def check_data_flow_references(self) -> BlueprintAssembleResult:
         """Warn (not reject) when data_flow references non-stage endpoints.
 
         Real blueprints use rich endpoint labels like "(config)", "(user)",
@@ -343,6 +360,76 @@ class BlueprintAssembleResult(BaseModel):
                     f"Valid stages: {sorted(stage_ids)}"
                 )
         return self
+
+
+class EvaluationIssue(BaseModel):
+    """A single issue found by the independent Evaluator."""
+
+    bd_id: str = Field(description="ID of the BD with the issue")
+    contract: Literal["evidence_validity", "classification", "rationale", "rc_split"] = Field(
+        description="Which verification contract was violated"
+    )
+    verdict: str = Field(
+        description=(
+            "INVALID | WEAK | OVER_CLASSIFIED | UNDER_CLASSIFIED"
+            " | SHALLOW | MISSING_WHY | MISSING_BOUNDARY | NEEDS_SPLIT"
+        ),
+    )
+    detail: str = Field(description="Specific explanation of the issue")
+    fix_suggestion: str = Field(
+        default="",
+        description="Concrete fix if possible",
+    )
+
+
+class EvaluationReport(BaseModel):
+    """Result of the independent Evaluator phase."""
+
+    evaluated_count: int = Field(ge=0, description="Total BDs evaluated")
+    pass_count: int = Field(ge=0, description="BDs that passed all contracts")
+    issues: list[EvaluationIssue] = Field(
+        default_factory=list,
+        description="All issues found across all BDs",
+    )
+    score: float = Field(ge=0.0, le=1.0, description="pass_count / evaluated_count")
+    recommendation: Literal["PASS", "FIXABLE", "NEEDS_REWORK"] = Field(
+        description="Overall recommendation",
+    )
+    passed_ids: list[str] = Field(
+        default_factory=list,
+        description="IDs of BDs that passed all contracts — used by DecisionCache",
+    )
+
+
+class ResourceOption(BaseModel):
+    """A concrete option in a replaceable resource slot."""
+
+    name: str
+    package: str = Field(default="N/A", description="pip package name")
+    traits: list[str] = Field(default_factory=list)
+    fit_for: str = ""
+    not_fit_for: str = ""
+    setup_effort: Literal["low", "medium", "high"] = "medium"
+    cost: Literal["free", "freemium", "paid"] = "free"
+
+
+class ResourceSlot(BaseModel):
+    """A replaceable resource slot with its options."""
+
+    slot_name: str
+    options: list[ResourceOption] = Field(default_factory=list)
+    default: str | None = None
+    selection_criteria: str = ""
+
+
+class ResourceInventory(BaseModel):
+    """Complete resource inventory from worker_resource."""
+
+    data_sources: list[dict[str, Any]] = Field(default_factory=list)
+    dependencies: list[dict[str, Any]] = Field(default_factory=list)
+    external_services: list[dict[str, Any]] = Field(default_factory=list)
+    infrastructure: dict[str, Any] = Field(default_factory=dict)
+    replaceable_resource_matrix: list[ResourceSlot] = Field(default_factory=list)
 
 
 @dataclass

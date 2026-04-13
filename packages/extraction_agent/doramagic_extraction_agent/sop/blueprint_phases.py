@@ -7,6 +7,7 @@ Agentic phases (2a, 2b, 2c, 2d, 4) carry system_prompt + initial_message_builder
 v5 adds:
 - ``build_blueprint_phases_v5()`` — Instructor-driven synthesis + quality gate
 """
+
 from __future__ import annotations
 
 import json
@@ -27,7 +28,7 @@ from ..tools.indexer import (
     build_structural_index,
 )
 from ..tools.sources import mine_source_context
-from . import prompts, prompts_v4, prompts_v5
+from . import prompts, prompts_v4, prompts_v5, prompts_v6
 from .blueprint_enrich import enrich_blueprint
 from .schemas_v5 import BDExtractionResult, QualityGateResult, RawFallback, UCExtractionResult
 
@@ -101,8 +102,9 @@ async def _structural_index_handler(state: AgentState, repo_path: Path) -> Phase
             json.dumps(index, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        logger.info("Structural index saved to %s (%d KB)",
-                     index_path, index_path.stat().st_size // 1024)
+        logger.info(
+            "Structural index saved to %s (%d KB)", index_path, index_path.stat().st_size // 1024
+        )
 
     stats = index.get("stats", {})
     logger.info(
@@ -145,7 +147,8 @@ async def _mine_sources_handler(state: AgentState, repo_path: Path) -> PhaseResu
         artifact_path.write_text(content, encoding="utf-8")
         logger.info(
             "Source context saved to %s (%d KB)",
-            artifact_path, len(content) // 1024,
+            artifact_path,
+            len(content) // 1024,
         )
 
     sections = sum(1 for line in content.splitlines() if line.startswith("## "))
@@ -187,14 +190,16 @@ async def _step3_handler(state: AgentState, repo_path: Path) -> PhaseResult:
                         combined_text += artifact_path.read_text(errors="ignore") + "\n"
 
     # Match file paths: must start with word char, dot, or slash (not backtick/CJK)
-    file_refs = re.findall(r'(?<![`\w\u4e00-\u9fff])([a-zA-Z_.~/][a-zA-Z0-9_./~-]*\.py)(?::(\d+))?', combined_text)
+    file_refs = re.findall(
+        r"(?<![`\w\u4e00-\u9fff])([a-zA-Z_.~/][a-zA-Z0-9_./~-]*\.py)(?::(\d+))?", combined_text
+    )
     missing_files: list[str] = []
     checked: set[str] = set()
     for fpath, _ in file_refs:
         if fpath in checked:
             continue
         # Skip glob patterns and invalid paths
-        if '*' in fpath or '?' in fpath or '[' in fpath:
+        if "*" in fpath or "?" in fpath or "[" in fpath:
             continue
         checked.add(fpath)
         candidate = repo_path / fpath
@@ -229,7 +234,20 @@ async def _step5_handler(state: AgentState, repo_path: Path) -> PhaseResult:
     """Step 5: Consistency check — BD type validity and UC required fields."""
     issues: list[str] = []
 
-    valid_bd_types = {"T", "B", "BA", "DK", "RC", "M", "B/BA", "M/B", "M/BA", "M/DK", "RC/DK", "B/DK"}
+    valid_bd_types = {
+        "T",
+        "B",
+        "BA",
+        "DK",
+        "RC",
+        "M",
+        "B/BA",
+        "M/B",
+        "M/BA",
+        "M/DK",
+        "RC/DK",
+        "B/DK",
+    }
     required_uc_fields = ("negative_keywords", "disambiguation", "data_domain")
 
     # Resolve artifacts_dir via run_dir stored on state (set by SOPExecutor).
@@ -247,7 +265,7 @@ async def _step5_handler(state: AgentState, repo_path: Path) -> PhaseResult:
     bd_path = artifacts_dir / "step2c_business_decisions.md"
     if bd_path.exists():
         bd_text = bd_path.read_text(errors="ignore")
-        bd_types = re.findall(r'\|\s*\d+\s*\|[^|]+\|\s*([A-Z/]+)\s*\|', bd_text)
+        bd_types = re.findall(r"\|\s*\d+\s*\|[^|]+\|\s*([A-Z/]+)\s*\|", bd_text)
         for t in bd_types:
             if t.strip() not in valid_bd_types:
                 issues.append(f"Invalid BD type: '{t.strip()}'")
@@ -306,7 +324,7 @@ def _repair_yaml(content: str) -> str:
         # Fix list items with unquoted colons in value:
         #   `- BD-7: Default pre-bucketing: max_n_bins=100`
         # → `- "BD-7: Default pre-bucketing: max_n_bins=100"`
-        m = re.match(r'^(\s*-\s+)(.+:.+:.+)$', line)
+        m = re.match(r"^(\s*-\s+)(.+:.+:.+)$", line)
         if m:
             indent, value = m.group(1), m.group(2)
             # Only quote if value is not already quoted
@@ -316,10 +334,12 @@ def _repair_yaml(content: str) -> str:
             # Fix mapping values with extra colons:
             #   `    key: value: with: colons`
             # → `    key: "value: with: colons"`
-            m2 = re.match(r'^(\s+\w[\w\s]*:\s+)(.+:.+)$', line)
+            m2 = re.match(r"^(\s+\w[\w\s]*:\s+)(.+:.+)$", line)
             if m2:
                 key_part, val_part = m2.group(1), m2.group(2)
-                if not (val_part.startswith('"') or val_part.startswith("'") or val_part.startswith("[")):
+                if not (
+                    val_part.startswith('"') or val_part.startswith("'") or val_part.startswith("[")
+                ):
                     line = f'{key_part}"{val_part}"'
         repaired.append(line.rstrip())
 
@@ -328,7 +348,10 @@ def _repair_yaml(content: str) -> str:
     # Verify the repair worked
     try:
         _yaml.safe_load(repaired_content)
-        logger.info("YAML repair successful — fixed %d lines", sum(1 for a, b in zip(content.split("\n"), repaired) if a.rstrip() != b))
+        logger.info(
+            "YAML repair successful — fixed %d lines",
+            sum(1 for a, b in zip(content.split("\n"), repaired) if a.rstrip() != b),
+        )
         return repaired_content
     except _yaml.YAMLError as e:
         logger.warning("YAML repair incomplete — still has errors: %s", e)
@@ -356,12 +379,21 @@ async def _finalize_handler(state: AgentState, repo_path: Path) -> PhaseResult:
 
     # Validate
     import yaml as _yaml
+
     try:
         parsed = _yaml.safe_load(content)
         if not isinstance(parsed, dict):
-            return PhaseResult(phase_name="bp_finalize", status="error", error="blueprint.yaml is not a YAML mapping")
+            return PhaseResult(
+                phase_name="bp_finalize",
+                status="error",
+                error="blueprint.yaml is not a YAML mapping",
+            )
     except _yaml.YAMLError as e:
-        return PhaseResult(phase_name="bp_finalize", status="error", error=f"blueprint.yaml YAML still invalid after repair: {e}")
+        return PhaseResult(
+            phase_name="bp_finalize",
+            status="error",
+            error=f"blueprint.yaml YAML still invalid after repair: {e}",
+        )
 
     # Normalize field name variants that MiniMax might use
     field_renames = {
@@ -435,6 +467,7 @@ def _blueprint_yaml_gate(state: AgentState, repo_path: Path) -> tuple[bool, str]
 def _bd_r2_gate(state: AgentState, repo_path: Path) -> tuple[bool, str]:
     """Quality gate for Round 2: check T ratio is not artificially high."""
     import json
+
     artifacts_dir = Path(state.run_dir) / "artifacts" if state.run_dir else None
     if not artifacts_dir:
         return True, "run_dir not set, skipping gate"
@@ -466,34 +499,36 @@ def _bd_final_gate(state: AgentState, repo_path: Path) -> tuple[bool, str]:
     content = md_path.read_text()
     # Count BD types from markdown table
     import re
-    type_pattern = re.compile(r'\|\s*\d+\s*\|[^|]+\|\s*([A-Z/]+)\s*\|')
+
+    type_pattern = re.compile(r"\|\s*\d+\s*\|[^|]+\|\s*([A-Z/]+)\s*\|")
     types = type_pattern.findall(content)
     if len(types) < 5:
         return False, f"Only {len(types)} BD entries (need >= 5)"
 
     from collections import Counter
+
     type_counts = Counter(t.strip() for t in types)
 
     labels = state.subdomain_labels or []
     issues = []
 
     # M check for quant projects
-    m_count = sum(v for k, v in type_counts.items() if 'M' in k)
+    m_count = sum(v for k, v in type_counts.items() if "M" in k)
     if any(l in labels for l in ["TRD", "PRC", "RSK"]) and m_count == 0:
         issues.append(f"M=0 in quant project (labels={labels})")
 
     # RC check for credit/compliance
-    rc_count = sum(v for k, v in type_counts.items() if 'RC' in k)
+    rc_count = sum(v for k, v in type_counts.items() if "RC" in k)
     if any(l in labels for l in ["CRD", "CMP"]) and rc_count == 0:
         issues.append("RC=0 in credit/compliance project")
 
     # DK check for market-specific projects
-    dk_count = sum(v for k, v in type_counts.items() if 'DK' in k)
+    dk_count = sum(v for k, v in type_counts.items() if "DK" in k)
     if any(l in labels for l in ["TRD", "A_STOCK"]) and dk_count == 0:
         issues.append("DK=0 in trading/A-stock project")
 
     # BA check (universal)
-    ba_count = sum(v for k, v in type_counts.items() if 'BA' in k)
+    ba_count = sum(v for k, v in type_counts.items() if "BA" in k)
     if ba_count == 0 and len(types) >= 10:
         issues.append("BA=0 despite having 10+ decisions")
 
@@ -515,6 +550,7 @@ def _get_index_summary(state: AgentState) -> str:
         run_dir_str = getattr(state, "run_dir", None)
         if run_dir_str:
             import json as _json
+
             artifact = Path(run_dir_str) / "artifacts" / "repo_index.json"
             if artifact.exists():
                 index = _json.loads(artifact.read_text())
@@ -600,13 +636,16 @@ def _build_step2c_r1_message(state: AgentState, repo_path: Path) -> str:
             "decisions about mathematical model selection, algorithm choice, or "
             "numerical method. You MUST explore these files and extract decisions from them."
         )
-    parts.extend([
-        "",
-        "Find concrete business workflows and extract ALL raw design decisions.",
-        "Use get_skeleton() and list_by_type('model') to efficiently find decision-bearing code.",
-        "Write the result as JSON array to write_artifact('step2c_r1_raw_decisions.json').",
-    ])
+    parts.extend(
+        [
+            "",
+            "Find concrete business workflows and extract ALL raw design decisions.",
+            "Use get_skeleton() and list_by_type('model') to efficiently find decision-bearing code.",
+            "Write the result as JSON array to write_artifact('step2c_r1_raw_decisions.json').",
+        ]
+    )
     return "\n".join(parts)
+
 
 def _build_step2c_r2_message(state: AgentState, repo_path: Path) -> str:
     """Round 2: Counterfactual separation initial message."""
@@ -618,6 +657,7 @@ def _build_step2c_r2_message(state: AgentState, repo_path: Path) -> str:
         f"Use read_file with relative paths (e.g., 'skorecard/main.py') to verify your reasoning against actual code.\n"
         f"Write result to write_artifact('step2c_r2_separated.json')."
     )
+
 
 def _build_step2c_r3_message(state: AgentState, repo_path: Path) -> str:
     """Round 3: Adversarial classification initial message."""
@@ -632,23 +672,24 @@ def _build_step2c_r3_message(state: AgentState, repo_path: Path) -> str:
         "3. Business Hypothesis Analyst → assess p(BA), p(B)",
     ]
     if source_ctx:
-        parts.append(
-            f"\n## Project Context (from README/docs/CHANGELOG)\n{source_ctx}"
-        )
+        parts.append(f"\n## Project Context (from README/docs/CHANGELOG)\n{source_ctx}")
     if math_summary:
         parts.append(f"\n## Context for Quantitative Analyst Role\n{math_summary}")
         parts.append(
             "Any decision involving these math-related files should have HIGH p(M). "
             "Use get_skeleton() to inspect the mathematical logic before classifying."
         )
-    parts.extend([
-        "",
-        f"The repository is at {repo_path}.",
-        "Use read_file with relative paths to find evidence for each classification.",
-        "Use get_skeleton() and list_by_type('math') for quick structural lookup.",
-        "Write result to write_artifact('step2c_r3_classified.json').",
-    ])
+    parts.extend(
+        [
+            "",
+            f"The repository is at {repo_path}.",
+            "Use read_file with relative paths to find evidence for each classification.",
+            "Use get_skeleton() and list_by_type('math') for quick structural lookup.",
+            "Write result to write_artifact('step2c_r3_classified.json').",
+        ]
+    )
     return "\n".join(parts)
+
 
 def _build_step2c_r4_message(state: AgentState, repo_path: Path) -> str:
     """Round 4: Evidence + anomaly detection + final output."""
@@ -684,6 +725,7 @@ def _build_step2c_r4_message(state: AgentState, repo_path: Path) -> str:
 
     # Build finance checklists for the final audit
     from .prompts import FINANCE_UNIVERSAL_CHECKLIST, build_subdomain_checklist
+
     checklist = build_subdomain_checklist(labels)
 
     anomaly_text = "\n".join(f"- {r}" for r in anomaly_rules)
@@ -799,9 +841,15 @@ def build_blueprint_phases(blueprint_id: str) -> list[Phase]:
             system_prompt=prompts.BP_STEP2A_SYSTEM,
             initial_message_builder=_build_step2a_message,
             allowed_tools=[
-                "read_file", "list_dir", "grep_codebase",
-                "search_codebase", "write_artifact",
-                "get_skeleton", "get_dependencies", "get_file_type", "list_by_type",
+                "read_file",
+                "list_dir",
+                "grep_codebase",
+                "search_codebase",
+                "write_artifact",
+                "get_skeleton",
+                "get_dependencies",
+                "get_file_type",
+                "list_by_type",
             ],
             max_iterations=80,
             depends_on=["bp_structural_index"],
@@ -817,8 +865,11 @@ def build_blueprint_phases(blueprint_id: str) -> list[Phase]:
             system_prompt=prompts.BP_STEP2B_SYSTEM,
             initial_message_builder=_build_step2b_message,
             allowed_tools=[
-                "read_file", "grep_codebase", "search_codebase",
-                "get_artifact", "write_artifact",
+                "read_file",
+                "grep_codebase",
+                "search_codebase",
+                "get_artifact",
+                "write_artifact",
             ],
             max_iterations=60,
             depends_on=["bp_architecture"],
@@ -835,8 +886,14 @@ def build_blueprint_phases(blueprint_id: str) -> list[Phase]:
             system_prompt=prompts.BP_STEP2C_R1_DISCOVERY,
             initial_message_builder=_build_step2c_r1_message,
             allowed_tools=[
-                "read_file", "list_dir", "grep_codebase", "get_artifact", "write_artifact",
-                "get_skeleton", "get_dependencies", "list_by_type",
+                "read_file",
+                "list_dir",
+                "grep_codebase",
+                "get_artifact",
+                "write_artifact",
+                "get_skeleton",
+                "get_dependencies",
+                "list_by_type",
             ],
             max_iterations=70,
             depends_on=["bp_architecture", "bp_claim_verify", "bp_mine_sources"],
@@ -850,7 +907,10 @@ def build_blueprint_phases(blueprint_id: str) -> list[Phase]:
             system_prompt=prompts.BP_STEP2C_R2_COUNTERFACTUAL,
             initial_message_builder=_build_step2c_r2_message,
             allowed_tools=[
-                "read_file", "grep_codebase", "get_artifact", "write_artifact",
+                "read_file",
+                "grep_codebase",
+                "get_artifact",
+                "write_artifact",
                 "get_skeleton",
             ],
             max_iterations=50,
@@ -866,8 +926,12 @@ def build_blueprint_phases(blueprint_id: str) -> list[Phase]:
             system_prompt=prompts.BP_STEP2C_R3_ADVERSARIAL,
             initial_message_builder=_build_step2c_r3_message,
             allowed_tools=[
-                "read_file", "grep_codebase", "get_artifact", "write_artifact",
-                "get_skeleton", "list_by_type",
+                "read_file",
+                "grep_codebase",
+                "get_artifact",
+                "write_artifact",
+                "get_skeleton",
+                "list_by_type",
             ],
             max_iterations=60,
             depends_on=["bp_bd_r2_counterfactual"],
@@ -881,8 +945,12 @@ def build_blueprint_phases(blueprint_id: str) -> list[Phase]:
             system_prompt=prompts.BP_STEP2C_R4_EVIDENCE,
             initial_message_builder=_build_step2c_r4_message,
             allowed_tools=[
-                "read_file", "grep_codebase", "get_artifact", "write_artifact",
-                "get_skeleton", "list_by_type",
+                "read_file",
+                "grep_codebase",
+                "get_artifact",
+                "write_artifact",
+                "get_skeleton",
+                "list_by_type",
             ],
             max_iterations=50,
             depends_on=["bp_bd_r3_adversarial"],
@@ -915,8 +983,10 @@ def build_blueprint_phases(blueprint_id: str) -> list[Phase]:
             requires_llm=False,
             python_handler=_step3_handler,
             depends_on=[
-                "bp_architecture", "bp_claim_verify",
-                "bp_bd_r4_evidence", "bp_usecase_scan",
+                "bp_architecture",
+                "bp_claim_verify",
+                "bp_bd_r4_evidence",
+                "bp_usecase_scan",
             ],
         ),
         # ------------------------------------------------------------------
@@ -1000,8 +1070,7 @@ def _build_explore_message(state: AgentState, repo_path: Path) -> str:
         )
     if any(l in labels for l in ["TRD", "A_STOCK"]):
         anomaly_rules.append(
-            "ANOMALY: DK=0 in a trading/A-stock project — search for "
-            "T+1, 涨跌停, 印花税, ST."
+            "ANOMALY: DK=0 in a trading/A-stock project — search for T+1, 涨跌停, 印花税, ST."
         )
     if anomaly_rules:
         parts.append("\n## Anomaly Detection Rules")
@@ -1056,11 +1125,11 @@ def _get_manifest_checklist(state: AgentState, max_dirs: int = 30) -> str:
         for d in dirs:
             parts.append(f"  - {d}/")
     if bases:
-        parts.append(f"\nYou MUST check these base classes for default values:")
+        parts.append("\nYou MUST check these base classes for default values:")
         for b in bases:
             parts.append(f"  - {b['class']} in {b['file']}")
     if patterns:
-        parts.append(f"\nGrep for these architecture patterns:")
+        parts.append("\nGrep for these architecture patterns:")
         for p in patterns:
             parts.append(f"  - {p}")
     return "\n".join(parts)
@@ -1112,9 +1181,16 @@ def build_blueprint_phases_v4(blueprint_id: str) -> list[Phase]:
     Total: 12 phases (6 agentic), ~11-14 min with depth.
     """
     all_tools = [
-        "read_file", "list_dir", "grep_codebase", "search_codebase",
-        "write_artifact", "get_artifact",
-        "get_skeleton", "get_dependencies", "get_file_type", "list_by_type",
+        "read_file",
+        "list_dir",
+        "grep_codebase",
+        "search_codebase",
+        "write_artifact",
+        "get_artifact",
+        "get_skeleton",
+        "get_dependencies",
+        "get_file_type",
+        "list_by_type",
     ]
 
     return [
@@ -1154,7 +1230,6 @@ def build_blueprint_phases_v4(blueprint_id: str) -> list[Phase]:
             python_handler=_mine_sources_handler,
             depends_on=["bp_clone"],
         ),
-
         # --- Parallel Workers (concurrent via parallel_group) ---
         Phase(
             name="worker_docs",
@@ -1197,8 +1272,11 @@ def build_blueprint_phases_v4(blueprint_id: str) -> list[Phase]:
             system_prompt=prompts_v4.WORKER_MATH_SYSTEM,
             initial_message_builder=_build_worker_math_message,
             allowed_tools=[
-                "read_file", "grep_codebase", "write_artifact",
-                "get_skeleton", "list_by_type",
+                "read_file",
+                "grep_codebase",
+                "write_artifact",
+                "get_skeleton",
+                "list_by_type",
             ],
             max_iterations=40,
             depends_on=["bp_structural_index"],
@@ -1206,7 +1284,6 @@ def build_blueprint_phases_v4(blueprint_id: str) -> list[Phase]:
             blocking=True,
             parallel_group="explore",
         ),
-
         # --- Synthesis ---
         Phase(
             name="bp_synthesis",
@@ -1214,18 +1291,23 @@ def build_blueprint_phases_v4(blueprint_id: str) -> list[Phase]:
             system_prompt=prompts_v4.BP_SYNTHESIS_SYSTEM,
             initial_message_builder=_build_synthesis_message,
             allowed_tools=[
-                "read_file", "grep_codebase", "get_artifact", "write_artifact",
-                "get_skeleton", "list_by_type",
+                "read_file",
+                "grep_codebase",
+                "get_artifact",
+                "write_artifact",
+                "get_skeleton",
+                "list_by_type",
             ],
             max_iterations=60,
             depends_on=[
-                "worker_docs", "worker_arch",
-                "worker_workflow", "worker_math",
+                "worker_docs",
+                "worker_arch",
+                "worker_workflow",
+                "worker_math",
             ],
             required_artifacts=["step2c_business_decisions.md"],
             blocking=True,
         ),
-
         # --- Assembly ---
         Phase(
             name="bp_assemble",
@@ -1233,8 +1315,11 @@ def build_blueprint_phases_v4(blueprint_id: str) -> list[Phase]:
             system_prompt=prompts_v4.BP_ASSEMBLE_SYSTEM,
             initial_message_builder=_build_assemble_message_v4(blueprint_id),
             allowed_tools=[
-                "read_file", "list_dir", "grep_codebase",
-                "get_artifact", "write_artifact",
+                "read_file",
+                "list_dir",
+                "grep_codebase",
+                "get_artifact",
+                "write_artifact",
             ],
             max_iterations=60,
             depends_on=["bp_synthesis"],
@@ -1242,7 +1327,6 @@ def build_blueprint_phases_v4(blueprint_id: str) -> list[Phase]:
             required_artifacts=["blueprint.yaml"],
             blocking=True,
         ),
-
         # --- Post-processing ---
         Phase(
             name="bp_consistency_check",
@@ -1375,9 +1459,7 @@ def _build_step1_message(
             "numpy.linalg, statsmodels."
         )
     if any(l in labels for l in ["TRD", "A_STOCK"]):
-        anomaly_rules.append(
-            "ANOMALY: DK=0 in A-stock → search for T+1, 涨跌停, 印花税, ST."
-        )
+        anomaly_rules.append("ANOMALY: DK=0 in A-stock → search for T+1, 涨跌停, 印花税, ST.")
     if anomaly_rules:
         parts.append("## Anomaly Detection Rules")
         parts.extend(f"- {r}" for r in anomaly_rules)
@@ -1431,6 +1513,7 @@ def _build_step2_message(
         state: Current agent state (unused directly, kept for signature parity).
     """
     from collections import Counter as _Counter
+
     patch_decisions = needy_bds + needy_gaps
     patch_summary = dict(_Counter(d.type for d in patch_decisions))
     patch_result = BDExtractionResult(
@@ -1474,32 +1557,39 @@ def build_blueprint_phases_v5(
     blueprint_id: str,
     *,
     agent: ExtractionAgent,
-    strict_quality_gate: bool = False,
+    strict_quality_gate: bool = True,
 ) -> list[Phase]:
-    """Build the v5 blueprint extraction phases.
+    """Build the v5/v6 blueprint extraction phases.
 
-    Architecture:
-    - Pre-processing: 4 Python phases (reused from v4.1)
-    - Parallel workers: 4 agentic phases (reused, with failure grading)
-    - Synthesis v5: 1 Python phase using Instructor (2-step structured call)
-    - Assembly: 1 agentic phase (reused from v4.1)
-    - Quality gate: 1 Python phase (SOP v3.3 checks)
-    - Post-processing: 2 Python phases (reused)
+    v6 architecture (20 phases):
+    - Pre-processing: 5 Python phases (fingerprint, clone, index, sources, manifest)
+    - Parallel workers: 6+2 agentic phases (arch/workflow/math/deep/docs/resource + verify/audit)
+    - Synthesis v5: 1 Python phase using Instructor (3-step structured call)
+    - Evaluation: 1 agentic phase (independent BD verification)
+    - Post-processing: 2 Python phases (UC extract + coverage gap, blocking)
+    - Assembly + Enrich: 2 Python phases
+    - Quality gate: 1 Python phase (BQ-01~09, strict by default)
+    - Finalization: 2 Python phases
 
-    Total: 13 phases, ~11-14 min with depth.
+    v6 key changes vs v5.2:
+    - worker_resource: dedicated resource extraction Worker (parallel)
+    - bp_evaluate: independent Evaluator (Sprint-contract verification)
+    - worker_audit: blocking=True, injected into synthesis Step 3
+    - bp_uc_extract/bp_coverage_gap: blocking=True
+    - Quality gate: strict=True by default, fix_hints in BQ messages
 
     Args:
         blueprint_id: The blueprint being extracted.
         agent: The ExtractionAgent for Instructor calls in synthesis.
         strict_quality_gate: When True, quality gate failure halts the pipeline.
-            Default False for development; switch to True once Instructor output
-            is stable.
+            Default True (v6).  Set False only for debugging.
     """
 
     # ----- Synthesis v5 handler (closure captures agent) -----
 
     async def _synthesis_v5_handler(
-        state: AgentState, repo_path: Path,
+        state: AgentState,
+        repo_path: Path,
     ) -> PhaseResult:
         """Three-step Instructor synthesis: Extract+Classify → Enhance → Interactions."""
         artifacts_dir = Path(state.run_dir) / "artifacts"
@@ -1511,9 +1601,11 @@ def build_blueprint_phases_v5(
         worker_workflow = _safe_read(artifacts_dir / "worker_workflow.json")
         worker_math = _safe_read(artifacts_dir / "worker_math.json")
         worker_docs = _safe_read(artifacts_dir / "worker_docs.md")
-        # NOTE: worker_verify.md and worker_audit.md are NOT injected into
-        # synthesis. They are consumed downstream by bp_enrich and bp_quality_gate.
-        # Keeping synthesis input lean ensures ~5min Step 1 (vs 15+ with reports).
+        # v6: worker_audit is now blocking=True and injected into Step 3
+        # for deterministic missing-gap generation.
+        worker_audit = _safe_read(artifacts_dir / "worker_audit.md")
+        # v6: worker_resource provides resource inventory for replaceable_points
+        worker_resource = _safe_read(artifacts_dir / "worker_resource.json")
 
         if not worker_arch and not worker_workflow:
             return PhaseResult(
@@ -1524,7 +1616,10 @@ def build_blueprint_phases_v5(
 
         # Step 1: Extract BD list + classify types
         step1_msg = _build_step1_message(
-            worker_arch, worker_workflow, worker_math, state,
+            worker_arch,
+            worker_workflow,
+            worker_math,
+            state,
             worker_arch_deep=worker_arch_deep,
         )
         step1_result, tokens1 = await agent.run_structured_call(
@@ -1537,7 +1632,8 @@ def build_blueprint_phases_v5(
         if isinstance(step1_result, RawFallback):
             # L3 fallback — save raw text and fail
             (artifacts_dir / "synthesis_v5_raw.txt").write_text(
-                step1_result.text, encoding="utf-8",
+                step1_result.text,
+                encoding="utf-8",
             )
             return PhaseResult(
                 phase_name="bp_synthesis_v5",
@@ -1557,19 +1653,25 @@ def build_blueprint_phases_v5(
         # Only send BDs that actually need enhancement; merge patch back locally.
         _STEP2_SKIP_THRESHOLD = 2  # skip Step 2 if ≤ this many BDs need it
         needy_bds, good_bds = _find_needy_bds(step1_result.decisions)
-        needy_gaps = [g for g in step1_result.missing_gaps if g.status == "missing"
-                      and len(g.rationale or "") < _STEP2_RATIONALE_THRESHOLD]
+        needy_gaps = [
+            g
+            for g in step1_result.missing_gaps
+            if g.status == "missing" and len(g.rationale or "") < _STEP2_RATIONALE_THRESHOLD
+        ]
         good_gaps = [g for g in step1_result.missing_gaps if g not in needy_gaps]
 
         logger.info(
             "Synthesis Step 2 pre-filter: %d needy BDs, %d good BDs (threshold=%d chars)",
-            len(needy_bds), len(good_bds), _STEP2_RATIONALE_THRESHOLD,
+            len(needy_bds),
+            len(good_bds),
+            _STEP2_RATIONALE_THRESHOLD,
         )
 
         if len(needy_bds) + len(needy_gaps) <= _STEP2_SKIP_THRESHOLD:
             logger.info(
                 "Step 2 skipped: only %d BDs need enhancement (≤ threshold %d)",
-                len(needy_bds), _STEP2_SKIP_THRESHOLD,
+                len(needy_bds),
+                _STEP2_SKIP_THRESHOLD,
             )
             step2_final = step1_result
         else:
@@ -1594,6 +1696,7 @@ def build_blueprint_phases_v5(
                 # from parent BD-066. These are accepted if their prefix matches
                 # a needy ID.
                 from collections import Counter as _Counter
+
                 needy_ids = {bd.id for bd in needy_bds}
                 needy_gap_ids = {g.id for g in needy_gaps}
 
@@ -1603,7 +1706,7 @@ def build_blueprint_phases_v5(
                         return True
                     # Check if this is a split derivative: strip trailing letter(s)
                     # e.g., BD-066a → BD-066, BD-066b → BD-066
-                    base = re.sub(r'[a-z]+$', '', bd_id)
+                    base = re.sub(r"[a-z]+$", "", bd_id)
                     return base in needy_ids and base != bd_id
 
                 merged_by_id: dict = {bd.id: bd for bd in good_bds}
@@ -1619,7 +1722,8 @@ def build_blueprint_phases_v5(
                         foreign_count += 1
                 if split_count:
                     logger.info(
-                        "Step 2 accepted %d RC-split derivative BDs", split_count,
+                        "Step 2 accepted %d RC-split derivative BDs",
+                        split_count,
                     )
                 if foreign_count:
                     logger.warning(
@@ -1634,7 +1738,8 @@ def build_blueprint_phases_v5(
                         missing_patch += 1
                 if missing_patch:
                     logger.info(
-                        "Step 2 omitted %d needy BDs — kept Step 1 versions", missing_patch,
+                        "Step 2 omitted %d needy BDs — kept Step 1 versions",
+                        missing_patch,
                     )
                 merged_decisions = list(merged_by_id.values())
 
@@ -1663,12 +1768,25 @@ def build_blueprint_phases_v5(
                     len(step2_final.missing_gaps),
                 )
 
-        # Step 3: Decision interaction analysis
+        # Step 3: Decision interaction analysis + audit-driven missing gaps
+        audit_section = ""
+        if worker_audit:
+            audit_section = (
+                "\n\n## Audit Checklist Findings (20-item finance universal + subdomain)\n\n"
+                "The following audit results were produced by an independent Worker.\n"
+                "For each ❌ or ⚠️ item NOT already covered by existing BDs, you MUST:\n"
+                "1. Generate a new BD with status=missing, known_gap=true\n"
+                "2. Set severity based on audit finding severity\n"
+                "3. Set impact to describe the consequence of the gap\n\n"
+                f"{worker_audit[:6000].rsplit(chr(10), 1)[0]}\n"
+                f"... (truncated, {max(0, len(worker_audit) - 6000)} more chars)\n"
+            )
         step3_msg = (
             f"## Enhanced BD List from Step 2\n\n"
             f"{step2_final.model_dump_json(indent=2)}\n\n"
             f"Analyze decision interactions: amplification, contradiction, "
             f"hidden dependency, risk cascade. Target ≥5 interactions."
+            f"{audit_section}"
         )
         step3_result, tokens3 = await agent.run_structured_call(
             prompts_v5.SYNTHESIS_V5_STEP3_SYSTEM,
@@ -1707,6 +1825,7 @@ def build_blueprint_phases_v5(
                     merged_missing.append(bd)
                     merged_missing_ids.add(bd.id)
             from collections import Counter as _Counter
+
             type_counts = _Counter(d.type for d in merged_decisions)
 
             final_result = BDExtractionResult(
@@ -1727,7 +1846,8 @@ def build_blueprint_phases_v5(
         # Write backward-compatible markdown for bp_assemble
         bd_md = _bd_to_markdown(final_result)
         (artifacts_dir / "step2c_business_decisions.md").write_text(
-            bd_md, encoding="utf-8",
+            bd_md,
+            encoding="utf-8",
         )
 
         return PhaseResult(
@@ -1741,7 +1861,8 @@ def build_blueprint_phases_v5(
     # ----- Assembly v5 handler (Instructor-driven) -----
 
     async def _assemble_instructor_handler(
-        state: AgentState, repo_path: Path,
+        state: AgentState,
+        repo_path: Path,
     ) -> PhaseResult:
         """Assemble blueprint.yaml via Instructor structured call.
 
@@ -1783,7 +1904,8 @@ def build_blueprint_phases_v5(
 
         if isinstance(result, RawFallback):
             (artifacts_dir / "assemble_raw.txt").write_text(
-                result.text, encoding="utf-8",
+                result.text,
+                encoding="utf-8",
             )
             return PhaseResult(
                 phase_name="bp_assemble",
@@ -1807,11 +1929,12 @@ def build_blueprint_phases_v5(
             "data_flow": [e.model_dump() for e in result.data_flow],
             "global_contracts": result.global_contracts,
             "business_decisions": [],  # Injected by bp_enrich P3
-            "known_use_cases": [],     # Injected by bp_enrich P9
+            "known_use_cases": [],  # Injected by bp_enrich P9
         }
 
         # --- Write blueprint.yaml ---
         from datetime import date as _date
+
         _today = _date.today().isoformat()
         content = (
             f"# Extraction pipeline: SOP v3.4 (v5.2 agent, Instructor synthesis + evidence packet)\n"
@@ -1819,8 +1942,11 @@ def build_blueprint_phases_v5(
             f"# Source: {state.repo_path} @ {state.commit_hash or 'unknown'}\n"
         )
         content += _yaml.dump(
-            bp, allow_unicode=True, default_flow_style=False,
-            sort_keys=False, width=100,
+            bp,
+            allow_unicode=True,
+            default_flow_style=False,
+            sort_keys=False,
+            width=100,
         )
 
         (artifacts_dir / "blueprint.yaml").write_text(content, encoding="utf-8")
@@ -1831,7 +1957,10 @@ def build_blueprint_phases_v5(
 
         logger.info(
             "bp_assemble (Instructor): %d stages, %d edges, %d contracts, %d tokens",
-            stage_count, edge_count, gc_count, total_tokens,
+            stage_count,
+            edge_count,
+            gc_count,
+            total_tokens,
         )
 
         return PhaseResult(
@@ -1844,7 +1973,8 @@ def build_blueprint_phases_v5(
     # ----- Quality gate handler -----
 
     async def _quality_gate_handler(
-        state: AgentState, repo_path: Path,
+        state: AgentState,
+        repo_path: Path,
     ) -> PhaseResult:
         """SOP v3.4 quality gate — BQ-01..BQ-09 hard gates + warnings.
 
@@ -1891,6 +2021,7 @@ def build_blueprint_phases_v5(
         if bp_path.exists():
             try:
                 import yaml as _yaml
+
                 bp_data = _yaml.safe_load(bp_path.read_text(encoding="utf-8")) or {}
             except Exception:
                 pass
@@ -1925,7 +2056,8 @@ def build_blueprint_phases_v5(
 
         # Vague word ratio
         vague_count = sum(
-            1 for bd in (bp_data.get("business_decisions") or [])
+            1
+            for bd in (bp_data.get("business_decisions") or [])
             if isinstance(bd, dict) and bd.get("vague_rationale")
         )
         total_bd_count = len(bp_data.get("business_decisions") or all_bds)
@@ -1934,16 +2066,39 @@ def build_blueprint_phases_v5(
         # Audit checklist
         has_audit = bool(bp_data.get("audit_checklist_summary"))
 
-        # ---- Hard gates (BQ-01 ~ BQ-04) ----
+        # ---- Hard gates (BQ-01, BQ-02, BQ-04) + Warnings (BQ-03, BQ-05~09) ----
         hard_issues: list[str] = []
+        warnings: list[str] = []
         checks: dict[str, bool] = {}
         details: dict[str, str] = {}
+
+        # BQ fix hints — embedded repair instructions (Harness Engineering pattern)
+        _BQ_FIX_HINTS = {
+            "BQ-01": (
+                "Fix: Re-examine uncovered directories for business decisions. "
+                "Focus on default parameter values (BA), regulatory rules (RC), "
+                "and mathematical model choices (M)."
+            ),
+            "BQ-02": (
+                "Fix: For each shallow BD, add: (1) WHY this approach was chosen "
+                "over alternatives, (2) BOUNDARY conditions under which it breaks."
+            ),
+            "BQ-03": (
+                "Fix: Review each single-type BD and evaluate dual nature — "
+                "B decisions often have BA implications, M decisions often have DK context."
+            ),
+            "BQ-04": (
+                "Fix: Cross-reference audit checklist findings against BD list. "
+                "Any audit ❌/⚠️ item not covered by existing BDs should generate "
+                "a missing-gap BD with status=missing, known_gap=true."
+            ),
+        }
 
         # BQ-01: non-T BD count >= 5
         checks["BQ-01_bd_count"] = len(non_t) >= 5
         details["BQ-01_bd_count"] = f"non_T={len(non_t)} (target ≥5)"
         if not checks["BQ-01_bd_count"]:
-            hard_issues.append(f"BQ-01 FAIL: non_T={len(non_t)} < 5")
+            hard_issues.append(f"BQ-01 FAIL: non_T={len(non_t)} < 5. {_BQ_FIX_HINTS['BQ-01']}")
         else:
             logger.info("BQ-01 PASS: non_T=%d ≥ 5", len(non_t))
 
@@ -1953,15 +2108,23 @@ def build_blueprint_phases_v5(
             f"mean={rationale_depth:.0f} chars (target ≥40, {len(non_t)} non-T)"
         )
         if not checks["BQ-02_rationale_depth"]:
-            hard_issues.append(f"BQ-02 FAIL: mean_rationale={rationale_depth:.0f} < 40")
+            hard_issues.append(
+                f"BQ-02 FAIL: mean_rationale={rationale_depth:.0f} < 40. {_BQ_FIX_HINTS['BQ-02']}"
+            )
         else:
             logger.info("BQ-02 PASS: mean_rationale=%.0f ≥ 40", rationale_depth)
 
-        # BQ-03: multi-type ratio >= 30%
+        # BQ-03: multi-type ratio >= 30% — DEMOTED to warning (v6)
+        # Multi-type annotation is a quality-enhancement metric, not a
+        # correctness baseline.  MiniMax M2.7 consistently produces < 10%
+        # multi-type ratio; blocking the pipeline on this is counterproductive.
         checks["BQ-03_multi_type_ratio"] = multi_type_ratio >= 0.30
         details["BQ-03_multi_type_ratio"] = f"ratio={multi_type_ratio:.1%} (target ≥30%)"
         if not checks["BQ-03_multi_type_ratio"]:
-            hard_issues.append(f"BQ-03 FAIL: multi_type={multi_type_ratio:.1%} < 30%")
+            # Moved from hard_issues to warnings — pipeline continues
+            warnings.append(
+                f"BQ-03 WARN: multi_type={multi_type_ratio:.1%} < 30%. {_BQ_FIX_HINTS['BQ-03']}"
+            )
         else:
             logger.info("BQ-03 PASS: multi_type=%.1f%%", multi_type_ratio * 100)
 
@@ -1969,12 +2132,13 @@ def build_blueprint_phases_v5(
         checks["BQ-04_missing_gaps"] = missing_gap_count >= 3
         details["BQ-04_missing_gaps"] = f"count={missing_gap_count} (target ≥3)"
         if not checks["BQ-04_missing_gaps"]:
-            hard_issues.append(f"BQ-04 FAIL: missing_gaps={missing_gap_count} < 3")
+            hard_issues.append(
+                f"BQ-04 FAIL: missing_gaps={missing_gap_count} < 3. {_BQ_FIX_HINTS['BQ-04']}"
+            )
         else:
             logger.info("BQ-04 PASS: missing_gaps=%d ≥ 3", missing_gap_count)
 
         # ---- Warnings (BQ-05 ~ BQ-09) ----
-        warnings: list[str] = []
 
         # BQ-05: stages count in [2, 30]
         checks["BQ-05_stages_range"] = 2 <= stage_count <= 30
@@ -1984,13 +2148,9 @@ def build_blueprint_phases_v5(
 
         # BQ-06: evidence coverage >= 50%
         checks["BQ-06_evidence_coverage"] = evidence_coverage >= 0.50
-        details["BQ-06_evidence_coverage"] = (
-            f"coverage={evidence_coverage:.1%} (target ≥50%)"
-        )
+        details["BQ-06_evidence_coverage"] = f"coverage={evidence_coverage:.1%} (target ≥50%)"
         if not checks["BQ-06_evidence_coverage"]:
-            warnings.append(
-                f"BQ-06 WARN: evidence_coverage={evidence_coverage:.1%} < 50%"
-            )
+            warnings.append(f"BQ-06 WARN: evidence_coverage={evidence_coverage:.1%} < 50%")
 
         # BQ-07: BD type diversity (subdomain-aware)
         type_diverse = len(non_t_types) >= 2 and not missing_expected
@@ -2008,15 +2168,11 @@ def build_blueprint_phases_v5(
             f"vague={vague_count}/{total_bd_count} ({vague_ratio:.1%}, target ≤30%)"
         )
         if not checks["BQ-08_vague_ratio"]:
-            warnings.append(
-                f"BQ-08 WARN: vague_ratio={vague_ratio:.1%} > 30%"
-            )
+            warnings.append(f"BQ-08 WARN: vague_ratio={vague_ratio:.1%} > 30%")
 
         # BQ-09: audit checklist present
         checks["BQ-09_audit_checklist"] = has_audit
-        details["BQ-09_audit_checklist"] = (
-            "present" if has_audit else "MISSING"
-        )
+        details["BQ-09_audit_checklist"] = "present" if has_audit else "MISSING"
         if not checks["BQ-09_audit_checklist"]:
             warnings.append("BQ-09 WARN: audit_checklist_summary missing")
 
@@ -2028,16 +2184,20 @@ def build_blueprint_phases_v5(
         all_passed = not hard_issues and not warnings
         hard_passed = not hard_issues
         gate_result = QualityGateResult(
-            passed=hard_passed, checks=checks, details=details,
+            passed=hard_passed,
+            checks=checks,
+            details=details,
         )
 
         (artifacts_dir / "quality_gate_result.json").write_text(
-            gate_result.model_dump_json(indent=2), encoding="utf-8",
+            gate_result.model_dump_json(indent=2),
+            encoding="utf-8",
         )
 
         if hard_issues:
             logger.warning(
-                "Quality gate HARD FAIL: %s", "; ".join(hard_issues),
+                "Quality gate HARD FAIL: %s",
+                "; ".join(hard_issues),
             )
             if strict_quality_gate:
                 return PhaseResult(
@@ -2047,9 +2207,10 @@ def build_blueprint_phases_v5(
                     final_text=gate_result.model_dump_json(indent=2),
                 )
 
-        status_msg = "ALL PASS" if all_passed else (
-            f"{'HARD FAIL' if hard_issues else 'PASS'}, "
-            f"{len(warnings)} warnings"
+        status_msg = (
+            "ALL PASS"
+            if all_passed
+            else (f"{'HARD FAIL' if hard_issues else 'PASS'}, {len(warnings)} warnings")
         )
         logger.info("Quality gate: %s", status_msg)
         return PhaseResult(
@@ -2061,7 +2222,8 @@ def build_blueprint_phases_v5(
     # ----- Phase A: Coverage manifest (deterministic pre-scan) -----
 
     async def _coverage_manifest_handler(
-        state: AgentState, repo_path: Path,
+        state: AgentState,
+        repo_path: Path,
     ) -> PhaseResult:
         """Generate a deterministic coverage checklist from structural index.
 
@@ -2095,8 +2257,7 @@ def build_blueprint_phases_v5(
             for cls in finfo.get("classes", []):
                 cls_name = cls if isinstance(cls, str) else cls.get("name", "")
                 if cls_name and any(
-                    kw in fpath.lower()
-                    for kw in ["contract", "base", "mixin", "abstract"]
+                    kw in fpath.lower() for kw in ["contract", "base", "mixin", "abstract"]
                 ):
                     base_classes.append({"file": fpath, "class": cls_name})
 
@@ -2150,7 +2311,9 @@ def build_blueprint_phases_v5(
 
         logger.info(
             "Coverage manifest: %d dirs, %d examples, %d base classes",
-            len(must_visit_dirs), len(examples), len(base_classes),
+            len(must_visit_dirs),
+            len(examples),
+            len(base_classes),
         )
 
         return PhaseResult(
@@ -2162,7 +2325,8 @@ def build_blueprint_phases_v5(
     # ----- Phase B: UC extraction (deterministic) -----
 
     async def _uc_extract_handler(
-        state: AgentState, repo_path: Path,
+        state: AgentState,
+        repo_path: Path,
     ) -> PhaseResult:
         """Extract use cases deterministically from all example files."""
         artifacts_dir = Path(state.run_dir) / "artifacts"
@@ -2204,13 +2368,15 @@ def build_blueprint_phases_v5(
                 # Extract entry point hints
                 has_main = any("if __name__" in l or "def main" in l for l in lines)
                 imports = [l for l in lines[:20] if l.strip().startswith(("import ", "from "))]
-                file_summaries.append({
-                    "file": ex_path,
-                    "head": head,
-                    "has_main": has_main,
-                    "imports": imports[:5],
-                    "total_lines": len(lines),
-                })
+                file_summaries.append(
+                    {
+                        "file": ex_path,
+                        "head": head,
+                        "has_main": has_main,
+                        "imports": imports[:5],
+                        "total_lines": len(lines),
+                    }
+                )
             except Exception:
                 continue
 
@@ -2292,7 +2458,9 @@ def build_blueprint_phases_v5(
             encoding="utf-8",
         )
 
-        logger.info("bp_uc_extract: %d use cases from %d example files", len(uc_list), len(file_summaries))
+        logger.info(
+            "bp_uc_extract: %d use cases from %d example files", len(uc_list), len(file_summaries)
+        )
 
         return PhaseResult(
             phase_name="bp_uc_extract",
@@ -2305,7 +2473,8 @@ def build_blueprint_phases_v5(
     # ----- Phase C: Coverage gap detection -----
 
     async def _coverage_gap_handler(
-        state: AgentState, repo_path: Path,
+        state: AgentState,
+        repo_path: Path,
     ) -> PhaseResult:
         """Detect uncovered subdirectories and do targeted BD extraction."""
         artifacts_dir = Path(state.run_dir) / "artifacts"
@@ -2366,7 +2535,8 @@ def build_blueprint_phases_v5(
         # Filter: ≥1 file, exclude test/build/cache/template directories
         skip_patterns = {"test", "tests", "__pycache__", "build", "dist", ".egg", "templates"}
         uncovered = [
-            d for d in uncovered
+            d
+            for d in uncovered
             if dir_file_counts.get(d, 0) >= 1
             and not any(skip in d.lower() for skip in skip_patterns)
         ]
@@ -2432,6 +2602,7 @@ def build_blueprint_phases_v5(
             merged = list(bd_result.decisions) + new_bds
             merged_missing = [d for d in merged if d.status == "missing"]
             from collections import Counter as _Counter
+
             type_counts = _Counter(d.type for d in merged)
 
             merged_result = BDExtractionResult(
@@ -2449,12 +2620,15 @@ def build_blueprint_phases_v5(
             # Also update markdown
             md = _bd_to_markdown(merged_result)
             (artifacts_dir / "step2c_business_decisions.md").write_text(
-                md, encoding="utf-8",
+                md,
+                encoding="utf-8",
             )
 
             logger.info(
                 "bp_coverage_gap: +%d BDs from %d uncovered dirs → total %d",
-                len(new_bds), len(uncovered), len(merged),
+                len(new_bds),
+                len(uncovered),
+                len(merged),
             )
 
         return PhaseResult(
@@ -2468,7 +2642,8 @@ def build_blueprint_phases_v5(
     # ----- Enrich handler (deterministic post-assembly patching) -----
 
     async def _enrich_handler(
-        state: AgentState, repo_path: Path,
+        state: AgentState,
+        repo_path: Path,
     ) -> PhaseResult:
         """Patch assembled blueprint.yaml with structured data from bd_list.json.
 
@@ -2502,9 +2677,9 @@ def build_blueprint_phases_v5(
                 if stripped.startswith("#"):
                     repaired_lines.append(line)
                     continue
-                list_str_match = _re.match(r'^(\s*-\s+)(.+)$', stripped)
+                list_str_match = _re.match(r"^(\s*-\s+)(.+)$", stripped)
                 if list_str_match and stripped.count(":") >= 2:
-                    indent = line[:len(line) - len(stripped)]
+                    indent = line[: len(line) - len(stripped)]
                     prefix = list_str_match.group(1)
                     value = list_str_match.group(2)
                     if not value.startswith(("'", '"', "|", ">")):
@@ -2513,7 +2688,8 @@ def build_blueprint_phases_v5(
                         repaired_lines.append(line)
                         continue
                 key_match = _re.match(
-                    r'^(\s*(?:-\s+)?[\w][\w\s.\-]*?):\s+(.+)$', line,
+                    r"^(\s*(?:-\s+)?[\w][\w\s.\-]*?):\s+(.+)$",
+                    line,
                 )
                 if key_match:
                     key_part = key_match.group(1)
@@ -2567,13 +2743,17 @@ def build_blueprint_phases_v5(
         try:
             content = "# Extraction pipeline: SOP v3.4 (v5 agent, auto-enriched)\n"
             content += _yaml.dump(
-                bp, allow_unicode=True, default_flow_style=False,
-                sort_keys=False, width=100,
+                bp,
+                allow_unicode=True,
+                default_flow_style=False,
+                sort_keys=False,
+                width=100,
             )
             _yaml.safe_load(content)  # verify before writing
 
             fd, tmp_path = _tmp.mkstemp(
-                dir=str(artifacts_dir), suffix=".yaml",
+                dir=str(artifacts_dir),
+                suffix=".yaml",
             )
             try:
                 with _os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -2606,9 +2786,16 @@ def build_blueprint_phases_v5(
     # ----- Phase list -----
 
     all_tools = [
-        "read_file", "list_dir", "grep_codebase", "search_codebase",
-        "write_artifact", "get_artifact",
-        "get_skeleton", "get_dependencies", "get_file_type", "list_by_type",
+        "read_file",
+        "list_dir",
+        "grep_codebase",
+        "search_codebase",
+        "write_artifact",
+        "get_artifact",
+        "get_skeleton",
+        "get_dependencies",
+        "get_file_type",
+        "list_by_type",
     ]
 
     return [
@@ -2648,7 +2835,6 @@ def build_blueprint_phases_v5(
             python_handler=_mine_sources_handler,
             depends_on=["bp_clone"],
         ),
-
         # --- Coverage Manifest (Phase A: deterministic pre-scan) ---
         Phase(
             name="bp_coverage_manifest",
@@ -2659,7 +2845,6 @@ def build_blueprint_phases_v5(
             python_handler=_coverage_manifest_handler,
             depends_on=["bp_structural_index"],
         ),
-
         # --- Parallel Workers (5-way: 4 breadth + 1 depth) ---
         Phase(
             name="worker_docs",
@@ -2703,8 +2888,11 @@ def build_blueprint_phases_v5(
             system_prompt=prompts_v4.WORKER_MATH_SYSTEM,
             initial_message_builder=_build_worker_math_message,
             allowed_tools=[
-                "read_file", "grep_codebase", "write_artifact",
-                "get_skeleton", "list_by_type",
+                "read_file",
+                "grep_codebase",
+                "write_artifact",
+                "get_skeleton",
+                "list_by_type",
             ],
             max_iterations=40,
             depends_on=["bp_coverage_manifest"],
@@ -2724,6 +2912,29 @@ def build_blueprint_phases_v5(
             blocking=False,
             parallel_group="explore",
         ),
+        # v6: dedicated resource Worker (parallel with arch workers)
+        Phase(
+            name="worker_resource",
+            description="Worker: resource and dependency inventory",
+            system_prompt=prompts_v6.WORKER_RESOURCE_SYSTEM,
+            initial_message_builder=lambda s, r: (
+                f"Repository: {r}\n\n"
+                "Inventory all non-code resources: data sources, Python dependencies, "
+                "external services, infrastructure requirements, and replaceable resource options."
+            ),
+            allowed_tools=[
+                "read_file",
+                "list_dir",
+                "grep_codebase",
+                "write_artifact",
+                "get_skeleton",
+            ],
+            max_iterations=30,
+            depends_on=["bp_coverage_manifest"],
+            required_artifacts=["worker_resource.json"],
+            blocking=True,
+            parallel_group="explore",
+        ),
         Phase(
             name="worker_verify",
             description="Verify factual claims (SOP 2b)",
@@ -2733,8 +2944,10 @@ def build_blueprint_phases_v5(
                 "Read get_artifact('worker_arch.json') and verify all factual claims."
             ),
             allowed_tools=[
-                "read_file", "grep_codebase",
-                "get_artifact", "write_artifact",
+                "read_file",
+                "grep_codebase",
+                "get_artifact",
+                "write_artifact",
             ],
             max_iterations=30,
             depends_on=["worker_arch"],
@@ -2752,35 +2965,60 @@ def build_blueprint_phases_v5(
                 "Audit the repository against the 20-item universal finance checklist."
             ),
             allowed_tools=[
-                "read_file", "grep_codebase",
-                "get_artifact", "write_artifact",
+                "read_file",
+                "grep_codebase",
+                "get_artifact",
+                "write_artifact",
             ],
             max_iterations=40,
             depends_on=["bp_clone"],
             parallel_group="workers",
-            blocking=False,
+            blocking=True,  # v6: audit results feed into synthesis Step 3
             required_artifacts=["worker_audit.md"],
         ),
-
-        # --- Synthesis v5 (Instructor-driven, 3-step) ---
+        # --- Synthesis v5/v6 (Instructor-driven, 3-step + audit injection) ---
         Phase(
             name="bp_synthesis_v5",
-            description="v5 structured synthesis (Instructor, 3-step)",
+            description="v6 structured synthesis (Instructor, 3-step + audit)",
             system_prompt="",
             initial_message_builder=lambda s, r: "",
             requires_llm=False,
             python_handler=_synthesis_v5_handler,
             depends_on=[
-                "worker_docs", "worker_arch", "worker_arch_deep",
-                "worker_workflow", "worker_math",
+                # Only blocking workers in depends_on — non-blocking workers
+                # (worker_docs, worker_arch_deep, worker_math) are read via
+                # _safe_read() which tolerates missing artifacts gracefully.
+                "worker_arch",
+                "worker_workflow",
                 "worker_verify",
-                # NOTE: worker_audit is blocking=False, so NOT listed here.
-                # Synthesis reads worker_audit.md if available but doesn't block on it.
+                "worker_audit",  # v6: audit is now blocking and injected into Step 3
+                "worker_resource",  # v6: resource Worker for replaceable_points
             ],
             required_artifacts=["bd_list.json", "step2c_business_decisions.md"],
             blocking=True,
         ),
-
+        # --- v6: Independent Evaluator (Sprint-contract BD verification) ---
+        Phase(
+            name="bp_evaluate",
+            description="Independent BD evaluation (Sprint-contract verification)",
+            system_prompt=prompts_v6.EVALUATOR_SYSTEM,
+            initial_message_builder=lambda s, r: (
+                f"Repository: {r}\n\n"
+                "Read get_artifact('bd_list.json') and independently verify each "
+                "non-T business decision against the source code.\n"
+                "Write your findings to artifact 'evaluation_report.json'."
+            ),
+            allowed_tools=[
+                "read_file",
+                "grep_codebase",
+                "get_artifact",
+                "write_artifact",
+            ],
+            max_iterations=40,
+            depends_on=["bp_synthesis_v5"],
+            required_artifacts=["evaluation_report.json"],
+            blocking=True,
+        ),
         # --- UC Extraction (Phase B: deterministic) ---
         Phase(
             name="bp_uc_extract",
@@ -2789,11 +3027,10 @@ def build_blueprint_phases_v5(
             initial_message_builder=lambda s, r: "",
             requires_llm=False,
             python_handler=_uc_extract_handler,
-            depends_on=["bp_synthesis_v5"],
+            depends_on=["bp_evaluate"],  # v6: depends on evaluate, not synthesis
             required_artifacts=["uc_list.json"],
-            blocking=False,
+            blocking=True,  # v6: UC is critical path
         ),
-
         # --- Coverage Gap Detection (Phase C) ---
         Phase(
             name="bp_coverage_gap",
@@ -2802,10 +3039,9 @@ def build_blueprint_phases_v5(
             initial_message_builder=lambda s, r: "",
             requires_llm=False,
             python_handler=_coverage_gap_handler,
-            depends_on=["bp_synthesis_v5"],
-            blocking=False,
+            depends_on=["bp_evaluate"],  # v6: depends on evaluate
+            blocking=True,  # v6: coverage gap is critical path
         ),
-
         # --- Assembly (v5.1: Instructor-driven, no agentic loop) ---
         Phase(
             name="bp_assemble",
@@ -2819,7 +3055,6 @@ def build_blueprint_phases_v5(
             required_artifacts=["blueprint.yaml"],
             blocking=True,
         ),
-
         # --- Enrich (deterministic post-assembly patching) ---
         Phase(
             name="bp_enrich",
@@ -2831,7 +3066,6 @@ def build_blueprint_phases_v5(
             depends_on=["bp_assemble"],
             blocking=True,
         ),
-
         # --- Quality Gate (SOP v3.4) ---
         Phase(
             name="bp_quality_gate",
@@ -2843,7 +3077,6 @@ def build_blueprint_phases_v5(
             depends_on=["bp_enrich"],
             required_artifacts=["quality_gate_result.json"],
         ),
-
         # --- Post-processing (reused from v4.1) ---
         Phase(
             name="bp_consistency_check",

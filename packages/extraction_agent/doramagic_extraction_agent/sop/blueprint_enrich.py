@@ -1,30 +1,33 @@
 """Blueprint enrichment — SOP v3.4 bp_enrich phase (deterministic post-processing).
 
-P13 pattern: zero LLM calls.  All 14 patches are pure Python transformations
-applied in sequence to the assembled blueprint YAML dict produced by the
-agentic bp_assemble phase.
+Zero LLM calls.  All patches are pure Python transformations applied in
+sequence to the assembled blueprint YAML dict.
 
-Patch summary
--------------
-P0.  id                  — inject blueprint_id if the LLM omitted the field
-P1.  commit_hash         — inject state.commit_hash into source.commit_hash
-P2.  sop_version         — force sop_version = "3.4"
-P3.  bd_injection        — replace bp.business_decisions with authoritative
-                           structured data from BDExtractionResult
-P4.  bd_type_enum_fix    — remap non-canonical BD type strings to valid enums
-P5.  evidence_format     — normalise BD evidence to file:line(fn) format;
-                           compute evidence_coverage_ratio into _enrich_meta
-P6.  vague_words         — tag BDs whose rationale contains vague language
-P7.  stage_id_validation — deduplicate stage ids/orders; repair BD.stage
-                           references against legal stage set via STAGE_MAPPING
-P8.  required_methods    — populate required_methods + key_behaviors per stage
-P9.  uc_merge            — merge uc_list.json (Phase B output) into
-                           known_use_cases, deduplicating by source
-P10. uc_normalize        — normalise known_use_cases field names and add
-                           auto-generated intent_keywords
-P11. audit_checklist     — auto-generate audit_checklist_summary if absent
-P12. relations           — inject placeholder relations list if absent
-P13. execution_paradigm  — inject placeholder execution_paradigm if absent
+Patch summary (v6: 16 patches, P0–P14 + P5.5)
+----------------------------------------------
+P0.   id                  — inject blueprint_id if the LLM omitted the field
+P1.   commit_hash         — inject state.commit_hash into source.commit_hash
+P2.   sop_version         — force sop_version = "3.4"
+P3.   bd_injection        — replace bp.business_decisions with authoritative
+                            structured data from BDExtractionResult
+P4.   bd_type_enum_fix    — remap non-canonical BD type strings to valid enums
+P5.   evidence_format     — normalise BD evidence to file:line(fn) format;
+                            compute evidence_coverage_ratio into _enrich_meta
+P5.5  evidence_verify     — (v6) deterministic verification: file exists,
+                            line valid, function present; auto-fix drifted refs
+P6.   vague_words         — tag BDs whose rationale contains vague language
+P7.   stage_id_validation — deduplicate stage ids/orders; repair BD.stage
+                            references against legal stage set via STAGE_MAPPING
+P8.   required_methods    — populate required_methods + key_behaviors per stage
+P9.   uc_merge            — merge uc_list.json (Phase B output) into
+                            known_use_cases, deduplicating by source
+P10.  uc_normalize        — normalise known_use_cases field names and add
+                            auto-generated intent_keywords
+P11.  audit_checklist     — auto-generate audit_checklist_summary if absent
+P12.  relations           — inject placeholder relations list if absent
+P13.  execution_paradigm  — inject placeholder execution_paradigm if absent
+P14.  resource_injection  — (v6) inject worker_resource.json into
+                            replaceable_points per stage
 """
 
 from __future__ import annotations
@@ -68,9 +71,7 @@ BD_TYPE_ENUM_FIX_MAP: dict[str, str] = {
 }
 
 # Valid BD type regex (single or slash-separated multi-type)
-_BD_TYPE_VALID_RE = re.compile(
-    r"^(T|B|BA|DK|RC|M)(/(?:T|B|BA|DK|RC|M))*$"
-)
+_BD_TYPE_VALID_RE = re.compile(r"^(T|B|BA|DK|RC|M)(/(?:T|B|BA|DK|RC|M))*$")
 
 # ---------------------------------------------------------------------------
 # Vague words lists (Patch 6)
@@ -120,13 +121,11 @@ STAGE_MAPPING: dict[str, str] = {
     "simulation_mode": "cost_modeling",
     # cross_stage is handled via "cross" substring check → global scope
     "cross_stage": "",  # sentinel — triggers global-scope promotion
-    "global": "",       # sentinel — same promotion
+    "global": "",  # sentinel — same promotion
 }
 
 # Regex patterns for evidence parsing (Patch 5)
-_EVIDENCE_FULL_RE = re.compile(
-    r"^(?P<path>[\w./\-]+\.\w+):(?P<line>\d+)\((?P<fn>[^)]+)\)$"
-)
+_EVIDENCE_FULL_RE = re.compile(r"^(?P<path>[\w./\-]+\.\w+):(?P<line>\d+)\((?P<fn>[^)]+)\)$")
 _EVIDENCE_FILE_LINE_RE = re.compile(
     r"^(?P<path>[\w./\-]+\.py):(?P<line>\d+)(?P<rest>.*)$",
     re.DOTALL,
@@ -219,18 +218,20 @@ def _patch_bd_injection(
     # so we can still enforce the minimum-3 requirement below.
     for gap in bd_result.missing_gaps:
         if gap.id not in seen_ids:
-            bd_dicts.append({
-                "id": gap.id,
-                "type": gap.type,
-                "content": gap.content,
-                "rationale": gap.rationale,
-                "evidence": gap.evidence,
-                "stage": gap.stage,
-                "status": "missing",
-                "known_gap": True,
-                "severity": gap.severity or "medium",
-                "impact": gap.impact,
-            })
+            bd_dicts.append(
+                {
+                    "id": gap.id,
+                    "type": gap.type,
+                    "content": gap.content,
+                    "rationale": gap.rationale,
+                    "evidence": gap.evidence,
+                    "stage": gap.stage,
+                    "status": "missing",
+                    "known_gap": True,
+                    "severity": gap.severity or "medium",
+                    "impact": gap.impact,
+                }
+            )
             seen_ids.add(gap.id)
 
     # --- Ensure minimum 3 missing gaps (SOP v3.4 requirement) ---
@@ -250,7 +251,9 @@ def _patch_bd_injection(
     final_missing = sum(1 for d in bd_dicts if d.get("status") == "missing")
     logger.info(
         "P3 (bd_injection): %d BDs written (%d present, %d missing)",
-        len(bd_dicts), present, final_missing,
+        len(bd_dicts),
+        present,
+        final_missing,
     )
     return len(bd_dicts)
 
@@ -282,7 +285,8 @@ def _patch_bd_type_enum_fix(bp: dict[str, Any]) -> int:
             # Not in fix map and not already valid — log warning, leave untouched
             logger.warning(
                 "P4 (bd_type_enum_fix): BD %s has unrecognised type %r — skipping",
-                bd.get("id", "?"), raw_type,
+                bd.get("id", "?"),
+                raw_type,
             )
 
     logger.info("P4 (bd_type_enum_fix): %d BD type fields corrected", count)
@@ -354,7 +358,10 @@ def _patch_evidence_format(bp: dict[str, Any]) -> int:
 
     logger.info(
         "P5 (evidence_format): %d BDs normalised; coverage ratio=%.3f (%d/%d)",
-        ev_fixed, ratio, valid_evidence_count, total_count,
+        ev_fixed,
+        ratio,
+        valid_evidence_count,
+        total_count,
     )
     return ev_fixed
 
@@ -385,7 +392,8 @@ def _patch_vague_words(bp: dict[str, Any]) -> int:
             count += 1
             logger.debug(
                 "P6: BD %s flagged — vague words: %s",
-                bd.get("id", "?"), ", ".join(found),
+                bd.get("id", "?"),
+                ", ".join(found),
             )
 
     logger.info("P6 (vague_words): %d BDs tagged with vague_rationale", count)
@@ -412,10 +420,7 @@ def _patch_stage_id_validation(bp: dict[str, Any]) -> int:
 
     # --- Step 1: Deduplicate stage ids ---
     # Collect all existing ids first to avoid suffix collisions
-    all_ids: set[str] = {
-        s.get("id", "") for s in stages
-        if isinstance(s, dict) and s.get("id")
-    }
+    all_ids: set[str] = {s.get("id", "") for s in stages if isinstance(s, dict) and s.get("id")}
     seen_ids: dict[str, int] = {}  # id → occurrence count
     for stage in stages:
         if not isinstance(stage, dict):
@@ -431,9 +436,7 @@ def _patch_stage_id_validation(bp: dict[str, Any]) -> int:
             while new_id in all_ids:
                 suffix += 1
                 new_id = f"{sid}_{suffix}"
-            logger.warning(
-                "P7: duplicate stage id %r → renaming to %r", sid, new_id
-            )
+            logger.warning("P7: duplicate stage id %r → renaming to %r", sid, new_id)
             stage["id"] = new_id
             all_ids.add(new_id)
             count += 1
@@ -442,14 +445,11 @@ def _patch_stage_id_validation(bp: dict[str, Any]) -> int:
 
     # --- Step 2: Ensure strictly increasing order ---
     numeric_stages = [
-        s for s in stages
-        if isinstance(s, dict) and isinstance(s.get("order"), (int, float))
+        s for s in stages if isinstance(s, dict) and isinstance(s.get("order"), (int, float))
     ]
     if len(numeric_stages) > 1:
         orders = [s["order"] for s in numeric_stages]
-        is_strictly_increasing = all(
-            orders[i] < orders[i + 1] for i in range(len(orders) - 1)
-        )
+        is_strictly_increasing = all(orders[i] < orders[i + 1] for i in range(len(orders) - 1))
         if not is_strictly_increasing:
             logger.warning("P7: stage orders not strictly increasing — renumbering")
             for idx, stage in enumerate(numeric_stages):
@@ -458,10 +458,7 @@ def _patch_stage_id_validation(bp: dict[str, Any]) -> int:
 
     # --- Step 3: Validate BD.stage against legal stage set ---
     # Rebuild legal set after dedup (step 1 may have renamed some)
-    legal_stages: set[str] = {
-        s["id"] for s in stages
-        if isinstance(s, dict) and s.get("id")
-    }
+    legal_stages: set[str] = {s["id"] for s in stages if isinstance(s, dict) and s.get("id")}
 
     if not legal_stages:
         logger.debug("P7 (stage_id_validation): no legal stages found in blueprint")
@@ -508,8 +505,8 @@ def _patch_stage_id_validation(bp: dict[str, Any]) -> int:
             sid_words = set(re.split(r"_", sid))
             # Also include stage name words
             sname = next(
-                (s.get("name", "") for s in stages
-                 if isinstance(s, dict) and s.get("id") == sid), ""
+                (s.get("name", "") for s in stages if isinstance(s, dict) and s.get("id") == sid),
+                "",
             )
             sid_words |= {w.lower() for w in re.split(r"[\s_\-]+", sname) if len(w) >= 3}
             overlap = len(ref_words & sid_words)
@@ -535,21 +532,25 @@ def _patch_stage_id_validation(bp: dict[str, Any]) -> int:
             count += 1
             logger.debug(
                 "P7: BD %s stage %r → 'global' (cross-stage promotion)",
-                bd.get("id", "?"), stage_ref,
+                bd.get("id", "?"),
+                stage_ref,
             )
         elif mapped and mapped in legal_stages:
             bd["stage"] = mapped
             count += 1
             logger.debug(
                 "P7: BD %s stage %r → %r via STAGE_MAPPING",
-                bd.get("id", "?"), stage_ref, mapped,
+                bd.get("id", "?"),
+                stage_ref,
+                mapped,
             )
         elif "cross" in stage_ref.lower():
             bd["stage"] = "global"
             count += 1
             logger.debug(
                 "P7: BD %s stage %r → 'global' (contains 'cross')",
-                bd.get("id", "?"), stage_ref,
+                bd.get("id", "?"),
+                stage_ref,
             )
         else:
             # Try dynamic fuzzy matching
@@ -559,17 +560,21 @@ def _patch_stage_id_validation(bp: dict[str, Any]) -> int:
                 count += 1
                 logger.debug(
                     "P7: BD %s stage %r → %r via fuzzy match",
-                    bd.get("id", "?"), stage_ref, fuzzy,
+                    bd.get("id", "?"),
+                    stage_ref,
+                    fuzzy,
                 )
             else:
                 logger.warning(
                     "P7 (stage_id_validation): BD %s has unresolvable stage %r",
-                    bd.get("id", "?"), stage_ref,
+                    bd.get("id", "?"),
+                    stage_ref,
                 )
 
     logger.info(
         "P7 (stage_id_validation): %d corrections applied (legal stages: %s)",
-        count, sorted(legal_stages),
+        count,
+        sorted(legal_stages),
     )
     return count
 
@@ -599,17 +604,17 @@ def _patch_required_methods(bp: dict[str, Any]) -> int:
         # --- required_methods: only fill if absent/empty ---
         methods = stage.get("required_methods")
         if not methods or (
-            len(methods) == 1
-            and isinstance(methods[0], dict)
-            and methods[0].get("name") == "N/A"
+            len(methods) == 1 and isinstance(methods[0], dict) and methods[0].get("name") == "N/A"
         ):
             # No real methods — keep as-is or set placeholder
             if not methods:
-                stage["required_methods"] = [{
-                    "name": "N/A",
-                    "description": "No user-facing methods identified by assembly",
-                    "evidence": "N/A",
-                }]
+                stage["required_methods"] = [
+                    {
+                        "name": "N/A",
+                        "description": "No user-facing methods identified by assembly",
+                        "evidence": "N/A",
+                    }
+                ]
                 stage_changed = True
 
         # --- key_behaviors: only fill if absent/empty ---
@@ -627,26 +632,32 @@ def _patch_required_methods(bp: dict[str, Any]) -> int:
             if isinstance(hints, list):
                 for hint in hints:
                     if isinstance(hint, str) and len(hint) > 5:
-                        derived.append({
-                            "behavior": hint[:80],
-                            "description": hint,
-                            "evidence": "see acceptance_hints",
-                        })
+                        derived.append(
+                            {
+                                "behavior": hint[:80],
+                                "description": hint,
+                                "evidence": "see acceptance_hints",
+                            }
+                        )
             elif isinstance(hints, str) and hints:
                 for line in hints.split("\n"):
                     line = line.strip().lstrip("✓⚠✗ -*")
                     if line and len(line) > 5:
-                        derived.append({
-                            "behavior": line[:80],
-                            "description": line,
-                            "evidence": "see acceptance_hints",
-                        })
+                        derived.append(
+                            {
+                                "behavior": line[:80],
+                                "description": line,
+                                "evidence": "see acceptance_hints",
+                            }
+                        )
 
-            stage["key_behaviors"] = derived or [{
-                "behavior": "N/A",
-                "description": "No observable behaviors identified by assembly",
-                "evidence": "N/A",
-            }]
+            stage["key_behaviors"] = derived or [
+                {
+                    "behavior": "N/A",
+                    "description": "No observable behaviors identified by assembly",
+                    "evidence": "N/A",
+                }
+            ]
             stage_changed = True
 
         if stage_changed:
@@ -723,9 +734,7 @@ def _patch_uc_normalize(bp: dict[str, Any]) -> int:
         ucs = []
         bp["known_use_cases"] = ucs
 
-    _keyword_re = re.compile(
-        r"[A-Z][a-z]{2,}|[A-Z]{2,}|[\u4e00-\u9fff]{2,}|\b[a-z]{4,}\b"
-    )
+    _keyword_re = re.compile(r"[A-Z][a-z]{2,}|[A-Z]{2,}|[\u4e00-\u9fff]{2,}|\b[a-z]{4,}\b")
 
     affected = 0
     for uc in ucs:
@@ -751,9 +760,7 @@ def _patch_uc_normalize(bp: dict[str, Any]) -> int:
                 if w not in keywords and len(w) >= 2:
                     keywords.append(w)
             uc["intent_keywords"] = (
-                keywords[:5]
-                if keywords
-                else ([name.split()[0]] if name.split() else ["unknown"])
+                keywords[:5] if keywords else ([name.split()[0]] if name.split() else ["unknown"])
             )
             changed = True
 
@@ -818,12 +825,13 @@ def _patch_audit_checklist(bp: dict[str, Any], state: AgentState, artifacts_dir:
         audit_data["note"] = "Parsed from worker_audit.md"
         logger.info(
             "P11 (audit_checklist): real audit data — pass=%d, warn=%d, fail=%d",
-            pass_count, warn_count, fail_count,
+            pass_count,
+            warn_count,
+            fail_count,
         )
     else:
         audit_data["note"] = (
-            "Auto-generated by bp_enrich; detailed audit pending "
-            "Batch C worker_audit"
+            "Auto-generated by bp_enrich; detailed audit pending Batch C worker_audit"
         )
         logger.debug("P11 (audit_checklist): placeholder (worker_audit.md not found)")
 
@@ -837,11 +845,13 @@ def _patch_relations(bp: dict[str, Any]) -> int:
     Returns 1 if a placeholder was injected, 0 otherwise.
     """
     if not bp.get("relations"):
-        bp["relations"] = [{
-            "target": "同子领域蓝图",
-            "type": "pending",
-            "description": "暂无同子领域参照，待批量提取后补充",
-        }]
+        bp["relations"] = [
+            {
+                "target": "同子领域蓝图",
+                "type": "pending",
+                "description": "暂无同子领域参照，待批量提取后补充",
+            }
+        ]
         logger.debug("P12 (relations): injected placeholder")
         return 1
     return 0
@@ -861,6 +871,190 @@ def _patch_execution_paradigm(bp: dict[str, Any]) -> int:
         logger.debug("P13 (execution_paradigm): injected placeholder")
         return 1
     return 0
+
+
+def _patch_evidence_verify(bp: dict[str, Any], repo_path: str) -> int:
+    """P5.5: deterministic verification of evidence file:line(fn) references.
+
+    Checks that the file exists, the line number is valid, and the function
+    name is present at the cited location.  Auto-fixes minor discrepancies
+    (e.g. wrong line number but correct function name).
+
+    Returns the number of evidence references verified or auto-fixed.
+    Zero LLM calls — pure Python + filesystem checks.
+
+    Design source: Harness Engineering — computational sensor (Böckeler matrix
+    bottom-left quadrant).
+    """
+    import ast as _ast
+
+    verified = 0
+    invalid = 0
+    auto_fixed = 0
+    _ev_pattern = re.compile(r"^(.+?):(\d+)\((.+?)\)$")
+
+    for bd in bp.get("business_decisions", []):
+        ev = bd.get("evidence", "")
+        if not ev or ev.startswith("N/A"):
+            continue
+        m = _ev_pattern.match(ev)
+        if not m:
+            continue
+        file_path, line_str, fn_name = m.group(1), m.group(2), m.group(3)
+        line_no = int(line_str)
+        full_path = Path(repo_path) / file_path
+
+        # Check 1: file exists
+        if not full_path.exists():
+            bd.setdefault("_evidence_issues", []).append(f"NOT_FOUND: {file_path}")
+            invalid += 1
+            continue
+
+        # Check 2: line number valid
+        try:
+            lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            invalid += 1
+            continue
+        if line_no > len(lines):
+            bd.setdefault("_evidence_issues", []).append(
+                f"LINE_OOB: {file_path}:{line_no} > {len(lines)}"
+            )
+            invalid += 1
+            continue
+
+        # Check 3: function name (Python files only)
+        if fn_name and fn_name != "see_rationale" and file_path.endswith(".py"):
+            try:
+                source = full_path.read_text(encoding="utf-8", errors="replace")
+                tree = _ast.parse(source, filename=file_path)
+            except (SyntaxError, UnicodeDecodeError):
+                verified += 1
+                continue
+
+            # Find all function/method definitions (bare name + Class.method)
+            fn_defs: dict[str, int] = {}
+            for node in _ast.walk(tree):
+                if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                    fn_defs[node.name] = node.lineno
+                if isinstance(node, _ast.ClassDef):
+                    for child in _ast.iter_child_nodes(node):
+                        if isinstance(child, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                            fn_defs[f"{node.name}.{child.name}"] = child.lineno
+
+            # Handle dotted names: "Class.method" or bare "method"
+            lookup_name = fn_name
+            bare_name = fn_name.split(".")[-1] if "." in fn_name else fn_name
+
+            # Check if cited function exists (try full name first, then bare)
+            match_name = (
+                lookup_name
+                if lookup_name in fn_defs
+                else (bare_name if bare_name in fn_defs else None)
+            )
+            if match_name and match_name in fn_defs:
+                actual_line = fn_defs[match_name]
+                if abs(actual_line - line_no) > 5:
+                    # Auto-fix: function exists but line drifted
+                    bd["evidence"] = f"{file_path}:{actual_line}({fn_name})"
+                    auto_fixed += 1
+                else:
+                    verified += 1
+            else:
+                # Function not found in file
+                bd.setdefault("_evidence_issues", []).append(
+                    f"FN_NOT_FOUND: {fn_name} in {file_path}"
+                )
+                invalid += 1
+                continue
+        else:
+            verified += 1
+
+    meta = bp.setdefault("_enrich_meta", {})
+    meta["evidence_verified"] = verified
+    meta["evidence_invalid"] = invalid
+    meta["evidence_auto_fixed"] = auto_fixed
+    total = verified + invalid
+    meta["evidence_verify_ratio"] = verified / total if total > 0 else 0.0
+    logger.info(
+        "P5.5 (evidence_verify): verified=%d, invalid=%d, auto_fixed=%d, ratio=%.1f%%",
+        verified,
+        invalid,
+        auto_fixed,
+        meta["evidence_verify_ratio"] * 100,
+    )
+    return verified + auto_fixed
+
+
+def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
+    """P14: inject resource inventory into replaceable_points.
+
+    Reads worker_resource.json and merges resource options into each stage's
+    replaceable_points, filling gaps that the architecture Worker missed.
+
+    Returns the number of resource slots injected.
+    """
+    resource_path = artifacts_dir / "worker_resource.json"
+    if not resource_path.exists():
+        logger.debug("P14 (resource_injection): worker_resource.json not found, skipping")
+        return 0
+
+    try:
+        resource_data = json.loads(resource_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("P14 (resource_injection): failed to read resource data: %s", exc)
+        return 0
+
+    matrix = resource_data.get("replaceable_resource_matrix", [])
+    if not matrix:
+        return 0
+
+    # Build lookup: slot_name → resource options
+    resource_slots: dict[str, dict[str, Any]] = {}
+    for slot in matrix:
+        name = slot.get("slot_name", "")
+        if name:
+            resource_slots[name] = slot
+
+    # Inject at blueprint level (global_resources), not per-stage.
+    # Resource slots don't have stage affiliation, so per-stage injection
+    # would incorrectly add all slots to every stage.
+    injected = 0
+    # Collect existing replaceable_point names across all stages
+    all_existing_names: set[str] = set()
+    for stage in bp.get("stages", []):
+        for rp in stage.get("replaceable_points", []):
+            if isinstance(rp, dict):
+                all_existing_names.add(rp.get("name", "").lower())
+
+    global_resources = bp.get("global_resources", [])
+    for slot_name, slot_data in resource_slots.items():
+        if slot_name.lower() not in all_existing_names:
+            new_rp = {
+                "name": slot_name,
+                "description": slot_data.get("selection_criteria", ""),
+                "options": [
+                    {
+                        "name": opt.get("name", ""),
+                        "traits": opt.get("traits", []),
+                        "fit_for": ([opt.get("fit_for", "")] if opt.get("fit_for") else []),
+                        "not_fit_for": (
+                            [opt.get("not_fit_for", "")] if opt.get("not_fit_for") else []
+                        ),
+                    }
+                    for opt in slot_data.get("options", [])
+                ],
+                "default": slot_data.get("default"),
+                "_source": "worker_resource",
+            }
+            global_resources.append(new_rp)
+            injected += 1
+
+    if global_resources:
+        bp["global_resources"] = global_resources
+
+    logger.info("P14 (resource_injection): injected %d resource slots", injected)
+    return injected
 
 
 # ---------------------------------------------------------------------------
@@ -907,6 +1101,10 @@ def enrich_blueprint(
     # BD field-level fixes
     patch_stats["p4_bd_type_enum_fix"] = _patch_bd_type_enum_fix(bp)
     patch_stats["p5_evidence_format"] = _patch_evidence_format(bp)
+    # P5.5: deterministic evidence verification (v6)
+    repo_path = str(state.repo_path) if hasattr(state, "repo_path") and state.repo_path else ""
+    if repo_path:
+        patch_stats["p5_5_evidence_verify"] = _patch_evidence_verify(bp, repo_path)
     patch_stats["p6_vague_words"] = _patch_vague_words(bp)
     patch_stats["p7_stage_id_validation"] = _patch_stage_id_validation(bp)
 
@@ -921,6 +1119,9 @@ def enrich_blueprint(
     patch_stats["p11_audit_checklist"] = _patch_audit_checklist(bp, state, artifacts_dir)
     patch_stats["p12_relations"] = _patch_relations(bp)
     patch_stats["p13_execution_paradigm"] = _patch_execution_paradigm(bp)
+
+    # v6: Resource injection from worker_resource
+    patch_stats["p14_resource_injection"] = _patch_resource_injection(bp, artifacts_dir)
 
     total_affected = sum(patch_stats.values())
     logger.info(

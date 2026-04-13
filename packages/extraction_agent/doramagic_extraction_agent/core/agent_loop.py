@@ -30,10 +30,8 @@ from dataclasses import dataclass
 from typing import Any, TypeVar
 
 import httpx
-
-from pydantic import BaseModel, ValidationError
-
 from doramagic_shared_utils.llm_adapter import LLMAdapter, LLMResponse
+from pydantic import BaseModel, ValidationError
 
 from doramagic_extraction_agent.core.circuit_breaker import CircuitBreaker
 from doramagic_extraction_agent.core.context_manager import ContextManager
@@ -63,8 +61,68 @@ _TRANSPORT_ERROR_MARKERS = ("529", "429", "500", "502", "503", "overloaded", "ov
 # Token budget estimation
 # ---------------------------------------------------------------------------
 
-_TOKEN_BUDGET_WARN = 60_000   # warn level: soft budget
-_TOKEN_BUDGET_MAX  = 120_000  # error level: hard budget
+_TOKEN_BUDGET_WARN = 60_000  # warn level: soft budget
+_TOKEN_BUDGET_MAX = 120_000  # error level: hard budget
+
+# ---------------------------------------------------------------------------
+# Convergence detection (Diminishing Returns)
+# ---------------------------------------------------------------------------
+
+_CONVERGENCE_PATIENCE = 3  # consecutive small-delta iterations before stopping
+_CONVERGENCE_THRESHOLD = 0.05  # artifact growth < 5% of previous = "small delta"
+_MAX_TOOL_RESULTS_KEPT = 8  # LRU cap for microcompact
+
+
+class ConvergenceDetector:
+    """Detect when a Worker has exhausted useful information.
+
+    Tracks artifact size across iterations.  When consecutive growth
+    drops below *threshold* for *patience* rounds, signals convergence.
+
+    Design source: Claude Code ``tokenBudget.ts`` — diminishing-returns
+    early stopping saves 15-30 % Worker-phase tokens.
+    """
+
+    def __init__(
+        self,
+        patience: int = _CONVERGENCE_PATIENCE,
+        threshold: float = _CONVERGENCE_THRESHOLD,
+    ) -> None:
+        self.patience = patience
+        self.threshold = threshold
+        self._prev_size: int = 0
+        self._small_delta_count: int = 0
+
+    def update(self, artifacts: dict[str, str]) -> bool:
+        """Return ``True`` when the Worker should stop early."""
+        current_size = sum(len(v) for v in artifacts.values())
+        if self._prev_size > 0:
+            delta = current_size - self._prev_size
+            if delta < self._prev_size * self.threshold:
+                self._small_delta_count += 1
+            else:
+                self._small_delta_count = 0
+        elif self._prev_size == 0 and current_size == 0 and self._small_delta_count >= 0:
+            # Worker producing nothing across iterations — count as small delta
+            self._small_delta_count += 1
+        self._prev_size = current_size
+        return self._small_delta_count >= self.patience
+
+
+def microcompact(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """LRU-clear old tool results to prevent context bloat.
+
+    Only clears *regenerable* content (tool outputs).  User and assistant
+    messages are never touched because they are not regenerable.
+
+    Design source: Claude Code Layer-1 Microcompact.
+    """
+    tool_indices = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
+    if len(tool_indices) <= _MAX_TOOL_RESULTS_KEPT:
+        return messages
+    for idx in tool_indices[:-_MAX_TOOL_RESULTS_KEPT]:
+        messages[idx]["content"] = "[cleared — regenerable tool result]"
+    return messages
 
 
 def estimate_tokens(text: str) -> int:
@@ -100,6 +158,7 @@ def _is_transport_error(exc: BaseException) -> bool:
 
     exc_str = str(exc).lower()
     return any(marker in exc_str for marker in _TRANSPORT_ERROR_MARKERS)
+
 
 # Two-tier httpx timeouts:
 # - FAST: for agent loop tool-use calls. MiniMax TTFT can exceed 120s with
@@ -265,11 +324,13 @@ class ExtractionAgent:
                 if is_overflow:
                     logger.warning(
                         "Phase %r: context overflow (%d messages) — aggressive compact and retry",
-                        phase_name, len(messages),
+                        phase_name,
+                        len(messages),
                     )
                     if self._context_manager and len(messages) > 2:
                         messages, _ = self._context_manager.summarize_messages(
-                            messages, keep_last_n=2,
+                            messages,
+                            keep_last_n=2,
                         )
                         logger.info("Aggressive compact: %d messages remain", len(messages))
                         continue
@@ -330,7 +391,9 @@ class ExtractionAgent:
                     cb.record_failure(result.content)
                     logger.warning(
                         "Phase %r: tool %r failed: %s",
-                        phase_name, tc["name"], result.content,
+                        phase_name,
+                        tc["name"],
+                        result.content,
                     )
                 else:
                     cb.record_success()
@@ -354,7 +417,9 @@ class ExtractionAgent:
                     _compaction_seq += 1
                     logger.info(
                         "Phase %r: context compacted (event #%d) — %d messages after compaction",
-                        phase_name, _compaction_seq, len(messages),
+                        phase_name,
+                        _compaction_seq,
+                        len(messages),
                     )
 
             # --- Check circuit breaker ---
@@ -398,9 +463,7 @@ class ExtractionAgent:
 
         suffix = ":long" if long_timeout else ""
         client_key = f"anthropic:{adapter._base_url or 'default'}{suffix}"
-        client: anthropic.AsyncAnthropic = adapter._get_or_create_client(
-            client_key, _make_client
-        )
+        client: anthropic.AsyncAnthropic = adapter._get_or_create_client(client_key, _make_client)
 
         temperature = adapter._resolve_temperature(0.0, self._model_id)
 
@@ -416,9 +479,8 @@ class ExtractionAgent:
                 )
                 break
             except Exception as exc:
-                status = (
-                    getattr(getattr(exc, "response", None), "status_code", None)
-                    or getattr(exc, "status_code", None)
+                status = getattr(getattr(exc, "response", None), "status_code", None) or getattr(
+                    exc, "status_code", None
                 )
                 is_retryable = (
                     isinstance(exc, (ConnectionError, TimeoutError))
@@ -428,7 +490,9 @@ class ExtractionAgent:
                 if is_retryable and delay is not None:
                     logger.warning(
                         "_raw_anthropic_call attempt %d failed: %s — retrying in %ds",
-                        attempt + 1, exc, delay,
+                        attempt + 1,
+                        exc,
+                        delay,
                     )
                     await asyncio.sleep(delay)
                     continue
@@ -442,11 +506,13 @@ class ExtractionAgent:
             if block_type == "text":
                 text_parts.append(block.text)
             elif block_type == "tool_use":
-                tool_calls.append({
-                    "id": block.id,
-                    "name": block.name,
-                    "arguments": block.input,
-                })
+                tool_calls.append(
+                    {
+                        "id": block.id,
+                        "name": block.name,
+                        "arguments": block.input,
+                    }
+                )
 
         llm_response = LLMResponse(
             content="\n".join(text_parts) if text_parts else "",
@@ -502,9 +568,7 @@ class ExtractionAgent:
         def _make_client() -> httpx.AsyncClient:
             return httpx.AsyncClient(timeout=timeout)
 
-        client: httpx.AsyncClient = adapter._get_or_create_client(
-            client_key, _make_client
-        )
+        client: httpx.AsyncClient = adapter._get_or_create_client(client_key, _make_client)
 
         for attempt, delay in enumerate((*_RETRY_DELAYS, None)):
             try:
@@ -513,8 +577,10 @@ class ExtractionAgent:
                     if delay is not None:
                         logger.warning(
                             "_raw_openai_call attempt %d failed: HTTP %d %s — retrying in %ds",
-                            attempt + 1, resp.status_code,
-                            resp.text[:200], delay,
+                            attempt + 1,
+                            resp.status_code,
+                            resp.text[:200],
+                            delay,
                         )
                         await asyncio.sleep(delay)
                         continue
@@ -525,7 +591,9 @@ class ExtractionAgent:
                 if delay is not None:
                     logger.warning(
                         "_raw_openai_call attempt %d timed out: %s — retrying in %ds",
-                        attempt + 1, type(exc).__name__, delay,
+                        attempt + 1,
+                        type(exc).__name__,
+                        delay,
                     )
                     await asyncio.sleep(delay)
                     continue
@@ -536,7 +604,9 @@ class ExtractionAgent:
                 if delay is not None:
                     logger.warning(
                         "_raw_openai_call attempt %d failed: %s — retrying in %ds",
-                        attempt + 1, exc, delay,
+                        attempt + 1,
+                        exc,
+                        delay,
                     )
                     await asyncio.sleep(delay)
                     continue
@@ -559,11 +629,13 @@ class ExtractionAgent:
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = {}
-            tool_calls.append({
-                "id": tc.get("id", ""),
-                "name": fn.get("name", ""),
-                "arguments": args,
-            })
+            tool_calls.append(
+                {
+                    "id": tc.get("id", ""),
+                    "name": fn.get("name", ""),
+                    "arguments": args,
+                }
+            )
 
         # Token usage
         usage = data.get("usage", {})
@@ -626,12 +698,14 @@ class ExtractionAgent:
             logger.error(
                 "run_structured_call: estimated input %d tokens EXCEEDS budget %d — "
                 "consider chunking the request",
-                input_estimate, _TOKEN_BUDGET_MAX,
+                input_estimate,
+                _TOKEN_BUDGET_MAX,
             )
         elif input_estimate > _TOKEN_BUDGET_WARN:
             logger.warning(
                 "run_structured_call: estimated input %d tokens exceeds soft budget %d",
-                input_estimate, _TOKEN_BUDGET_WARN,
+                input_estimate,
+                _TOKEN_BUDGET_WARN,
             )
         else:
             logger.debug(
@@ -646,10 +720,7 @@ class ExtractionAgent:
         # --- L1: Instructor structured output ---
         # Skip L1 for models known to be incompatible with Instructor
         # (thinking mode + tool_choice=required conflict, never succeeds)
-        _skip_l1 = any(
-            tag in self._model_id.lower()
-            for tag in ("glm-5", "glm-4", "deepseek")
-        )
+        _skip_l1 = any(tag in self._model_id.lower() for tag in ("glm-5", "glm-4", "deepseek"))
 
         # Outer transport-layer retry loop: 529/429/5xx are retried here with
         # exponential back-off so Instructor never gets a chance to fast-retry
@@ -657,18 +728,19 @@ class ExtractionAgent:
         for _t_attempt, _t_delay in enumerate((*_TRANSPORT_RETRY_DELAYS, None)):
             try:
                 if _skip_l1:
-                    raise RuntimeError(
-                        f"L1 skipped for {self._model_id} (Instructor incompatible)"
-                    )
+                    raise RuntimeError(f"L1 skipped for {self._model_id} (Instructor incompatible)")
                 result, tokens = await self._instructor_call(
-                    system_prompt, user_message, response_model,
+                    system_prompt,
+                    user_message,
+                    response_model,
                     max_retries=max_retries,
                     max_tokens=effective_max_tokens,
                 )
                 total_tokens += tokens
                 logger.info(
                     "run_structured_call L1 success: %s (%d tokens)",
-                    response_model.__name__, tokens,
+                    response_model.__name__,
+                    tokens,
                 )
                 return result, total_tokens
             except (KeyboardInterrupt, asyncio.CancelledError):
@@ -678,8 +750,10 @@ class ExtractionAgent:
                     logger.warning(
                         "run_structured_call L1: transport error (attempt %d/%d): "
                         "%s — waiting %ds before retry (NOT degrading to L2)",
-                        _t_attempt + 1, len(_TRANSPORT_RETRY_DELAYS),
-                        type(l1_exc).__name__, _t_delay,
+                        _t_attempt + 1,
+                        len(_TRANSPORT_RETRY_DELAYS),
+                        type(l1_exc).__name__,
+                        _t_delay,
                     )
                     await asyncio.sleep(_t_delay)
                     continue  # retry L1, do not degrade
@@ -688,12 +762,12 @@ class ExtractionAgent:
                 # transport retries exhausted) → fall through to L2.
                 logger.warning(
                     "run_structured_call L1 failed (%s): %s — falling back to L2",
-                    type(l1_exc).__name__, l1_exc,
+                    type(l1_exc).__name__,
+                    l1_exc,
                 )
                 # Instructor exposes retry usage via total_usage or n_attempts
-                l1_usage = (
-                    getattr(l1_exc, "total_usage", None)
-                    or getattr(l1_exc, "_tokens_used", None)
+                l1_usage = getattr(l1_exc, "total_usage", None) or getattr(
+                    l1_exc, "_tokens_used", None
                 )
                 if l1_usage is not None:
                     if hasattr(l1_usage, "total_tokens"):
@@ -742,7 +816,8 @@ class ExtractionAgent:
                     validated = response_model.model_validate(extracted)
                     logger.info(
                         "run_structured_call L1.5 success: salvaged %s from L1 completion (%d tokens)",
-                        response_model.__name__, total_tokens,
+                        response_model.__name__,
+                        total_tokens,
                     )
                     return validated, total_tokens
             except (KeyboardInterrupt, asyncio.CancelledError):
@@ -750,7 +825,8 @@ class ExtractionAgent:
             except Exception as l15_exc:
                 logger.warning(
                     "L1.5 salvage failed: %s: %s — proceeding to L2",
-                    type(l15_exc).__name__, l15_exc,
+                    type(l15_exc).__name__,
+                    l15_exc,
                 )
 
         # --- L2: Free-form call with schema hint + _extract_json + model_validate ---
@@ -772,7 +848,9 @@ class ExtractionAgent:
         for _t2_attempt, _t2_delay in enumerate((*_TRANSPORT_RETRY_DELAYS, None)):
             try:
                 raw_text, tokens = await self._freeform_call(
-                    system_prompt, l2_message, long_timeout=True,
+                    system_prompt,
+                    l2_message,
+                    long_timeout=True,
                 )
                 total_tokens += tokens
 
@@ -785,7 +863,8 @@ class ExtractionAgent:
                 validated = response_model.model_validate(extracted)
                 logger.info(
                     "run_structured_call L2 success: %s (%d tokens total)",
-                    response_model.__name__, total_tokens,
+                    response_model.__name__,
+                    total_tokens,
                 )
                 return validated, total_tokens
             except (KeyboardInterrupt, asyncio.CancelledError):
@@ -794,7 +873,8 @@ class ExtractionAgent:
                 # Schema/parse errors are not transport errors; go straight to L3.
                 logger.warning(
                     "run_structured_call L2 failed (%s): %s — falling back to L3",
-                    type(l2_exc).__name__, l2_exc,
+                    type(l2_exc).__name__,
+                    l2_exc,
                 )
                 break
             except Exception as l2_exc:
@@ -802,15 +882,18 @@ class ExtractionAgent:
                     logger.warning(
                         "run_structured_call L2: transport error (attempt %d/%d): "
                         "%s — waiting %ds before retry (NOT degrading to L3)",
-                        _t2_attempt + 1, len(_TRANSPORT_RETRY_DELAYS),
-                        type(l2_exc).__name__, _t2_delay,
+                        _t2_attempt + 1,
+                        len(_TRANSPORT_RETRY_DELAYS),
+                        type(l2_exc).__name__,
+                        _t2_delay,
                     )
                     await asyncio.sleep(_t2_delay)
                     continue  # retry L2, do not degrade
 
                 logger.warning(
                     "run_structured_call L2 LLM call failed (%s): %s — falling back to L3",
-                    type(l2_exc).__name__, l2_exc,
+                    type(l2_exc).__name__,
+                    l2_exc,
                 )
                 break  # exit transport retry loop, proceed to L3
 
@@ -832,7 +915,6 @@ class ExtractionAgent:
         max_tokens: int | None = None,
     ) -> tuple[_T, int]:
         """L1: Instructor-wrapped LLM call using tool_use for schema enforcement."""
-        import instructor
 
         adapter = self._adapter
         effective_max_tokens = max_tokens or self._max_tokens_per_call
@@ -852,9 +934,7 @@ class ExtractionAgent:
                 ],
                 "max_retries": max_retries,
                 "max_tokens": effective_max_tokens,
-                "temperature": adapter._resolve_temperature(
-                    0.0, self._model_id
-                ),
+                "temperature": adapter._resolve_temperature(0.0, self._model_id),
             }
             if extra_body:
                 create_kwargs["extra_body"] = extra_body
@@ -871,20 +951,28 @@ class ExtractionAgent:
         else:
             # Anthropic format (MiniMax, Claude)
             client = self._get_instructor_anthropic_client(adapter)
-            resp = await client.messages.create(
-                model=self._model_id,
-                response_model=response_model,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_message}],
-                max_retries=max_retries,
-                max_tokens=effective_max_tokens,
-                temperature=adapter._resolve_temperature(0.0, self._model_id),
-            )
+            # Disable thinking mode for Anthropic-format Instructor calls.
+            # MiniMax M2.7 returns [ThinkingBlock, ToolUseBlock] when thinking
+            # is enabled, but Instructor expects [ToolUseBlock] only.
+            # tool_choice=required (set by Instructor) conflicts with thinking.
+            #
+            # The Anthropic SDK accepts thinking={"type":"disabled"} to suppress
+            # ThinkingBlock output.  This is safe for Claude (no-op if model
+            # doesn't support extended thinking) and fixes MiniMax.
+            create_kwargs_anthropic: dict[str, Any] = {
+                "model": self._model_id,
+                "response_model": response_model,
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_message}],
+                "max_retries": max_retries,
+                "max_tokens": effective_max_tokens,
+                "temperature": adapter._resolve_temperature(0.0, self._model_id),
+                "thinking": {"type": "disabled"},
+            }
+            resp = await client.messages.create(**create_kwargs_anthropic)
             tokens = getattr(resp, "_raw_response", None)
             if tokens and hasattr(tokens, "usage"):
-                token_count = (tokens.usage.input_tokens or 0) + (
-                    tokens.usage.output_tokens or 0
-                )
+                token_count = (tokens.usage.input_tokens or 0) + (tokens.usage.output_tokens or 0)
             else:
                 token_count = 0
             return resp, token_count
@@ -944,8 +1032,8 @@ class ExtractionAgent:
 
     def _get_instructor_openai_client(self, adapter: LLMAdapter) -> Any:
         """Get or create an Instructor-wrapped OpenAI async client."""
-        import openai
         import instructor
+        import openai
 
         cache_key = f"instructor_openai:{adapter._base_url or 'default'}"
 
@@ -994,14 +1082,16 @@ class ExtractionAgent:
         """
         openai_tools = []
         for tool in anthropic_tools:
-            openai_tools.append({
-                "type": "function",
-                "function": {
-                    "name": tool["name"],
-                    "description": tool.get("description", ""),
-                    "parameters": tool.get("input_schema", {}),
-                },
-            })
+            openai_tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool["name"],
+                        "description": tool.get("description", ""),
+                        "parameters": tool.get("input_schema", {}),
+                    },
+                }
+            )
         return openai_tools
 
     @staticmethod

@@ -3,6 +3,7 @@
 Covers all 14 patch functions and the enrich_blueprint orchestrator.
 No LLM calls; all test data is self-contained.
 """
+
 from __future__ import annotations
 
 import json
@@ -10,10 +11,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-
 from doramagic_extraction_agent.sop.blueprint_enrich import (
     BD_TYPE_ENUM_FIX_MAP,
-    STAGE_MAPPING,
     _patch_audit_checklist,
     _patch_bd_injection,
     _patch_bd_type_enum_fix,
@@ -32,7 +31,6 @@ from doramagic_extraction_agent.sop.blueprint_enrich import (
 )
 from doramagic_extraction_agent.sop.schemas_v5 import BDExtractionResult, BusinessDecision
 from doramagic_extraction_agent.state.schema import AgentState
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -138,8 +136,7 @@ def make_blueprint(
                 "type": "B",
                 "content": "Use stop-loss mechanism.",
                 "rationale": (
-                    "Stop-loss caps downside risk. "
-                    "Breaks under extreme gap-down scenarios."
+                    "Stop-loss caps downside risk. Breaks under extreme gap-down scenarios."
                 ),
                 "evidence": "trader/trader.py:42(on_stop_loss)",
                 "stage": "risk_management",
@@ -297,7 +294,14 @@ class TestPatchBdTypeEnumFix:
     def _make_bp_with_types(self, *types: str) -> dict[str, Any]:
         return {
             "business_decisions": [
-                {"id": f"BD-{i:03d}", "type": t, "content": "x", "rationale": "y", "evidence": "f.py:1(fn)", "stage": "s"}
+                {
+                    "id": f"BD-{i:03d}",
+                    "type": t,
+                    "content": "x",
+                    "rationale": "y",
+                    "evidence": "f.py:1(fn)",
+                    "stage": "s",
+                }
                 for i, t in enumerate(types, 1)
             ]
         }
@@ -343,7 +347,10 @@ class TestPatchBdTypeEnumFix:
         """Unknown types not in fix map and not matching pattern: warn only, no modify."""
         bp = self._make_bp_with_types("TOTALLY_INVALID_TYPE")
         import logging
-        with caplog.at_level(logging.WARNING, logger="doramagic_extraction_agent.sop.blueprint_enrich"):
+
+        with caplog.at_level(
+            logging.WARNING, logger="doramagic_extraction_agent.sop.blueprint_enrich"
+        ):
             count = _patch_bd_type_enum_fix(bp)
         assert count == 0
         # Type left untouched
@@ -354,10 +361,13 @@ class TestPatchBdTypeEnumFix:
     def test_all_fix_map_entries_produce_valid_types(self) -> None:
         """Every mapped value in BD_TYPE_ENUM_FIX_MAP must be a canonical type."""
         import re
+
         valid_re = re.compile(r"^(T|B|BA|DK|RC|M)(/(?:T|B|BA|DK|RC|M))*$")
         for raw, fixed in BD_TYPE_ENUM_FIX_MAP.items():
             if fixed:  # empty string sentinels are skipped
-                assert valid_re.match(fixed), f"Fix map value {fixed!r} (from {raw!r}) is not canonical"
+                assert valid_re.match(fixed), (
+                    f"Fix map value {fixed!r} (from {raw!r}) is not canonical"
+                )
 
     def test_skips_non_dict_entries(self) -> None:
         bp: dict[str, Any] = {"business_decisions": ["not-a-dict", None, 42]}
@@ -461,9 +471,7 @@ class TestPatchEvidenceFormat:
 
     def test_coverage_ratio_stored_rounded(self) -> None:
         """Ratio should be rounded to 3 decimal places."""
-        bp = self._make_bp_with_evidence(
-            "a.py:1(f)", "b.py:2(g)", "bad text"
-        )
+        bp = self._make_bp_with_evidence("a.py:1(f)", "b.py:2(g)", "bad text")
         _patch_evidence_format(bp)
         ratio = bp["_enrich_meta"]["evidence_coverage_ratio"]
         # 2/3 = 0.6666... → 0.667
@@ -561,16 +569,12 @@ class TestPatchVagueWords:
         assert bp["business_decisions"][2].get("vague_rationale") is True
 
     def test_empty_rationale_skipped(self) -> None:
-        bp: dict[str, Any] = {
-            "business_decisions": [{"id": "BD-001", "rationale": ""}]
-        }
+        bp: dict[str, Any] = {"business_decisions": [{"id": "BD-001", "rationale": ""}]}
         count = _patch_vague_words(bp)
         assert count == 0
 
     def test_absent_rationale_skipped(self) -> None:
-        bp: dict[str, Any] = {
-            "business_decisions": [{"id": "BD-001"}]
-        }
+        bp: dict[str, Any] = {"business_decisions": [{"id": "BD-001"}]}
         count = _patch_vague_words(bp)
         assert count == 0
 
@@ -715,7 +719,10 @@ class TestPatchStageIdValidation:
             ],
         }
         import logging
-        with caplog.at_level(logging.WARNING, logger="doramagic_extraction_agent.sop.blueprint_enrich"):
+
+        with caplog.at_level(
+            logging.WARNING, logger="doramagic_extraction_agent.sop.blueprint_enrich"
+        ):
             _patch_stage_id_validation(bp)
         # Stage left unchanged
         assert bp["business_decisions"][0]["stage"] == "completely_made_up_stage"
@@ -740,13 +747,15 @@ class TestPatchStageIdValidation:
 
 class TestPatchRequiredMethods:
     def test_populates_placeholder_when_no_methods(self) -> None:
-        bp: dict[str, Any] = {
-            "stages": [{"id": "s1", "order": 1}]
-        }
+        bp: dict[str, Any] = {"stages": [{"id": "s1", "order": 1}]}
         count = _patch_required_methods(bp)
         assert count == 1
         assert bp["stages"][0]["required_methods"] == [
-            {"name": "N/A", "description": "No user-facing methods identified by assembly", "evidence": "N/A"}
+            {
+                "name": "N/A",
+                "description": "No user-facing methods identified by assembly",
+                "evidence": "N/A",
+            }
         ]
 
     def test_skips_when_instructor_populated(self) -> None:
@@ -757,10 +766,18 @@ class TestPatchRequiredMethods:
                     "id": "s1",
                     "order": 1,
                     "required_methods": [
-                        {"name": "Factor.compute", "description": "Main compute", "evidence": "src/f.py:42(compute)"}
+                        {
+                            "name": "Factor.compute",
+                            "description": "Main compute",
+                            "evidence": "src/f.py:42(compute)",
+                        }
                     ],
                     "key_behaviors": [
-                        {"behavior": "Entity isolation", "description": "Each entity independent", "evidence": "src/f.py:50"}
+                        {
+                            "behavior": "Entity isolation",
+                            "description": "Each entity independent",
+                            "evidence": "src/f.py:50",
+                        }
                     ],
                 }
             ]
@@ -770,12 +787,14 @@ class TestPatchRequiredMethods:
         assert bp["stages"][0]["required_methods"][0]["name"] == "Factor.compute"
 
     def test_populates_key_behaviors_placeholder(self) -> None:
-        bp: dict[str, Any] = {
-            "stages": [{"id": "s1", "order": 1}]
-        }
+        bp: dict[str, Any] = {"stages": [{"id": "s1", "order": 1}]}
         _patch_required_methods(bp)
         assert bp["stages"][0]["key_behaviors"] == [
-            {"behavior": "N/A", "description": "No observable behaviors identified by assembly", "evidence": "N/A"}
+            {
+                "behavior": "N/A",
+                "description": "No observable behaviors identified by assembly",
+                "evidence": "N/A",
+            }
         ]
 
     def test_parses_acceptance_hints(self) -> None:
@@ -1053,13 +1072,30 @@ class TestEnrichBlueprint:
 
         # All patch keys present
         expected_keys = {
-            "p0_id", "p1_commit_hash", "p2_sop_version", "p3_bd_injection",
-            "p4_bd_type_enum_fix", "p5_evidence_format", "p6_vague_words",
-            "p7_stage_id_validation", "p8_required_methods", "p9_uc_merge",
-            "p10_uc_normalize", "p11_audit_checklist", "p12_relations",
+            "p0_id",
+            "p1_commit_hash",
+            "p2_sop_version",
+            "p3_bd_injection",
+            "p4_bd_type_enum_fix",
+            "p5_evidence_format",
+            "p6_vague_words",
+            "p7_stage_id_validation",
+            "p8_required_methods",
+            "p9_uc_merge",
+            "p10_uc_normalize",
+            "p11_audit_checklist",
+            "p12_relations",
             "p13_execution_paradigm",
+            "p14_resource_injection",
         }
-        assert expected_keys == set(patch_stats.keys())
+        # v6: p5_5_evidence_verify is conditional (requires repo_path)
+        actual_keys = set(patch_stats.keys())
+        # P5.5 may or may not be present depending on state.repo_path
+        optional_keys = {"p5_5_evidence_verify"}
+        assert (
+            expected_keys == actual_keys - optional_keys
+            or expected_keys | optional_keys == actual_keys
+        )
 
         # P2 always fires
         assert patch_stats["p2_sop_version"] == 1
@@ -1239,7 +1275,9 @@ class TestCodexRegressions:
         _patch_stage_id_validation(bp)
         assert bp["business_decisions"][0]["stage"] == "global"
 
-    def test_bd_injection_warns_on_insufficient_gaps(self, caplog: pytest.LogCaptureFixture) -> None:
+    def test_bd_injection_warns_on_insufficient_gaps(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """Bug: second pass could never add gaps because seen_ids was exhausted."""
         import logging
 
