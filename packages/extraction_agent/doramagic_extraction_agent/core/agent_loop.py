@@ -728,10 +728,17 @@ class ExtractionAgent:
         # Outer transport-layer retry loop: 529/429/5xx are retried here with
         # exponential back-off so Instructor never gets a chance to fast-retry
         # them.  Schema / validation errors fall through immediately to L2.
+        if _skip_l1:
+            logger.info(
+                "run_structured_call: L1 skipped for %s (Instructor incompatible) — using L2",
+                self._model_id,
+            )
+
         for _t_attempt, _t_delay in enumerate((*_TRANSPORT_RETRY_DELAYS, None)):
+            if _skip_l1:
+                break  # skip L1 entirely, proceed to L1.5/L2
+
             try:
-                if _skip_l1:
-                    raise RuntimeError(f"L1 skipped for {self._model_id} (Instructor incompatible)")
                 result, tokens = await self._instructor_call(
                     system_prompt,
                     user_message,
