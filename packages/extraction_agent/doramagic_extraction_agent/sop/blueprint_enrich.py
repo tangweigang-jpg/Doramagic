@@ -1303,43 +1303,62 @@ def _patch_absolute_words(bp: dict[str, Any]) -> int:
     """P17: reduce 'all/All' frequency to ≤3 in text fields.
 
     SOP v3.4 rule: "所有"+"全部" ≤3 occurrences; English "all" similarly
-    restricted. Replace overused absolute words with precise alternatives.
+    restricted. Uses regex to replace "all {noun}" → "each {noun}" broadly.
     """
-    _REPLACEMENTS = [
-        ("all stages", "each stage"),
-        ("all modules", "each module"),
-        ("all entities", "each entity"),
-        ("all schemas", "each schema"),
-        ("all recorders", "each recorder"),
-        ("all providers", "each provider"),
-        ("all decisions", "each decision"),
-        ("all fields", "each field"),
-        ("All stages", "Each stage"),
-        ("All modules", "Each module"),
-        ("All entities", "Each entity"),
-        ("All schemas", "Each schema"),
-    ]
 
+    def _replace_all_in_str(text: str) -> tuple[str, int]:
+        """Replace 'all/All + noun' patterns with 'each/Every + noun'."""
+        count = 0
+        # "All X" at start of sentence → "Every X"
+        new, n = re.subn(r"\bAll (\w+)", r"Every \1", text)
+        count += n
+        text = new
+        # "all X" mid-sentence → "each X" (but not "all" standalone)
+        new, n = re.subn(r"\ball (\w+)", r"each \1", text)
+        count += n
+        text = new
+        return text, count
+
+    def _walk_and_replace(obj: Any) -> tuple[Any, int]:
+        """Recursively replace in all string values."""
+        total = 0
+        if isinstance(obj, str):
+            new_str, count = _replace_all_in_str(obj)
+            return new_str, count
+        elif isinstance(obj, dict):
+            new_dict = {}
+            for k, v in obj.items():
+                new_v, count = _walk_and_replace(v)
+                new_dict[k] = new_v
+                total += count
+            return new_dict, total
+        elif isinstance(obj, list):
+            new_list = []
+            for item in obj:
+                new_item, count = _walk_and_replace(item)
+                new_list.append(new_item)
+                total += count
+            return new_list, total
+        return obj, 0
+
+    # Count current occurrences
     import yaml as _yaml
 
     content = _yaml.dump(bp, allow_unicode=True, default_flow_style=False)
-    count = content.lower().count(" all ")
-    if count <= 3:
+    before_count = len(re.findall(r"\ball\b", content, re.IGNORECASE))
+    if before_count <= 3:
         return 0
 
-    replaced = 0
-    for old, new in _REPLACEMENTS:
-        if old in content:
-            content = content.replace(old, new)
-            replaced += 1
+    new_bp, replaced = _walk_and_replace(bp)
+    bp.update(new_bp)
 
-    if replaced > 0:
-        bp.update(_yaml.safe_load(content))
-        logger.info(
-            "P17 (absolute_words): replaced %d 'all' patterns (%d remaining)",
-            replaced,
-            content.lower().count(" all "),
-        )
+    after_content = _yaml.dump(bp, allow_unicode=True, default_flow_style=False)
+    after_count = len(re.findall(r"\ball\b", after_content, re.IGNORECASE))
+
+    logger.info(
+        "P17 (absolute_words): %d replacements (%d → %d occurrences)",
+        replaced, before_count, after_count,
+    )
     return replaced
 
 
