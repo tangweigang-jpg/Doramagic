@@ -82,6 +82,38 @@ class BusinessDecision(BaseModel):
         description="Alternative approach that was considered but not chosen",
     )
 
+    @field_validator("known_gap", mode="before")
+    @classmethod
+    def coerce_known_gap(cls, v: Any) -> bool | None:
+        """Coerce known_gap: MiniMax writes long strings instead of bool."""
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            if v.lower() in ("true", "yes", "1"):
+                return True
+            if v.lower() in ("false", "no", "0", ""):
+                return False
+            # Any non-empty string → True (MiniMax writes descriptions)
+            return True
+        return bool(v)
+
+    @field_validator("severity", mode="before")
+    @classmethod
+    def coerce_severity(cls, v: Any) -> str | None:
+        """Coerce severity: MiniMax writes 'low' or other non-standard values."""
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            return "medium"
+        v = v.strip().lower()
+        if v in ("critical", "high", "medium"):
+            return v
+        if v in ("low", "minor", "info"):
+            return "medium"
+        return "medium"
+
     @field_validator("evidence")
     @classmethod
     def evidence_format_check(cls, v: str) -> str:
