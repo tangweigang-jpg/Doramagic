@@ -1975,37 +1975,83 @@ def build_blueprint_phases_v5(
                 result.text,
                 encoding="utf-8",
             )
-            return PhaseResult(
-                phase_name="bp_assemble",
-                status="error",
-                total_tokens=total_tokens,
-                error=f"Assembly returned raw fallback ({result.stage})",
-                final_text=result.text[:500],
-            )
+            # L3 recovery: try to parse the raw text as JSON (MiniMax often
+            # wraps valid JSON in markdown fences or produces it with minor
+            # validation errors that BlueprintAssembleResult rejects).
+            import re as _re
 
-        # --- Build blueprint dict from structured result ---
-        bp: dict = {
-            "id": state.blueprint_id,
-            "name": result.name,
-            "sop_version": "3.2",  # bp_enrich will upgrade to 3.4
-            "source": {
-                "projects": [],
-                "extraction_method": "semi_auto",
-            },
-            "applicability": result.applicability,
-            "stages": [s.model_dump(exclude_none=True) for s in result.stages],
-            "data_flow": [e.model_dump() for e in result.data_flow],
-            "global_contracts": result.global_contracts,
-            "business_decisions": [],  # Injected by bp_enrich P3
-            "known_use_cases": [],  # Injected by bp_enrich P9
-        }
+            raw = result.text.strip()
+            # Strip markdown code fences
+            raw = _re.sub(r"^```(?:json|yaml)?\s*\n?", "", raw)
+            raw = _re.sub(r"\n?```\s*$", "", raw)
+            try:
+                import json as _json
+
+                parsed_raw = _json.loads(raw)
+                if isinstance(parsed_raw, dict) and "stages" in parsed_raw:
+                    logger.info(
+                        "bp_assemble: L3 recovery — parsed raw JSON (%d stages)",
+                        len(parsed_raw.get("stages", [])),
+                    )
+                    # Skip Pydantic validation, build blueprint directly
+                    result = None  # sentinel: use parsed_raw below
+                else:
+                    raise ValueError("No 'stages' key in parsed JSON")
+            except Exception as parse_exc:
+                logger.warning(
+                    "bp_assemble: L3 recovery failed (%s) — cannot assemble",
+                    parse_exc,
+                )
+                return PhaseResult(
+                    phase_name="bp_assemble",
+                    status="error",
+                    total_tokens=total_tokens,
+                    error=f"Assembly returned raw fallback ({result.stage})",
+                    final_text=result.text[:500],
+                )
+
+        # --- Build blueprint dict from structured result or L3 parsed JSON ---
+        if result is None:
+            # L3 recovery path: use parsed_raw dict directly
+            bp: dict = {
+                "id": state.blueprint_id,
+                "name": parsed_raw.get("name", "unknown"),
+                "sop_version": "3.2",
+                "source": {
+                    "projects": [],
+                    "extraction_method": "semi_auto",
+                },
+                "applicability": parsed_raw.get("applicability", {}),
+                "stages": parsed_raw.get("stages", []),
+                "data_flow": parsed_raw.get("data_flow", []),
+                "global_contracts": parsed_raw.get("global_contracts", []),
+                "business_decisions": [],
+                "known_use_cases": [],
+            }
+        else:
+            bp = {
+                "id": state.blueprint_id,
+                "name": result.name,
+                "sop_version": "3.2",  # bp_enrich will upgrade to 3.4
+                "source": {
+                    "projects": [],
+                    "extraction_method": "semi_auto",
+                },
+                "applicability": result.applicability,
+                "stages": [s.model_dump(exclude_none=True) for s in result.stages],
+                "data_flow": [e.model_dump() for e in result.data_flow],
+                "global_contracts": result.global_contracts,
+                "business_decisions": [],
+                "known_use_cases": [],
+            }
 
         # --- Write blueprint.yaml ---
         from datetime import date as _date
 
         _today = _date.today().isoformat()
+        _recovery = " [L3 recovery]" if result is None else ""
         content = (
-            f"# Extraction pipeline: SOP v3.4 (v5.2 agent, Instructor synthesis + evidence packet)\n"
+            f"# Extraction pipeline: SOP v3.4 (v6 agent, Instructor synthesis){_recovery}\n"
             f"# Extracted: {_today}, model: {agent._model_id}\n"
             f"# Source: {state.repo_path} @ {state.commit_hash or 'unknown'}\n"
         )
@@ -2019,9 +2065,9 @@ def build_blueprint_phases_v5(
 
         (artifacts_dir / "blueprint.yaml").write_text(content, encoding="utf-8")
 
-        stage_count = len(result.stages)
-        edge_count = len(result.data_flow)
-        gc_count = len(result.global_contracts)
+        stage_count = len(bp.get("stages", []))
+        edge_count = len(bp.get("data_flow", []))
+        gc_count = len(bp.get("global_contracts", []))
 
         logger.info(
             "bp_assemble (Instructor): %d stages, %d edges, %d contracts, %d tokens",
