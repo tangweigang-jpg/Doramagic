@@ -968,8 +968,56 @@ class ExtractionAgent:
                 )
                 break  # exit transport retry loop, proceed to L3
 
-        # --- L3: Raw text fallback (preserve best available text) ---
+        # --- L3: Universal recovery before returning RawFallback ---
+        # Try JSON → YAML → truncated JSON on the raw text. If any parse
+        # succeeds AND model_validate passes (lenient), return the validated
+        # result instead of RawFallback. This saves EVERY phase handler from
+        # implementing its own L3 recovery logic.
         fallback_text = raw_text or l1_partial_text
+        if fallback_text:
+            import re as _re
+            import yaml as _yaml_recover
+
+            cleaned = fallback_text.strip()
+            cleaned = _re.sub(r"^```(?:json|yaml)?\s*\n?", "", cleaned)
+            cleaned = _re.sub(r"\n?```\s*$", "", cleaned)
+
+            parsed = None
+            # Try 1: JSON
+            try:
+                parsed = json.loads(cleaned)
+            except (json.JSONDecodeError, ValueError):
+                pass
+            # Try 2: YAML
+            if parsed is None:
+                try:
+                    parsed = _yaml_recover.safe_load(cleaned)
+                except Exception:
+                    pass
+            # Try 3: Truncated JSON (max_tokens cutoff)
+            if parsed is None:
+                last_complete = cleaned.rfind("},")
+                if last_complete > 0:
+                    try:
+                        parsed = json.loads(cleaned[:last_complete + 1] + "\n  ]\n}")
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+            if isinstance(parsed, dict):
+                try:
+                    validated = response_model.model_validate(parsed)
+                    logger.info(
+                        "run_structured_call L3 recovery success: %s (%d chars → validated)",
+                        response_model.__name__,
+                        len(fallback_text),
+                    )
+                    return validated, total_tokens
+                except Exception as l3_exc:
+                    logger.warning(
+                        "run_structured_call L3 recovery: parsed but validation failed (%s)",
+                        l3_exc,
+                    )
+
         logger.error(
             "run_structured_call L3: returning raw text fallback (%d chars)",
             len(fallback_text),
