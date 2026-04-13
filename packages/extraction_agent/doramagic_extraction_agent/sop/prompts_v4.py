@@ -155,9 +155,16 @@ Architecture-level decisions spanning multiple modules: ordering contracts, inhe
 ## Key Rules:
 - Use get_skeleton() and get_dependencies() to navigate efficiently — these give you the full picture WITHOUT reading every file
 - Focus on DECISIONS, not exhaustive listings — do NOT list every class and method
-- Include file:line(function) evidence for every finding
 - Each design_decision entry: ≤ 200 chars, must contain WHY + evidence
 - Target: 8-12 stages, 20-30 design decisions total, 5-10 cross-cutting findings
+
+## Evidence Format (CRITICAL — wrong format causes downstream failures):
+- MUST be: `src/module/file.py:42(ClassName.method_name)` or `src/file.py:42(function_name)`
+- Include the FULL relative path from repo root
+- Include the EXACT line number where the decision is implemented
+- Include the function/method name in parentheses
+- ❌ WRONG: `"file.py"`, `"line 42"`, `"see trader.py"`, `"42(43)"`
+- ✅ RIGHT: `"src/zvt/trader/trader.py:247(on_profit_control)"`
 
 ## EXPLORATION LIMITS (CRITICAL):
 - Read at most 15 source files with read_file. Use get_skeleton() for the rest.
@@ -213,6 +220,11 @@ You are a business workflow analyst. Your ONLY job is to extract business decisi
 - Target: 25-35 raw decisions (prioritize non-trivial decisions over exhaustive listing)
 - Each decision's context field: ≤ 150 chars
 - Each alternatives field: ≤ 100 chars
+
+## Evidence Format (CRITICAL):
+- MUST be: `src/module/file.py:42(function_name)`
+- ❌ WRONG: `"file.py"`, `"line 42"`, `"see trader.py"`
+- ✅ RIGHT: `"src/zvt/trader/trader.py:247(on_profit_control)"`
 
 ## Output: JSON array of objects with fields:
   id, decision, stage, evidence, source, alternatives, context

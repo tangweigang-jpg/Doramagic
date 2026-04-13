@@ -1077,21 +1077,35 @@ def _patch_missing_gaps_from_audit(
     audit_text = audit_path.read_text(encoding="utf-8")
 
     # Extract ❌ FAIL items from audit report
+    # Each item gets at most 2 detail lines (prevent rationale pollution)
     fail_items: list[dict[str, str]] = []
     current_item = ""
-    current_detail = ""
+    current_detail_lines: list[str] = []
+    _MAX_DETAIL_LINES = 2
+    _MAX_DETAIL_CHARS = 200
     for line in audit_text.splitlines():
+        # New ❌ item starts
         if "❌" in line and ("FAIL" in line or "fail" in line or "absent" in line):
             if current_item:
-                fail_items.append({"item": current_item, "detail": current_detail.strip()})
-            # Extract item description
+                detail = " ".join(current_detail_lines)[:_MAX_DETAIL_CHARS]
+                fail_items.append({"item": current_item, "detail": detail.strip()})
             clean = line.replace("❌", "").replace("FAIL", "").strip(" |-#*")
             current_item = clean
-            current_detail = ""
-        elif current_item and line.strip().startswith(("-", "•", "*", "Impact")):
-            current_detail += " " + line.strip(" -•*")
+            current_detail_lines = []
+        # ✅ or ⚠️ means next audit item — stop collecting detail
+        elif ("✅" in line or "⚠️" in line or line.strip().startswith(("##", "---"))):
+            if current_item:
+                detail = " ".join(current_detail_lines)[:_MAX_DETAIL_CHARS]
+                fail_items.append({"item": current_item, "detail": detail.strip()})
+                current_item = ""
+                current_detail_lines = []
+        elif current_item and len(current_detail_lines) < _MAX_DETAIL_LINES:
+            stripped = line.strip(" -•*|")
+            if stripped and len(stripped) > 5:
+                current_detail_lines.append(stripped)
     if current_item:
-        fail_items.append({"item": current_item, "detail": current_detail.strip()})
+        detail = " ".join(current_detail_lines)[:_MAX_DETAIL_CHARS]
+        fail_items.append({"item": current_item, "detail": detail.strip()})
 
     if not fail_items:
         logger.debug("P15 (missing_gaps): no ❌ FAIL items found in audit")
@@ -1170,6 +1184,64 @@ def _patch_missing_gaps_from_audit(
     return injected
 
 
+# Keywords that signal a BD might deserve a secondary type annotation
+_MULTI_TYPE_RULES: list[tuple[str, str, list[str]]] = [
+    # (current_type, candidate_secondary, trigger_keywords)
+    ("B", "BA", ["assume", "assumption", "default", "threshold", "expect",
+                  "tolerance", "typical", "empirical", "heuristic"]),
+    ("B", "DK", ["market", "china", "a-share", "a股", "exchange", "regulatory",
+                  "convention", "tradition", "culture"]),
+    ("B", "RC", ["regulation", "mandatory", "required", "compliance",
+                  "settlement", "T+1", "stamp", "tax"]),
+    ("BA", "DK", ["market", "china", "a-share", "specific", "local",
+                   "domestic", "convention"]),
+    ("BA", "M", ["formula", "model", "statistical", "distribution",
+                  "normal", "gaussian", "variance", "correlation"]),
+    ("M", "DK", ["market", "china", "a-share", "specific", "domestic"]),
+    ("M", "BA", ["assume", "assumption", "empirical", "calibrat",
+                  "parameter", "default"]),
+]
+
+
+def _patch_multi_type_annotation(bp: dict[str, Any]) -> int:
+    """P16: deterministic multi-type annotation enhancement.
+
+    Scans single-type non-T BDs for keyword signals that suggest a
+    secondary type. E.g., a B-type BD whose rationale mentions
+    "assumption" or "threshold" likely has BA implications.
+
+    This is a quality enhancement — it never removes existing types,
+    only adds secondary types to single-type BDs. Pure Python, no LLM.
+
+    Returns the number of BDs upgraded to multi-type.
+    """
+    bds = bp.get("business_decisions", [])
+    upgraded = 0
+
+    for bd in bds:
+        if not isinstance(bd, dict):
+            continue
+        bd_type = bd.get("type", "T")
+        # Skip T, missing, and already multi-type
+        if bd_type == "T" or "/" in bd_type or bd.get("status") == "missing":
+            continue
+
+        rationale = (bd.get("rationale", "") + " " + bd.get("content", "")).lower()
+
+        for primary, secondary, keywords in _MULTI_TYPE_RULES:
+            if bd_type != primary:
+                continue
+            # Count keyword matches
+            hits = sum(1 for kw in keywords if kw.lower() in rationale)
+            if hits >= 2:  # At least 2 keyword matches to avoid false positives
+                bd["type"] = f"{primary}/{secondary}"
+                upgraded += 1
+                break  # Only apply first matching rule
+
+    logger.info("P16 (multi_type): upgraded %d BDs to multi-type annotation", upgraded)
+    return upgraded
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -1238,6 +1310,9 @@ def enrich_blueprint(
 
     # v6: Deterministic missing gap generation from audit findings
     patch_stats["p15_missing_gaps"] = _patch_missing_gaps_from_audit(bp, artifacts_dir)
+
+    # v6: Deterministic multi-type annotation enhancement
+    patch_stats["p16_multi_type"] = _patch_multi_type_annotation(bp)
 
     total_affected = sum(patch_stats.values())
     logger.info(
