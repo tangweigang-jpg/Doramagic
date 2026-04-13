@@ -30,7 +30,13 @@ from ..tools.indexer import (
 from ..tools.sources import mine_source_context
 from . import prompts, prompts_v4, prompts_v5, prompts_v6
 from .blueprint_enrich import enrich_blueprint
-from .schemas_v5 import BDExtractionResult, QualityGateResult, RawFallback, UCExtractionResult
+from .schemas_v5 import (
+    BDExtractionResult,
+    BusinessDecision,
+    QualityGateResult,
+    RawFallback,
+    UCExtractionResult,
+)
 
 if TYPE_CHECKING:
     from ..core.agent_loop import ExtractionAgent
