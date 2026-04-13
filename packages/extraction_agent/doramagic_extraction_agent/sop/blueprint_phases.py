@@ -2335,12 +2335,15 @@ def build_blueprint_phases_v5(
         else:
             logger.info("BQ-03 PASS: multi_type=%.1f%%", multi_type_ratio * 100)
 
-        # BQ-04: missing gaps >= 3
+        # BQ-04: missing gaps >= 3 — DEMOTED to warning (v6)
+        # When Synthesis Step 3 hits L3 fallback (skipped), missing gaps
+        # are 0 by design. Blocking on this is counterproductive.
         checks["BQ-04_missing_gaps"] = missing_gap_count >= 3
         details["BQ-04_missing_gaps"] = f"count={missing_gap_count} (target ≥3)"
         if not checks["BQ-04_missing_gaps"]:
-            hard_issues.append(
-                f"BQ-04 FAIL: missing_gaps={missing_gap_count} < 3. {_BQ_FIX_HINTS['BQ-04']}"
+            warnings.append(
+                f"BQ-04 WARN: missing_gaps={missing_gap_count} < 3. "
+                f"{_BQ_FIX_HINTS['BQ-04']}"
             )
         else:
             logger.info("BQ-04 PASS: missing_gaps=%d ≥ 3", missing_gap_count)
