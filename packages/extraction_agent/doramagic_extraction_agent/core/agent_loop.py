@@ -1003,20 +1003,45 @@ class ExtractionAgent:
                     except (json.JSONDecodeError, ValueError):
                         pass
 
-            if isinstance(parsed, dict):
-                try:
-                    validated = response_model.model_validate(parsed)
-                    logger.info(
-                        "run_structured_call L3 recovery success: %s (%d chars → validated)",
-                        response_model.__name__,
-                        len(fallback_text),
-                    )
-                    return validated, total_tokens
-                except Exception as l3_exc:
-                    logger.warning(
-                        "run_structured_call L3 recovery: parsed but validation failed (%s)",
-                        l3_exc,
-                    )
+            if isinstance(parsed, (dict, list)):
+                # Strategy A: direct validation (parsed is the correct shape)
+                if isinstance(parsed, dict):
+                    try:
+                        validated = response_model.model_validate(parsed)
+                        logger.info(
+                            "run_structured_call L3 recovery success: %s (direct)",
+                            response_model.__name__,
+                        )
+                        return validated, total_tokens
+                    except Exception:
+                        pass
+
+                # Strategy B: parsed is a list or unwrapped item — wrap it
+                # Find the main list field in the model and wrap accordingly
+                for field_name, field_info in response_model.model_fields.items():
+                    origin = getattr(field_info.annotation, "__origin__", None)
+                    if origin is list:
+                        items = parsed if isinstance(parsed, list) else [parsed]
+                        try:
+                            validated = response_model.model_validate(
+                                {field_name: items}
+                            )
+                            logger.info(
+                                "run_structured_call L3 recovery success: %s "
+                                "(wrapped %d items in '%s')",
+                                response_model.__name__,
+                                len(items),
+                                field_name,
+                            )
+                            return validated, total_tokens
+                        except Exception:
+                            continue
+
+                logger.warning(
+                    "run_structured_call L3 recovery: parsed %s but all "
+                    "validation strategies failed",
+                    type(parsed).__name__,
+                )
 
         logger.error(
             "run_structured_call L3: returning raw text fallback (%d chars)",
