@@ -1033,6 +1033,7 @@ class ExtractionAgent:
                     origin = getattr(field_info.annotation, "__origin__", None)
                     if origin is list:
                         items = parsed if isinstance(parsed, list) else [parsed]
+                        # Try full list first
                         try:
                             validated = response_model.model_validate(
                                 {field_name: items}
@@ -1046,7 +1047,35 @@ class ExtractionAgent:
                             )
                             return validated, total_tokens
                         except Exception:
-                            continue
+                            pass
+                        # Per-item validation: keep valid, skip invalid
+                        item_type = getattr(field_info.annotation, "__args__", (None,))[0]
+                        if item_type and isinstance(item_type, type):
+                            valid_items = []
+                            for item in items:
+                                if isinstance(item, dict):
+                                    try:
+                                        item_type.model_validate(item)
+                                        valid_items.append(item)
+                                    except Exception:
+                                        continue
+                            if valid_items:
+                                try:
+                                    validated = response_model.model_validate(
+                                        {field_name: valid_items}
+                                    )
+                                    logger.info(
+                                        "run_structured_call L3 recovery success: %s "
+                                        "(%d/%d items valid in '%s')",
+                                        response_model.__name__,
+                                        len(valid_items),
+                                        len(items),
+                                        field_name,
+                                    )
+                                    return validated, total_tokens
+                                except Exception:
+                                    pass
+                        break  # only try the first list field
 
                 logger.warning(
                     "run_structured_call L3 recovery: parsed %s but all "
