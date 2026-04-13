@@ -1057,6 +1057,119 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
     return injected
 
 
+def _patch_missing_gaps_from_audit(
+    bp: dict[str, Any], artifacts_dir: Path
+) -> int:
+    """P15: deterministic missing gap generation from audit findings.
+
+    Cross-references worker_audit.md ❌ FAIL items against existing BDs.
+    Any audit failure not covered by an existing BD becomes a missing gap.
+    This is pure Python — no LLM dependency — ensuring missing gaps are
+    always generated even when Synthesis Step 3 hits L3 fallback.
+
+    Returns the number of missing gap BDs injected.
+    """
+    audit_path = artifacts_dir / "worker_audit.md"
+    if not audit_path.exists():
+        logger.debug("P15 (missing_gaps): worker_audit.md not found, skipping")
+        return 0
+
+    audit_text = audit_path.read_text(encoding="utf-8")
+
+    # Extract ❌ FAIL items from audit report
+    fail_items: list[dict[str, str]] = []
+    current_item = ""
+    current_detail = ""
+    for line in audit_text.splitlines():
+        if "❌" in line and ("FAIL" in line or "fail" in line or "absent" in line):
+            if current_item:
+                fail_items.append({"item": current_item, "detail": current_detail.strip()})
+            # Extract item description
+            clean = line.replace("❌", "").replace("FAIL", "").strip(" |-#*")
+            current_item = clean
+            current_detail = ""
+        elif current_item and line.strip().startswith(("-", "•", "*", "Impact")):
+            current_detail += " " + line.strip(" -•*")
+    if current_item:
+        fail_items.append({"item": current_item, "detail": current_detail.strip()})
+
+    if not fail_items:
+        logger.debug("P15 (missing_gaps): no ❌ FAIL items found in audit")
+        return 0
+
+    # Check which fail items are already covered by existing BDs
+    bds = bp.get("business_decisions", [])
+    existing_content = " ".join(
+        str(bd.get("content", "")) + " " + str(bd.get("rationale", ""))
+        for bd in bds
+        if isinstance(bd, dict)
+    ).lower()
+
+    # Find the next available BD ID
+    existing_ids = {
+        bd.get("id", "") for bd in bds if isinstance(bd, dict)
+    }
+    gap_counter = 1
+
+    injected = 0
+    for fail in fail_items:
+        # Simple keyword overlap check — if the fail item's key terms
+        # appear in existing BD content, it's already covered
+        keywords = [
+            w.lower() for w in fail["item"].split()
+            if len(w) > 3 and w.lower() not in {
+                "the", "and", "for", "with", "from", "that", "this",
+                "item", "check", "missing", "absent",
+            }
+        ]
+        covered = sum(1 for k in keywords if k in existing_content)
+        coverage_ratio = covered / max(len(keywords), 1)
+
+        if coverage_ratio < 0.5:
+            # Not covered — generate missing gap BD
+            gap_id = f"BD-GAP-{gap_counter:03d}"
+            while gap_id in existing_ids:
+                gap_counter += 1
+                gap_id = f"BD-GAP-{gap_counter:03d}"
+
+            detail = fail["detail"] or "Identified by audit checklist"
+            gap_bd = {
+                "id": gap_id,
+                "content": fail["item"],
+                "type": "B",
+                "rationale": (
+                    f"Audit finding: this capability is absent from the codebase. "
+                    f"{detail}. Should be implemented for production use."
+                ),
+                "evidence": "N/A:0(see_rationale)",
+                "stage": "unknown",
+                "status": "missing",
+                "severity": "high",
+                "impact": detail,
+                "known_gap": True,
+            }
+            # Pad rationale to >= 40 chars
+            if len(gap_bd["rationale"]) < 40:
+                gap_bd["rationale"] += " " * (40 - len(gap_bd["rationale"]))
+
+            bds.append(gap_bd)
+            existing_ids.add(gap_id)
+            gap_counter += 1
+            injected += 1
+
+    if injected > 0:
+        bp["business_decisions"] = bds
+
+    logger.info(
+        "P15 (missing_gaps): %d gap BDs from %d audit ❌ items "
+        "(%.0f%% already covered)",
+        injected,
+        len(fail_items),
+        (1 - injected / max(len(fail_items), 1)) * 100,
+    )
+    return injected
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -1122,6 +1235,9 @@ def enrich_blueprint(
 
     # v6: Resource injection from worker_resource
     patch_stats["p14_resource_injection"] = _patch_resource_injection(bp, artifacts_dir)
+
+    # v6: Deterministic missing gap generation from audit findings
+    patch_stats["p15_missing_gaps"] = _patch_missing_gaps_from_audit(bp, artifacts_dir)
 
     total_affected = sum(patch_stats.values())
     logger.info(

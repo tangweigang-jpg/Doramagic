@@ -1087,10 +1087,10 @@ class TestEnrichBlueprint:
             "p12_relations",
             "p13_execution_paradigm",
             "p14_resource_injection",
+            "p15_missing_gaps",
         }
         # v6: p5_5_evidence_verify is conditional (requires repo_path)
         actual_keys = set(patch_stats.keys())
-        # P5.5 may or may not be present depending on state.repo_path
         optional_keys = {"p5_5_evidence_verify"}
         assert (
             expected_keys == actual_keys - optional_keys
