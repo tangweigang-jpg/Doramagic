@@ -206,32 +206,67 @@ class CoverageGapResult(BaseModel):
     )
 
 
+_UC_TYPE_ALIASES: dict[str, str] = {
+    "strategy": "trading_strategy",
+    "trading": "trading_strategy",
+    "trade": "trading_strategy",
+    "screen": "screening",
+    "filter": "screening",
+    "data": "data_pipeline",
+    "pipeline": "data_pipeline",
+    "monitor": "monitoring",
+    "live": "live_trading",
+    "report": "reporting",
+    "research": "research_analysis",
+    "analysis": "research_analysis",
+    "ml": "ml_prediction",
+    "prediction": "ml_prediction",
+    "factor": "builtin_factor",
+    "example": "extension_example",
+    "complete": "complete_strategy",
+}
+
+
 class UseCase(BaseModel):
     """A single use case extracted from an example file."""
 
-    id: str = Field(description="Unique ID, e.g. UC-001", pattern=r"^UC-\d+$")
+    id: str = Field(description="Unique ID, e.g. UC-001")
     name: str = Field(description="Short descriptive name")
     source: str = Field(description="Source file path, e.g. examples/trader/macd_day_trader.py")
-    uc_type: Literal[
-        "trading_strategy",
-        "screening",
-        "data_pipeline",
-        "monitoring",
-        "live_trading",
-        "reporting",
-        "research_analysis",
-        "ml_prediction",
-        "builtin_factor",
-        "extension_example",
-        "complete_strategy",
-    ] = Field(description="Use case type category")
+    uc_type: str = Field(description="Use case type category")
     business_problem: str = Field(description="What business problem this example solves")
     intent_keywords: list[str] = Field(
         default_factory=list,
         description="3-5 keywords for matching user intent",
-        min_length=1,
-        max_length=10,
     )
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def coerce_uc_id(cls, v: str) -> str:
+        """Normalize UC ID: UC1 → UC-001, uc-1 → UC-001."""
+        if not isinstance(v, str):
+            return str(v)
+        v = v.strip().upper()
+        m = re.match(r"^UC-?(\d+)$", v)
+        if m:
+            return f"UC-{int(m.group(1)):03d}"
+        return v
+
+    @field_validator("uc_type", mode="before")
+    @classmethod
+    def coerce_uc_type(cls, v: str) -> str:
+        """Normalize UC type: 'strategy' → 'trading_strategy'."""
+        if not isinstance(v, str):
+            return "data_pipeline"
+        v = v.strip().lower().replace(" ", "_").replace("-", "_")
+        valid = {
+            "trading_strategy", "screening", "data_pipeline", "monitoring",
+            "live_trading", "reporting", "research_analysis", "ml_prediction",
+            "builtin_factor", "extension_example", "complete_strategy",
+        }
+        if v in valid:
+            return v
+        return _UC_TYPE_ALIASES.get(v, "data_pipeline")
     negative_keywords: list[str] = Field(
         default_factory=list,
         description="Keywords of OTHER use cases that overlap with this one — helps disambiguation",
