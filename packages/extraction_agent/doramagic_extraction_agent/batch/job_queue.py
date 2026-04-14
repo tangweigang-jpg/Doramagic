@@ -18,7 +18,7 @@ class RepoJob:
     domain: str = "finance"
     priority: int = 1
     skip_blueprint: bool = False  # skip blueprint extraction (already exists)
-    skip_constraint: bool = False  # skip constraint extraction
+    skip_constraint: bool = True  # default: only extract blueprint; constraint has its own pipeline
 
 
 @dataclass
