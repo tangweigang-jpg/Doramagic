@@ -2771,12 +2771,17 @@ def build_blueprint_phases_v5(
         )
 
         if isinstance(result, _RF):
-            logger.warning("bp_uc_extract: Instructor failed, raw fallback")
+            logger.warning("bp_uc_extract: Instructor failed, writing empty UC list")
+            # Write empty uc_list.json so pipeline continues — P9 uc_merge
+            # handles empty lists gracefully.
+            (artifacts_dir / "uc_list.json").write_text(
+                "[]", encoding="utf-8",
+            )
             return PhaseResult(
                 phase_name="bp_uc_extract",
                 status="completed",
                 total_tokens=tokens,
-                final_text="UC extraction returned raw fallback",
+                final_text="UC extraction returned raw fallback — empty UC list written",
             )
 
         # Convert to dict format for uc_list.json
