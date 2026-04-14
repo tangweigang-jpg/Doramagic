@@ -285,6 +285,61 @@ class ExtractionAgent:
         self._api_format = api_format  # "anthropic" or "openai"
 
     # ------------------------------------------------------------------
+    # Execution trace archive (Meta-Harness insight)
+    # ------------------------------------------------------------------
+
+    def _save_trace(
+        self,
+        *,
+        phase: str,
+        model: str,
+        prompt: str,
+        raw_output: str,
+        error: str,
+        tokens: int,
+    ) -> None:
+        """Save execution trace for post-hoc failure analysis.
+
+        Each L2/L3 failure is logged with full context (prompt, output,
+        error) so we can diagnose systemic patterns across many runs
+        without re-running extractions.
+
+        Design source: Meta-Harness (arxiv 2603.28052) — full trace
+        feedback outperforms compressed scores by 3 orders of magnitude.
+        """
+        trace_dir = None
+        if self._checkpoint_mgr:
+            trace_dir = getattr(self._checkpoint_mgr, "artifacts_dir", None)
+        if trace_dir is None:
+            return  # No checkpoint manager, skip trace
+
+        from pathlib import Path
+        from datetime import datetime, UTC
+
+        traces_path = Path(trace_dir).parent / "traces"
+        traces_path.mkdir(parents=True, exist_ok=True)
+
+        ts = datetime.now(UTC).strftime("%H%M%S")
+        trace_file = traces_path / f"{phase}_{model}_{ts}.json"
+        trace_data = {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "phase": phase,
+            "response_model": model,
+            "llm_model": self._model_id,
+            "tokens": tokens,
+            "prompt_preview": prompt,
+            "raw_output_preview": raw_output,
+            "error": error,
+        }
+        try:
+            trace_file.write_text(
+                json.dumps(trace_data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass  # Trace saving is best-effort, never block pipeline
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
@@ -959,6 +1014,16 @@ class ExtractionAgent:
                     type(l2_exc).__name__,
                     l2_exc,
                 )
+                # --- Execution trace archive (Meta-Harness insight) ---
+                # Save full diagnostic for post-hoc analysis of failure patterns.
+                self._save_trace(
+                    phase="L2",
+                    model=response_model.__name__,
+                    prompt=l2_message[:2000],
+                    raw_output=raw_text[:5000],
+                    error=str(l2_exc)[:2000],
+                    tokens=total_tokens,
+                )
                 break
             except Exception as l2_exc:
                 if _is_transport_error(l2_exc) and _t2_delay is not None:
@@ -1086,6 +1151,14 @@ class ExtractionAgent:
         logger.error(
             "run_structured_call L3: returning raw text fallback (%d chars)",
             len(fallback_text),
+        )
+        self._save_trace(
+            phase="L3_fallback",
+            model=response_model.__name__,
+            prompt=user_message[:2000],
+            raw_output=fallback_text[:5000],
+            error="All recovery strategies failed",
+            tokens=total_tokens,
         )
         return RawFallback(text=fallback_text, stage="l3_raw"), total_tokens
 
