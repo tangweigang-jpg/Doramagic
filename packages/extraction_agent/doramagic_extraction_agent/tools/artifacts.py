@@ -51,10 +51,7 @@ def _validate_name(name: str) -> str | None:
         return f"ERROR: artifact name {name!r} must be a relative path, not absolute"
 
     if p.suffix not in _VALID_EXTENSIONS:
-        return (
-            f"ERROR: artifact name {name!r} must end with one of "
-            f"{sorted(_VALID_EXTENSIONS)}"
-        )
+        return f"ERROR: artifact name {name!r} must end with one of {sorted(_VALID_EXTENSIONS)}"
 
     return None
 
@@ -95,10 +92,7 @@ def create_artifact_tools(artifacts_dir: Path) -> list[ToolDef]:
         # Optionally validate artifact_type if provided
         if artifact_type is not None and artifact_type not in _ARTIFACT_TYPE_EXTENSIONS:
             valid = list(_ARTIFACT_TYPE_EXTENSIONS)
-            return (
-                f"ERROR: unknown artifact_type {artifact_type!r}. "
-                f"Must be one of: {valid}"
-            )
+            return f"ERROR: unknown artifact_type {artifact_type!r}. Must be one of: {valid}"
 
         dest = base_dir / name
         try:

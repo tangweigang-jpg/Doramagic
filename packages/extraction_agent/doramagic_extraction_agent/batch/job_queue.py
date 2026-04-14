@@ -1,4 +1,5 @@
 """Job queue — defines extraction jobs and parses YAML job files."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

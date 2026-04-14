@@ -1,4 +1,5 @@
 """Progress tracking for batch extraction."""
+
 from __future__ import annotations
 
 import logging

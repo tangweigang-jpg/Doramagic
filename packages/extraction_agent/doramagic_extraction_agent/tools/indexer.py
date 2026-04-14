@@ -12,6 +12,7 @@ query tools that the extraction agent can call during agentic phases.
 Design reference: Agentless (ICLR 2025) skeleton representation,
 ArchAgent (2026) File Summarizer.
 """
+
 from __future__ import annotations
 
 import ast
@@ -27,49 +28,121 @@ logger = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-_SKIP_DIRS = {"__pycache__", ".git", "node_modules", ".mypy_cache",
-              ".ruff_cache", ".tox", ".eggs", "*.egg-info", "dist", "build"}
+_SKIP_DIRS = {
+    "__pycache__",
+    ".git",
+    "node_modules",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".eggs",
+    "*.egg-info",
+    "dist",
+    "build",
+}
 
-_MATH_IMPORTS = frozenset({
-    "scipy", "sklearn", "statsmodels", "torch",
-    "tensorflow", "tf", "optbinning", "cvxpy", "sympy",
-})
+_MATH_IMPORTS = frozenset(
+    {
+        "scipy",
+        "sklearn",
+        "statsmodels",
+        "torch",
+        "tensorflow",
+        "tf",
+        "optbinning",
+        "cvxpy",
+        "sympy",
+    }
+)
 
-_MATH_QUALNAMES = frozenset({
-    "numpy.linalg", "numpy.random", "numpy.fft",
-    "scipy.optimize", "scipy.stats", "scipy.linalg", "scipy.signal",
-    "sklearn.linear_model", "sklearn.ensemble", "sklearn.pipeline",
-    "sklearn.preprocessing", "sklearn.cluster", "sklearn.metrics",
-    "statsmodels.api", "statsmodels.tsa", "statsmodels.regression",
-    "torch.nn", "torch.optim",
-})
+_MATH_QUALNAMES = frozenset(
+    {
+        "numpy.linalg",
+        "numpy.random",
+        "numpy.fft",
+        "scipy.optimize",
+        "scipy.stats",
+        "scipy.linalg",
+        "scipy.signal",
+        "sklearn.linear_model",
+        "sklearn.ensemble",
+        "sklearn.pipeline",
+        "sklearn.preprocessing",
+        "sklearn.cluster",
+        "sklearn.metrics",
+        "statsmodels.api",
+        "statsmodels.tsa",
+        "statsmodels.regression",
+        "torch.nn",
+        "torch.optim",
+    }
+)
 
 # Broader keyword patterns that signal math/quant logic in source.
 # Two tiers: strong (1 hit = math) and weak (need 2+ hits).
-_MATH_KEYWORDS_STRONG = frozenset({
-    # Explicit math/stats operations (avoid ambiguous terms like bare "regression")
-    "linear_regression", "logistic_regression", "ridge_regression",
-    "gradient_descent", "backprop", "loss_function",
-    "linear_model", "decision_tree", "random_forest",
-    "cross_entropy", "mean_squared_error", "r_squared",
-    "eigenvalue", "matrix_inverse", "cholesky",
-    "monte_carlo", "confidence_interval",
-    "scipy.optimize", "scipy.stats", "sklearn.",
-    # Quant finance specific
-    "sharpe_ratio", "max_drawdown", "covariance_matrix",
-    "black_scholes", "greeks", "var_calc", "value_at_risk",
-})
-_MATH_KEYWORDS_WEAK = frozenset({
-    # Pandas/numpy quant operations (common in factor/trading code)
-    ".rolling(", ".ewm(", ".pct_change(", "cumsum(", "cumprod(",
-    ".corr(", ".cov(", ".std(", ".var(",
-    # Trading/simulation signals
-    "buy_cost", "sell_cost", "slippage", "commission",
-    "position_size", "fill_price", "pnl",
-    # Factor computation signals
-    "moving_average", "exponential_moving", "macd", "bollinger",
-    "rsi", "atr", "volatility",
-})
+_MATH_KEYWORDS_STRONG = frozenset(
+    {
+        # Explicit math/stats operations (avoid ambiguous terms like bare "regression")
+        "linear_regression",
+        "logistic_regression",
+        "ridge_regression",
+        "gradient_descent",
+        "backprop",
+        "loss_function",
+        "linear_model",
+        "decision_tree",
+        "random_forest",
+        "cross_entropy",
+        "mean_squared_error",
+        "r_squared",
+        "eigenvalue",
+        "matrix_inverse",
+        "cholesky",
+        "monte_carlo",
+        "confidence_interval",
+        "scipy.optimize",
+        "scipy.stats",
+        "sklearn.",
+        # Quant finance specific
+        "sharpe_ratio",
+        "max_drawdown",
+        "covariance_matrix",
+        "black_scholes",
+        "greeks",
+        "var_calc",
+        "value_at_risk",
+    }
+)
+_MATH_KEYWORDS_WEAK = frozenset(
+    {
+        # Pandas/numpy quant operations (common in factor/trading code)
+        ".rolling(",
+        ".ewm(",
+        ".pct_change(",
+        "cumsum(",
+        "cumprod(",
+        ".corr(",
+        ".cov(",
+        ".std(",
+        ".var(",
+        # Trading/simulation signals
+        "buy_cost",
+        "sell_cost",
+        "slippage",
+        "commission",
+        "position_size",
+        "fill_price",
+        "pnl",
+        # Factor computation signals
+        "moving_average",
+        "exponential_moving",
+        "macd",
+        "bollinger",
+        "rsi",
+        "atr",
+        "volatility",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -78,8 +151,20 @@ _MATH_KEYWORDS_WEAK = frozenset({
 
 
 _TEST_SEGMENTS = frozenset({"test", "tests", "testing"})
-_EXAMPLE_SEGMENTS = frozenset({"example", "examples", "tutorial", "tutorials",
-                               "notebook", "notebooks", "demo", "demos", "sample", "samples"})
+_EXAMPLE_SEGMENTS = frozenset(
+    {
+        "example",
+        "examples",
+        "tutorial",
+        "tutorials",
+        "notebook",
+        "notebooks",
+        "demo",
+        "demos",
+        "sample",
+        "samples",
+    }
+)
 
 
 def _classify_file(rel_path: str, has_classes: bool) -> str:
@@ -100,8 +185,16 @@ def _classify_file(rel_path: str, has_classes: bool) -> str:
     # Example: directory segment
     if segments & _EXAMPLE_SEGMENTS:
         return "example"
-    if fname in ("setup.py", "pyproject.toml", "setup.cfg", "conf.py",
-                 "settings.py", "config.py", "manage.py", "__main__.py"):
+    if fname in (
+        "setup.py",
+        "pyproject.toml",
+        "setup.cfg",
+        "conf.py",
+        "settings.py",
+        "config.py",
+        "manage.py",
+        "__main__.py",
+    ):
         return "config"
     if has_classes:
         return "model"
@@ -181,31 +274,37 @@ def _parse_file(filepath: Path, repo_root: Path) -> dict[str, Any] | None:
             for item in node.body:
                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     sig = ast.unparse(item.args) if hasattr(ast, "unparse") else ""
-                    methods.append({
-                        "name": item.name,
-                        "signature": f"({sig})",
-                        "line": item.lineno,
-                        "docstring": (ast.get_docstring(item) or "")[:200],
-                    })
-            classes.append({
-                "name": node.name,
-                "bases": bases,
-                "methods": methods,
-                "line": node.lineno,
-                "docstring": (ast.get_docstring(node) or "")[:200],
-            })
+                    methods.append(
+                        {
+                            "name": item.name,
+                            "signature": f"({sig})",
+                            "line": item.lineno,
+                            "docstring": (ast.get_docstring(item) or "")[:200],
+                        }
+                    )
+            classes.append(
+                {
+                    "name": node.name,
+                    "bases": bases,
+                    "methods": methods,
+                    "line": node.lineno,
+                    "docstring": (ast.get_docstring(node) or "")[:200],
+                }
+            )
 
     # Top-level functions (not inside classes)
     functions: list[dict[str, Any]] = []
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             sig = ast.unparse(node.args) if hasattr(ast, "unparse") else ""
-            functions.append({
-                "name": node.name,
-                "signature": f"({sig})",
-                "line": node.lineno,
-                "docstring": (ast.get_docstring(node) or "")[:200],
-            })
+            functions.append(
+                {
+                    "name": node.name,
+                    "signature": f"({sig})",
+                    "line": node.lineno,
+                    "docstring": (ast.get_docstring(node) or "")[:200],
+                }
+            )
 
     file_type = _classify_file(rel, bool(classes))
     math_related = _is_math_related(imports, source)
@@ -240,8 +339,10 @@ def build_structural_index(repo_path: Path) -> dict[str, Any]:
     for fpath in repo_root.rglob("*.py"):
         # Skip hidden/build dirs
         rel_parts = fpath.relative_to(repo_root).parts
-        if any(part.startswith(".") or part in _SKIP_DIRS
-               or part.endswith(".egg-info") for part in rel_parts):
+        if any(
+            part.startswith(".") or part in _SKIP_DIRS or part.endswith(".egg-info")
+            for part in rel_parts
+        ):
             continue
         py_files.append(fpath)
 
@@ -320,12 +421,12 @@ def build_structural_index(repo_path: Path) -> dict[str, Any]:
     for pattern in ("**/*.ipynb", "**/*.md"):
         for fpath in repo_root.rglob(pattern.split("/")[-1]):
             rel_parts = fpath.relative_to(repo_root).parts
-            if any(part.startswith(".") or part in _SKIP_DIRS
-                   for part in rel_parts):
+            if any(part.startswith(".") or part in _SKIP_DIRS for part in rel_parts):
                 continue
             rel = str(fpath.relative_to(repo_root))
-            if any(kw in rel.lower() for kw in
-                   ("example", "tutorial", "notebook", "demo", "guide")):
+            if any(
+                kw in rel.lower() for kw in ("example", "tutorial", "notebook", "demo", "guide")
+            ):
                 examples.append(rel)
     examples.sort()
 
@@ -359,7 +460,10 @@ def build_structural_index(repo_path: Path) -> dict[str, Any]:
 
     logger.info(
         "Index built: %d files, %d classes, %d functions, %d math-related",
-        len(files), total_classes, total_functions, math_count,
+        len(files),
+        total_classes,
+        total_functions,
+        math_count,
     )
     return index
 
@@ -396,15 +500,17 @@ def build_index_summary(index: dict[str, Any], max_lines: int = 200) -> str:
 
     # Math-related files (critical for M-type BD detection)
     math_files = [
-        (path, info) for path, info in index.get("files", {}).items()
-        if info.get("math_related")
+        (path, info) for path, info in index.get("files", {}).items() if info.get("math_related")
     ]
     if math_files:
         lines.append(f"\n### Math-Related Files ({len(math_files)})")
         for path, info in sorted(math_files):
             classes = [c["name"] for c in info.get("classes", [])]
-            imports = [i for i in info.get("imports", [])
-                       if i.split(".")[0] in _MATH_IMPORTS or i in _MATH_QUALNAMES]
+            imports = [
+                i
+                for i in info.get("imports", [])
+                if i.split(".")[0] in _MATH_IMPORTS or i in _MATH_QUALNAMES
+            ]
             desc = ""
             if classes:
                 desc += f" classes=[{', '.join(classes)}]"
@@ -414,8 +520,7 @@ def build_index_summary(index: dict[str, Any], max_lines: int = 200) -> str:
 
     # Model files skeleton (non-test, non-example, with classes)
     model_files = [
-        (path, info) for path, info in index.get("files", {}).items()
-        if info.get("type") == "model"
+        (path, info) for path, info in index.get("files", {}).items() if info.get("type") == "model"
     ]
     if model_files:
         lines.append(f"\n### Model Files ({len(model_files)}) — Class Skeleton")
@@ -449,8 +554,7 @@ def build_math_files_summary(index: dict[str, Any], max_files: int = 30) -> str:
     Prioritizes non-test, non-example files (model > util > config).
     """
     math_files = [
-        (path, info) for path, info in index.get("files", {}).items()
-        if info.get("math_related")
+        (path, info) for path, info in index.get("files", {}).items() if info.get("math_related")
     ]
     if not math_files:
         return ""
@@ -463,15 +567,20 @@ def build_math_files_summary(index: dict[str, Any], max_files: int = 30) -> str:
     remaining = len(math_files) - len(shown)
 
     lines = [f"## Math-Related Files ({len(math_files)})"]
-    lines.append("These files contain mathematical/quantitative logic. "
-                 "Each likely represents one or more M-type business decisions.")
+    lines.append(
+        "These files contain mathematical/quantitative logic. "
+        "Each likely represents one or more M-type business decisions."
+    )
     if remaining > 0:
         lines.append(f"Showing top {max_files}; use list_by_type('math') for the full list.")
     lines.append("")
 
     for path, info in shown:
-        math_imports = [i for i in info.get("imports", [])
-                        if i.split(".")[0] in _MATH_IMPORTS or i in _MATH_QUALNAMES]
+        math_imports = [
+            i
+            for i in info.get("imports", [])
+            if i.split(".")[0] in _MATH_IMPORTS or i in _MATH_QUALNAMES
+        ]
 
         lines.append(f"### {path}")
         if info.get("module_docstring"):
@@ -524,12 +633,16 @@ def create_index_tools(index: dict[str, Any]) -> list[ToolDef]:
             # Try fuzzy match
             candidates = [p for p in files if p.endswith(file_path) or file_path in p]
             if candidates:
-                return (f"File '{file_path}' not found in index. "
-                        f"Did you mean: {', '.join(candidates[:5])}?")
+                return (
+                    f"File '{file_path}' not found in index. "
+                    f"Did you mean: {', '.join(candidates[:5])}?"
+                )
             return f"File '{file_path}' not found in index."
 
-        parts = [f"# {file_path} ({info['lines']} lines, type={info['type']}"
-                 f"{', math-related' if info.get('math_related') else ''})"]
+        parts = [
+            f"# {file_path} ({info['lines']} lines, type={info['type']}"
+            f"{', math-related' if info.get('math_related') else ''})"
+        ]
 
         if info.get("module_docstring"):
             parts.append(f'"""{info["module_docstring"]}"""')
@@ -583,19 +696,16 @@ def create_index_tools(index: dict[str, Any]) -> list[ToolDef]:
         if info is None:
             candidates = [p for p in files if p.endswith(file_path) or file_path in p]
             if candidates:
-                return (f"File '{file_path}' not found. "
-                        f"Did you mean: {', '.join(candidates[:5])}?")
+                return f"File '{file_path}' not found. Did you mean: {', '.join(candidates[:5])}?"
             return f"File '{file_path}' not found in index."
 
         parts = [f"# Dependencies for {file_path}"]
 
         # External imports: not matching any known internal top-level module
         internal_set = (
-            set(internal_modules) if not isinstance(internal_modules, set)
-            else internal_modules
+            set(internal_modules) if not isinstance(internal_modules, set) else internal_modules
         )
-        ext_imports = [i for i in info.get("imports", [])
-                       if i.split(".")[0] not in internal_set]
+        ext_imports = [i for i in info.get("imports", []) if i.split(".")[0] not in internal_set]
         if ext_imports:
             parts.append(f"\nExternal imports: {', '.join(ext_imports)}")
 
@@ -648,8 +758,7 @@ def create_index_tools(index: dict[str, Any]) -> list[ToolDef]:
         if info is None:
             candidates = [p for p in files if p.endswith(file_path) or file_path in p]
             if candidates:
-                return (f"File '{file_path}' not found. "
-                        f"Did you mean: {', '.join(candidates[:5])}?")
+                return f"File '{file_path}' not found. Did you mean: {', '.join(candidates[:5])}?"
             return f"File '{file_path}' not found in index."
 
         return (
@@ -720,8 +829,7 @@ def create_index_tools(index: dict[str, Any]) -> list[ToolDef]:
                 "file_type": {
                     "type": "string",
                     "description": (
-                        "File type to list. One of: model, util, test, example, "
-                        "config, math."
+                        "File type to list. One of: model, util, test, example, config, math."
                     ),
                 },
             },
@@ -730,5 +838,4 @@ def create_index_tools(index: dict[str, Any]) -> list[ToolDef]:
         handler=_list_by_type,
     )
 
-    return [get_skeleton_tool, get_dependencies_tool,
-            get_file_type_tool, list_by_type_tool]
+    return [get_skeleton_tool, get_dependencies_tool, get_file_type_tool, list_by_type_tool]

@@ -213,9 +213,7 @@ def build_subdomain_checklist(subdomain_labels: list[str]) -> str:
         ``BP_STEP2C_SYSTEM``.
     """
     parts = [
-        SUBDOMAIN_CHECKLISTS[label]
-        for label in subdomain_labels
-        if label in SUBDOMAIN_CHECKLISTS
+        SUBDOMAIN_CHECKLISTS[label] for label in subdomain_labels if label in SUBDOMAIN_CHECKLISTS
     ]
     return "\n".join(parts) if parts else "（无匹配子领域，跳过子领域专项必审）"
 

@@ -21,10 +21,8 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
-import signal
 import time
 from pathlib import Path
-from typing import Any
 
 from doramagic_extraction_agent.core.tool_registry import ToolDef
 
@@ -46,7 +44,7 @@ def _guard(repo_root: Path, raw_path: str) -> Path | str:
     """
     try:
         candidate = (repo_root / raw_path).resolve()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return f"ERROR: invalid path {raw_path!r}: {exc}"
 
     if not candidate.is_relative_to(repo_root.resolve()):
@@ -235,11 +233,7 @@ def create_filesystem_tools(repo_path: Path) -> list[ToolDef]:
 
         header = f"# {resolved.relative_to(repo_root) if resolved != repo_root else '.'}/\n"
         body = "\n".join(lines)
-        suffix = (
-            f"\n\n[Truncated: showing first {_MAX_LIST_ENTRIES} entries]"
-            if truncated
-            else ""
-        )
+        suffix = f"\n\n[Truncated: showing first {_MAX_LIST_ENTRIES} entries]" if truncated else ""
         return header + body + suffix
 
     list_dir_tool = ToolDef(
@@ -266,9 +260,7 @@ def create_filesystem_tools(repo_path: Path) -> list[ToolDef]:
                 },
                 "max_depth": {
                     "type": "integer",
-                    "description": (
-                        "Maximum recursion depth when recursive=true. Default: 3."
-                    ),
+                    "description": ("Maximum recursion depth when recursive=true. Default: 3."),
                 },
             },
             "required": ["path"],
@@ -439,9 +431,7 @@ def create_filesystem_tools(repo_path: Path) -> list[ToolDef]:
                     else ""
                 )
                 parts.append(
-                    f"## Files matching '{file_pattern}'\n"
-                    + "\n".join(matched_files)
-                    + truncation
+                    f"## Files matching '{file_pattern}'\n" + "\n".join(matched_files) + truncation
                 )
             else:
                 parts.append(f"## Files matching '{file_pattern}'\nNo files found.")

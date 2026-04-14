@@ -6,6 +6,7 @@ the AST structural index with human-written context.
 
 Design reference: CoMRAT (MSR 2025) — commit message design rationale.
 """
+
 from __future__ import annotations
 
 import logging
@@ -74,8 +75,12 @@ def _safe_read(filepath: Path, repo_root: Path, max_chars: int) -> str | None:
 def _mine_readme(repo_root: Path) -> str:
     """Extract content from README files."""
     candidates = [
-        "README.md", "README.rst", "README.txt", "README",
-        "README-en.md", "readme.md",
+        "README.md",
+        "README.rst",
+        "README.txt",
+        "README",
+        "README-en.md",
+        "readme.md",
     ]
     for name in candidates:
         readme = repo_root / name
@@ -108,8 +113,7 @@ def _mine_docs(repo_root: Path) -> str:
             rel_parts = f.relative_to(docs_dir).parts
         except ValueError:
             continue
-        if any(p.startswith(".") or p in ("_build", "build")
-               for p in rel_parts):
+        if any(p.startswith(".") or p in ("_build", "build") for p in rel_parts):
             continue
         safe_files.append(f)
 
@@ -163,9 +167,15 @@ def _mine_docs(repo_root: Path) -> str:
 def _mine_changelog(repo_root: Path) -> str:
     """Extract evolution history from CHANGELOG."""
     candidates = [
-        "CHANGELOG.md", "CHANGELOG.rst", "CHANGELOG.txt",
-        "CHANGELOG", "CHANGES.md", "CHANGES.rst", "HISTORY.md",
-        "RELEASES.md", "NEWS.md",
+        "CHANGELOG.md",
+        "CHANGELOG.rst",
+        "CHANGELOG.txt",
+        "CHANGELOG",
+        "CHANGES.md",
+        "CHANGES.rst",
+        "HISTORY.md",
+        "RELEASES.md",
+        "NEWS.md",
     ]
     for name in candidates:
         changelog = repo_root / name
@@ -194,9 +204,7 @@ def _mine_dependencies(repo_root: Path) -> str:
                 for d in deps[:_DEPS_MAX_ENTRIES]:
                     sections.append(f"- {d}")
                 if len(deps) > _DEPS_MAX_ENTRIES:
-                    sections.append(
-                        f"- ... and {len(deps) - _DEPS_MAX_ENTRIES} more"
-                    )
+                    sections.append(f"- ... and {len(deps) - _DEPS_MAX_ENTRIES} more")
 
     # setup.py fallback
     if not sections:
@@ -205,12 +213,14 @@ def _mine_dependencies(repo_root: Path) -> str:
             content = _safe_read(setup_py, repo_root, _FILE_READ_LIMIT)
             if content:
                 match = re.search(
-                    r'install_requires\s*=\s*\[(.*?)\]',
-                    content, re.DOTALL,
+                    r"install_requires\s*=\s*\[(.*?)\]",
+                    content,
+                    re.DOTALL,
                 )
                 if match:
                     deps = re.findall(
-                        r'["\']([^"\']+)["\']', match.group(1),
+                        r'["\']([^"\']+)["\']',
+                        match.group(1),
                     )
                     if deps:
                         sections.append("## Dependencies (from setup.py)")
@@ -227,6 +237,7 @@ def _parse_toml_deps(content: str) -> list[str]:
     """
     try:
         import tomllib
+
         data = tomllib.loads(content)
         return list(data.get("project", {}).get("dependencies", []))
     except (ImportError, Exception):
@@ -236,7 +247,7 @@ def _parse_toml_deps(content: str) -> list[str]:
     deps: list[str] = []
     in_deps = False
     for line in content.splitlines():
-        if re.match(r'\s*dependencies\s*=\s*\[', line):
+        if re.match(r"\s*dependencies\s*=\s*\[", line):
             in_deps = True
             # Check if closing bracket is on the same line
             inline = re.findall(r'["\']([^"\']+)["\']', line)
@@ -259,9 +270,11 @@ def _mine_git_log(repo_root: Path) -> str:
     """Extract recent commit messages for design rationale context."""
     try:
         result = subprocess.run(
-            ["git", "log", f"--max-count={_GIT_LOG_MAX_ENTRIES}",
-             "--format=%h %s"],
-            cwd=repo_root, capture_output=True, text=True, timeout=10,
+            ["git", "log", f"--max-count={_GIT_LOG_MAX_ENTRIES}", "--format=%h %s"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if result.returncode != 0 or not result.stdout.strip():
             return ""

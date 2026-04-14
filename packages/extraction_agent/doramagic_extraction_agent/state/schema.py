@@ -1,14 +1,15 @@
 """Agent state schema — artifact-backed persistence."""
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 
 def _utcnow_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class AgentPhaseState(BaseModel):
@@ -37,9 +38,9 @@ class AgentState(BaseModel):
     blueprint_id: str
     domain: str = "finance"
     repo_path: str = ""
-    run_dir: str = ""           # path to _runs/{bp_id}/
-    output_dir: str = ""        # path to knowledge/sources/{domain}/{bp_id}/
-    blueprint_path: str = ""    # path to output/blueprint.yaml
+    run_dir: str = ""  # path to _runs/{bp_id}/
+    output_dir: str = ""  # path to knowledge/sources/{domain}/{bp_id}/
+    blueprint_path: str = ""  # path to output/blueprint.yaml
     commit_hash: str = ""
     subdomain_labels: list[str] = Field(default_factory=list)
     current_pipeline: str = "blueprint"  # "blueprint" | "constraint"

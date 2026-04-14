@@ -50,9 +50,25 @@ _FRESHNESS = Literal["stable", "semi_stable", "volatile"]
 _TARGET_SCOPE = Literal["global", "stage", "edge"]
 
 _VALID_CONSTRAINT_KINDS: frozenset[str] = frozenset(
-    ["domain_rule", "resource_boundary", "operational_lesson", "architecture_guardrail", "claim_boundary"]
+    [
+        "domain_rule",
+        "resource_boundary",
+        "operational_lesson",
+        "architecture_guardrail",
+        "claim_boundary",
+    ]
 )
-_VAGUE_WORDS = ["考虑", "注意", "建议", "适当", "尽量", "try to", "consider", "be careful", "appropriate"]
+_VAGUE_WORDS = [
+    "考虑",
+    "注意",
+    "建议",
+    "适当",
+    "尽量",
+    "try to",
+    "consider",
+    "be careful",
+    "appropriate",
+]
 
 
 class RawConstraint(BaseModel):
@@ -111,9 +127,7 @@ class RawConstraint(BaseModel):
     def action_no_vague_words(cls, v: str) -> str:
         found = [w for w in _VAGUE_WORDS if w in v]
         if found:
-            raise ValueError(
-                f"action 含模糊词 {found!r}，必须改为具体可执行的行为描述"
-            )
+            raise ValueError(f"action 含模糊词 {found!r}，必须改为具体可执行的行为描述")
         return v
 
     @field_validator("evidence_summary")
@@ -132,9 +146,7 @@ class RawConstraint(BaseModel):
     @model_validator(mode="after")
     def scope_stage_ids_check(self) -> RawConstraint:
         if self.target_scope == "stage" and not self.stage_ids:
-            raise ValueError(
-                "target_scope='stage' 时 stage_ids 不能为空，请填写对应的阶段 ID"
-            )
+            raise ValueError("target_scope='stage' 时 stage_ids 不能为空，请填写对应的阶段 ID")
         return self
 
 
@@ -167,8 +179,7 @@ class ConstraintExtractionResult(BaseModel):
         actual = len(self.constraints)
         if total_reported != actual:
             raise ValueError(
-                f"coverage_report 总计 {total_reported} ≠ constraints 数量 {actual}，"
-                "请对齐统计数字"
+                f"coverage_report 总计 {total_reported} ≠ constraints 数量 {actual}，请对齐统计数字"
             )
         return self
 
@@ -309,7 +320,9 @@ class ExternalService(BaseModel):
     """An external API, data source, or service used by the project."""
 
     name: str = Field(description="服务/工具名称")
-    type: str = Field(default="", description="data_api / broker_api / storage_backend / transformer")
+    type: str = Field(
+        default="", description="data_api / broker_api / storage_backend / transformer"
+    )
     usage: str = Field(min_length=5, description="用途说明")
     install: str = Field(default="", description="安装命令，如 pip install xxx")
     api_example: str = Field(default="", description="最小可运行代码示例")
@@ -361,8 +374,11 @@ class SynthesizedConstraint(BaseModel):
 
     original_index: int = Field(description="在 merged list 中的原始索引")
     constraint_kind: Literal[
-        "domain_rule", "resource_boundary", "operational_lesson",
-        "architecture_guardrail", "claim_boundary",
+        "domain_rule",
+        "resource_boundary",
+        "operational_lesson",
+        "architecture_guardrail",
+        "claim_boundary",
     ] = Field(description="审查后的 constraint_kind（可能已升级）")
     severity: Literal["fatal", "high", "medium", "low"] = Field(description="审查后的 severity")
     upgrade_reason: str = Field(default="", description="如果 kind 被修改，说明理由")
@@ -375,6 +391,5 @@ class ConstraintSynthesisResult(BaseModel):
         description="所有需要修改 kind/severity 的约束条目"
     )
     rebalance_actions: list[str] = Field(
-        default_factory=list,
-        description="执行的 rebalance 操作摘要"
+        default_factory=list, description="执行的 rebalance 操作摘要"
     )

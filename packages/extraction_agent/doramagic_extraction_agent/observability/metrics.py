@@ -1,10 +1,14 @@
 """Token and cost metrics for extraction runs."""
+
 from __future__ import annotations
+
 from dataclasses import dataclass, field
+
 
 @dataclass
 class PhaseMetrics:
     """Per-phase metrics."""
+
     phase_name: str
     input_tokens: int = 0
     output_tokens: int = 0
@@ -12,9 +16,11 @@ class PhaseMetrics:
     tool_calls: int = 0
     tool_calls_by_name: dict[str, int] = field(default_factory=dict)
 
+
 @dataclass
 class ExtractionMetrics:
     """Cumulative metrics for one extraction run."""
+
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     total_llm_calls: int = 0
@@ -57,5 +63,12 @@ class ExtractionMetrics:
             "llm_calls": self.total_llm_calls,
             "tool_calls": self.total_tool_calls,
             "retries": self.total_retries,
-            "by_phase": {k: {"tokens": v.input_tokens + v.output_tokens, "llm_calls": v.llm_calls, "tool_calls": v.tool_calls} for k, v in self.by_phase.items()},
+            "by_phase": {
+                k: {
+                    "tokens": v.input_tokens + v.output_tokens,
+                    "llm_calls": v.llm_calls,
+                    "tool_calls": v.tool_calls,
+                }
+                for k, v in self.by_phase.items()
+            },
         }

@@ -1,8 +1,11 @@
 """State transition tracking — records WHY each phase transition happened."""
+
 from __future__ import annotations
+
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import UTC, datetime
+
 
 @dataclass
 class Transition:
@@ -12,6 +15,7 @@ class Transition:
     timestamp: str
     elapsed_ms: int = 0
     tokens_used: int = 0
+
 
 class TransitionTracker:
     def __init__(self) -> None:
@@ -25,14 +29,16 @@ class TransitionTracker:
 
     def exit_phase(self, to_phase: str, reason: str, tokens: int = 0) -> None:
         elapsed = int((time.monotonic() - self._phase_start) * 1000) if self._phase_start else 0
-        self._transitions.append(Transition(
-            from_phase=self._current_phase,
-            to_phase=to_phase,
-            reason=reason,
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            elapsed_ms=elapsed,
-            tokens_used=tokens,
-        ))
+        self._transitions.append(
+            Transition(
+                from_phase=self._current_phase,
+                to_phase=to_phase,
+                reason=reason,
+                timestamp=datetime.now(UTC).isoformat(),
+                elapsed_ms=elapsed,
+                tokens_used=tokens,
+            )
+        )
         self._current_phase = to_phase
         self._phase_start = time.monotonic()
 
@@ -43,5 +49,7 @@ class TransitionTracker:
     def summary(self) -> str:
         lines = ["Phase Transitions:"]
         for t in self._transitions:
-            lines.append(f"  {t.from_phase} → {t.to_phase} [{t.reason}] {t.elapsed_ms}ms, {t.tokens_used} tokens")
+            lines.append(
+                f"  {t.from_phase} → {t.to_phase} [{t.reason}] {t.elapsed_ms}ms, {t.tokens_used} tokens"
+            )
         return "\n".join(lines)

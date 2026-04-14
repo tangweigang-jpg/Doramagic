@@ -10,6 +10,7 @@ Design references:
 - Claude Code Ch.04: supervision tree (restart/failover/skip strategies)
 - Multi-model strategy research: Phase-Model matching matrix
 """
+
 from __future__ import annotations
 
 import logging
@@ -73,8 +74,7 @@ class ModelRouter:
         specs = self.phase_models.get(phase_name, self.default_models)
         if not specs:
             raise ValueError(
-                f"No models configured for phase {phase_name!r} "
-                f"and no default models set"
+                f"No models configured for phase {phase_name!r} and no default models set"
             )
         return specs[0]
 

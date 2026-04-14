@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from doramagic_extraction_agent.core.message import ToolResult
@@ -89,9 +89,7 @@ class ToolRegistry:
         is visible during development.
         """
         if tool.name in self._tools:
-            logger.warning(
-                "ToolRegistry: replacing already-registered tool %r", tool.name
-            )
+            logger.warning("ToolRegistry: replacing already-registered tool %r", tool.name)
         self._tools[tool.name] = tool
 
     # ------------------------------------------------------------------
@@ -157,7 +155,7 @@ class ToolRegistry:
                 content=str(result),
                 is_error=False,
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("Tool %r raised an exception: %s", name, exc)
             return ToolResult(
                 tool_use_id="",
@@ -169,7 +167,7 @@ class ToolRegistry:
     # Subset / filtering
     # ------------------------------------------------------------------
 
-    def filter(self, names: list[str]) -> "ToolRegistry":
+    def filter(self, names: list[str]) -> ToolRegistry:
         """Return a new registry containing only the named tools.
 
         Tools whose names are not present in this registry are silently
@@ -188,9 +186,7 @@ class ToolRegistry:
         for name in names:
             tool = self._tools.get(name)
             if tool is None:
-                logger.warning(
-                    "ToolRegistry.filter: tool %r not found, skipping", name
-                )
+                logger.warning("ToolRegistry.filter: tool %r not found, skipping", name)
                 continue
             subset._tools[name] = tool
         return subset

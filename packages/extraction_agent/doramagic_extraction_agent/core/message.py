@@ -136,7 +136,7 @@ class AgentMessage:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_text(cls, role: str, text: str) -> "AgentMessage":
+    def from_text(cls, role: str, text: str) -> AgentMessage:
         """Build a single-text-block message.
 
         Convenience constructor for the common case where a message
@@ -145,7 +145,7 @@ class AgentMessage:
         return cls(role=role, blocks=[ContentBlock(type="text", text=text)])
 
     @classmethod
-    def from_llm_response(cls, response: "LLMResponse") -> "AgentMessage":
+    def from_llm_response(cls, response: LLMResponse) -> AgentMessage:
         """Build an assistant message from an ``LLMResponse``.
 
         Handles three kinds of content that ``LLMResponse`` may carry:
@@ -180,7 +180,7 @@ class AgentMessage:
         return cls(role="assistant", blocks=blocks)
 
     @classmethod
-    def from_raw_api_response(cls, resp: Any) -> "AgentMessage":
+    def from_raw_api_response(cls, resp: Any) -> AgentMessage:
         """Build an assistant message directly from a raw Anthropic API response.
 
         Preserves ALL content blocks returned by the API — including ``thinking``
@@ -236,7 +236,7 @@ class AgentMessage:
         return cls(role="assistant", blocks=blocks)
 
     @classmethod
-    def tool_results(cls, results: list[ToolResult]) -> "AgentMessage":
+    def tool_results(cls, results: list[ToolResult]) -> AgentMessage:
         """Build a user message containing tool_result blocks.
 
         This is the message sent back to the model after executing the

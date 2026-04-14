@@ -210,11 +210,11 @@ def _patch_resource_boundary(
     Matches against manifest.replaceable_points_by_stage (dict[stage_id, list[rp]]).
     Returns the number of constraints updated.
     """
-    rp_by_stage: dict[str, list[dict[str, Any]]] = manifest.get(
-        "replaceable_points_by_stage", {}
-    )
+    rp_by_stage: dict[str, list[dict[str, Any]]] = manifest.get("replaceable_points_by_stage", {})
     if not rp_by_stage:
-        logger.debug("Patch 2 (resource_boundary): manifest has no replaceable_points_by_stage — skipped")
+        logger.debug(
+            "Patch 2 (resource_boundary): manifest has no replaceable_points_by_stage — skipped"
+        )
         return 0
 
     # Build a quick lookup: rp_name (lower) → list[stage_id]
@@ -458,9 +458,18 @@ def _patch_vague_words(constraints: list[dict[str, Any]]) -> int:
 
 # Regulatory keywords that justify official_doc source_type
 _REGULATORY_KEYWORDS = [
-    "证监会", "csrc", "交易所规则", "上交所", "深交所",
-    "保证金", "印花税", "交割制度", "融资融券",
-    "regulation", "rule no.", "circular",
+    "证监会",
+    "csrc",
+    "交易所规则",
+    "上交所",
+    "深交所",
+    "保证金",
+    "印花税",
+    "交割制度",
+    "融资融券",
+    "regulation",
+    "rule no.",
+    "circular",
 ]
 
 
@@ -508,8 +517,9 @@ def _patch_source_type_correction(
             refs_text = ""
             for ref in raw.get("evidence_refs", []):
                 if isinstance(ref, dict):
-                    refs_text += (ref.get("summary", "") + " " +
-                                  ref.get("locator", "") + " ").lower()
+                    refs_text += (
+                        ref.get("summary", "") + " " + ref.get("locator", "") + " "
+                    ).lower()
             combined = f"{evidence} {refs_text}"
 
             # Force-downgrade INTERACTION BDs regardless of keywords
@@ -528,7 +538,8 @@ def _patch_source_type_correction(
 
         # Direction 2: upgrade RC-derived constraints to official_doc
         elif bd_id in rc_bd_ids and source_type in (
-            "code_analysis", "expert_reasoning",
+            "code_analysis",
+            "expert_reasoning",
         ):
             raw["source_type"] = "official_doc"
             count += 1
@@ -558,8 +569,9 @@ def _patch_stage_id_override(
     Returns the number of constraints whose stage_ids were corrected.
     """
     # Build legal stage set from blueprint
-    legal_stages = {s["id"] for s in blueprint.get("stages", [])
-                    if isinstance(s, dict) and "id" in s}
+    legal_stages = {
+        s["id"] for s in blueprint.get("stages", []) if isinstance(s, dict) and "id" in s
+    }
 
     if not legal_stages:
         return 0
@@ -631,9 +643,9 @@ def _patch_stage_id_override(
                 changed = True
             else:
                 logger.warning(
-                    "Patch 10: unmapped stage_id '%s' in %s — "
-                    "dropping (constraint becomes global)",
-                    sid, raw.get("id", "?"),
+                    "Patch 10: unmapped stage_id '%s' in %s — dropping (constraint becomes global)",
+                    sid,
+                    raw.get("id", "?"),
                 )
                 changed = True
 

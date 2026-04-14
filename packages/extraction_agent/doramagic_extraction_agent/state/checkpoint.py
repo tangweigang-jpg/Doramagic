@@ -1,4 +1,5 @@
 """Checkpoint persistence — save/load agent state + conversation archives."""
+
 from __future__ import annotations
 
 import json

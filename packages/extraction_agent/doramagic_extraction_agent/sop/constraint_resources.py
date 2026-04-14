@@ -6,6 +6,7 @@ Implements the resource extraction phase for SOP v2.2:
   Step C: Instructor structured call → ResourceExtractionResult
            with RawFallback graceful degradation to scan-only result
 """
+
 from __future__ import annotations
 
 import json
@@ -60,9 +61,9 @@ CON_RESOURCE_V2_SYSTEM = """\
 # ---------------------------------------------------------------------------
 
 _DEP_LINE_RE = re.compile(
-    r"^(?P<pkg>[A-Za-z0-9_.\-]+)"      # package name (with extras stripped below)
-    r"(?:\[[^\]]*\])?"                   # optional [extra]
-    r"\s*(?P<ver>[><=!~^][^\s;#]*)?"    # optional version specifier
+    r"^(?P<pkg>[A-Za-z0-9_.\-]+)"  # package name (with extras stripped below)
+    r"(?:\[[^\]]*\])?"  # optional [extra]
+    r"\s*(?P<ver>[><=!~^][^\s;#]*)?"  # optional version specifier
 )
 
 
@@ -82,7 +83,8 @@ def _parse_requirements_txt(path: Path) -> list[dict[str, str]]:
             else:
                 logger.debug(
                     "requirements.txt includes -r %s but file not found at %s",
-                    ref_file, ref_path,
+                    ref_file,
+                    ref_path,
                 )
             continue
         if line.startswith("-"):
@@ -92,10 +94,12 @@ def _parse_requirements_txt(path: Path) -> list[dict[str, str]]:
         line = line.split("#")[0].strip()
         m = _DEP_LINE_RE.match(line)
         if m:
-            deps.append({
-                "package": m.group("pkg"),
-                "version": (m.group("ver") or "").strip(),
-            })
+            deps.append(
+                {
+                    "package": m.group("pkg"),
+                    "version": (m.group("ver") or "").strip(),
+                }
+            )
     return deps
 
 
@@ -106,10 +110,12 @@ def _parse_pyproject_toml(path: Path) -> list[dict[str, str]]:
     # Try stdlib tomllib first (Python 3.11+), fall back to regex
     try:
         import tomllib  # type: ignore[import]
+
         data: dict[str, Any] = tomllib.loads(text)
     except ImportError:
         try:
             import tomli as tomllib  # type: ignore[import]
+
             data = tomllib.loads(text)
         except ImportError:
             data = {}
@@ -118,21 +124,19 @@ def _parse_pyproject_toml(path: Path) -> list[dict[str, str]]:
 
     if data:
         # PEP 517 / PEP 621
-        pep621_deps: list[str] = (
-            data.get("project", {}).get("dependencies", [])
-        )
+        pep621_deps: list[str] = data.get("project", {}).get("dependencies", [])
         for dep_str in pep621_deps:
             m = _DEP_LINE_RE.match(dep_str.strip())
             if m:
-                deps.append({
-                    "package": m.group("pkg"),
-                    "version": (m.group("ver") or "").strip(),
-                })
+                deps.append(
+                    {
+                        "package": m.group("pkg"),
+                        "version": (m.group("ver") or "").strip(),
+                    }
+                )
 
         # Poetry
-        poetry_deps: dict[str, Any] = (
-            data.get("tool", {}).get("poetry", {}).get("dependencies", {})
-        )
+        poetry_deps: dict[str, Any] = data.get("tool", {}).get("poetry", {}).get("dependencies", {})
         for pkg, ver_val in poetry_deps.items():
             if pkg.lower() == "python":
                 continue
@@ -147,18 +151,21 @@ def _parse_pyproject_toml(path: Path) -> list[dict[str, str]]:
     if not deps:
         # Regex fallback: look for [project] dependencies = [...] or [tool.poetry.dependencies]
         pep_block = re.search(
-            r'\[project\].*?dependencies\s*=\s*\[(.*?)\]',
-            text, re.DOTALL,
+            r"\[project\].*?dependencies\s*=\s*\[(.*?)\]",
+            text,
+            re.DOTALL,
         )
         if pep_block:
             for item in re.findall(r'"([^"]+)"|\'([^\']+)\'', pep_block.group(1)):
                 raw = (item[0] or item[1]).strip()
                 m = _DEP_LINE_RE.match(raw)
                 if m:
-                    deps.append({
-                        "package": m.group("pkg"),
-                        "version": (m.group("ver") or "").strip(),
-                    })
+                    deps.append(
+                        {
+                            "package": m.group("pkg"),
+                            "version": (m.group("ver") or "").strip(),
+                        }
+                    )
 
     return deps
 
@@ -167,8 +174,9 @@ def _parse_setup_py(path: Path) -> list[dict[str, str]]:
     """Extract install_requires entries from setup.py via regex (no exec)."""
     text = path.read_text(encoding="utf-8", errors="replace")
     block = re.search(
-        r'install_requires\s*=\s*\[(.*?)\]',
-        text, re.DOTALL,
+        r"install_requires\s*=\s*\[(.*?)\]",
+        text,
+        re.DOTALL,
     )
     if not block:
         return []
@@ -177,16 +185,19 @@ def _parse_setup_py(path: Path) -> list[dict[str, str]]:
         raw = (item[0] or item[1]).strip()
         m = _DEP_LINE_RE.match(raw)
         if m:
-            deps.append({
-                "package": m.group("pkg"),
-                "version": (m.group("ver") or "").strip(),
-            })
+            deps.append(
+                {
+                    "package": m.group("pkg"),
+                    "version": (m.group("ver") or "").strip(),
+                }
+            )
     return deps
 
 
 def _parse_setup_cfg(path: Path) -> list[dict[str, str]]:
     """Extract install_requires from [options] section in setup.cfg."""
     import configparser
+
     cfg = configparser.ConfigParser()
     cfg.read_string(path.read_text(encoding="utf-8", errors="replace"))
     raw = cfg.get("options", "install_requires", fallback="")
@@ -197,10 +208,12 @@ def _parse_setup_cfg(path: Path) -> list[dict[str, str]]:
             continue
         m = _DEP_LINE_RE.match(line)
         if m:
-            deps.append({
-                "package": m.group("pkg"),
-                "version": (m.group("ver") or "").strip(),
-            })
+            deps.append(
+                {
+                    "package": m.group("pkg"),
+                    "version": (m.group("ver") or "").strip(),
+                }
+            )
     return deps
 
 
@@ -214,9 +227,9 @@ def scan_repo_dependencies(repo_path: Path) -> dict[str, Any]:
     """
     candidates: list[tuple[str, Path]] = [
         ("requirements.txt", repo_path / "requirements.txt"),
-        ("pyproject.toml",   repo_path / "pyproject.toml"),
-        ("setup.py",         repo_path / "setup.py"),
-        ("setup.cfg",        repo_path / "setup.cfg"),
+        ("pyproject.toml", repo_path / "pyproject.toml"),
+        ("setup.py", repo_path / "setup.py"),
+        ("setup.cfg", repo_path / "setup.cfg"),
     ]
 
     all_deps: list[dict[str, str]] = []
@@ -237,16 +250,18 @@ def scan_repo_dependencies(repo_path: Path) -> dict[str, Any]:
 
             logger.info(
                 "scan_repo_dependencies: parsed %s (%d packages)",
-                source_name, len(deps),
+                source_name,
+                len(deps),
             )
             if deps:
                 all_deps.extend(deps)
                 source_files.append(source_name)
 
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(
                 "scan_repo_dependencies: failed to parse %s — %s",
-                candidate_path, exc,
+                candidate_path,
+                exc,
             )
             continue
 
@@ -263,7 +278,8 @@ def scan_repo_dependencies(repo_path: Path) -> dict[str, Any]:
         source_label = ", ".join(source_files)
         logger.info(
             "scan_repo_dependencies: total %d unique packages from [%s]",
-            len(unique_deps), source_label,
+            len(unique_deps),
+            source_label,
         )
         return {"dependencies": unique_deps, "source_file": source_label}
 
@@ -350,12 +366,9 @@ def build_resource_context(
     source_file: str | None = scanned_deps.get("source_file")
     if dep_list:
         dep_lines = "\n".join(
-            f"  - {d['package']}{' ' + d['version'] if d.get('version') else ''}"
-            for d in dep_list
+            f"  - {d['package']}{' ' + d['version'] if d.get('version') else ''}" for d in dep_list
         )
-        parts.append(
-            f"## Scanned Dependencies (from {source_file})\n\n{dep_lines}"
-        )
+        parts.append(f"## Scanned Dependencies (from {source_file})\n\n{dep_lines}")
     else:
         parts.append("## Scanned Dependencies\n\n(none found)")
 
@@ -371,8 +384,7 @@ def build_resource_context(
     projects = source.get("projects", [])
     if projects:
         proj_text = "\n".join(
-            f"  - {p}" if isinstance(p, str) else f"  - {p.get('name', p)}"
-            for p in projects
+            f"  - {p}" if isinstance(p, str) else f"  - {p.get('name', p)}" for p in projects
         )
         parts.append(f"## Source Projects (repos)\n\n{proj_text}")
 
@@ -438,7 +450,7 @@ def _build_fallback_result(scanned_deps: dict[str, Any]) -> dict[str, Any]:
 
 
 async def extract_resources(
-    agent: "ExtractionAgent",
+    agent: ExtractionAgent,
     blueprint: dict[str, Any],
     manifest: dict[str, Any],
     repo_path: Path,
@@ -472,7 +484,7 @@ async def extract_resources(
     user_msg = build_resource_context(blueprint, manifest, scanned_deps)
 
     # -- Step C: Instructor call --
-    from .constraint_schemas_v2 import ResourceExtractionResult, RawFallback  # noqa: PLC0415
+    from .constraint_schemas_v2 import RawFallback, ResourceExtractionResult
 
     result_dict: dict[str, Any]
     total_tokens: int = 0
@@ -489,12 +501,14 @@ async def extract_resources(
         if isinstance(result, RawFallback):
             logger.warning(
                 "%s: Instructor L3 fallback (stage=%s) — using scan-only result",
-                phase_name, result.stage,
+                phase_name,
+                result.stage,
             )
             # Save raw text for debugging
             artifacts_dir.mkdir(parents=True, exist_ok=True)
             (artifacts_dir / "resources_raw_fallback.txt").write_text(
-                result.text, encoding="utf-8",
+                result.text,
+                encoding="utf-8",
             )
             result_dict = _build_fallback_result(scanned_deps)
         else:
@@ -509,10 +523,11 @@ async def extract_resources(
                 len(result.optional),
             )
 
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning(
             "%s: Instructor call raised %s — falling back to scan-only",
-            phase_name, exc,
+            phase_name,
+            exc,
         )
         result_dict = _build_fallback_result(scanned_deps)
 

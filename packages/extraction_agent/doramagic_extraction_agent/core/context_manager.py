@@ -1,8 +1,8 @@
 """Context window management — track usage, trigger summarization."""
+
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -18,9 +18,7 @@ def _count_chars(obj: Any) -> int:
     if isinstance(obj, str):
         return len(obj)
     if isinstance(obj, dict):
-        return sum(_count_chars(v) for v in obj.values()) + sum(
-            _count_chars(k) for k in obj.keys()
-        )
+        return sum(_count_chars(v) for v in obj.values()) + sum(_count_chars(k) for k in obj.keys())
     if isinstance(obj, (list, tuple)):
         return sum(_count_chars(item) for item in obj)
     return 0
@@ -268,6 +266,7 @@ class ContextManager:
 # ------------------------------------------------------------------ #
 # Private helpers                                                     #
 # ------------------------------------------------------------------ #
+
 
 def _dedup(items: list[str]) -> list[str]:
     """Remove duplicates while preserving insertion order."""
