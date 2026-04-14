@@ -577,12 +577,21 @@ class SOPExecutor:
                 for artifact_name in phase.required_artifacts:
                     artifact_path = artifacts_dir / artifact_name
                     if not artifact_path.is_file() or artifact_path.stat().st_size == 0:
-                        placeholder = (
-                            f"# {phase.name} — placeholder (max_iterations reached)\n"
-                            f"# Worker exhausted {phase_result.iterations} iterations "
-                            f"without writing this artifact.\n"
-                            f"# Downstream patches (P15/P16/P17) will compensate.\n"
-                        )
+                        # Generate format-appropriate placeholder
+                        if artifact_name.endswith(".yaml"):
+                            placeholder = (
+                                f"# {phase.name} — placeholder\n"
+                                f"id: placeholder\nname: placeholder\nstages: []\n"
+                            )
+                        elif artifact_name.endswith(".json"):
+                            placeholder = "{}\n"
+                        elif artifact_name.endswith(".jsonl"):
+                            placeholder = ""
+                        else:
+                            placeholder = (
+                                f"# {phase.name} — placeholder\n"
+                                f"# Worker exhausted iterations without writing.\n"
+                            )
                         artifact_path.write_text(placeholder, encoding="utf-8")
                         logger.warning(
                             "Phase %r: generated placeholder for %r "
