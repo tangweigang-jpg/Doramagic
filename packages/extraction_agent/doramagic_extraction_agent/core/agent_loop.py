@@ -398,8 +398,43 @@ class ExtractionAgent:
             effective_max,
         )
 
+        _checkpoint_interval = 10  # inject write reminder every N iterations
+
         while True:
             cb.increment_iterations()
+            iters = cb.stats["total_iterations"]
+
+            # --- Checkpoint injection: remind Worker to write artifact ---
+            if (
+                iters > 0
+                and iters % _checkpoint_interval == 0
+                and allowed_tools
+                and "write_artifact" in allowed_tools
+            ):
+                # Check if any required artifact exists
+                checkpoint_dir = None
+                if self._checkpoint_mgr:
+                    checkpoint_dir = getattr(self._checkpoint_mgr, "artifacts_dir", None)
+                if checkpoint_dir:
+                    from pathlib import Path as _P
+
+                    has_artifact = any(
+                        (_P(checkpoint_dir) / f).exists()
+                        for f in (_P(checkpoint_dir).iterdir())
+                        if f.suffix in (".md", ".json")
+                    ) if _P(checkpoint_dir).exists() else False
+                    if not has_artifact:
+                        remaining = effective_max - iters
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"CHECKPOINT: {iters} iterations used, {remaining} remaining. "
+                                f"You have NOT written your artifact yet. "
+                                f"Call write_artifact NOW with your findings so far. "
+                                f"If you run out of iterations, ALL work is lost."
+                            ),
+                        })
+
             should_stop, reason = cb.should_break()
             if should_stop and "max iterations" in reason:
                 logger.warning("Phase %r hit iteration cap: %s", phase_name, reason)
@@ -503,12 +538,22 @@ class ExtractionAgent:
                 )
 
             # --- Execute tools ---
+            _MAX_TOOL_RESULT_CHARS = 30_000  # prevent context overflow
             tool_results: list[ToolResult] = []
             for tc in response.tool_calls:
                 result = await registry.execute(tc["name"], tc["arguments"])
+                content = result.content
+                # Truncate oversized tool results to prevent context overflow
+                if len(content) > _MAX_TOOL_RESULT_CHARS:
+                    truncated_len = len(content) - _MAX_TOOL_RESULT_CHARS
+                    content = (
+                        content[:_MAX_TOOL_RESULT_CHARS]
+                        + f"\n\n... (truncated {truncated_len} chars — "
+                        f"use more specific queries to reduce output size)"
+                    )
                 result = ToolResult(
                     tool_use_id=tc["id"],
-                    content=result.content,
+                    content=content,
                     is_error=result.is_error,
                 )
                 tool_results.append(result)

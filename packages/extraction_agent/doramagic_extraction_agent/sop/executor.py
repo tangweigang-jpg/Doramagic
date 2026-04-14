@@ -552,7 +552,7 @@ class SOPExecutor:
             # required artifact was already written, treat as completed.
             # This happens when the model writes the artifact then tries
             # to do one more exploration round before being cut off.
-            if phase_result.status == "max_iterations" and phase.required_artifacts:
+            if phase_result.status in ("max_iterations", "error") and phase.required_artifacts:
                 artifacts_dir = self._checkpoint.artifacts_dir
                 all_present = all(
                     (artifacts_dir / a).is_file() and (artifacts_dir / a).stat().st_size > 0
