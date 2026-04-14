@@ -160,6 +160,35 @@ class BDExtractionResult(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
+    def coerce_type_summary_values(cls, data: Any) -> Any:
+        """Coerce type_summary values to int.
+
+        MiniMax Step 3 produces string descriptions as values
+        (e.g. {"amplification": "BD-103 double target..."}) instead of
+        integer counts. Coerce to int before Pydantic rejects them.
+        """
+        if not isinstance(data, dict):
+            return data
+        ts = data.get("type_summary")
+        if not isinstance(ts, dict):
+            return data
+        coerced = {}
+        for k, v in ts.items():
+            if isinstance(v, int):
+                coerced[k] = v
+            elif isinstance(v, str):
+                m = re.search(r"\d+", v)
+                coerced[k] = int(m.group()) if m else 1
+            else:
+                try:
+                    coerced[k] = int(v)
+                except (TypeError, ValueError):
+                    coerced[k] = 1
+        data["type_summary"] = coerced
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
     def coerce_missing_gaps_from_ids(cls, data: Any) -> Any:
         """Convert missing_gaps string IDs to BusinessDecision references.
 
@@ -514,6 +543,35 @@ class BlueprintStage(BaseModel):
     )
     acceptance_hints: list[str] = Field(default_factory=list)
 
+    @field_validator("design_decisions", mode="before")
+    @classmethod
+    def coerce_design_decisions(cls, v: Any) -> list[str]:
+        """Coerce design_decisions: MiniMax produces dicts instead of strings.
+
+        Input artifact has design_decisions as
+        [{"decision": "...", "evidence": "...", "rationale": "..."}].
+        MiniMax mirrors that structure. Flatten to strings.
+        """
+        if not isinstance(v, list):
+            return v
+        coerced = []
+        for item in v:
+            if isinstance(item, str):
+                coerced.append(item)
+            elif isinstance(item, dict):
+                decision = item.get("decision", item.get("content", ""))
+                evidence = item.get("evidence", "")
+                rationale = item.get("rationale", "")
+                parts = [decision]
+                if evidence:
+                    parts.append(f"(evidence: {evidence})")
+                if rationale:
+                    parts.append(f"— {rationale}")
+                coerced.append(" ".join(parts) or str(item))
+            else:
+                coerced.append(str(item))
+        return coerced
+
     @field_validator("id")
     @classmethod
     def id_must_be_snake_case(cls, v: str) -> str:
@@ -549,6 +607,33 @@ class BlueprintAssembleResult(BaseModel):
         min_length=1,
         description="Cross-cutting contracts with 'contract' and 'evidence' keys",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_global_contracts(cls, data: Any) -> Any:
+        """Coerce global_contracts: MiniMax produces list[str] instead of list[dict]."""
+        if not isinstance(data, dict):
+            return data
+        gc = data.get("global_contracts")
+        if not isinstance(gc, list):
+            return data
+        coerced = []
+        for item in gc:
+            if isinstance(item, dict):
+                coerced.append(item)
+            elif isinstance(item, str):
+                m = re.search(r"\(evidence:\s*([^)]+)\)", item)
+                if m:
+                    evidence = m.group(1).strip()
+                    contract = item[: m.start()].strip()
+                else:
+                    contract = item
+                    evidence = ""
+                coerced.append({"contract": contract, "evidence": evidence})
+            else:
+                coerced.append({"contract": str(item), "evidence": ""})
+        data["global_contracts"] = coerced
+        return data
 
     @model_validator(mode="after")
     def check_stage_orders_unique(self) -> BlueprintAssembleResult:
