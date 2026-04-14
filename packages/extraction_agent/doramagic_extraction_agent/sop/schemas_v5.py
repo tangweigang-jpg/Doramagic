@@ -292,6 +292,24 @@ class GapBusinessDecision(BaseModel):
             data["status"] = "present"
         if "stage" not in data:
             data["stage"] = "unknown"
+        # --- severity coercion (MiniMax writes 'low', 'info', etc.) ---
+        sev = data.get("severity")
+        if sev is not None:
+            if not isinstance(sev, str):
+                data["severity"] = "medium"
+            else:
+                sev = sev.strip().lower()
+                if sev in ("critical", "high", "medium"):
+                    data["severity"] = sev
+                else:
+                    data["severity"] = "medium"
+        # --- known_gap coercion (MiniMax writes strings instead of bool) ---
+        kg = data.get("known_gap")
+        if kg is not None and not isinstance(kg, bool):
+            if isinstance(kg, str):
+                data["known_gap"] = kg.lower() not in ("false", "no", "0", "")
+            else:
+                data["known_gap"] = bool(kg)
         # --- coerce_field_names compat (same as BusinessDecision) ---
         if "content" not in data and "decision" in data:
             data["content"] = data.pop("decision")
