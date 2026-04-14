@@ -177,8 +177,10 @@ class BDExtractionResult(BaseModel):
             if isinstance(v, int):
                 coerced[k] = v
             elif isinstance(v, str):
-                m = re.search(r"\d+", v)
-                coerced[k] = int(m.group()) if m else 1
+                # Don't extract digits from strings like "BD-103 double target..."
+                # — that would produce 103 instead of a count.
+                # Use fallback=1 (we know at least 1 BD of this type exists).
+                coerced[k] = 1
             else:
                 try:
                     coerced[k] = int(v)

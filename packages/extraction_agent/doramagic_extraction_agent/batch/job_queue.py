@@ -105,7 +105,7 @@ def load_batch_config(path: Path) -> BatchConfig:
                 domain=repo_dict.get("domain", data.get("domain", "finance")),
                 priority=int(repo_dict.get("priority", 1)),
                 skip_blueprint=bool(repo_dict.get("skip_blueprint", False)),
-                skip_constraint=bool(repo_dict.get("skip_constraint", False)),
+                skip_constraint=bool(repo_dict.get("skip_constraint", True)),
             )
         )
 

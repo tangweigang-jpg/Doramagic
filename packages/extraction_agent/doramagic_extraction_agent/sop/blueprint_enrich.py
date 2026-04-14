@@ -1214,11 +1214,17 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
 
     # v7: use "resources" (schema-compliant) instead of "global_resources"
     resources = bp.get("resources", bp.get("global_resources", []))
+    res_counter = len(resources)
     for slot_name, slot_data in resource_slots.items():
         if slot_name.lower() not in all_existing_names:
+            res_counter += 1
             new_rp = {
+                "id": f"res-slot-{res_counter:03d}",
+                "type": "replaceable_component",
                 "name": slot_name,
+                "path": None,
                 "description": slot_data.get("selection_criteria", ""),
+                "used_in_stages": [],
                 "options": [
                     {
                         "name": opt.get("name", ""),

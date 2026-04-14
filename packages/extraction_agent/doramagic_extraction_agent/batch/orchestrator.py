@@ -369,6 +369,13 @@ class BatchOrchestrator:
             state.extra["source_context"] = source_context
             logger.info("Source context: %d chars", len(source_context))
 
+            # v7: detect knowledge source types (code/document/config)
+            from ..tools.knowledge_source_detector import detect_knowledge_sources
+
+            ks_result = detect_knowledge_sources(repo_path)
+            state.extra["knowledge_sources"] = ks_result.get("knowledge_sources", [])
+            logger.info("Knowledge sources: %s", state.extra["knowledge_sources"])
+
         # 6. Create agent + model router
         context_mgr = ContextManager()
         agent = ExtractionAgent(

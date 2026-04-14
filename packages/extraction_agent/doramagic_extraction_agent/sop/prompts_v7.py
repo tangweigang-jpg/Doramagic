@@ -70,7 +70,7 @@ architecture from documents rather than REVERSE-ENGINEERING it from code.
     {
       "id": "BD-001",
       "content": "Decision content",
-      "type": "process_design | quality_gate | escalation_threshold",
+      "type": "B | B/BA | M | M/BA | DK | RC | T",
       "rationale": "WHY this decision + WHEN to reconsider (min 40 chars)",
       "evidence": "file:§section",
       "stage": "stage_id",
