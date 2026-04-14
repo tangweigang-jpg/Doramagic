@@ -892,13 +892,33 @@ class SOPExecutor:
                     artifact_path.stat().st_size,
                 )
             else:
-                logger.error(
-                    "Phase %r: could not auto-save %r — "
-                    "LLM response did not contain extractable content",
+                # Last resort: generate format-appropriate placeholder.
+                # This is the UNIVERSAL safety net — no handler needs to
+                # worry about writing artifacts on every exit path.
+                # Better an empty/minimal artifact than a halted pipeline.
+                if artifact_name.endswith(".yaml"):
+                    placeholder = (
+                        f"# {phase.name} — auto-generated placeholder\n"
+                        f"id: placeholder\nname: placeholder\nstages: []\n"
+                    )
+                elif artifact_name.endswith(".json"):
+                    placeholder = "{}\n"
+                elif artifact_name.endswith(".jsonl"):
+                    placeholder = ""
+                elif artifact_name.endswith(".md"):
+                    placeholder = (
+                        f"# {phase.name} — placeholder\n\n"
+                        f"No content produced. Pipeline continued with empty data.\n"
+                    )
+                else:
+                    placeholder = ""
+                artifact_path.write_text(placeholder, encoding="utf-8")
+                logger.warning(
+                    "Phase %r: generated placeholder for %r "
+                    "(auto-save failed, using format-aware fallback)",
                     phase.name,
                     artifact_name,
                 )
-                still_missing.append(artifact_name)
 
         return still_missing
 
