@@ -2617,14 +2617,29 @@ def build_blueprint_phases_v5(
                     base_classes.append({"file": fpath, "class": cls_name})
 
         # 3. All example files (100% enumeration — scan repo directly)
-        # structural_index "examples" field may only have notebooks/md,
-        # so we scan the actual repo for Python example files
+        # v6.3: expanded patterns to match SOP P0-P2 priority sources:
+        #   P0: examples/**/*.py, notebooks/**/*.py, tutorials/**/*.py
+        #   P1: **/*.ipynb (Jupyter notebooks anywhere)
+        #   P2: docs/**/*.py, docs/**/*.ipynb
         actual_repo = Path(state.repo_path)
         examples: list[str] = []
-        for pattern in ["examples/**/*.py", "notebooks/**/*.py", "tutorials/**/*.py"]:
+        _uc_patterns = [
+            # P0: runnable scripts
+            "examples/**/*.py", "notebooks/**/*.py", "tutorials/**/*.py",
+            # P1: Jupyter notebooks (any location)
+            "**/*.ipynb",
+            # P2: docs tutorials/howto
+            "docs/**/*.py", "docs/**/*.ipynb",
+        ]
+        for pattern in _uc_patterns:
             for p in actual_repo.glob(pattern):
-                if "__pycache__" not in str(p) and "__init__" not in p.name:
-                    examples.append(str(p.relative_to(actual_repo)))
+                rel = str(p.relative_to(actual_repo))
+                if (
+                    "__pycache__" not in rel
+                    and "__init__" not in p.name
+                    and ".ipynb_checkpoints" not in rel
+                ):
+                    examples.append(rel)
         examples = sorted(set(examples))
 
         entry_points = sorted(index.get("entry_points", []))
@@ -2692,13 +2707,17 @@ def build_blueprint_phases_v5(
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             examples = manifest.get("examples", [])
         else:
-            # Fallback: scan repo directly (same patterns as manifest)
+            # Fallback: scan repo directly (same patterns as manifest, v6.3)
             examples = []
-            for pattern in ["examples/**/*.py", "notebooks/**/*.py", "tutorials/**/*.py"]:
+            for pattern in [
+                "examples/**/*.py", "notebooks/**/*.py", "tutorials/**/*.py",
+                "**/*.ipynb", "docs/**/*.py", "docs/**/*.ipynb",
+            ]:
                 examples.extend(
                     str(p.relative_to(repo_path))
                     for p in repo_path.glob(pattern)
                     if "__pycache__" not in str(p)
+                    and ".ipynb_checkpoints" not in str(p)
                 )
 
         if not examples:
@@ -2711,6 +2730,7 @@ def build_blueprint_phases_v5(
             )
 
         # Read head of each example file (cap at 100 for context limits)
+        # v6.3: support .ipynb files — extract code cell source
         if len(examples) > 100:
             logger.warning("bp_uc_extract: %d examples, capping at 100", len(examples))
         file_summaries: list[dict] = []
@@ -2719,11 +2739,32 @@ def build_blueprint_phases_v5(
             if not full_path.exists():
                 continue
             try:
-                lines = full_path.read_text(encoding="utf-8", errors="ignore").split("\n")
+                if ex_path.endswith(".ipynb"):
+                    # v6.3: parse Jupyter notebook JSON, extract code cells
+                    nb = json.loads(
+                        full_path.read_text(encoding="utf-8", errors="ignore")
+                    )
+                    code_lines: list[str] = []
+                    for cell in nb.get("cells", []):
+                        if cell.get("cell_type") == "code":
+                            src = cell.get("source", [])
+                            if isinstance(src, list):
+                                code_lines.extend(src)
+                            elif isinstance(src, str):
+                                code_lines.extend(src.split("\n"))
+                    lines = [l.rstrip("\n") for l in code_lines]
+                else:
+                    lines = full_path.read_text(
+                        encoding="utf-8", errors="ignore"
+                    ).split("\n")
                 head = "\n".join(lines[:40])
-                # Extract entry point hints
-                has_main = any("if __name__" in l or "def main" in l for l in lines)
-                imports = [l for l in lines[:20] if l.strip().startswith(("import ", "from "))]
+                has_main = any(
+                    "if __name__" in ln or "def main" in ln for ln in lines
+                )
+                imports = [
+                    ln for ln in lines[:20]
+                    if ln.strip().startswith(("import ", "from "))
+                ]
                 file_summaries.append(
                     {
                         "file": ex_path,

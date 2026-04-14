@@ -892,6 +892,9 @@ def _patch_evidence_verify(bp: dict[str, Any], repo_path: str) -> int:
     invalid = 0
     auto_fixed = 0
     _ev_pattern = re.compile(r"^(.+?):(\d+)\((.+?)\)$")
+    # v6.3: valid Python identifier pre-check — reject constants, formulas,
+    # natural language before attempting AST lookup
+    _ident_pattern = re.compile(r"^[\w.]+$")
 
     for bd in bp.get("business_decisions", []):
         ev = bd.get("evidence", "")
@@ -925,6 +928,16 @@ def _patch_evidence_verify(bp: dict[str, Any], repo_path: str) -> int:
 
         # Check 3: function name (Python files only)
         if fn_name and fn_name != "see_rationale" and file_path.endswith(".py"):
+            # v6.3: pre-check — reject non-identifier fn names before AST
+            # lookup.  Constants (max_n_bins=10), formulas (np.log(...)),
+            # and natural language ("Event Rate rounding") waste AST parse.
+            if not _ident_pattern.match(fn_name):
+                bd.setdefault("_evidence_issues", []).append(
+                    f"INVALID_IDENTIFIER: {fn_name} in {file_path}"
+                )
+                invalid += 1
+                continue
+
             try:
                 source = full_path.read_text(encoding="utf-8", errors="replace")
                 tree = _ast.parse(source, filename=file_path)
@@ -932,12 +945,15 @@ def _patch_evidence_verify(bp: dict[str, Any], repo_path: str) -> int:
                 verified += 1
                 continue
 
-            # Find all function/method definitions (bare name + Class.method)
+            # Find all function/method/class definitions
             fn_defs: dict[str, int] = {}
             for node in _ast.walk(tree):
                 if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
                     fn_defs[node.name] = node.lineno
                 if isinstance(node, _ast.ClassDef):
+                    # v6.3: also register class name itself (LLM often
+                    # cites the class embodying a decision, not a method)
+                    fn_defs[node.name] = node.lineno
                     for child in _ast.iter_child_nodes(node):
                         if isinstance(child, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
                             fn_defs[f"{node.name}.{child.name}"] = child.lineno
@@ -974,7 +990,9 @@ def _patch_evidence_verify(bp: dict[str, Any], repo_path: str) -> int:
     meta["evidence_verified"] = verified
     meta["evidence_invalid"] = invalid
     meta["evidence_auto_fixed"] = auto_fixed
-    total = verified + invalid
+    # v6.3: auto_fixed BDs ARE successfully verified (fn found, line
+    # corrected) — include them in denominator for accurate ratio
+    total = verified + invalid + auto_fixed
     meta["evidence_verify_ratio"] = verified / total if total > 0 else 0.0
     logger.info(
         "P5.5 (evidence_verify): verified=%d, invalid=%d, auto_fixed=%d, ratio=%.1f%%",
@@ -1076,24 +1094,42 @@ def _patch_missing_gaps_from_audit(
 
     audit_text = audit_path.read_text(encoding="utf-8")
 
-    # Extract ❌ FAIL items from audit report
-    # Each item gets at most 2 detail lines (prevent rationale pollution)
+    # Extract FAIL items from audit report.
+    # v6.3: match both ❌ and ⚠️ lines with case-insensitive "fail"/"absent".
+    # Worker_audit may use "⚠️ Fail" (warning emoji + title-case) instead
+    # of "❌ FAIL" (cross emoji + all-caps).
     fail_items: list[dict[str, str]] = []
     current_item = ""
     current_detail_lines: list[str] = []
     _MAX_DETAIL_LINES = 2
     _MAX_DETAIL_CHARS = 200
     for line in audit_text.splitlines():
-        # New ❌ item starts
-        if "❌" in line and ("FAIL" in line or "fail" in line or "absent" in line):
+        line_lower = line.lower()
+        # v6.3: broadened trigger — any line with (❌ or ⚠️) + fail/absent
+        is_fail_line = (
+            ("❌" in line or "⚠️" in line)
+            and ("fail" in line_lower or "absent" in line_lower)
+        )
+        if is_fail_line:
             if current_item:
                 detail = " ".join(current_detail_lines)[:_MAX_DETAIL_CHARS]
                 fail_items.append({"item": current_item, "detail": detail.strip()})
-            clean = line.replace("❌", "").replace("FAIL", "").strip(" |-#*")
+            clean = (
+                line.replace("❌", "").replace("⚠️", "")
+                .replace("FAIL", "").replace("Fail", "").replace("fail", "")
+                .strip(" |-#*")
+            )
             current_item = clean
             current_detail_lines = []
-        # ✅ or ⚠️ means next audit item — stop collecting detail
-        elif ("✅" in line or "⚠️" in line or line.strip().startswith(("##", "---"))):
+        # ✅ or new section means stop collecting detail for current item
+        elif "✅" in line or line.strip().startswith(("##", "---")):
+            if current_item:
+                detail = " ".join(current_detail_lines)[:_MAX_DETAIL_CHARS]
+                fail_items.append({"item": current_item, "detail": detail.strip()})
+                current_item = ""
+                current_detail_lines = []
+        # ⚠️ without "fail" = warning/pass item, also stops detail collection
+        elif "⚠️" in line and "fail" not in line_lower:
             if current_item:
                 detail = " ".join(current_detail_lines)[:_MAX_DETAIL_CHARS]
                 fail_items.append({"item": current_item, "detail": detail.strip()})
@@ -1107,8 +1143,41 @@ def _patch_missing_gaps_from_audit(
         detail = " ".join(current_detail_lines)[:_MAX_DETAIL_CHARS]
         fail_items.append({"item": current_item, "detail": detail.strip()})
 
+    # v6.3: also parse "Missing Gap BD Candidates" structured section
+    # Worker audit may include a markdown section with pre-structured gap BDs
+    _gap_section_re = re.compile(
+        r"##\s*Missing\s+Gap\s+BD\s+Candidates",
+        re.IGNORECASE,
+    )
+    _gap_section_match = _gap_section_re.search(audit_text)
+    if _gap_section_match:
+        gap_section = audit_text[_gap_section_match.end():]
+        # Stop at next ## heading or end of text
+        next_heading = re.search(r"\n##\s", gap_section)
+        if next_heading:
+            gap_section = gap_section[:next_heading.start()]
+        # Parse structured items: look for "content:", "type:", etc.
+        for block in re.split(r"\n(?=\d+\.\s|\*\s|-\s(?=\*\*)|###\s)", gap_section):
+            content_m = re.search(
+                r"content[:\s]+[\"']?(.+?)[\"']?\s*$", block, re.MULTILINE
+            )
+            if content_m:
+                item_text = content_m.group(1).strip()
+                detail_m = re.search(
+                    r"(?:impact|rationale|detail)[:\s]+[\"']?(.+?)[\"']?\s*$",
+                    block,
+                    re.MULTILINE,
+                )
+                detail = detail_m.group(1).strip() if detail_m else ""
+                # De-dup against existing fail_items
+                if not any(
+                    item_text[:50].lower() in fi["item"].lower()
+                    for fi in fail_items
+                ):
+                    fail_items.append({"item": item_text, "detail": detail})
+
     if not fail_items:
-        logger.debug("P15 (missing_gaps): no ❌ FAIL items found in audit")
+        logger.debug("P15 (missing_gaps): no FAIL items found in audit")
         return 0
 
     # Check which fail items are already covered by existing BDs
@@ -1232,7 +1301,7 @@ def _patch_missing_gaps_from_audit(
         bp["business_decisions"] = bds
 
     logger.info(
-        "P15 (missing_gaps): %d gap BDs from %d audit ❌ items "
+        "P15 (missing_gaps): %d gap BDs from %d audit FAIL items "
         "(%.0f%% already covered)",
         injected,
         len(fail_items),
