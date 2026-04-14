@@ -55,11 +55,7 @@ def _extract_json(
         # schema metadata, not data instances.
         if isinstance(data, dict) and ("$defs" in data or "$ref" in data):
             return None
-        if (
-            isinstance(data, dict)
-            and data.get("type") == "object"
-            and "properties" in data
-        ):
+        if isinstance(data, dict) and data.get("type") == "object" and "properties" in data:
             return None
         return data
 
@@ -471,12 +467,16 @@ class SOPExecutor:
         phase_result = await self._execute_single_phase(phase)
         if isinstance(phase_result, Exception):
             error_msg = f"Phase {phase.name!r} raised: {phase_result}"
-            logger.exception(error_msg)
             self._state.mark_phase_failed(phase.name, str(phase_result))
-            result.failed_phase = phase.name
             result.errors.append(error_msg)
             self._checkpoint.save_state(self._state)
-            return "break"
+            if phase.blocking:
+                logger.exception(error_msg)
+                result.failed_phase = phase.name
+                return "break"
+            else:
+                logger.warning("%s (non-blocking, skipped)", error_msg)
+                return "continue"
 
         # 5. Process result
         outcome = self._process_phase_result(phase, phase_result, result)
@@ -594,8 +594,7 @@ class SOPExecutor:
                             )
                         artifact_path.write_text(placeholder, encoding="utf-8")
                         logger.warning(
-                            "Phase %r: generated placeholder for %r "
-                            "(%d iterations exhausted)",
+                            "Phase %r: generated placeholder for %r (%d iterations exhausted)",
                             phase.name,
                             artifact_name,
                             phase_result.iterations,

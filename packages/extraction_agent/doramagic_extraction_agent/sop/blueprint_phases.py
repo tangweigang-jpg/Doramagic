@@ -427,9 +427,7 @@ async def _finalize_handler(state: AgentState, repo_path: Path) -> PhaseResult:
         parsed_source["projects"] = [repo] if repo else []
         logger.info("bp_finalize: populated source.projects=[%r] from repo path", repo)
 
-    content = _yaml.dump(
-        parsed, allow_unicode=True, default_flow_style=False, sort_keys=False
-    )
+    content = _yaml.dump(parsed, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
     # Write repaired YAML back to artifacts (for debugging)
     bp_file.write_text(content)
@@ -467,9 +465,7 @@ async def _finalize_handler(state: AgentState, repo_path: Path) -> PhaseResult:
         try:
             import json as _json
 
-            version_meta["quality_gate"] = _json.loads(
-                qg_path.read_text(encoding="utf-8")
-            )
+            version_meta["quality_gate"] = _json.loads(qg_path.read_text(encoding="utf-8"))
         except Exception:
             pass
 
@@ -1696,10 +1692,17 @@ def build_blueprint_phases_v5(
         # risk and validation error count.
 
         step1a_msg = _build_step1_message(
-            worker_arch, "", "", state, worker_arch_deep=worker_arch_deep,
+            worker_arch,
+            "",
+            "",
+            state,
+            worker_arch_deep=worker_arch_deep,
         )
         step1b_msg = _build_step1_message(
-            "", worker_workflow, worker_math, state,
+            "",
+            worker_workflow,
+            worker_math,
+            state,
         )
 
         # Run both calls (sequential to avoid MiniMax rate limits)
@@ -1728,9 +1731,11 @@ def build_blueprint_phases_v5(
             if isinstance(result_part, RawFallback):
                 # L3 recovery for this half
                 (artifacts_dir / f"synthesis_v5_{label}_raw.txt").write_text(
-                    result_part.text, encoding="utf-8",
+                    result_part.text,
+                    encoding="utf-8",
                 )
                 import re as _re
+
                 import yaml as _recover_yaml
 
                 raw = result_part.text.strip()
@@ -1749,9 +1754,7 @@ def build_blueprint_phases_v5(
                     last_complete = raw.rfind("},")
                     if last_complete > 0:
                         try:
-                            recovered = json.loads(
-                                raw[:last_complete + 1] + "\n  ]\n}"
-                            )
+                            recovered = json.loads(raw[: last_complete + 1] + "\n  ]\n}")
                         except (json.JSONDecodeError, ValueError):
                             pass
 
@@ -1759,7 +1762,7 @@ def build_blueprint_phases_v5(
                     for bd_raw in recovered["decisions"]:
                         if not isinstance(bd_raw, dict) or "content" not in bd_raw:
                             continue
-                        bd_raw.setdefault("id", f"BD-{len(all_decisions)+1:03d}")
+                        bd_raw.setdefault("id", f"BD-{len(all_decisions) + 1:03d}")
                         bd_raw.setdefault("type", "B")
                         bd_raw.setdefault("stage", "unknown")
                         bd_raw.setdefault("status", "present")
@@ -1789,7 +1792,8 @@ def build_blueprint_phases_v5(
                                 pass
                     logger.info(
                         "Synthesis Step 1 (%s): L3 recovery — %d BDs",
-                        label, len(all_decisions),
+                        label,
+                        len(all_decisions),
                     )
                 else:
                     logger.warning(
@@ -1802,7 +1806,8 @@ def build_blueprint_phases_v5(
                 all_missing.extend(result_part.missing_gaps)
                 logger.info(
                     "Synthesis Step 1 (%s): %d decisions",
-                    label, len(result_part.decisions),
+                    label,
+                    len(result_part.decisions),
                 )
 
         if not all_decisions:
@@ -1824,7 +1829,7 @@ def build_blueprint_phases_v5(
 
         # Re-number IDs sequentially
         for i, bd in enumerate(deduped):
-            bd.id = f"BD-{i+1:03d}"
+            bd.id = f"BD-{i + 1:03d}"
 
         missing_deduped = [bd for bd in deduped if bd.status == "missing"]
         step1_result = BDExtractionResult(
@@ -1848,6 +1853,7 @@ def build_blueprint_phases_v5(
                 encoding="utf-8",
             )
             import re as _re
+
             import yaml as _recover_yaml
 
             raw = step1_result.text.strip()
@@ -1870,7 +1876,7 @@ def build_blueprint_phases_v5(
                 last_complete = raw.rfind("},")
                 if last_complete > 0:
                     try:
-                        recovered = json.loads(raw[:last_complete + 1] + "\n  ]\n}")
+                        recovered = json.loads(raw[: last_complete + 1] + "\n  ]\n}")
                         logger.info(
                             "Synthesis L3: recovered %d items from truncated JSON",
                             len(recovered.get("decisions", [])),
@@ -1886,7 +1892,7 @@ def build_blueprint_phases_v5(
                     if not isinstance(bd_raw, dict) or "content" not in bd_raw:
                         continue
                     # Coerce minimum fields
-                    bd_raw.setdefault("id", f"BD-{len(valid_bds)+1:03d}")
+                    bd_raw.setdefault("id", f"BD-{len(valid_bds) + 1:03d}")
                     bd_raw.setdefault("type", "B")
                     bd_raw.setdefault("stage", "unknown")
                     bd_raw.setdefault("status", "present")
@@ -1901,14 +1907,16 @@ def build_blueprint_phases_v5(
                     try:
                         valid_bds.append(BusinessDecision.model_validate(bd_raw))
                     except Exception:
-                        valid_bds.append(BusinessDecision(
-                            id=bd_raw["id"],
-                            content=str(bd_raw.get("content", "")),
-                            type=bd_raw.get("type", "B"),
-                            rationale=rat,
-                            evidence=bd_raw.get("evidence", "N/A:0(see_rationale)"),
-                            stage=bd_raw.get("stage", "unknown"),
-                        ))
+                        valid_bds.append(
+                            BusinessDecision(
+                                id=bd_raw["id"],
+                                content=str(bd_raw.get("content", "")),
+                                type=bd_raw.get("type", "B"),
+                                rationale=rat,
+                                evidence=bd_raw.get("evidence", "N/A:0(see_rationale)"),
+                                stage=bd_raw.get("stage", "unknown"),
+                            )
+                        )
 
                 if valid_bds:
                     missing = [b for b in valid_bds if b.status == "missing"]
@@ -1932,7 +1940,7 @@ def build_blueprint_phases_v5(
                     phase_name="bp_synthesis_v5",
                     status="error",
                     total_tokens=total_tokens,
-                    error=f"Synthesis L3 recovery failed: no 'decisions' key in raw text",
+                    error="Synthesis L3 recovery failed: no 'decisions' key in raw text",
                 )
 
         logger.info(
@@ -2480,8 +2488,7 @@ def build_blueprint_phases_v5(
         details["BQ-04_missing_gaps"] = f"count={missing_gap_count} (target ≥3)"
         if not checks["BQ-04_missing_gaps"]:
             warnings.append(
-                f"BQ-04 WARN: missing_gaps={missing_gap_count} < 3. "
-                f"{_BQ_FIX_HINTS['BQ-04']}"
+                f"BQ-04 WARN: missing_gaps={missing_gap_count} < 3. {_BQ_FIX_HINTS['BQ-04']}"
             )
         else:
             logger.info("BQ-04 PASS: missing_gaps=%d ≥ 3", missing_gap_count)
@@ -2777,7 +2784,8 @@ def build_blueprint_phases_v5(
             # Write empty uc_list.json so pipeline continues — P9 uc_merge
             # handles empty lists gracefully.
             (artifacts_dir / "uc_list.json").write_text(
-                "[]", encoding="utf-8",
+                "[]",
+                encoding="utf-8",
             )
             return PhaseResult(
                 phase_name="bp_uc_extract",
@@ -2826,6 +2834,62 @@ def build_blueprint_phases_v5(
         )
 
     # ----- Phase C: Coverage gap detection -----
+
+    # v6.2: BD field sanitizer for coverage-gap extraction.
+    # MiniMax produces non-standard types and short rationales from sparse
+    # skeleton context.  Sanitize BEFORE schema validation so L2/L3 can
+    # succeed instead of rejecting every item.
+    _GAP_TYPE_MAP: dict[str, str] = {
+        "business": "B",
+        "technical": "T",
+        "assumption": "BA",
+        "business assumption": "BA",
+        "domain": "DK",
+        "domain knowledge": "DK",
+        "domain_knowledge": "DK",
+        "regulatory": "RC",
+        "regulatory constraint": "RC",
+        "math": "M",
+        "model": "M",
+        "mathematical": "M",
+    }
+
+    def _sanitize_gap_bd(raw: dict) -> dict:
+        """Coerce coverage-gap BD fields to pass BusinessDecision validation."""
+        import re as _re_gap
+
+        # --- type coercion ---
+        type_val = raw.get("type", "B")
+        if isinstance(type_val, str):
+            type_val = type_val.strip()
+            valid_pattern = _re_gap.compile(r"^(T|B|BA|DK|RC|M)(/(?:T|B|BA|DK|RC|M))*$")
+            if valid_pattern.match(type_val):
+                raw["type"] = type_val  # write back stripped value
+            else:
+                mapped = _GAP_TYPE_MAP.get(type_val.lower())
+                raw["type"] = mapped if mapped else "B"
+
+        # --- rationale padding ---
+        rationale = raw.get("rationale", "")
+        if isinstance(rationale, str) and len(rationale) < 40:
+            content = raw.get("content", "")
+            if rationale:
+                rationale = f"{rationale} — discovered in coverage gap analysis of: {content[:80]}"
+            else:
+                rationale = (
+                    f"Coverage gap: {content[:120]}. Identified from uncovered directory analysis."
+                )
+            raw["rationale"] = rationale[:300]
+
+        # --- evidence fallback ---
+        if not raw.get("evidence") or not str(raw["evidence"]).strip():
+            raw["evidence"] = "N/A:0(coverage_gap)"
+
+        # --- status fallback ---
+        if "status" not in raw:
+            raw["status"] = "present"
+
+        return raw
 
     async def _coverage_gap_handler(
         state: AgentState,
@@ -2953,17 +3017,64 @@ def build_blueprint_phases_v5(
         )
 
         if isinstance(result, _RF):
-            logger.warning("bp_coverage_gap: Instructor failed")
-            return PhaseResult(
-                phase_name="bp_coverage_gap",
-                status="completed",
-                total_tokens=tokens,
-                final_text=f"Gap detection found {len(uncovered)} dirs but extraction failed",
-            )
+            # v6.2: Salvage gap BDs from raw text before giving up.
+            # L2/L3 fail because BusinessDecision validators reject sparse
+            # output.  Extract + sanitize individual items here.
+            logger.warning("bp_coverage_gap: Instructor L2/L3 failed — attempting salvage")
+            from .schemas_v5 import GapBusinessDecision as _GBD
 
-        # Merge gap BDs into bd_list.json
+            salvaged_bds: list[_GBD] = []
+            try:
+                from doramagic_extraction_agent.sop.executor import (
+                    _extract_json as _gap_extract,
+                )
+
+                parsed = _gap_extract(result.text)
+                if parsed is not None:
+                    items: list[dict] = []
+                    if isinstance(parsed, list):
+                        items = [i for i in parsed if isinstance(i, dict)]
+                    elif isinstance(parsed, dict):
+                        items = parsed.get("decisions", [])
+                        if not isinstance(items, list):
+                            items = [parsed]
+                    for raw_item in items:
+                        if not isinstance(raw_item, dict):
+                            continue
+                        try:
+                            salvaged_bds.append(_GBD.model_validate(raw_item))
+                        except Exception:
+                            continue
+            except Exception as salvage_exc:
+                logger.warning("bp_coverage_gap: salvage parse error: %s", salvage_exc)
+
+            if salvaged_bds:
+                logger.info(
+                    "bp_coverage_gap: salvaged %d BDs from raw text",
+                    len(salvaged_bds),
+                )
+                result = _CGR(decisions=salvaged_bds)
+            else:
+                logger.warning("bp_coverage_gap: salvage yielded 0 valid BDs")
+                return PhaseResult(
+                    phase_name="bp_coverage_gap",
+                    status="completed",
+                    total_tokens=tokens,
+                    final_text=f"Gap detection found {len(uncovered)} dirs but extraction failed",
+                )
+
+        # Merge gap BDs into bd_list.json.
+        # result.decisions may be GapBusinessDecision (relaxed) — convert
+        # to BusinessDecision for BDExtractionResult compatibility.
         existing_ids = {bd.id for bd in bd_result.decisions}
-        new_bds = [bd for bd in result.decisions if bd.id not in existing_ids]
+        new_bds: list[BusinessDecision] = []
+        for gap_bd in result.decisions:
+            if gap_bd.id in existing_ids:
+                continue
+            try:
+                new_bds.append(BusinessDecision.model_validate(gap_bd.model_dump()))
+            except Exception:
+                continue
 
         if new_bds:
             merged = list(bd_result.decisions) + new_bds
@@ -3143,6 +3254,60 @@ def build_blueprint_phases_v5(
 
         summary = ", ".join(f"{k}={v}" for k, v in patch_stats.items() if v)
         logger.info("bp_enrich: %s", summary)
+
+        # --- Sync bd_list.json with enriched business_decisions (v6.2) ---
+        # QG reads bd_list.json for BQ-01~04.  P15/P16 only modify
+        # blueprint.yaml, leaving bd_list.json stale.  Rewrite it here so
+        # the quality gate sees post-enrichment data.
+        try:
+            enriched_bds_raw = bp.get("business_decisions", [])
+            if enriched_bds_raw and isinstance(enriched_bds_raw, list):
+                from collections import Counter as _Ctr
+
+                enriched_decisions: list[BusinessDecision] = []
+                _skipped = 0
+                for bd_dict in enriched_bds_raw:
+                    if not isinstance(bd_dict, dict):
+                        continue
+                    try:
+                        enriched_decisions.append(BusinessDecision.model_validate(bd_dict))
+                    except Exception:
+                        _skipped += 1
+                        continue
+
+                if _skipped:
+                    logger.warning(
+                        "bp_enrich: bd_list.json sync skipped %d/%d BDs that failed validation",
+                        _skipped,
+                        len(enriched_bds_raw),
+                    )
+
+                if enriched_decisions:
+                    _type_counts = _Ctr(d.type for d in enriched_decisions)
+                    _missing = [d for d in enriched_decisions if d.status == "missing"]
+                    synced_result = BDExtractionResult(
+                        decisions=enriched_decisions,
+                        type_summary=dict(_type_counts),
+                        missing_gaps=_missing,
+                    )
+                    bd_path.write_text(
+                        synced_result.model_dump_json(indent=2),
+                        encoding="utf-8",
+                    )
+                    logger.info(
+                        "bp_enrich: synced bd_list.json (%d decisions, %d missing)",
+                        len(enriched_decisions),
+                        len(_missing),
+                    )
+                else:
+                    logger.warning(
+                        "bp_enrich: bd_list.json sync produced 0 valid "
+                        "decisions from %d enriched BDs — QG will read "
+                        "pre-enrichment data",
+                        len(enriched_bds_raw),
+                    )
+        except Exception as sync_exc:
+            logger.warning("bp_enrich: bd_list.json sync failed (non-fatal): %s", sync_exc)
 
         return PhaseResult(
             phase_name="bp_enrich",

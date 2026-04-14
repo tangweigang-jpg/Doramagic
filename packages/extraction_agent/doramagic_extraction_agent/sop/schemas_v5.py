@@ -218,11 +218,86 @@ class BDExtractionResult(BaseModel):
                 len(invalid_keys),
                 invalid_keys,
             )
-        self.type_summary = {
-            k: v for k, v in self.type_summary.items()
-            if valid_pattern.match(k)
-        }
+        self.type_summary = {k: v for k, v in self.type_summary.items() if valid_pattern.match(k)}
         return self
+
+
+_GAP_TYPE_MAP: dict[str, str] = {
+    "business": "B",
+    "technical": "T",
+    "assumption": "BA",
+    "business assumption": "BA",
+    "domain": "DK",
+    "domain knowledge": "DK",
+    "domain_knowledge": "DK",
+    "regulatory": "RC",
+    "regulatory constraint": "RC",
+    "math": "M",
+    "model": "M",
+    "mathematical": "M",
+}
+
+
+class GapBusinessDecision(BaseModel):
+    """Relaxed BD for coverage-gap extraction (v6.2).
+
+    MiniMax produces non-standard types and short rationales from sparse
+    skeleton context.  This model coerces fields in ``mode="before"`` so
+    L2/L3 structured calls succeed instead of rejecting every item.
+    """
+
+    id: str = Field(description="Unique ID, e.g. BD-G001")
+    content: str = Field(description="The specific design decision")
+    type: str = Field(default="B", description="BD type (coerced)")
+    rationale: str = Field(default="", description="WHY + BOUNDARY")
+    evidence: str = Field(default="N/A:0(coverage_gap)", description="Source ref")
+    stage: str = Field(default="unknown", description="Pipeline stage")
+    status: Literal["present", "missing"] = "present"
+    severity: Literal["critical", "high", "medium"] | None = None
+    impact: str | None = None
+    known_gap: bool | None = None
+    alternative_considered: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_fields(cls, data: Any) -> Any:
+        """Sanitize type/rationale/evidence before validation."""
+        if not isinstance(data, dict):
+            return data
+        # --- type coercion ---
+        type_val = data.get("type", "B")
+        if isinstance(type_val, str):
+            type_val = type_val.strip()
+            if re.match(r"^(T|B|BA|DK|RC|M)(/(?:T|B|BA|DK|RC|M))*$", type_val):
+                data["type"] = type_val
+            else:
+                mapped = _GAP_TYPE_MAP.get(type_val.lower())
+                data["type"] = mapped if mapped else "B"
+        # --- rationale padding ---
+        rationale = data.get("rationale", "")
+        if isinstance(rationale, str) and len(rationale) < 40:
+            content = data.get("content", "")
+            if rationale:
+                rationale = f"{rationale} — coverage gap analysis of: {content[:80]}"
+            else:
+                rationale = (
+                    f"Coverage gap: {content[:120]}. Identified from uncovered directory analysis."
+                )
+            data["rationale"] = rationale[:300]
+        # --- evidence fallback ---
+        if not data.get("evidence") or not str(data["evidence"]).strip():
+            data["evidence"] = "N/A:0(coverage_gap)"
+        # --- status/stage fallback ---
+        if "status" not in data:
+            data["status"] = "present"
+        if "stage" not in data:
+            data["stage"] = "unknown"
+        # --- coerce_field_names compat (same as BusinessDecision) ---
+        if "content" not in data and "decision" in data:
+            data["content"] = data.pop("decision")
+        if data.get("status") not in ("present", "missing", None):
+            data["status"] = "present"
+        return data
 
 
 class CoverageGapResult(BaseModel):
@@ -231,9 +306,12 @@ class CoverageGapResult(BaseModel):
     Uses a minimal schema (just a decision list) instead of the full
     BDExtractionResult — avoids type_summary/missing_gaps validation
     failures that cause MiniMax to degrade to L3 on every run.
+
+    v6.2: Uses ``GapBusinessDecision`` (relaxed validators) instead of
+    strict ``BusinessDecision`` so L2/L3 structured calls succeed.
     """
 
-    decisions: list[BusinessDecision] = Field(
+    decisions: list[GapBusinessDecision] = Field(
         description="Supplementary BDs extracted from uncovered directories",
     )
 
@@ -292,13 +370,22 @@ class UseCase(BaseModel):
             return "data_pipeline"
         v = v.strip().lower().replace(" ", "_").replace("-", "_")
         valid = {
-            "trading_strategy", "screening", "data_pipeline", "monitoring",
-            "live_trading", "reporting", "research_analysis", "ml_prediction",
-            "builtin_factor", "extension_example", "complete_strategy",
+            "trading_strategy",
+            "screening",
+            "data_pipeline",
+            "monitoring",
+            "live_trading",
+            "reporting",
+            "research_analysis",
+            "ml_prediction",
+            "builtin_factor",
+            "extension_example",
+            "complete_strategy",
         }
         if v in valid:
             return v
         return _UC_TYPE_ALIASES.get(v, "data_pipeline")
+
     negative_keywords: list[str] = Field(
         default_factory=list,
         description="Keywords of OTHER use cases that overlap with this one — helps disambiguation",
