@@ -382,6 +382,8 @@ class ExtractionAgent:
             ]
 
         _compaction_seq: int = 0
+        _overflow_retries: int = 0
+        _MAX_OVERFLOW_RETRIES: int = 3
 
         cb = CircuitBreaker(
             max_consecutive=self._max_consecutive_failures,
@@ -426,10 +428,27 @@ class ExtractionAgent:
                     or "prompt is too long" in exc_str.lower()
                 )
                 if is_overflow:
+                    _overflow_retries += 1
+                    if _overflow_retries > _MAX_OVERFLOW_RETRIES:
+                        logger.error(
+                            "Phase %r: context overflow persists after %d compaction attempts "
+                            "— system prompt may exceed model context window",
+                            phase_name,
+                            _overflow_retries,
+                        )
+                        return PhaseResult(
+                            phase_name=phase_name,
+                            status="error",
+                            iterations=cb.stats["total_iterations"],
+                            total_tokens=cb.stats["total_tokens"],
+                            error=f"Context overflow after {_overflow_retries} compaction retries",
+                        )
                     logger.warning(
-                        "Phase %r: context overflow (%d messages) — aggressive compact and retry",
+                        "Phase %r: context overflow (%d messages, retry %d/%d) — compact and retry",
                         phase_name,
                         len(messages),
+                        _overflow_retries,
+                        _MAX_OVERFLOW_RETRIES,
                     )
                     if self._context_manager and len(messages) > 2:
                         messages, _ = self._context_manager.summarize_messages(
