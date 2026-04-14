@@ -23,6 +23,10 @@ class BusinessDecision(BaseModel):
 
     id: str = Field(description="Unique ID, e.g. BD-001")
     content: str = Field(description="The specific design decision")
+    source_basis: str | None = Field(
+        default=None,
+        description="code_observed or doc_declared — origin of this BD",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -655,3 +659,71 @@ class RawFallback:
 
     text: str
     stage: str  # "l1_instructor_failed" | "l2_extract_failed" | "l3_raw"
+
+
+# ---------------------------------------------------------------------------
+# v7: Structural extraction schemas (non-code knowledge sources)
+# ---------------------------------------------------------------------------
+
+
+class ActivationExtraction(BaseModel):
+    """Activation semantics extracted from SKILL.md 'When to Use' sections."""
+
+    triggers: list[str] = Field(
+        default_factory=list,
+        description="What signals should trigger this blueprint",
+    )
+    emphasis: list[str] = Field(default_factory=list, description="Use ESPECIALLY when...")
+    anti_skip: list[str] = Field(default_factory=list, description="Don't skip because of...")
+
+
+class ResourceExtraction(BaseModel):
+    """A resource extracted from document knowledge sources."""
+
+    id: str = Field(description="Unique resource ID within blueprint")
+    type: str = Field(
+        description=(
+            "Resource type: technique_document / tool_script / code_example / external_service"
+        ),
+    )
+    name: str = Field(description="Resource name")
+    path: str | None = Field(default=None, description="Path relative to repo root")
+    description: str = Field(default="", description="What this resource is for")
+    used_in_stages: list[str] = Field(
+        default_factory=list,
+        description="Stage IDs that use this resource",
+    )
+
+
+class RelationExtraction(BaseModel):
+    """A relationship between this blueprint and another entity."""
+
+    type: str = Field(
+        description=(
+            "Relation type: depends_on / complementary / contains"
+            " / alternative_to / specializes / generalizes"
+        ),
+    )
+    target: str = Field(description="Target blueprint ID or resource path")
+    description: str = Field(default="", description="Relationship description")
+    evidence: str = Field(default="", description="Evidence reference")
+
+
+class StructuralExtractionResult(BaseModel):
+    """Complete extraction result from document knowledge sources (Step 2a-s output)."""
+
+    stages: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Stages extracted from document structure",
+    )
+    activation: ActivationExtraction = Field(default_factory=ActivationExtraction)
+    resources: list[ResourceExtraction] = Field(default_factory=list)
+    relations: list[RelationExtraction] = Field(default_factory=list)
+    global_contracts: list[str] = Field(
+        default_factory=list,
+        description="Iron laws and cross-stage invariants from documents",
+    )
+    design_decisions: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Design decisions stated in documents",
+    )

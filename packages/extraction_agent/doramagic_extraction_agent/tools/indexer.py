@@ -325,10 +325,104 @@ def _parse_file(filepath: Path, repo_root: Path) -> dict[str, Any] | None:
 # ---------------------------------------------------------------------------
 
 
+def _scan_document_sources(repo_root: Path) -> dict[str, Any]:
+    """Scan non-code knowledge sources: SKILL.md, CLAUDE.md, agent defs.
+
+    Returns a dict with keys: skill_files, claude_md, agent_files.
+    Each skill_file entry contains frontmatter metadata and heading structure.
+    """
+    import re as _re
+
+    import yaml as _yaml
+
+    skill_files: list[dict[str, Any]] = []
+    claude_md: list[dict[str, Any]] = []
+    agent_files: list[dict[str, Any]] = []
+
+    _doc_names = {"skill.md", "claude.md", "agents.md", "gemini.md"}
+    _frontmatter_re = _re.compile(r"^---\s*\n(.*?)\n---\s*\n", _re.DOTALL)
+    _heading_re = _re.compile(r"^(#{1,4})\s+(.+)$", _re.MULTILINE)
+
+    for fpath in repo_root.rglob("*.md"):
+        rel_parts = fpath.relative_to(repo_root).parts
+        if any(
+            (part.startswith(".") and part != ".claude") or part in _SKIP_DIRS for part in rel_parts
+        ):
+            continue
+
+        name_lower = fpath.name.lower()
+        if name_lower not in _doc_names:
+            # Check if inside skills/ or .claude/agents/ directory
+            rel_str = str(fpath.relative_to(repo_root))
+            if not any(
+                seg in rel_str.lower()
+                for seg in ("skills/", ".claude/agents/", ".claude/commands/")
+            ):
+                continue
+
+        rel = str(fpath.relative_to(repo_root))
+        try:
+            content = fpath.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        # Parse YAML frontmatter
+        frontmatter: dict[str, Any] = {}
+        fm_match = _frontmatter_re.match(content)
+        if fm_match:
+            import contextlib
+
+            with contextlib.suppress(_yaml.YAMLError):
+                frontmatter = _yaml.safe_load(fm_match.group(1)) or {}
+
+        # Parse heading structure
+        headings: list[dict[str, str]] = []
+        for m in _heading_re.finditer(content):
+            headings.append(
+                {
+                    "level": len(m.group(1)),
+                    "title": m.group(2).strip(),
+                }
+            )
+
+        entry = {
+            "path": rel,
+            "frontmatter": frontmatter,
+            "headings": headings[:30],  # Cap to avoid bloat
+            "size_bytes": len(content.encode("utf-8")),
+        }
+
+        if name_lower == "skill.md":
+            skill_files.append(entry)
+        elif name_lower == "claude.md":
+            claude_md.append(entry)
+        elif "agents/" in rel.lower() or "agent" in name_lower:
+            agent_files.append(entry)
+        else:
+            # Generic document in skills/ or commands/
+            skill_files.append(entry)
+
+    result = {
+        "skill_files": sorted(skill_files, key=lambda x: x["path"]),
+        "claude_md": sorted(claude_md, key=lambda x: x["path"]),
+        "agent_files": sorted(agent_files, key=lambda x: x["path"]),
+    }
+
+    if skill_files or claude_md or agent_files:
+        logger.info(
+            "Document sources: %d skills, %d CLAUDE.md, %d agents",
+            len(skill_files),
+            len(claude_md),
+            len(agent_files),
+        )
+    return result
+
+
 def build_structural_index(repo_path: Path) -> dict[str, Any]:
     """Build a complete structural index for all .py files in a repository.
 
-    Returns a dict with keys: files, dependency_graph, entry_points, stats.
+    Returns a dict with keys: files, dependency_graph, entry_points, stats,
+    document_sources.
     """
     repo_root = repo_path.resolve()
     files: dict[str, Any] = {}
@@ -443,27 +537,34 @@ def build_structural_index(repo_path: Path) -> dict[str, Any]:
         total_classes += len(info.get("classes", []))
         total_functions += len(info.get("functions", []))
 
+    # v7: Scan document knowledge sources (SKILL.md, CLAUDE.md, etc.)
+    doc_index = _scan_document_sources(repo_root)
+
     index = {
         "files": files,
         "dependency_graph": dep_graph,
         "_internal_top_modules": sorted(internal_top_modules),
         "entry_points": entry_points,
         "examples": examples[:50],
+        "document_sources": doc_index,  # v7: non-code knowledge source index
         "stats": {
             "total_py_files": len(files),
             "total_classes": total_classes,
             "total_functions": total_functions,
             "math_related_files": math_count,
+            "document_source_files": len(doc_index.get("skill_files", []))
+            + len(doc_index.get("claude_md", [])),
             "by_type": type_counts,
         },
     }
 
     logger.info(
-        "Index built: %d files, %d classes, %d functions, %d math-related",
+        "Index built: %d files, %d classes, %d functions, %d math, %d doc sources",
         len(files),
         total_classes,
         total_functions,
         math_count,
+        index["stats"]["document_source_files"],
     )
     return index
 

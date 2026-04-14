@@ -9,6 +9,7 @@ from typing import Optional
 from doramagic_contracts.adapter import *  # noqa: F403
 from doramagic_contracts.api import *  # noqa: F403
 from doramagic_contracts.base import *  # noqa: F403
+from doramagic_contracts.blueprint import *  # noqa: F403
 from doramagic_contracts.brick_v2 import *  # noqa: F403
 from doramagic_contracts.budget import *  # noqa: F403
 from doramagic_contracts.cross_project import *  # noqa: F403

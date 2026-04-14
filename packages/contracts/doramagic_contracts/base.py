@@ -43,10 +43,17 @@ class RepoRef(BaseModel):
     local_path: str
 
 
-class EvidenceRef(BaseModel):
-    """证据引用 — 支撑知识声明的具体来源。"""
+EvidenceRole = Literal["normative", "example", "rationale", "anti_pattern"]
 
-    kind: Literal["file_line", "artifact_ref", "community_ref"]
+
+class EvidenceRef(BaseModel):
+    """证据引用 — 支撑知识声明的具体来源。
+
+    v1.1: 新增 document_section kind + section_id + evidence_role，
+    支持非代码项目（SKILL.md 等）的 section 级引用。
+    """
+
+    kind: Literal["file_line", "artifact_ref", "community_ref", "document_section"]
     path: str
     start_line: int | None = Field(default=None, ge=1)
     end_line: int | None = Field(default=None, ge=1)
@@ -54,6 +61,10 @@ class EvidenceRef(BaseModel):
     artifact_name: str | None = None
     source_url: str | None = None
     evidence_tag: EvidenceTag | None = None  # CODE/DOC/COMMUNITY/INFERENCE
+    # v1.1: non-code project support
+    section_id: str | None = None  # e.g. "§Phase-1-Step-4", "§When-to-Use"
+    # normative=规则 / example=示例 / rationale=理由 / anti_pattern=反模式
+    evidence_role: EvidenceRole | None = None
 
 
 class SearchDirection(BaseModel):

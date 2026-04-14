@@ -339,6 +339,9 @@ def _patch_evidence_format(bp: dict[str, Any]) -> int:
     valid_evidence_count = 0
     total_count = 0
 
+    # Document section evidence (non-code sources) — no line number needed
+    doc_section_re = re.compile(r"^.+:§.+$")  # e.g. "SKILL.md:§Phase-1-Step-4"
+
     for entry in bd_list:
         if not isinstance(entry, dict):
             continue
@@ -346,6 +349,11 @@ def _patch_evidence_format(bp: dict[str, Any]) -> int:
         ev = entry.get("evidence", "")
         if not isinstance(ev, str):
             ev = ""
+
+        # Case 0: document section evidence — count as valid, skip normalization
+        if doc_section_re.match(ev):
+            valid_evidence_count += 1
+            continue
 
         # Case 1: already fully valid — count as valid and skip
         if _EVIDENCE_FULL_RE.match(ev):
@@ -925,6 +933,10 @@ def _patch_evidence_verify(bp: dict[str, Any], repo_path: str) -> int:
         ev = bd.get("evidence", "")
         if not ev or ev.startswith("N/A"):
             continue
+        # Skip AST verification for document section evidence
+        if "§" in ev:
+            verified += 1
+            continue
         m = _ev_pattern.match(ev)
         if not m:
             continue
@@ -1100,9 +1112,7 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
     return injected
 
 
-def _patch_missing_gaps_from_audit(
-    bp: dict[str, Any], artifacts_dir: Path
-) -> int:
+def _patch_missing_gaps_from_audit(bp: dict[str, Any], artifacts_dir: Path) -> int:
     """P15: deterministic missing gap generation from audit findings.
 
     Cross-references worker_audit.md ❌ FAIL items against existing BDs.
@@ -1131,30 +1141,29 @@ def _patch_missing_gaps_from_audit(
     for line in audit_text.splitlines():
         line_lower = line.lower()
         # v6.3: broadened trigger — any line with (❌ or ⚠️) + fail/absent
-        is_fail_line = (
-            ("❌" in line or "⚠️" in line)
-            and ("fail" in line_lower or "absent" in line_lower)
+        is_fail_line = ("❌" in line or "⚠️" in line) and (
+            "fail" in line_lower or "absent" in line_lower
         )
         if is_fail_line:
             if current_item:
                 detail = " ".join(current_detail_lines)[:_MAX_DETAIL_CHARS]
                 fail_items.append({"item": current_item, "detail": detail.strip()})
             clean = (
-                line.replace("❌", "").replace("⚠️", "")
-                .replace("FAIL", "").replace("Fail", "").replace("fail", "")
+                line.replace("❌", "")
+                .replace("⚠️", "")
+                .replace("FAIL", "")
+                .replace("Fail", "")
+                .replace("fail", "")
                 .strip(" |-#*")
             )
             current_item = clean
             current_detail_lines = []
         # ✅ or new section means stop collecting detail for current item
-        elif "✅" in line or line.strip().startswith(("##", "---")):
-            if current_item:
-                detail = " ".join(current_detail_lines)[:_MAX_DETAIL_CHARS]
-                fail_items.append({"item": current_item, "detail": detail.strip()})
-                current_item = ""
-                current_detail_lines = []
-        # ⚠️ without "fail" = warning/pass item, also stops detail collection
-        elif "⚠️" in line and "fail" not in line_lower:
+        elif (
+            "✅" in line
+            or line.strip().startswith(("##", "---"))
+            or ("⚠️" in line and "fail" not in line_lower)
+        ):
             if current_item:
                 detail = " ".join(current_detail_lines)[:_MAX_DETAIL_CHARS]
                 fail_items.append({"item": current_item, "detail": detail.strip()})
@@ -1176,16 +1185,14 @@ def _patch_missing_gaps_from_audit(
     )
     _gap_section_match = _gap_section_re.search(audit_text)
     if _gap_section_match:
-        gap_section = audit_text[_gap_section_match.end():]
+        gap_section = audit_text[_gap_section_match.end() :]
         # Stop at next ## heading or end of text
         next_heading = re.search(r"\n##\s", gap_section)
         if next_heading:
-            gap_section = gap_section[:next_heading.start()]
+            gap_section = gap_section[: next_heading.start()]
         # Parse structured items: look for "content:", "type:", etc.
         for block in re.split(r"\n(?=\d+\.\s|\*\s|-\s(?=\*\*)|###\s)", gap_section):
-            content_m = re.search(
-                r"content[:\s]+[\"']?(.+?)[\"']?\s*$", block, re.MULTILINE
-            )
+            content_m = re.search(r"content[:\s]+[\"']?(.+?)[\"']?\s*$", block, re.MULTILINE)
             if content_m:
                 item_text = content_m.group(1).strip()
                 detail_m = re.search(
@@ -1195,10 +1202,7 @@ def _patch_missing_gaps_from_audit(
                 )
                 detail = detail_m.group(1).strip() if detail_m else ""
                 # De-dup against existing fail_items
-                if not any(
-                    item_text[:50].lower() in fi["item"].lower()
-                    for fi in fail_items
-                ):
+                if not any(item_text[:50].lower() in fi["item"].lower() for fi in fail_items):
                     fail_items.append({"item": item_text, "detail": detail})
 
     if not fail_items:
@@ -1214,9 +1218,7 @@ def _patch_missing_gaps_from_audit(
     ).lower()
 
     # Find the next available BD ID
-    existing_ids = {
-        bd.get("id", "") for bd in bds if isinstance(bd, dict)
-    }
+    existing_ids = {bd.get("id", "") for bd in bds if isinstance(bd, dict)}
     gap_counter = 1
 
     # --- GAP type inference from audit item keywords ---
@@ -1268,18 +1270,29 @@ def _patch_missing_gaps_from_audit(
 
     # Get stage IDs from blueprint for stage inference
     bp_stages = [
-        s.get("id", "") for s in bp.get("stages", [])
-        if isinstance(s, dict) and s.get("id")
+        s.get("id", "") for s in bp.get("stages", []) if isinstance(s, dict) and s.get("id")
     ]
 
     injected = 0
     for fail in fail_items:
         # Simple keyword overlap check
         keywords = [
-            w.lower() for w in fail["item"].split()
-            if len(w) > 3 and w.lower() not in {
-                "the", "and", "for", "with", "from", "that", "this",
-                "item", "check", "missing", "absent",
+            w.lower()
+            for w in fail["item"].split()
+            if len(w) > 3
+            and w.lower()
+            not in {
+                "the",
+                "and",
+                "for",
+                "with",
+                "from",
+                "that",
+                "this",
+                "item",
+                "check",
+                "missing",
+                "absent",
             }
         ]
         covered = sum(1 for k in keywords if k in existing_content)
@@ -1295,7 +1308,8 @@ def _patch_missing_gaps_from_audit(
             content = _clean_gap_content(fail["item"])
             gap_type = _infer_gap_type(fail["item"] + " " + fail.get("detail", ""))
             gap_stage = _infer_gap_stage(
-                fail["item"] + " " + fail.get("detail", ""), bp_stages,
+                fail["item"] + " " + fail.get("detail", ""),
+                bp_stages,
             )
             detail = fail.get("detail", "") or "Identified by audit checklist"
 
@@ -1326,8 +1340,7 @@ def _patch_missing_gaps_from_audit(
         bp["business_decisions"] = bds
 
     logger.info(
-        "P15 (missing_gaps): %d gap BDs from %d audit FAIL items "
-        "(%.0f%% already covered)",
+        "P15 (missing_gaps): %d gap BDs from %d audit FAIL items (%.0f%% already covered)",
         injected,
         len(fail_items),
         (1 - injected / max(len(fail_items), 1)) * 100,
@@ -1338,19 +1351,58 @@ def _patch_missing_gaps_from_audit(
 # Keywords that signal a BD might deserve a secondary type annotation
 _MULTI_TYPE_RULES: list[tuple[str, str, list[str]]] = [
     # (current_type, candidate_secondary, trigger_keywords)
-    ("B", "BA", ["assume", "assumption", "default", "threshold", "expect",
-                  "tolerance", "typical", "empirical", "heuristic"]),
-    ("B", "DK", ["market", "china", "a-share", "a股", "exchange", "regulatory",
-                  "convention", "tradition", "culture"]),
-    ("B", "RC", ["regulation", "mandatory", "required", "compliance",
-                  "settlement", "T+1", "stamp", "tax"]),
-    ("BA", "DK", ["market", "china", "a-share", "specific", "local",
-                   "domestic", "convention"]),
-    ("BA", "M", ["formula", "model", "statistical", "distribution",
-                  "normal", "gaussian", "variance", "correlation"]),
+    (
+        "B",
+        "BA",
+        [
+            "assume",
+            "assumption",
+            "default",
+            "threshold",
+            "expect",
+            "tolerance",
+            "typical",
+            "empirical",
+            "heuristic",
+        ],
+    ),
+    (
+        "B",
+        "DK",
+        [
+            "market",
+            "china",
+            "a-share",
+            "a股",
+            "exchange",
+            "regulatory",
+            "convention",
+            "tradition",
+            "culture",
+        ],
+    ),
+    (
+        "B",
+        "RC",
+        ["regulation", "mandatory", "required", "compliance", "settlement", "T+1", "stamp", "tax"],
+    ),
+    ("BA", "DK", ["market", "china", "a-share", "specific", "local", "domestic", "convention"]),
+    (
+        "BA",
+        "M",
+        [
+            "formula",
+            "model",
+            "statistical",
+            "distribution",
+            "normal",
+            "gaussian",
+            "variance",
+            "correlation",
+        ],
+    ),
     ("M", "DK", ["market", "china", "a-share", "specific", "domestic"]),
-    ("M", "BA", ["assume", "assumption", "empirical", "calibrat",
-                  "parameter", "default"]),
+    ("M", "BA", ["assume", "assumption", "empirical", "calibrat", "parameter", "default"]),
 ]
 
 
@@ -1451,9 +1503,59 @@ def _patch_absolute_words(bp: dict[str, Any]) -> int:
 
     logger.info(
         "P17 (absolute_words): %d replacements (%d → %d occurrences)",
-        replaced, before_count, after_count,
+        replaced,
+        before_count,
+        after_count,
     )
     return replaced
+
+
+def _patch_activation_injection(bp: dict[str, Any], run_dir: Path, **kw: Any) -> None:
+    """P16b: Inject activation from worker_structural.json into applicability.activation."""
+    structural_path = run_dir / "artifacts" / "worker_structural.json"
+    if not structural_path.exists():
+        return
+
+    with open(structural_path) as f:
+        structural = json.load(f)
+
+    activation = structural.get("activation", {})
+    if not activation:
+        return
+
+    if "applicability" not in bp:
+        bp["applicability"] = {}
+    bp["applicability"]["activation"] = activation
+    logger.info("P16b: injected activation with %d triggers", len(activation.get("triggers", [])))
+
+
+def _patch_relations_injection(bp: dict[str, Any], run_dir: Path, **kw: Any) -> None:
+    """P17b: Inject relations from worker_structural.json, merging with existing."""
+    structural_path = run_dir / "artifacts" / "worker_structural.json"
+    if not structural_path.exists():
+        return
+
+    with open(structural_path) as f:
+        structural = json.load(f)
+
+    new_relations = structural.get("relations", [])
+    if not new_relations:
+        return
+
+    existing = bp.get("relations", [])
+    # Deduplicate by (type, target)
+    existing_keys = {(r.get("type"), r.get("target")) for r in existing if isinstance(r, dict)}
+    for rel in new_relations:
+        key = (rel.get("type"), rel.get("target"))
+        if key not in existing_keys:
+            existing.append(rel)
+            existing_keys.add(key)
+    bp["relations"] = existing
+    logger.info(
+        "P17b: relations now %d (added %d from structural)",
+        len(existing),
+        len(new_relations),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1530,6 +1632,11 @@ def enrich_blueprint(
 
     # v6: Replace overused absolute words (SOP: "all/All" ≤ 3 occurrences)
     patch_stats["p17_absolute_words"] = _patch_absolute_words(bp)
+
+    # v7: Structural document injection (activation + relations from worker_structural)
+    run_dir = artifacts_dir.parent if artifacts_dir.name == "artifacts" else artifacts_dir
+    _patch_activation_injection(bp, run_dir)
+    _patch_relations_injection(bp, run_dir)
 
     total_affected = sum(patch_stats.values())
     logger.info(

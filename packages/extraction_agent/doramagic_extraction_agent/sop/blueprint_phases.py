@@ -28,7 +28,7 @@ from ..tools.indexer import (
     build_structural_index,
 )
 from ..tools.sources import mine_source_context
-from . import prompts, prompts_v4, prompts_v5, prompts_v6
+from . import prompts, prompts_v4, prompts_v5, prompts_v6, prompts_v7
 from .blueprint_enrich import enrich_blueprint
 from .schemas_v5 import (
     BDExtractionResult,
@@ -1226,6 +1226,63 @@ def _build_worker_math_message(state: AgentState, repo_path: Path) -> str:
     )
 
 
+def _build_worker_structural_message(state: AgentState, repo_path: Path) -> str:
+    """Build initial message for worker_structural (document knowledge sources).
+
+    Skips extraction if no document knowledge sources detected in Step 0.
+    """
+    knowledge_sources = state.extra.get("knowledge_sources", [])
+    if "document" not in knowledge_sources:
+        return (
+            "No document knowledge sources detected (no SKILL.md/CLAUDE.md). "
+            "Write an empty JSON to worker_structural.json: "
+            '{"stages":[],"activation":{},"resources":[],"relations":[],'
+            '"global_contracts":[],"business_decisions":[]}'
+        )
+
+    # Gather document source info from structural index
+    doc_index = state.extra.get("structural_index", {}).get("document_sources", {})
+    skill_files = doc_index.get("skill_files", [])
+    claude_md = doc_index.get("claude_md", [])
+    agent_files = doc_index.get("agent_files", [])
+
+    doc_summary_parts = [f"Repository: {repo_path}\n"]
+    doc_summary_parts.append("## Document Knowledge Sources Detected\n")
+
+    if skill_files:
+        doc_summary_parts.append(f"### SKILL.md files ({len(skill_files)})")
+        for sf in skill_files[:20]:
+            fm = sf.get("frontmatter", {})
+            name = fm.get("name", "unnamed")
+            desc = fm.get("description", "")[:100]
+            doc_summary_parts.append(f"- `{sf['path']}` — name={name}, desc={desc}")
+            headings = sf.get("headings", [])
+            if headings:
+                top_headings = [h["title"] for h in headings if h["level"] <= 2][:8]
+                doc_summary_parts.append(f"  Sections: {', '.join(top_headings)}")
+
+    if claude_md:
+        doc_summary_parts.append(f"\n### CLAUDE.md files ({len(claude_md)})")
+        for cm in claude_md[:5]:
+            headings = cm.get("headings", [])
+            top_h = [h["title"] for h in headings if h["level"] <= 2][:8]
+            doc_summary_parts.append(f"- `{cm['path']}` — Sections: {', '.join(top_h)}")
+
+    if agent_files:
+        doc_summary_parts.append(f"\n### Agent definitions ({len(agent_files)})")
+        for af in agent_files[:10]:
+            doc_summary_parts.append(f"- `{af['path']}`")
+
+    doc_summary_parts.append(
+        "\n## Instructions\n"
+        "Read each document source listed above using read_file. "
+        "Extract the complete architecture following the system prompt schema. "
+        "Write the result as JSON to worker_structural.json using write_artifact."
+    )
+
+    return "\n".join(doc_summary_parts)
+
+
 def _build_synthesis_message(state: AgentState, repo_path: Path) -> str:
     labels = state.subdomain_labels or ["TRD"]
     checklist = prompts_v4.build_subdomain_checklist(labels)
@@ -1637,8 +1694,7 @@ def _build_worker_audit_message(s: AgentState, r: str) -> str:
             checklist_parts.append(content)
 
     checklist_section = (
-        "\n\n## Subdomain-Specific Checklist Items\n\n"
-        + "\n".join(checklist_parts)
+        "\n\n## Subdomain-Specific Checklist Items\n\n" + "\n".join(checklist_parts)
         if checklist_parts
         else "\n\n（No subdomain-specific checklist — apply universal items only.）"
     )
@@ -1648,8 +1704,7 @@ def _build_worker_audit_message(s: AgentState, r: str) -> str:
         f"Subdomain labels: {', '.join(labels)}\n\n"
         "Audit the repository against BOTH:\n"
         "1. The 20-item universal finance checklist\n"
-        "2. The subdomain-specific checklist items below\n"
-        + checklist_section
+        "2. The subdomain-specific checklist items below\n" + checklist_section
     )
 
 
@@ -1706,8 +1761,10 @@ def build_blueprint_phases_v5(
         worker_audit = _safe_read(artifacts_dir / "worker_audit.md")
         # v6: worker_resource provides resource inventory for replaceable_points
         worker_resource = _safe_read(artifacts_dir / "worker_resource.json")
+        # v7: worker_structural provides document-extracted architecture
+        worker_structural = _safe_read(artifacts_dir / "worker_structural.json")
 
-        if not worker_arch and not worker_workflow:
+        if not worker_arch and not worker_workflow and not worker_structural:
             return PhaseResult(
                 phase_name="bp_synthesis_v5",
                 status="error",
@@ -1857,9 +1914,61 @@ def build_blueprint_phases_v5(
                 seen_content.add(key)
                 deduped.append(bd)
 
-        # Re-number IDs sequentially
+        # Re-number IDs sequentially (before structural merge)
         for i, bd in enumerate(deduped):
             bd.id = f"BD-{i + 1:03d}"
+
+        # v7: Merge structural extraction BDs (from document knowledge sources)
+        structural_bd_count = 0
+        if worker_structural:
+            try:
+                structural_data = json.loads(worker_structural)
+                structural_bds = structural_data.get("business_decisions", [])
+                for bd_raw in structural_bds:
+                    if not isinstance(bd_raw, dict) or not bd_raw.get("content"):
+                        continue
+                    bd_raw.setdefault("id", f"BD-{len(deduped) + 1:03d}")
+                    bd_raw.setdefault("type", "B")
+                    bd_raw.setdefault("stage", "unknown")
+                    bd_raw.setdefault("status", "present")
+                    bd_raw.setdefault("source_basis", "doc_declared")
+                    rat = bd_raw.get("rationale", bd_raw.get("content", ""))
+                    if len(rat) < 40:
+                        rat = rat + " " * (40 - len(rat))
+                    bd_raw["rationale"] = rat
+                    if not bd_raw.get("evidence"):
+                        bd_raw["evidence"] = "N/A:0(see_rationale)"
+                    # Dedup against existing code-extracted BDs
+                    key = bd_raw["content"][:50].lower().strip()
+                    if key not in seen_content:
+                        seen_content.add(key)
+                        try:
+                            bd = BusinessDecision.model_validate(bd_raw)
+                            deduped.append(bd)
+                            structural_bd_count += 1
+                            if bd.status == "missing":
+                                missing_deduped.append(bd)
+                        except Exception:
+                            pass
+                    else:
+                        # Corroboration boost: mark existing BD as aligned
+                        for existing_bd in deduped:
+                            if existing_bd.content[:50].lower().strip() == key:
+                                if not existing_bd.source_basis:
+                                    existing_bd.source_basis = "aligned"
+                                break
+            except (json.JSONDecodeError, KeyError):
+                logger.warning("Failed to parse worker_structural.json BDs")
+
+        if structural_bd_count:
+            # Re-number all IDs after structural merge
+            for i, bd in enumerate(deduped):
+                bd.id = f"BD-{i + 1:03d}"
+            logger.info(
+                "v7: merged %d structural BDs, %d aligned with code BDs",
+                structural_bd_count,
+                sum(1 for bd in deduped if bd.source_basis == "aligned"),
+            )
 
         missing_deduped = [bd for bd in deduped if bd.status == "missing"]
         step1_result = BDExtractionResult(
@@ -1870,8 +1979,8 @@ def build_blueprint_phases_v5(
         logger.info(
             "Synthesis Step 1 merged: %d decisions (%d deduped from %d), %d missing gaps",
             len(deduped),
-            len(all_decisions) - len(deduped),
-            len(all_decisions),
+            len(all_decisions) - len(deduped) + structural_bd_count,
+            len(all_decisions) + structural_bd_count,
             len(missing_deduped),
         )
 
@@ -2436,9 +2545,9 @@ def build_blueprint_phases_v5(
         if any(l in labels for l in ["TRD", "A_STOCK"]):
             expected_types.add("DK")
         if any(l in labels for l in ["INS", "TRS"]):
-            expected_types.add("M")      # actuarial/ALM models
+            expected_types.add("M")  # actuarial/ALM models
         if any(l in labels for l in ["LND", "AML"]):
-            expected_types.add("RC")     # lending/AML regulatory constraints
+            expected_types.add("RC")  # lending/AML regulatory constraints
         missing_expected = expected_types - non_t_types
 
         # Vague word ratio
@@ -2659,11 +2768,14 @@ def build_blueprint_phases_v5(
         examples: list[str] = []
         _uc_patterns = [
             # P0: runnable scripts
-            "examples/**/*.py", "notebooks/**/*.py", "tutorials/**/*.py",
+            "examples/**/*.py",
+            "notebooks/**/*.py",
+            "tutorials/**/*.py",
             # P1: Jupyter notebooks (any location)
             "**/*.ipynb",
             # P2: docs tutorials/howto
-            "docs/**/*.py", "docs/**/*.ipynb",
+            "docs/**/*.py",
+            "docs/**/*.ipynb",
         ]
         for pattern in _uc_patterns:
             for p in actual_repo.glob(pattern):
@@ -2744,14 +2856,17 @@ def build_blueprint_phases_v5(
             # Fallback: scan repo directly (same patterns as manifest, v6.3)
             examples = []
             for pattern in [
-                "examples/**/*.py", "notebooks/**/*.py", "tutorials/**/*.py",
-                "**/*.ipynb", "docs/**/*.py", "docs/**/*.ipynb",
+                "examples/**/*.py",
+                "notebooks/**/*.py",
+                "tutorials/**/*.py",
+                "**/*.ipynb",
+                "docs/**/*.py",
+                "docs/**/*.ipynb",
             ]:
                 examples.extend(
                     str(p.relative_to(repo_path))
                     for p in repo_path.glob(pattern)
-                    if "__pycache__" not in str(p)
-                    and ".ipynb_checkpoints" not in str(p)
+                    if "__pycache__" not in str(p) and ".ipynb_checkpoints" not in str(p)
                 )
 
         if not examples:
@@ -2775,9 +2890,7 @@ def build_blueprint_phases_v5(
             try:
                 if ex_path.endswith(".ipynb"):
                     # v6.3: parse Jupyter notebook JSON, extract code cells
-                    nb = json.loads(
-                        full_path.read_text(encoding="utf-8", errors="ignore")
-                    )
+                    nb = json.loads(full_path.read_text(encoding="utf-8", errors="ignore"))
                     code_lines: list[str] = []
                     for cell in nb.get("cells", []):
                         if cell.get("cell_type") == "code":
@@ -2788,17 +2901,10 @@ def build_blueprint_phases_v5(
                                 code_lines.extend(src.split("\n"))
                     lines = [l.rstrip("\n") for l in code_lines]
                 else:
-                    lines = full_path.read_text(
-                        encoding="utf-8", errors="ignore"
-                    ).split("\n")
+                    lines = full_path.read_text(encoding="utf-8", errors="ignore").split("\n")
                 head = "\n".join(lines[:40])
-                has_main = any(
-                    "if __name__" in ln or "def main" in ln for ln in lines
-                )
-                imports = [
-                    ln for ln in lines[:20]
-                    if ln.strip().startswith(("import ", "from "))
-                ]
+                has_main = any("if __name__" in ln or "def main" in ln for ln in lines)
+                imports = [ln for ln in lines[:20] if ln.strip().startswith(("import ", "from "))]
                 file_summaries.append(
                     {
                         "file": ex_path,
@@ -3540,6 +3646,28 @@ def build_blueprint_phases_v5(
             depends_on=["bp_coverage_manifest"],
             required_artifacts=["worker_resource.json"],
             blocking=True,
+            parallel_group="explore",
+        ),
+        # v7: structural extraction from document knowledge sources (SOP 2a-s)
+        # Conditionally activated: only runs when knowledge_sources contains "document".
+        # Phase handler checks state.extra["knowledge_sources"] at runtime and
+        # returns early if no document sources detected.
+        Phase(
+            name="worker_structural",
+            description="Extract architecture from document knowledge sources (SOP 2a-s)",
+            system_prompt=prompts_v7.WORKER_STRUCTURAL_SYSTEM,
+            initial_message_builder=_build_worker_structural_message,
+            allowed_tools=[
+                "read_file",
+                "list_dir",
+                "grep_codebase",
+                "get_artifact",
+                "write_artifact",
+            ],
+            max_iterations=40,
+            depends_on=["bp_structural_index"],
+            required_artifacts=["worker_structural.json"],
+            blocking=False,
             parallel_group="explore",
         ),
         Phase(

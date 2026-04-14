@@ -1,6 +1,6 @@
-# 蓝图提取流水线操作手册（SOP v3.2）
+# 蓝图提取流水线操作手册（SOP v3.6）
 
-> **领域**: Finance | 版本: 3.5 | 执行时只需阅读本文件
+> **领域**: Finance | 版本: 3.6 | 执行时只需阅读本文件
 
 ---
 
@@ -8,15 +8,19 @@
 
 蓝图提取是一个**人机协作的 9 步流程**。
 
+项目是光谱（纯代码 ↔ 纯 skill），同一金融项目可能同时包含代码知识源（.py）和文档知识源（SKILL.md/CLAUDE.md）。步骤 0 探测知识源类型，步骤 2a/2a-s 按知识源类型选择提取策略。
+
 ```
-步骤 0: 指纹探针    — 快速判断子领域，确定必审清单范围
+步骤 0: 指纹探针    — 判定子领域 + 探测知识源类型（代码/文档/配置/混合）
 步骤 1: Clone       — 自动（git clone）
-步骤 2a: 架构提取   — LLM 子代理读源码（产出架构骨架）
-步骤 2b: 声明验证   — LLM 子代理逐行验证关键声明
-步骤 2c: 业务决策标注 — 用 T/B/BA/DK/RC/M 分类审视已提取内容
-步骤 2d: 业务用例扫描 — 扫描 examples/notebooks 提取业务用例索引
-步骤 3: 自动验证    — 脚本 grep 检查（防硬事实错误）
-步骤 4: 组装蓝图    — 基于验证结果写 YAML（有精细度检查清单）
+步骤 2a: 架构提取   — 代码知识源：LLM 子代理读源码（产出架构骨架）
+步骤 2a-s: 结构化萃取 — 文档知识源：LLM 子代理读 SKILL.md/CLAUDE.md（产出架构骨架）
+                       混合项目：步骤 2a + 2a-s 都执行，产出合并
+步骤 2b: 声明验证   — LLM 子代理逐条验证关键声明
+步骤 2c: 业务决策标注 — 用 T/B/BA/DK/RC/M 分类审视已提取内容（所有知识源通用）
+步骤 2d: 业务用例扫描 — 扫描 examples/notebooks/When-to-Use 提取用例索引
+步骤 3: 自动验证    — 脚本 grep 检查（代码源）+ 结构完整性检查（文档源）
+步骤 4: 组装蓝图    — 基于验证结果写 YAML（统一 schema，含 resources/activation）
 步骤 5: 一致性检查  — 检查新蓝图与已有蓝图的交叉引用
 步骤 6: 多模型评审  — 四方评审（Claude/GPT/Gemini/Grok）
 ```
@@ -28,10 +32,40 @@
 
 ## 步骤 0: 项目指纹探针
 
-在 Clone 之前，先快速判断项目属于哪些金融子领域，以确定步骤 2c 中需要审视的必审清单。
+在 Clone 之前，快速判断项目属于哪些金融子领域 + 探测知识源类型。
 
-**输入**：项目 README + GitHub 描述
-**输出**：适用的子领域标签（可多选）
+**输入**：项目 README + GitHub 描述 + 目录结构
+**输出**：适用的子领域标签（可多选）+ 知识源类型（代码/文档/配置/混合）
+
+### 0a. 知识源类型探测
+
+Clone 后执行：
+```bash
+# 代码知识源
+find /tmp/{repo} -name "*.py" | head -30
+
+# 文档知识源
+find /tmp/{repo} -name "SKILL.md" -o -name "CLAUDE.md" -o -name "AGENTS.md" -o -name "GEMINI.md" | head -20
+ls /tmp/{repo}/skills/ 2>/dev/null
+find /tmp/{repo} -name "*.prompt" -o -name "*.prompt.md" | head -10
+
+# 配置知识源
+find /tmp/{repo} -name "hooks.json" -o -name "settings.json" -o -name "manifest.json" | head -20
+find /tmp/{repo} -name "*.yaml" -o -name "*.toml" | grep -v node_modules | grep -v __pycache__ | head -20
+
+# 评测知识源
+find /tmp/{repo} -name "evals.json" -o -name "*eval*" -o -name "*benchmark*" | head -10
+```
+
+| 条件 | 知识源类型 | 步骤 2 策略 |
+|------|-----------|------------|
+| 有 `.py` 源码文件且含业务逻辑 | **代码** | 执行步骤 2a |
+| 有 `SKILL.md`/`CLAUDE.md` 或 `skills/` 目录 | **文档** | 执行步骤 2a-s |
+| 同时满足代码 + 文档条件 | **混合** | 步骤 2a + 2a-s 都执行 |
+
+**金融项目说明**：当前 59 个蓝图全部是代码知识源。随着 AI 金融项目增多（如 FinRL 的 agent 配置、量化 skill 框架），文档知识源会出现。
+
+### 0b. 金融子领域判定
 
 ### 十一个子领域（v3.5 扩展）
 
@@ -106,9 +140,82 @@ cd /tmp/{repo} && git rev-parse HEAD > /tmp/{repo}_commit.txt
 
 ---
 
+## 步骤 2a-s: 结构化萃取（文档知识源）
+
+**条件**：步骤 0 探测到文档知识源时执行。混合项目与步骤 2a 并行执行，产出合并。
+
+启动 Claude Code 子代理，使用以下 prompt：
+
+```
+你是一位 AI 知识架构师。请从 /tmp/{repo}/ 的文档知识源中提取架构骨架。
+
+知识源清单（从步骤 0 指纹获取）：
+{SKILL.md / CLAUDE.md / AGENTS.md 文件列表}
+
+任务清单：
+1. 对每个 SKILL.md / agent 定义文件：
+   a. 提取阶段结构（phases/steps → stages）
+   b. 提取每阶段的输入/输出/方法/验收条件
+   c. 提取可替换点
+   d. 提取激活语义（"When to Use" / "When NOT to Use"）
+   e. 提取关联资源（子技术文档/工具脚本/代码示例）
+   f. 提取跨 skill 关系（引用/依赖/互补/包含）
+
+2. 对项目级文件（CLAUDE.md / README.md）：
+   a. 提取全局契约（铁律/不可违反的规则）
+   b. 提取设计哲学和质量标准
+
+3. 对配置知识源（hooks.json / settings.json）：
+   a. 提取行为规则（事件→动作映射）
+   b. 提取权限模型（允许/禁止/需确认）
+
+对每个发现必须包含：
+- 文件路径 + section 标题（如 SKILL.md:§Phase-1）
+- 原文引用
+- 知识角色标注：normative（规则）/ example（示例）/ rationale（理由）
+
+不要猜测。原文没写的写"未确认"。
+写入 /tmp/{repo}_extract_structural.md
+```
+
+### 与步骤 2a 的产出合并（混合项目）
+
+| 维度 | 代码产出（2a） | 文档产出（2a-s） | 合并规则 |
+|------|--------------|----------------|---------|
+| stages | 从代码逆向的阶段 | 从文档萃取的阶段 | 同一阶段合并，不同阶段各自保留 |
+| global_contracts | 从代码中推断的不变式 | 从文档中显式声明的规则 | 全部保留，标注来源（code_observed / doc_declared） |
+| resources | evidence 中的 API/数据源 | 显式列出的子技术/工具/示例 | 合并到统一 resources 列表 |
+| activation | 无 | 从 "When to Use" 萃取 | 直接使用文档产出 |
+| business_decisions | 从代码推断 | 从文档显式声明 | 全部保留，标注来源 |
+
+**冲突处理**（代码与文档不一致时）：
+
+代码是运行时事实，文档是意图声明。文档会腐烂，代码不会骗人。
+
+| 冲突场景 | 处理 |
+|---------|------|
+| 文档声明了 X，代码确实实现了 X | `aligned` — 正常写入蓝图 |
+| 文档声明了 X，代码未实现 X | `doc_only` — 写入蓝图但标注 `verification: unimplemented`，降级为参考 |
+| 代码实现了 X，文档未提及 | `code_only` — 正常写入蓝图，evidence 来自代码 |
+| 文档说 X，代码实际做 Y（矛盾） | `divergent` — 两者都写入，标注 `conflict: true`，交由人工裁决 |
+
+---
+
 ## 步骤 2b: 声明验证（不可跳过）
 
-从 round 1 报告中提取所有事实性声明（通常 8-12 条），启动第二个子代理验证。
+从步骤 2a / 2a-s 的报告中提取所有事实性声明，按知识源类型选择验证策略。
+
+### 验证策略路由
+
+| 知识源类型 | 验证方法 | 工具 |
+|-----------|---------|------|
+| 代码 | 源码 grep + 行号验证 | grep/rg + 源码阅读 |
+| 文档 | 原文对照 + 语义忠实度检查 | 原文引用 + LLM 交叉验证 |
+| 混合 | 代码声明走源码验证，文档声明走原文对照，跨源声明走交叉验证 | 两种工具都用 |
+
+### 代码声明验证（步骤 2a 产出）
+
+提取所有事实性声明（通常 8-12 条），启动第二个子代理验证。
 
 ```
 你是代码审计专家。请对以下声明逐一做源码验证。
@@ -151,6 +258,68 @@ cd /tmp/{repo} && git rev-parse HEAD > /tmp/{repo}_commit.txt
 
 写入 /tmp/{repo}_verify_round2.md
 ```
+
+### 文档声明验证（步骤 2a-s 产出）
+
+**条件**：步骤 0 探测到文档知识源时执行。
+
+文档验证不能用 grep——文档声明的是意图而非实现。验证方法是原文对照 + 语义忠实度。
+
+启动子代理：
+
+```
+你是知识提取审计专家。请验证以下从文档中提取的声明是否忠实于原文。
+
+源文件目录：/tmp/{repo}/
+
+## 待验证声明
+{从步骤 2a-s 报告中提取的声明列表}
+
+## 验证方法
+对每条声明：
+1. 找到原文出处（文件路径 + section 标题）
+2. 引用原文关键段落
+3. 判断提取结论是否忠实于原文（没有添加、遗漏、歪曲）
+4. 判断知识角色标注是否正确：
+   - normative：原文明确要求"必须/禁止/总是/永远不"
+   - example：原文是具体案例/代码示例/场景描述
+   - rationale：原文解释"为什么这么做"
+   - anti_pattern：原文明确列出的错误做法/反模式/红旗信号
+
+## 高风险检查
+- 提取结论是否把"示例"误当成了"规则"？
+- 提取结论是否遗漏了原文的"例外条件"？
+- 原文的条件限定（"当 X 时"/"仅在 Y 情况下"）是否被保留？
+
+## 输出格式
+对每条声明：
+  声明: "xxx"
+  验证结果: ✅ faithful / ⚠️ partial / ❌ distorted
+  原文出处: file:§section
+  原文引用: "关键段落"
+  知识角色: normative / example / rationale / anti_pattern
+  差异说明: （如不完全忠实）
+
+写入 /tmp/{repo}_verify_structural.md
+```
+
+### 跨源交叉验证（混合项目）
+
+**条件**：步骤 2a + 2a-s 都执行时，对两路产出做交叉验证。
+
+检查每条文档声明是否在代码中有对应实现：
+```bash
+# 对 2a-s 提取的每条 normative 声明，在代码中搜索相关实现
+grep -rn "{关键行为}" /tmp/{repo}/ --include='*.py' | grep -v test
+```
+
+| 结果 | 处理 |
+|------|------|
+| 代码中找到对应实现 | `aligned` — 高置信度 |
+| 代码中未找到实现 | `doc_only` — 标注 `verification: unimplemented` |
+| 代码实现与文档矛盾 | `divergent` — 标注 `conflict: true`，交由人工裁决 |
+
+写入 `/tmp/{repo}_cross_verify.md`
 
 ---
 
@@ -520,7 +689,7 @@ cd /tmp/{repo} && git rev-parse HEAD > /tmp/{repo}_commit.txt
 
 ```yaml
 audit_checklist_summary:
-  sop_version: "3.2"
+  sop_version: "3.6"
   executed_at: "2026-04-05"
   subdomain_labels: ["TRD", "DAT"]  # 步骤 0 指纹探针结果
   finance_universal: {pass: 3, warn: 14, fail: 3}
@@ -546,12 +715,18 @@ audit_checklist_summary:
 ### 扫描范围
 
 ```
-优先级排序：
+代码知识源优先级：
 P0: examples/**/*.py          — 完整可运行策略
 P1: notebooks/**/*.ipynb      — 端到端研究流程
 P2: docs/tutorials/**/*       — 结构化教程
 P3: README.md Quick Start     — 最小可用示例
 P4: 源码中继承基类的内置实现   — 内置因子/策略/模型
+
+文档知识源优先级（步骤 0 探测到文档知识源时补充扫描）：
+P0: SKILL.md 的 "When to Use" 段      — 激活条件和触发场景
+P1: SKILL.md 的 "Common Mistakes" 段   — 反向用例（不应该用的场景）
+P2: CREATION-LOG.md 的测试场景          — 已验证的压力测试用例
+P3: README.md 的 workflow 描述          — 技能调用拓扑中的使用场景
 ```
 
 ### 执行方法
@@ -658,12 +833,24 @@ knowledge/blueprints/{domain}/{domain}-bp-{number}.yaml
 - round 2 的 ⚠️ 声明 → 在 notes 中说明不确定性
 - round 2 的 ✅ 声明 → 直接使用
 
-**规则 2：evidence 格式（双锚点）**
+**规则 2：evidence 格式**
+
+代码知识源（双锚点）：
 ```yaml
 evidence:
   event_engine: vnpy/event/engine.py:48-78(EventEngine._run)
   # 格式：file:line(function_name)
   # 行号 + 函数签名双锚点，防行号漂移
+```
+
+文档知识源（section 锚点 + role 标注）：
+```yaml
+evidence:
+  iron_law:
+    kind: document_section
+    path: skills/systematic-debugging/SKILL.md
+    section_id: "§The-Iron-Law"
+    evidence_role: normative  # normative=规则 / example=示例 / rationale=理由
 ```
 
 **规则 3：避免过度概括**
@@ -707,6 +894,11 @@ global_contracts:
 | 量化金融必审清单 | 20 项金融通用必审 + 子领域必审清单是否逐项审视并记录（存在→标注，不存在→记录为遗漏） | 未审视 → 回步骤 2c |
 | audit_checklist_summary | 审计汇总字段必须存在，包含 sop_version、subdomain_labels、各清单通过/警告/失败计数 | 缺失 → 补充 |
 | replaceable_points 资源完整性 | 每个数据源选项是否包含当前主流方案（如 A 股必须包含 AkShare）；是否列出 Python 依赖包清单；存储后端是否有替代选项描述 | 缺失主流数据源或依赖包 → 补充 |
+| resources 字段 | 子技术文档/工具脚本/代码示例/外部服务是否全部列入 `resources`，每条有 id/type/name/path/used_in_stages | 缺失 → 从步骤 2a-s 产出补充；纯代码项目至少列出外部 API/数据源依赖 |
+| applicability.activation | 文档知识源的 "When to Use" 是否提取到 `activation.triggers` / `activation.anti_skip` | 有文档知识源但无 activation → 回步骤 2a-s 补充；纯代码项目可为空 |
+| relations 类型 | 跨蓝图关系是否使用了正确的 type（depends_on/complementary/contains 用于执行关系） | 所有引用都标 alternative_to → 检查是否应标 depends_on 或 contains |
+| extraction_methods | `source.extraction_methods` 是否列出实际使用的所有提取策略（列表） | 混合项目只标了一种策略 → 补充 |
+| evidence_role | 文档知识源的 evidence 是否标注了 evidence_role（normative/example/rationale） | 未标注 → 回溯原文判断并补充 |
 | BD rationale 深度 | 非 T 类 BD 的 rationale 平均字数 ≥ 40 字（中文）或 ≥ 20 词（英文） | 低于阈值 → 回步骤 2c 逐条补充 rationale |
 | BD 多类型标注比例 | 非 T 类 BD 中多类型标注（如 B/BA、M/BA）占比 ≥ 30% | 低于阈值 → 回步骤 2c 逐条评估双重性质 |
 | missing gap 条数 | missing gap（`status: missing`）至少 3 条 | 0 条 → 审计覆盖不充分，回步骤 2c 重做 Missing Gap 分析 |
