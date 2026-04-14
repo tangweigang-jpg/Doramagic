@@ -462,7 +462,9 @@ class BatchOrchestrator:
                 "Skipping blueprint pipeline for %s (skip_blueprint=True)", job.blueprint_id
             )
             # Fix 3: set blueprint_path so constraint phases can find the blueprint
-            bp_path = output_mgr.output_dir / "blueprint.yaml"
+            bp_path = output_mgr.output_dir / "LATEST.yaml"
+            if not bp_path.exists():
+                bp_path = output_mgr.output_dir / "blueprint.yaml"  # legacy fallback
             if not bp_path.exists():
                 # Also check the canonical knowledge/ location
                 bp_path = (
@@ -527,7 +529,13 @@ class BatchOrchestrator:
                 )
             else:
                 state.current_pipeline = "constraint"
-                bp_path = output_mgr.output_dir / "blueprint.yaml"
+                # Use LATEST.yaml (symlink to versioned blueprint.vN.yaml)
+                # or fall back to state.blueprint_path set by bp_finalize
+                bp_path = output_mgr.output_dir / "LATEST.yaml"
+                if not bp_path.exists() and state.blueprint_path:
+                    bp_path = Path(state.blueprint_path)
+                if not bp_path.exists():
+                    bp_path = output_mgr.output_dir / "blueprint.yaml"  # legacy fallback
                 if self._config.constraint_version == "v2":
                     # Build fallback agent for derive chunk retry.
                     # Skip if fallback is the same model as primary (no point retrying).

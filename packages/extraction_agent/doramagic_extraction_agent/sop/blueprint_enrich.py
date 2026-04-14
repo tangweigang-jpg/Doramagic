@@ -191,12 +191,23 @@ def _patch_commit_hash(bp: dict[str, Any], state: AgentState) -> int:
 
 
 def _patch_sop_version(bp: dict[str, Any]) -> int:
-    """P2: force bp["sop_version"] = "3.4".
+    """P2: force bp["sop_version"] and ensure extraction_methods is a list.
 
     Always returns 1 (this patch is always applied).
     """
-    bp["sop_version"] = "3.4"
-    logger.debug("P2 (sop_version): forced to 3.4")
+    bp["sop_version"] = "3.6"
+
+    # Ensure source.extraction_methods is a list (v7 schema compliance)
+    source = bp.get("source", {})
+    if isinstance(source, dict):
+        em = source.get("extraction_methods") or source.pop("extraction_method", None)
+        if isinstance(em, str):
+            source["extraction_methods"] = [em]
+        elif not isinstance(em, list):
+            source["extraction_methods"] = ["semi_auto"]
+        bp["source"] = source
+
+    logger.debug("P2 (sop_version): forced to 3.6, extraction_methods normalized")
     return 1
 
 
@@ -843,18 +854,17 @@ def _patch_audit_checklist(bp: dict[str, Any], state: AgentState, artifacts_dir:
                 warn_count += 1
             elif "❌" in stripped:
                 fail_count += 1
-        # Cap at 20 (universal checklist size) to avoid inflated counts
-        total = min(pass_count + warn_count + fail_count, 20)
-        pass_count = min(pass_count, 20)
-        warn_count = min(warn_count, 20 - pass_count)
-        fail_count = min(fail_count, 20 - pass_count - warn_count)
+        # Report actual counts — don't cap, the audit covers universal + subdomain
+        total = pass_count + warn_count + fail_count
 
         audit_data["finance_universal"] = {
             "pass": pass_count,
             "warn": warn_count,
             "fail": fail_count,
         }
-        audit_data["coverage"] = f"{total}/20 ({total * 100 // 20}%)" if total else "0/20 (0%)"
+        audit_data["coverage"] = (
+            f"{pass_count}/{total} ({pass_count * 100 // total}%)" if total else "0/0 (0%)"
+        )
         audit_data["note"] = "Parsed from worker_audit.md"
         logger.info(
             "P11 (audit_checklist): real audit data — pass=%d, warn=%d, fail=%d",
@@ -1082,7 +1092,8 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
             if isinstance(rp, dict):
                 all_existing_names.add(rp.get("name", "").lower())
 
-    global_resources = bp.get("global_resources", [])
+    # v7: use "resources" (schema-compliant) instead of "global_resources"
+    resources = bp.get("resources", bp.get("global_resources", []))
     for slot_name, slot_data in resource_slots.items():
         if slot_name.lower() not in all_existing_names:
             new_rp = {
@@ -1102,11 +1113,12 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
                 "default": slot_data.get("default"),
                 "_source": "worker_resource",
             }
-            global_resources.append(new_rp)
+            resources.append(new_rp)
             injected += 1
 
-    if global_resources:
-        bp["global_resources"] = global_resources
+    if resources:
+        bp["resources"] = resources
+        bp.pop("global_resources", None)  # remove legacy field name
 
     logger.info("P14 (resource_injection): injected %d resource slots", injected)
     return injected
