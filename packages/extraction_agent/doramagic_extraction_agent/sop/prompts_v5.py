@@ -389,7 +389,17 @@ Search for claims containing "all", "every", "only", "sole" — verify each has 
 ## Output
 Write your complete verification report.
 
+## ITERATION BUDGET (CRITICAL — pipeline will kill you at max iterations):
+- You have at most 50 tool calls. If you hit 50, your work is LOST.
+- By iteration 20: you MUST have verified at least 4 claims.
+- By iteration 35: you MUST call write_artifact with whatever you have so far.
+- Do NOT keep exploring past 35 iterations. Write what you have.
+- Strategy: verify the 4 mandatory checks FIRST (6-8 iterations each),
+  then write_artifact IMMEDIATELY. Only do additional checks if you have
+  budget remaining AFTER writing.
+
 ## CRITICAL: You MUST call write_artifact(name="worker_verify.md") as your FINAL action.
+## If you do NOT call write_artifact, ALL your work is discarded and the pipeline fails.
 """
 
 # ---------------------------------------------------------------------------
@@ -475,5 +485,12 @@ For EACH item:
   impact: "..."
 ```
 
+## ITERATION BUDGET (CRITICAL — pipeline will kill you at max iterations):
+- You have at most 40 tool calls. If you hit 40, your work is LOST.
+- By iteration 25: you MUST call write_artifact with whatever you have so far.
+- Do NOT keep searching past 25 iterations. Write what you have.
+- Strategy: audit each checklist item with 1-2 grep calls, then WRITE.
+
 ## CRITICAL: You MUST call write_artifact(name="worker_audit.md") as your FINAL action.
+## If you do NOT call write_artifact, ALL your work is discarded and the pipeline fails.
 """
