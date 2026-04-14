@@ -2695,11 +2695,12 @@ def build_blueprint_phases_v5(
                 )
 
         if not examples:
-            logger.warning("bp_uc_extract: no example files found")
+            logger.warning("bp_uc_extract: no example files found — writing empty UC list")
+            (artifacts_dir / "uc_list.json").write_text("[]", encoding="utf-8")
             return PhaseResult(
                 phase_name="bp_uc_extract",
                 status="completed",
-                final_text="No examples found",
+                final_text="No examples found — empty UC list",
             )
 
         # Read head of each example file (cap at 100 for context limits)
@@ -2729,10 +2730,11 @@ def build_blueprint_phases_v5(
                 continue
 
         if not file_summaries:
+            (artifacts_dir / "uc_list.json").write_text("[]", encoding="utf-8")
             return PhaseResult(
                 phase_name="bp_uc_extract",
                 status="completed",
-                final_text="No readable examples",
+                final_text="No readable examples — empty UC list",
             )
 
         # Build prompt for Instructor (using dedicated UC schema)
