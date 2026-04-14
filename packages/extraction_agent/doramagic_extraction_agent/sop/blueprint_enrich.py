@@ -1285,7 +1285,17 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
         })
         injected += 1
 
-    deps = resource_data.get("dependencies", [])
+    raw_deps = resource_data.get("dependencies", [])
+    # dependencies can be list or dict ({"core": [...], "optional": [...]})
+    if isinstance(raw_deps, dict):
+        deps: list = []
+        for group in raw_deps.values():
+            if isinstance(group, list):
+                deps.extend(group)
+    elif isinstance(raw_deps, list):
+        deps = raw_deps
+    else:
+        deps = []
     for dep in deps[:10]:  # Cap at 10 most important
         if not isinstance(dep, dict):
             continue
