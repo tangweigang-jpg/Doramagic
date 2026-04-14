@@ -479,6 +479,9 @@ class ExtractionAgent:
                 len(response.tool_calls),
             )
 
+            # --- Microcompact: LRU-clear old tool results to prevent overflow ---
+            messages = microcompact(messages)
+
             # --- Append assistant turn ---
             assistant_dict = self._build_assistant_message(raw_resp)
             messages.append(assistant_dict)
