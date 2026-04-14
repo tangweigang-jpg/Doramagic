@@ -3330,7 +3330,7 @@ def build_blueprint_phases_v5(
                 "get_artifact",
                 "write_artifact",
             ],
-            max_iterations=40,
+            max_iterations=50,  # increased from 40 — MiniMax sometimes over-explores
             depends_on=["bp_clone"],
             parallel_group="workers",
             blocking=True,  # v6: audit results feed into synthesis Step 3
