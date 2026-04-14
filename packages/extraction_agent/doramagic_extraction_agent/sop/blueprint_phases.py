@@ -3437,7 +3437,7 @@ def build_blueprint_phases_v5(
             system_prompt=prompts_v4.WORKER_ARCH_SYSTEM,
             initial_message_builder=_build_worker_arch_message,
             allowed_tools=all_tools,
-            max_iterations=20,  # Reduced: evidence packet needs focused extraction, not exhaustive scanning
+            max_iterations=40,  # v6.3: raised from 20 — complex repos (zvt) need more exploration rounds
             depends_on=["bp_coverage_manifest"],
             required_artifacts=["worker_arch.json"],
             blocking=True,
