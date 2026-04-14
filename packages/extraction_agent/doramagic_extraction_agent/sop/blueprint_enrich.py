@@ -329,16 +329,26 @@ def _patch_bd_type_enum_fix(bp: dict[str, Any]) -> int:
     return count
 
 
-def _patch_evidence_format(bp: dict[str, Any]) -> int:
+def _patch_evidence_format(
+    bp: dict[str, Any],
+    file_path_map: dict[str, str] | None = None,
+) -> int:
     """P5: normalise BD evidence fields to file:line(fn) format.
 
     Three cases:
+    0. Document section evidence (file:§section) — skip.
     1. Already matches file:line(fn) — skip.
     2. Matches file.py:line with optional trailing text — extract/derive fn.
+       v7: also resolves bare filenames to full repo-relative paths using file_path_map.
     3. No .py file reference at all — replace with N/A:0(see_rationale).
 
     Also computes evidence_coverage_ratio = (BDs with valid evidence) / total BDs,
     stored in bp["_enrich_meta"]["evidence_coverage_ratio"].
+
+    Args:
+        bp: The blueprint dict.
+        file_path_map: Optional mapping of bare filename → full repo-relative path.
+            Built from structural_index in enrich_blueprint().
 
     Returns the number of BDs whose evidence was modified.
     """
@@ -377,10 +387,23 @@ def _patch_evidence_format(bp: dict[str, Any]) -> int:
             fp = m.group("path")
             line = m.group("line")
             rest = m.group("rest") or ""
+
+            # v7: resolve bare filename to full repo-relative path
+            # e.g. "env_stocktrading.py" → "finrl/meta/env_stock_trading/env_stocktrading.py"
+            if "/" not in fp and file_path_map:
+                bare = fp.split("/")[-1]
+                resolved = file_path_map.get(bare)
+                if resolved:
+                    fp = resolved
+
             # Look for explicit (function) in trailing text
             func_m = re.search(r"\(([^)]+)\)", rest)
             if func_m:
-                entry["evidence"] = f"{fp}:{line}({func_m.group(1)})"
+                fn_name = func_m.group(1)
+                # Sanitize: reject non-identifier function names
+                if not re.match(r"^[\w.]+$", fn_name):
+                    fn_name = "module"
+                entry["evidence"] = f"{fp}:{line}({fn_name})"
             else:
                 # Derive from first word after separators
                 word_m = re.search(r"[\s\u2014\-:]+(\w+)", rest)
@@ -882,22 +905,71 @@ def _patch_audit_checklist(bp: dict[str, Any], state: AgentState, artifacts_dir:
     return 1
 
 
-def _patch_relations(bp: dict[str, Any]) -> int:
-    """P12: inject placeholder relations list if the field is absent or empty.
+def _patch_relations(bp: dict[str, Any], state: AgentState | None = None) -> int:
+    """P12: discover and inject relations with existing blueprints.
 
-    Returns 1 if a placeholder was injected, 0 otherwise.
+    v7: scans existing blueprints in the same domain to find related projects.
+    Falls back to placeholder only if no existing blueprints are found.
+
+    Returns the number of relations injected.
     """
-    if not bp.get("relations"):
-        bp["relations"] = [
-            {
-                "target": "同子领域蓝图",
-                "type": "pending",
-                "description": "暂无同子领域参照，待批量提取后补充",
-            }
-        ]
-        logger.debug("P12 (relations): injected placeholder")
-        return 1
-    return 0
+    if bp.get("relations"):
+        # Remove placeholder entries
+        real = [r for r in bp["relations"] if isinstance(r, dict) and r.get("type") != "pending"]
+        if real:
+            return 0  # Already has real relations
+
+    # Try to discover related blueprints from the knowledge directory
+    from pathlib import Path as _Path
+
+    domain = bp.get("applicability", {}).get("domain", "finance")
+    bp_id = bp.get("id", "")
+    bp_dir = _Path("knowledge/blueprints") / domain
+
+    relations: list[dict[str, str]] = []
+    if bp_dir.is_dir():
+        import yaml as _yaml
+
+        for yaml_file in sorted(bp_dir.glob("*.yaml")):
+            if yaml_file.name.startswith("_"):
+                continue
+            try:
+                other = _yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
+                if not isinstance(other, dict):
+                    continue
+                other_id = other.get("id", "")
+                if not other_id or other_id == bp_id:
+                    continue
+                other_name = other.get("name", "")
+                other_task = other.get("applicability", {}).get("task_type", "")
+                bp_task = bp.get("applicability", {}).get("task_type", "")
+
+                # Determine relation type based on task_type similarity
+                if bp_task and other_task and bp_task == other_task:
+                    rel_type = "alternative_to"
+                    desc = f"{other_name} — same task type ({other_task}), different implementation"
+                else:
+                    rel_type = "complementary"
+                    desc = f"{other_name} — different capability, potential data/component synergy"
+
+                relations.append({
+                    "type": rel_type,
+                    "target": other_id,
+                    "description": desc,
+                })
+            except Exception:
+                continue
+
+    if not relations:
+        relations = [{
+            "target": "pending",
+            "type": "pending",
+            "description": "No existing blueprints found in this domain for relation discovery",
+        }]
+
+    bp["relations"] = relations
+    logger.info("P12 (relations): discovered %d relations", len(relations))
+    return len(relations)
 
 
 def _patch_execution_paradigm(bp: dict[str, Any]) -> int:
@@ -1363,58 +1435,77 @@ def _patch_missing_gaps_from_audit(bp: dict[str, Any], artifacts_dir: Path) -> i
 # Keywords that signal a BD might deserve a secondary type annotation
 _MULTI_TYPE_RULES: list[tuple[str, str, list[str]]] = [
     # (current_type, candidate_secondary, trigger_keywords)
+    # v7: expanded keyword lists + AI/RL/finance signals for better coverage
     (
         "B",
         "BA",
         [
-            "assume",
-            "assumption",
-            "default",
-            "threshold",
-            "expect",
-            "tolerance",
-            "typical",
-            "empirical",
-            "heuristic",
+            "assume", "assumption", "default", "threshold", "expect",
+            "tolerance", "typical", "empirical", "heuristic", "convention",
+            "encode", "implicit", "approximate", "simplif", "proxy",
+            "initial", "baseline", "conservative", "aggressive",
+            "institutional", "retail", "scale", "capital",
         ],
     ),
     (
         "B",
         "DK",
         [
-            "market",
-            "china",
-            "a-share",
-            "a股",
-            "exchange",
-            "regulatory",
-            "convention",
-            "tradition",
-            "culture",
+            "market", "china", "a-share", "a股", "exchange", "regulatory",
+            "convention", "tradition", "culture", "nyse", "nasdaq",
+            "us equity", "us stock", "crypto", "dow", "s&p",
         ],
     ),
     (
         "B",
         "RC",
-        ["regulation", "mandatory", "required", "compliance", "settlement", "T+1", "stamp", "tax"],
+        [
+            "regulation", "mandatory", "required", "compliance",
+            "settlement", "T+1", "stamp", "tax", "sec", "finra",
+        ],
     ),
-    ("BA", "DK", ["market", "china", "a-share", "specific", "local", "domestic", "convention"]),
+    (
+        "BA",
+        "DK",
+        [
+            "market", "china", "a-share", "specific", "local",
+            "domestic", "convention", "us equity", "trading day",
+        ],
+    ),
     (
         "BA",
         "M",
         [
-            "formula",
-            "model",
-            "statistical",
-            "distribution",
-            "normal",
-            "gaussian",
-            "variance",
-            "correlation",
+            "formula", "model", "statistical", "distribution", "normal",
+            "gaussian", "variance", "correlation", "sharpe", "sortino",
+            "mahalanobis", "covariance", "annuali", "sqrt",
         ],
     ),
-    ("M", "DK", ["market", "china", "a-share", "specific", "domestic"]),
-    ("M", "BA", ["assume", "assumption", "empirical", "calibrat", "parameter", "default"]),
+    (
+        "M",
+        "DK",
+        [
+            "market", "china", "a-share", "specific", "domestic",
+            "trading day", "252", "us equity", "nyse",
+        ],
+    ),
+    (
+        "M",
+        "BA",
+        [
+            "assume", "assumption", "empirical", "calibrat", "parameter",
+            "default", "convention", "approximate", "practical",
+            "domain", "financial", "reward", "scaling", "normalize",
+        ],
+    ),
+    (
+        "DK",
+        "B",
+        [
+            "design", "choice", "select", "choose", "implement",
+            "decision", "architect", "framework",
+        ],
+    ),
 ]
 
 
@@ -1446,9 +1537,9 @@ def _patch_multi_type_annotation(bp: dict[str, Any]) -> int:
         for primary, secondary, keywords in _MULTI_TYPE_RULES:
             if bd_type != primary:
                 continue
-            # Count keyword matches
+            # Count keyword matches (v7: lowered threshold from 2→1)
             hits = sum(1 for kw in keywords if kw.lower() in rationale)
-            if hits >= 2:  # At least 2 keyword matches to avoid false positives
+            if hits >= 1:
                 bd["type"] = f"{primary}/{secondary}"
                 upgraded += 1
                 break  # Only apply first matching rule
@@ -1613,9 +1704,26 @@ def enrich_blueprint(
 
     # BD field-level fixes
     patch_stats["p4_bd_type_enum_fix"] = _patch_bd_type_enum_fix(bp)
-    patch_stats["p5_evidence_format"] = _patch_evidence_format(bp)
-    # P5.5: deterministic evidence verification (v6)
+
+    # v7: build filename→full_path map for evidence path resolution
+    file_path_map: dict[str, str] = {}
     repo_path = str(state.repo_path) if hasattr(state, "repo_path") and state.repo_path else ""
+    if repo_path:
+        from pathlib import Path as _P
+
+        repo_root = _P(repo_path).resolve()
+        for py_file in repo_root.rglob("*.py"):
+            rel_parts = py_file.relative_to(repo_root).parts
+            if any(p.startswith(".") or p == "__pycache__" for p in rel_parts):
+                continue
+            rel = str(py_file.relative_to(repo_root))
+            bare = py_file.name
+            # Only map if no collision (first match wins)
+            if bare not in file_path_map:
+                file_path_map[bare] = rel
+
+    patch_stats["p5_evidence_format"] = _patch_evidence_format(bp, file_path_map=file_path_map)
+    # P5.5: deterministic evidence verification (v6)
     if repo_path:
         patch_stats["p5_5_evidence_verify"] = _patch_evidence_verify(bp, repo_path)
     patch_stats["p6_vague_words"] = _patch_vague_words(bp)
@@ -1630,7 +1738,7 @@ def enrich_blueprint(
 
     # Metadata scaffolding (fill absent top-level fields)
     patch_stats["p11_audit_checklist"] = _patch_audit_checklist(bp, state, artifacts_dir)
-    patch_stats["p12_relations"] = _patch_relations(bp)
+    patch_stats["p12_relations"] = _patch_relations(bp, state=state)
     patch_stats["p13_execution_paradigm"] = _patch_execution_paradigm(bp)
 
     # v6: Resource injection from worker_resource
