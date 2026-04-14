@@ -563,7 +563,6 @@ class SOPExecutor:
                         "Phase %r hit iteration cap but artifacts present — promoting to completed",
                         phase.name,
                     )
-                    # Re-process as completed
                     phase_result = PhaseResult(
                         phase_name=phase_result.phase_name,
                         status="completed",
@@ -572,6 +571,35 @@ class SOPExecutor:
                         final_text=phase_result.final_text,
                     )
                     return self._process_phase_result(phase, phase_result, result)
+
+                # Artifacts missing at max_iterations: generate placeholder
+                # so the pipeline can continue. Better partial data than halt.
+                for artifact_name in phase.required_artifacts:
+                    artifact_path = artifacts_dir / artifact_name
+                    if not artifact_path.is_file() or artifact_path.stat().st_size == 0:
+                        placeholder = (
+                            f"# {phase.name} — placeholder (max_iterations reached)\n"
+                            f"# Worker exhausted {phase_result.iterations} iterations "
+                            f"without writing this artifact.\n"
+                            f"# Downstream patches (P15/P16/P17) will compensate.\n"
+                        )
+                        artifact_path.write_text(placeholder, encoding="utf-8")
+                        logger.warning(
+                            "Phase %r: generated placeholder for %r "
+                            "(%d iterations exhausted)",
+                            phase.name,
+                            artifact_name,
+                            phase_result.iterations,
+                        )
+                # Re-check — all should be present now
+                phase_result = PhaseResult(
+                    phase_name=phase_result.phase_name,
+                    status="completed",
+                    iterations=phase_result.iterations,
+                    total_tokens=phase_result.total_tokens,
+                    final_text="placeholder generated after max_iterations",
+                )
+                return self._process_phase_result(phase, phase_result, result)
 
             if not phase.blocking:
                 # Non-blocking phase failure: mark as skipped, continue pipeline
