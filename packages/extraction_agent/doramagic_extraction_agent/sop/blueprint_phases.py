@@ -1623,6 +1623,36 @@ def _build_step2_message(
     return "\n".join(parts)
 
 
+def _build_worker_audit_message(s: AgentState, r: str) -> str:
+    """Build the initial message for the worker_audit phase.
+
+    Injects subdomain-specific checklist tables so the auditor knows
+    exactly which items to check beyond the 20 universal finance items.
+    """
+    labels = s.subdomain_labels or ["TRD"]
+    checklist_parts: list[str] = []
+    for label in labels:
+        content = prompts.SUBDOMAIN_CHECKLISTS.get(label, "")
+        if content:
+            checklist_parts.append(content)
+
+    checklist_section = (
+        "\n\n## Subdomain-Specific Checklist Items\n\n"
+        + "\n".join(checklist_parts)
+        if checklist_parts
+        else "\n\n（No subdomain-specific checklist — apply universal items only.）"
+    )
+
+    return (
+        f"Repository: {r}\n"
+        f"Subdomain labels: {', '.join(labels)}\n\n"
+        "Audit the repository against BOTH:\n"
+        "1. The 20-item universal finance checklist\n"
+        "2. The subdomain-specific checklist items below\n"
+        + checklist_section
+    )
+
+
 def build_blueprint_phases_v5(
     blueprint_id: str,
     *,
@@ -2405,6 +2435,10 @@ def build_blueprint_phases_v5(
             expected_types.add("RC")
         if any(l in labels for l in ["TRD", "A_STOCK"]):
             expected_types.add("DK")
+        if any(l in labels for l in ["INS", "TRS"]):
+            expected_types.add("M")      # actuarial/ALM models
+        if any(l in labels for l in ["LND", "AML"]):
+            expected_types.add("RC")     # lending/AML regulatory constraints
         missing_expected = expected_types - non_t_types
 
         # Vague word ratio
@@ -3532,11 +3566,7 @@ def build_blueprint_phases_v5(
             name="worker_audit",
             description="Systematic audit checklist (SOP 2c)",
             system_prompt=prompts_v5.WORKER_AUDIT_SYSTEM,
-            initial_message_builder=lambda s, r: (
-                f"Repository: {r}\n"
-                f"Subdomain labels: {', '.join(s.subdomain_labels or ['TRD'])}\n\n"
-                "Audit the repository against the 20-item universal finance checklist."
-            ),
+            initial_message_builder=_build_worker_audit_message,
             allowed_tools=[
                 "read_file",
                 "grep_codebase",

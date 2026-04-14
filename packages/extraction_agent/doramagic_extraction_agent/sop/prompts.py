@@ -188,6 +188,57 @@ AIL_CHECKLIST = """\
 | 6 | 多智能体决策共识与风险否决权 | LLM 输出格式异常 = 决策缺失 | ST |
 """
 
+INS_CHECKLIST = """\
+### INS 保险精算（6 项）
+
+| # | 必审项 | 为什么必审 | 常见标注 |
+|---|--------|----------|---------|
+| 1 | 准备金充足性方法（Chain Ladder/BF/Mack） | 方法选择直接影响准备金规模与偿付能力 | NM/CV |
+| 2 | 死亡率表版本与来源（SOA/UK ONS/中国生命表） | 版本错误导致长期寿险定价系统性偏差 | DS/RC |
+| 3 | 最优估计假设（Best Estimate）与风险边际 | IFRS 17 核心要求，混淆则报告不合规 | RC/CV |
+| 4 | Solvency II SCR 标准公式 vs 内部模型 | 模型选择决定资本要求量级 | RC/M |
+| 5 | 再保险合约映射（QS/XL/Stop Loss） | 合约条款映射错误导致净敞口计算失真 | DP/DS |
+| 6 | 巨灾模型选择与校准（AIR/RMS） | 模型差异导致 CAT 准备金差异达数倍 | NM/CV |
+"""
+
+LND_CHECKLIST = """\
+### LND 贷款与信贷（6 项）
+
+| # | 必审项 | 为什么必审 | 常见标注 |
+|---|--------|----------|---------|
+| 1 | 利率类型处理（固定/浮动/混合） | 利率类型混淆导致还款计划和 IRR 计算错误 | NM/DS |
+| 2 | 还款计划生成（等额本息/等额本金/先息后本） | 方法差异影响现金流建模与 IFRS 9 ECL | NM/CV |
+| 3 | 逾期定义与滚动率（DPD 30/60/90） | 逾期定义不一致导致跨机构风险比较失真 | RC/DS |
+| 4 | 催收优先级与合规约束 | 违反催收法规（如 FDCPA）导致合规处罚 | RC/DP |
+| 5 | 双重记账完整性（Debit = Credit） | 借贷不平衡导致账务系统数据损坏 | CV/DS |
+| 6 | 对账时效与差异处理 | 差异未及时处理累积成审计风险 | ST/RC |
+"""
+
+TRS_CHECKLIST = """\
+### TRS 资金与流动性（5 项）
+
+| # | 必审项 | 为什么必审 | 常见标注 |
+|---|--------|----------|---------|
+| 1 | 流动性覆盖率（LCR）与净稳定资金比率（NSFR） | 监管红线，计算口径错误导致违规 | RC/QT |
+| 2 | 利率缺口分析时间桶划分 | 时间桶边界不一致导致 IRRBB 错误 | TM/DS |
+| 3 | 资金转移定价（FTP）方法 | FTP 方法不一致导致业务线盈利能力失真 | NM/DP |
+| 4 | 现金池法律结构 | 跨境现金池需满足所在司法管辖区监管要求 | RC/DS |
+| 5 | 外汇风险敞口计量与对冲比率 | 敞口口径不一致导致套保效果评估失真 | QT/CV |
+"""
+
+AML_CHECKLIST = """\
+### AML 反洗钱与合规（6 项）
+
+| # | 必审项 | 为什么必审 | 常见标注 |
+|---|--------|----------|---------|
+| 1 | 交易阈值配置（CTR/SAR，各国不同） | 阈值硬编码无法跨司法管辖区部署 | RC/DP |
+| 2 | 制裁名单版本与更新频率（OFAC/EU/UN） | 名单过时导致制裁违规，法律风险极高 | RC/DS |
+| 3 | 模糊匹配算法与阈值（Jaro-Winkler/Levenshtein） | 阈值过高漏报，过低误报率不可控 | NM/CV |
+| 4 | 网络分析深度（跳数/层数） | 深度不足遗漏间接关联实体 | DP/QT |
+| 5 | 误报率监控与模型治理 | 高误报耗尽人工审核资源，触发监管问询 | CV/RC |
+| 6 | 审计日志不可变性与保留期 | 可变日志不满足监管举证要求 | RC/DS |
+"""
+
 # Mapping used by blueprint_phases.py to assemble subdomain-specific checklist
 SUBDOMAIN_CHECKLISTS: dict[str, str] = {
     "TRD": TRD_CHECKLIST,
@@ -198,6 +249,10 @@ SUBDOMAIN_CHECKLISTS: dict[str, str] = {
     "CMP": CMP_CHECKLIST,
     "DAT": DAT_CHECKLIST,
     "AIL": AIL_CHECKLIST,
+    "INS": INS_CHECKLIST,
+    "LND": LND_CHECKLIST,
+    "TRS": TRS_CHECKLIST,
+    "AML": AML_CHECKLIST,
 }
 
 

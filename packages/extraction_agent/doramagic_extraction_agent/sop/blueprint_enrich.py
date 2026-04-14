@@ -122,6 +122,31 @@ STAGE_MAPPING: dict[str, str] = {
     # cross_stage is handled via "cross" substring check → global scope
     "cross_stage": "",  # sentinel — triggers global-scope promotion
     "global": "",  # sentinel — same promotion
+    # INS — Insurance & Actuarial
+    "claims_processing": "claim_adjudication",
+    "claims": "claim_adjudication",
+    "reserving": "reserve_calculation",
+    "reserve": "reserve_calculation",
+    "underwriting_ins": "risk_assessment",
+    "actuarial": "actuarial_analysis",
+    "reinsurance": "reinsurance_mapping",
+    # LND — Lending & Payments
+    "underwriting": "loan_underwriting",
+    "origination": "loan_origination",
+    "collections": "collection_management",
+    "disbursement": "loan_disbursement",
+    "repayment": "repayment_processing",
+    "reconciliation": "payment_reconciliation",
+    # TRS — Treasury & ALM
+    "alm": "asset_liability_management",
+    "liquidity": "liquidity_management",
+    "cash_management": "cash_pooling",
+    "ftp": "transfer_pricing",
+    # AML — Anti-Money Laundering
+    "screening": "sanctions_screening",
+    "monitoring": "transaction_monitoring",
+    "investigation": "case_investigation",
+    "reporting_aml": "regulatory_reporting",
 }
 
 # Regex patterns for evidence parsing (Patch 5)
