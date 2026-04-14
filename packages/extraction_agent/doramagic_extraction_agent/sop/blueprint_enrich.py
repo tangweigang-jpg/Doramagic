@@ -325,8 +325,31 @@ def _patch_bd_type_enum_fix(bp: dict[str, Any]) -> int:
                 raw_type,
             )
 
-    logger.info("P4 (bd_type_enum_fix): %d BD type fields corrected", count)
-    return count
+    # v7: detect RC misclassification — RC without regulatory keywords → T
+    _RC_KEYWORDS = {
+        "regulation", "regulatory", "mandatory", "required", "compliance",
+        "settlement", "t+1", "t+2", "stamp", "tax", "sec", "finra",
+        "exchange rule", "law", "legal", "statute", "directive",
+        "basel", "mifid", "solvency", "ifrs", "gaap",
+    }
+    rc_fixed = 0
+    for bd in bp.get("business_decisions", []):
+        if not isinstance(bd, dict):
+            continue
+        bd_type = bd.get("type", "")
+        if bd_type != "RC" or bd.get("status") == "missing":
+            continue
+        text = (bd.get("content", "") + " " + bd.get("rationale", "")).lower()
+        if not any(kw in text for kw in _RC_KEYWORDS):
+            bd["type"] = "T"
+            rc_fixed += 1
+            logger.info(
+                "P4: RC→T for %s (no regulatory keywords): %s",
+                bd.get("id", "?"), bd.get("content", "")[:50],
+            )
+
+    logger.info("P4 (bd_type_enum_fix): %d type corrected, %d RC→T", count, rc_fixed)
+    return count + rc_fixed
 
 
 def _patch_evidence_format(
@@ -399,15 +422,21 @@ def _patch_evidence_format(
             # Look for explicit (function) in trailing text
             func_m = re.search(r"\(([^)]+)\)", rest)
             if func_m:
-                fn_name = func_m.group(1)
+                fn_name = func_m.group(1).strip()
                 # Sanitize: reject non-identifier function names
-                if not re.match(r"^[\w.]+$", fn_name):
+                # Invalid: "self", "module", "for i in range()", numbers, comma-lists
+                if (
+                    not re.match(r"^[A-Za-z_][\w.]*$", fn_name)
+                    or fn_name in ("self", "module", "cls", "args", "kwargs")
+                ):
                     fn_name = "module"
                 entry["evidence"] = f"{fp}:{line}({fn_name})"
             else:
                 # Derive from first word after separators
-                word_m = re.search(r"[\s\u2014\-:]+(\w+)", rest)
+                word_m = re.search(r"[\s\u2014\-:]+([A-Za-z_]\w*)", rest)
                 fn = word_m.group(1) if word_m else "module"
+                if fn in ("self", "cls", "args", "kwargs"):
+                    fn = "module"
                 entry["evidence"] = f"{fp}:{line}({fn})"
             ev_fixed += 1
             valid_evidence_count += 1
@@ -854,52 +883,70 @@ def _patch_audit_checklist(bp: dict[str, Any], state: AgentState, artifacts_dir:
     # Try to read real audit data
     audit_path = artifacts_dir / "worker_audit.md"
     audit_data: dict[str, Any] = {
-        "sop_version": "3.4",
+        "sop_version": bp.get("sop_version", "3.6"),
         "executed_at": "auto",
         "subdomain_labels": labels,
     }
 
     if audit_path.exists():
         content = audit_path.read_text(encoding="utf-8")
-        # Parse pass/warn/fail from markdown table rows only (lines starting
-        # with "|" that contain a status emoji).  This avoids over-counting
-        # emojis in prose, examples, or remediation sections.
-        pass_count = 0
-        warn_count = 0
-        fail_count = 0
+        # Parse pass/warn/fail per section (universal vs subdomain).
+        # Sections are separated by "##" headings. Table rows start with "|".
+        # Only count rows containing status emojis, skip header/separator rows.
+        universal = {"pass": 0, "warn": 0, "fail": 0}
+        subdomain_totals = {"pass": 0, "warn": 0, "fail": 0}
+        current_section = "unknown"
+
         for line in content.split("\n"):
             stripped = line.strip()
+            # Detect section headers
+            if stripped.startswith("##"):
+                lower = stripped.lower()
+                if "universal" in lower or "通用" in lower:
+                    current_section = "universal"
+                elif any(
+                    kw in lower
+                    for kw in ["trd", "prc", "rsk", "crd", "cmp", "dat", "ail",
+                               "ins", "lnd", "trs", "aml", "a_stock", "a股"]
+                ):
+                    current_section = "subdomain"
+                else:
+                    current_section = "other"
+                continue
+
             if not stripped.startswith("|"):
                 continue
-            if "✅" in stripped:
-                pass_count += 1
-            elif "⚠️" in stripped:
-                warn_count += 1
-            elif "❌" in stripped:
-                fail_count += 1
-        # Report actual counts — don't cap, the audit covers universal + subdomain
-        total = pass_count + warn_count + fail_count
+            # Skip table header/separator rows
+            if "---" in stripped or "必审项" in stripped or "Check" in stripped:
+                continue
 
-        audit_data["finance_universal"] = {
-            "pass": pass_count,
-            "warn": warn_count,
-            "fail": fail_count,
-        }
+            target = universal if current_section == "universal" else subdomain_totals
+            if "✅" in stripped:
+                target["pass"] += 1
+            elif "⚠️" in stripped:
+                target["warn"] += 1
+            elif "❌" in stripped:
+                target["fail"] += 1
+
+        total_all = sum(universal.values()) + sum(subdomain_totals.values())
+        total_pass = universal["pass"] + subdomain_totals["pass"]
+
+        audit_data["finance_universal"] = universal
+        audit_data["subdomain_totals"] = subdomain_totals
         audit_data["coverage"] = (
-            f"{pass_count}/{total} ({pass_count * 100 // total}%)" if total else "0/0 (0%)"
+            f"{total_pass}/{total_all} ({total_pass * 100 // total_all}%)"
+            if total_all else "0/0 (0%)"
         )
-        audit_data["note"] = "Parsed from worker_audit.md"
+        audit_data["note"] = "Parsed from worker_audit.md (universal + subdomain separated)"
         logger.info(
-            "P11 (audit_checklist): real audit data — pass=%d, warn=%d, fail=%d",
-            pass_count,
-            warn_count,
-            fail_count,
+            "P11 (audit): universal=%s, subdomain=%s, total=%d",
+            universal, subdomain_totals, total_all,
         )
     else:
         audit_data["note"] = (
-            "Auto-generated by bp_enrich; detailed audit pending Batch C worker_audit"
+            "Auto-generated by bp_enrich; detailed audit pending"
         )
-        logger.debug("P11 (audit_checklist): placeholder (worker_audit.md not found)")
+        logger.debug("P11 (audit): placeholder (worker_audit.md not found)")
 
     bp["audit_checklist_summary"] = audit_data
     return 1
@@ -945,12 +992,13 @@ def _patch_relations(bp: dict[str, Any], state: AgentState | None = None) -> int
                 bp_task = bp.get("applicability", {}).get("task_type", "")
 
                 # Determine relation type based on task_type similarity
+                # Use ID as description base (English, stable) instead of name (may be Chinese)
                 if bp_task and other_task and bp_task == other_task:
                     rel_type = "alternative_to"
-                    desc = f"{other_name} — same task type ({other_task}), different implementation"
+                    desc = f"Same task type ({other_task}), different implementation approach"
                 else:
                     rel_type = "complementary"
-                    desc = f"{other_name} — different capability, potential data/component synergy"
+                    desc = "Different capability, potential data/component synergy"
 
                 relations.append({
                     "type": rel_type,
@@ -962,9 +1010,9 @@ def _patch_relations(bp: dict[str, Any], state: AgentState | None = None) -> int
 
     if not relations:
         relations = [{
-            "target": "pending",
             "type": "pending",
-            "description": "No existing blueprints found in this domain for relation discovery",
+            "target": "none",
+            "description": "No existing blueprints found in this domain",
         }]
 
     bp["relations"] = relations
@@ -1188,11 +1236,72 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
             resources.append(new_rp)
             injected += 1
 
+    # v7: also inject data_sources and external_services into resources[]
+    # with schema-compliant format (id/type/name/path/description/used_in_stages)
+    res_counter = len(resources)
+    data_sources = resource_data.get("data_sources", [])
+    for ds in data_sources:
+        if not isinstance(ds, dict):
+            continue
+        provider = ds.get("provider", "")
+        if not provider:
+            continue
+        res_counter += 1
+        resources.append({
+            "id": f"res-{res_counter:03d}",
+            "type": "external_service",
+            "name": provider,
+            "description": (
+                f"{ds.get('data_type', '')}. "
+                f"Coverage: {ds.get('coverage', 'N/A')}. "
+                f"Auth: {ds.get('auth_requirements', 'N/A')}"
+            ).strip(),
+            "used_in_stages": ["data_download"],
+            "_source": "worker_resource",
+        })
+        injected += 1
+
+    ext_services = resource_data.get("external_services", [])
+    for svc in ext_services:
+        if not isinstance(svc, dict):
+            continue
+        name = svc.get("name", svc.get("service", ""))
+        if not name:
+            continue
+        res_counter += 1
+        resources.append({
+            "id": f"res-{res_counter:03d}",
+            "type": "external_service",
+            "name": name,
+            "description": svc.get("description", svc.get("purpose", "")),
+            "used_in_stages": svc.get("used_in_stages", []),
+            "_source": "worker_resource",
+        })
+        injected += 1
+
+    deps = resource_data.get("dependencies", [])
+    for dep in deps[:10]:  # Cap at 10 most important
+        if not isinstance(dep, dict):
+            continue
+        pkg = dep.get("package", dep.get("name", ""))
+        if not pkg:
+            continue
+        res_counter += 1
+        resources.append({
+            "id": f"res-{res_counter:03d}",
+            "type": "python_package",
+            "name": pkg,
+            "description": dep.get("purpose", dep.get("description", "")),
+            "used_in_stages": dep.get("used_in_stages", []),
+            "_source": "worker_resource",
+        })
+        injected += 1
+
     if resources:
         bp["resources"] = resources
         bp.pop("global_resources", None)  # remove legacy field name
 
-    logger.info("P14 (resource_injection): injected %d resource slots", injected)
+    logger.info("P14 (resource_injection): injected %d resources total", injected)
     return injected
 
 
