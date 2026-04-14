@@ -406,6 +406,7 @@ class BatchOrchestrator:
                 repo_path,
                 model_router=model_router,
                 agent_factory=agent_factory,
+                max_parallel=3,  # v6.4: reduced from 5 to avoid Token Plan rate limits
             )
             bp_result = await bp_executor.run()
 

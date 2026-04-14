@@ -40,7 +40,7 @@ SUBDOMAIN_KEYWORDS: dict[str, list[str]] = {
     "INS":     ["actuarial", "reserving", "mortality", "solvency", "claim", "premium", "cat_risk", "annuity"],
     "LND":     ["loan", "origination", "underwriting", "collection", "payment", "ledger", "bnpl", "amortization"],
     "TRS":     ["treasury", "alm", "liquidity", "irrbb", "cash_pool", "funding", "lcr", "nsfr"],
-    "AML":     ["aml", "kyc", "sanction", "screening", "transaction_monitoring", "suspicious", "pep"],
+    "AML":     [r"\baml\b", "kyc", "sanction", "transaction_monitoring", "suspicious", r"\bpep\b(?![\d])", "money.laundering", "anti.money", "typolog"],
 }
 
 # 指纹探针最小关键词命中数
@@ -66,17 +66,42 @@ def fingerprint_repo(repo_path: Path) -> list[str]:
     """
     text_sources: list[str] = []
 
+    # v6.4 fix: include repo root directory name itself — project names
+    # like "AMLSim" contain domain keywords that should count as a hit
+    text_sources.append(repo_path.name.lower())
+
     readme = repo_path / "README.md"
     if readme.exists():
         text_sources.append(readme.read_text(errors="ignore").lower())
 
-    # 搜索 Python 文件名
+    # 搜索 Python 文件名 + module docstring (v6.4 fix)
+    # README + filenames alone miss domain keywords in Java/multi-lang
+    # projects (e.g., AMLSim has "aml"/"suspicious" only in .py content).
+    # Read the first 5 lines of each .py (module docstring/comments) —
+    # high signal, low false-positive risk vs reading 30+ lines.
     for py_file in repo_path.rglob("*.py"):
+        rel = str(py_file.relative_to(repo_path))
+        if "__pycache__" in rel or ".venv" in rel or "node_modules" in rel:
+            continue
         text_sources.append(py_file.name.lower())
+        try:
+            head = py_file.read_text(errors="ignore").split("\n")[:5]
+            text_sources.append(" ".join(head).lower())
+        except OSError:
+            pass
+
+    # Project metadata files (setup.py, pyproject.toml have descriptions)
+    for meta_file in ["setup.py", "pyproject.toml", "setup.cfg"]:
+        p = repo_path / meta_file
+        if p.exists():
+            try:
+                text_sources.append(p.read_text(errors="ignore").lower())
+            except OSError:
+                pass
 
     # 目录名
     for item in repo_path.rglob("*"):
-        if item.is_dir():
+        if item.is_dir() and "__pycache__" not in str(item) and ".venv" not in str(item):
             text_sources.append(item.name.lower())
 
     combined = " ".join(text_sources)
