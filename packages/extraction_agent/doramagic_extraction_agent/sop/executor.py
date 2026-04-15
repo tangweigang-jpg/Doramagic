@@ -717,7 +717,7 @@ class SOPExecutor:
             allowed_tools=phase.allowed_tools,
             max_iterations=phase.max_iterations,
             coverage_context=coverage_context,
-            enable_convergence=phase.enable_convergence,
+            enable_convergence=getattr(phase, "enable_convergence", False),
         )
 
         # Success or no failover available → return as-is
@@ -774,7 +774,7 @@ class SOPExecutor:
             allowed_tools=phase.allowed_tools,
             max_iterations=phase.max_iterations,
             coverage_context=coverage_context,
-            enable_convergence=phase.enable_convergence,
+            enable_convergence=getattr(phase, "enable_convergence", False),
         )
 
         # Combine token counts from both attempts
@@ -842,7 +842,7 @@ class SOPExecutor:
             allowed_tools=phase.allowed_tools,
             max_iterations=phase.max_iterations,
             coverage_context=coverage_context,
-            enable_convergence=phase.enable_convergence,
+            enable_convergence=getattr(phase, "enable_convergence", False),
         )
 
     def _build_coverage_context(self, phase: Phase) -> dict | None:
@@ -851,7 +851,7 @@ class SOPExecutor:
         v10: specialized workers skip repo-wide directory coverage because
         their prompts target specific file subsets (non-code, math, resources).
         """
-        if not phase.enable_convergence:
+        if not getattr(phase, "enable_convergence", False):
             return None
         manifest = self._state.extra.get("coverage_manifest")
         if not manifest:

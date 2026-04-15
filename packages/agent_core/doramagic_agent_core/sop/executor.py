@@ -177,6 +177,7 @@ class Phase:
     required_artifacts: list[str] = field(default_factory=list)
     blocking: bool = False
     parallel_group: str | None = None  # phases with same group run concurrently
+    enable_convergence: bool = False  # v10: activate ConvergenceDetector + coverage tracking
 
 
 @dataclass
