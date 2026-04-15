@@ -1593,18 +1593,24 @@ async def _con_ingest_v2_handler(state: AgentState, repo_path: Path) -> PhaseRes
             error=f"No valid constraints after Pydantic validation (deduped={len(deduped_list)}, all failed)",
         )
 
-    # Write to output dir — derive repo_slug from repo_path to match bp_finalize naming
-    out_dir = Path(state.output_dir) if getattr(state, "output_dir", "") else run_dir / "output"
-    repo_slug = Path(state.repo_path).name if getattr(state, "repo_path", "") else ""
-    output_mgr = OutputManager(out_dir, state.blueprint_id, repo_slug=repo_slug)
-    output_path = output_mgr.write_constraints(valid_dicts)
+    # Write validated constraints to intermediate artifact (NOT to output dir).
+    # con_postprocess is the single output point that calls write_constraints().
+    # This avoids the double-write bug where both ingest and postprocess create
+    # separate version files with identical content.
+    artifacts_dir = run_dir / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    ingest_path = artifacts_dir / "constraints_ingested.json"
+    ingest_path.write_text(
+        json.dumps(valid_dicts, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     stats = {
         "deduped_input": len(deduped_list),
         "valid": len(valid_dicts),
         "errors": len(errors),
         "by_kind": by_kind,
-        "output_path": str(output_path),
+        "output_path": str(ingest_path),
     }
 
     logger.info("con_ingest: %s", stats)
@@ -1647,34 +1653,48 @@ async def _con_postprocess_v2_handler(state: AgentState, repo_path: Path) -> Pha
             error="state.run_dir is not set",
         )
 
-    output_dir_str = getattr(state, "output_dir", "")
-    base = Path(output_dir_str) if output_dir_str else Path(run_dir_str) / "output"
-    output_path = base / "LATEST.jsonl"
-    if not output_path.exists():
-        output_path = base / "constraints.jsonl"  # legacy fallback
+    # Read from con_ingest's intermediate artifact (not LATEST.jsonl)
+    run_dir = Path(run_dir_str)
+    ingest_path = run_dir / "artifacts" / "constraints_ingested.json"
 
-    if not output_path.exists():
+    # Fallback: try LATEST.jsonl for backward compatibility with older runs
+    output_dir_str = getattr(state, "output_dir", "")
+    base = Path(output_dir_str) if output_dir_str else run_dir / "output"
+    if not ingest_path.exists():
+        ingest_path = base / "LATEST.jsonl"
+    if not ingest_path.exists():
+        ingest_path = base / "constraints.jsonl"
+    if not ingest_path.exists():
         return PhaseResult(
             phase_name="con_postprocess",
             status="error",
-            error=f"constraints not found at {base} — run con_ingest first",
+            error="constraints not found — run con_ingest first",
         )
 
-    # Load constraints from JSONL
+    # Load constraints (support both JSON array and JSONL formats)
     constraints: list[Constraint] = []
-    raw_lines = output_path.read_text(encoding="utf-8").splitlines()
+    raw_text = ingest_path.read_text(encoding="utf-8").strip()
     parse_errors = 0
-    for line in raw_lines:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-            c = Constraint.model_validate(obj)
-            constraints.append(c)
-        except Exception as exc:
-            logger.warning("Failed to parse constraint line: %s", exc)
-            parse_errors += 1
+
+    if raw_text.startswith("["):
+        # JSON array format (from con_ingest intermediate artifact)
+        for obj in json.loads(raw_text):
+            try:
+                constraints.append(Constraint.model_validate(obj))
+            except Exception as exc:
+                logger.warning("Failed to parse constraint: %s", exc)
+                parse_errors += 1
+    else:
+        # JSONL format (legacy)
+        for line in raw_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                constraints.append(Constraint.model_validate(json.loads(line)))
+            except Exception as exc:
+                logger.warning("Failed to parse constraint line: %s", exc)
+                parse_errors += 1
 
     logger.info(
         "Loaded %d constraints for post-processing (%d parse errors)",
@@ -1685,14 +1705,14 @@ async def _con_postprocess_v2_handler(state: AgentState, repo_path: Path) -> Pha
     # Apply P0-P5 rules in-place
     _postprocess_constraints(constraints)
 
-    # Write back — derive repo_slug to match bp_finalize / con_ingest naming
-    out_dir = Path(output_dir_str) if output_dir_str else Path(run_dir_str) / "output"
+    # Write final output — this is the SINGLE write_constraints call in the pipeline
+    out_dir = Path(output_dir_str) if output_dir_str else run_dir / "output"
     repo_slug = Path(state.repo_path).name if getattr(state, "repo_path", "") else ""
     output_mgr = OutputManager(out_dir, state.blueprint_id, repo_slug=repo_slug)
     dicts = [json.loads(c.model_dump_json()) for c in constraints]
     output_mgr.write_constraints(dicts)
 
-    logger.info("con_postprocess complete: %d constraints rewritten", len(constraints))
+    logger.info("con_postprocess complete: %d constraints written", len(constraints))
     return PhaseResult(
         phase_name="con_postprocess",
         status="completed",

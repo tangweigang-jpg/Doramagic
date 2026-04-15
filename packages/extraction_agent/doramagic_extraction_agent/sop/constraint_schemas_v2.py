@@ -331,12 +331,22 @@ class DerivedConstraint(RawConstraint):
         description="Derivation provenance: blueprint ID + business_decision ID + SOP version",
     )
 
+    @model_validator(mode="after")
+    def scope_stage_ids_check(self) -> DerivedConstraint:
+        """Override: auto-correct stage+empty→global instead of raising.
+
+        GLM-5 consistently generates target_scope="stage" without stage_ids
+        in derived constraints (7/7 chunks on bp-070). Since derived constraints
+        come from blueprint BDs (not code analysis), global scope is the safe default.
+        """
+        if self.target_scope == "stage" and not self.stage_ids:
+            self.target_scope = "global"
+        return self
+
     @field_validator("action")
     @classmethod
     def action_no_vague_words(cls, v: str) -> str:
         """Override: derived constraints are advisory — relax vague word check."""
-        # Only block the strongest vague words; allow "consider"/"appropriate"
-        # which are natural in advisory derived constraints (BA/operational_lesson)
         hard_block = ["try to", "be careful", "if possible"]
         found = [w for w in hard_block if w in v.lower()]
         if found:
