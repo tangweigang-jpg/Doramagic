@@ -398,9 +398,10 @@ async def _con_ingest_handler(state: AgentState, repo_path: Path) -> PhaseResult
             error=f"No valid constraints produced (total_raw={total_raw}, all failed validation)",
         )
 
-    # Write to output dir (knowledge/sources/{domain}/{bp_id}/)
+    # Write to output dir — derive repo_slug to match bp_finalize naming
     out_dir = Path(state.output_dir) if getattr(state, "output_dir", "") else run_dir / "output"
-    output_mgr = OutputManager(out_dir, state.blueprint_id)
+    repo_slug = Path(state.repo_path).name if getattr(state, "repo_path", "") else ""
+    output_mgr = OutputManager(out_dir, state.blueprint_id, repo_slug=repo_slug)
     output_path = output_mgr.write_constraints(valid_constraints_dicts)
 
     stats_detail = (
@@ -482,9 +483,10 @@ async def _con_postprocess_handler(state: AgentState, repo_path: Path) -> PhaseR
     # Apply P0-P5 rules in-place
     _postprocess_constraints(constraints)
 
-    # Write back to output dir
+    # Write back to output dir — derive repo_slug to match bp_finalize / con_ingest naming
     out_dir_pp = Path(output_dir_str) if output_dir_str else Path(run_dir_str) / "output"
-    output_mgr = OutputManager(out_dir_pp, state.blueprint_id)
+    repo_slug = Path(state.repo_path).name if getattr(state, "repo_path", "") else ""
+    output_mgr = OutputManager(out_dir_pp, state.blueprint_id, repo_slug=repo_slug)
     dicts = [json.loads(c.model_dump_json()) for c in constraints]
     output_mgr.write_constraints(dicts)
 

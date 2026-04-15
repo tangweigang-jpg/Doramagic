@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import random
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -19,8 +20,10 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 529}
 _RETRY_DELAYS_SECONDS = (1, 2, 4)
+# 529 = Server Overloaded — needs much longer back-off than transient errors
+_OVERLOAD_RETRY_DELAYS_SECONDS = (5, 15, 30)
 
 
 @dataclass
@@ -203,13 +206,23 @@ class LLMAdapter:
             except Exception as exc:
                 if not _is_retryable_exception(exc) or delay is None:
                     raise
+                status_code = _status_code_from_exception(exc)
+                if status_code == 529:
+                    # Server overloaded — use longer delays to avoid hammering a saturated server
+                    base_delay = _OVERLOAD_RETRY_DELAYS_SECONDS[
+                        min(attempt, len(_OVERLOAD_RETRY_DELAYS_SECONDS) - 1)
+                    ]
+                    actual_delay = base_delay + random.uniform(0, base_delay * 0.3)
+                else:
+                    actual_delay = delay
                 logger.warning(
-                    "LLMAdapter.chat() failed on attempt %s with %s; retrying in %ss",
+                    "LLMAdapter.chat() failed on attempt %s with %s (HTTP %s); retrying in %.1fs",
                     attempt + 1,
                     exc.__class__.__name__,
-                    delay,
+                    status_code or "?",
+                    actual_delay,
                 )
-                time.sleep(delay)
+                time.sleep(actual_delay)
 
     async def generate(
         self,
@@ -295,6 +308,21 @@ class LLMAdapter:
 
     # --- Anthropic ---
 
+    def _resolve_temperature(self, temperature: float, model_id: str = "") -> float:
+        """Clamp temperature for providers that reject 0.0 (e.g. MiniMax requires (0.0, 1.0]).
+
+        Detects MiniMax via base_url OR model_id to handle all config paths
+        (explicit _base_url, ANTHROPIC_BASE_URL env, or model-only config).
+        """
+        is_minimax = (
+            (self._base_url and "minimax" in self._base_url.lower())
+            or "minimax" in model_id.lower()
+            or "minimax" in self._default_model.lower()
+        )
+        if is_minimax:
+            return max(0.01, temperature)
+        return temperature
+
     async def _call_anthropic(
         self, model_id: str, messages: Sequence[LLMMessage], **kwargs
     ) -> LLMResponse:
@@ -320,7 +348,7 @@ class LLMAdapter:
             model=model_id,
             messages=api_messages,
             max_tokens=kwargs.get("max_tokens", 4096),
-            temperature=kwargs.get("temperature", 0.0),
+            temperature=self._resolve_temperature(kwargs.get("temperature", 0.0), model_id),
             system=system_text or "",
         )
         text_parts = [b.text for b in resp.content if getattr(b, "type", None) == "text"]
@@ -366,7 +394,7 @@ class LLMAdapter:
             messages=api_messages,
             tools=api_tools,
             max_tokens=kwargs.get("max_tokens", 4096),
-            temperature=kwargs.get("temperature", 0.0),
+            temperature=self._resolve_temperature(kwargs.get("temperature", 0.0), model_id),
             system=system_text or "",
         )
         tool_calls = []

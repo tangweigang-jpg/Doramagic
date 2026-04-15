@@ -1591,9 +1591,10 @@ async def _con_ingest_v2_handler(state: AgentState, repo_path: Path) -> PhaseRes
             error=f"No valid constraints after Pydantic validation (deduped={len(deduped_list)}, all failed)",
         )
 
-    # Write to output dir
+    # Write to output dir — derive repo_slug from repo_path to match bp_finalize naming
     out_dir = Path(state.output_dir) if getattr(state, "output_dir", "") else run_dir / "output"
-    output_mgr = OutputManager(out_dir, state.blueprint_id)
+    repo_slug = Path(state.repo_path).name if getattr(state, "repo_path", "") else ""
+    output_mgr = OutputManager(out_dir, state.blueprint_id, repo_slug=repo_slug)
     output_path = output_mgr.write_constraints(valid_dicts)
 
     stats = {
@@ -1682,9 +1683,10 @@ async def _con_postprocess_v2_handler(state: AgentState, repo_path: Path) -> Pha
     # Apply P0-P5 rules in-place
     _postprocess_constraints(constraints)
 
-    # Write back
+    # Write back — derive repo_slug to match bp_finalize / con_ingest naming
     out_dir = Path(output_dir_str) if output_dir_str else Path(run_dir_str) / "output"
-    output_mgr = OutputManager(out_dir, state.blueprint_id)
+    repo_slug = Path(state.repo_path).name if getattr(state, "repo_path", "") else ""
+    output_mgr = OutputManager(out_dir, state.blueprint_id, repo_slug=repo_slug)
     dicts = [json.loads(c.model_dump_json()) for c in constraints]
     output_mgr.write_constraints(dicts)
 

@@ -29,7 +29,7 @@ class BatchConfig:
     domain: str = "finance"
     concurrency: int = 3
     repos: list[RepoJob] = field(default_factory=list)
-    llm_model: str = "MiniMax-M2.7"
+    llm_model: str = "MiniMax-M2.7-highspeed"
     llm_base_url: str = ""
     llm_api_key_env: str = "LLM_API_KEY"
     max_tokens_per_repo: int = 2_000_000

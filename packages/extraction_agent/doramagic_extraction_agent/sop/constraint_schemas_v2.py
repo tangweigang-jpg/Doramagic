@@ -62,15 +62,12 @@ _VALID_CONSTRAINT_KINDS: frozenset[str] = frozenset(
     ]
 )
 _VAGUE_WORDS = [
-    "考虑",
-    "注意",
-    "建议",
-    "适当",
-    "尽量",
     "try to",
     "consider",
     "be careful",
     "appropriate",
+    "if possible",
+    "as needed",
 ]
 
 
@@ -81,54 +78,56 @@ class RawConstraint(BaseModel):
     tool_use without deep object construction failures.
     """
 
-    when: str = Field(min_length=5, description="触发条件（编码时视角）")
-    modality: _MODALITY = Field(description="约束极性：must / must_not / should / should_not")
-    action: str = Field(min_length=5, description="具体可执行行为")
-    consequence_kind: _CONSEQUENCE_KIND = Field(description="后果分类")
+    when: str = Field(min_length=5, description="Trigger condition (coding-time perspective)")
+    modality: _MODALITY = Field(
+        description="Constraint polarity: must / must_not / should / should_not"
+    )
+    action: str = Field(min_length=5, description="Specific actionable behavior")
+    consequence_kind: _CONSEQUENCE_KIND = Field(description="Consequence category")
     consequence_description: str = Field(
         min_length=20,
-        description="违反约束的具体失败现象，禁止只填 consequence_kind 单词",
+        description="Specific failure scenario when violated — NEVER just the consequence_kind word",
     )
-    constraint_kind: _CONSTRAINT_KIND = Field(description="约束性质")
-    severity: _SEVERITY = Field(description="严重度：fatal / high / medium / low")
-    confidence_score: float = Field(ge=0.0, le=1.0, description="可信度分数 0.0–1.0")
-    source_type: _SOURCE_TYPE = Field(description="证据来源类型")
-    consensus: _CONSENSUS = Field(description="社区共识程度")
-    freshness: _FRESHNESS = Field(description="约束稳定性：stable / semi_stable / volatile")
-    target_scope: _TARGET_SCOPE = Field(description="挂载点类型：global / stage / edge")
+    constraint_kind: _CONSTRAINT_KIND = Field(description="Constraint kind")
+    severity: _SEVERITY = Field(description="Severity: fatal / high / medium / low")
+    confidence_score: float = Field(ge=0.0, le=1.0, description="Confidence score 0.0-1.0")
+    source_type: _SOURCE_TYPE = Field(description="Evidence source type")
+    consensus: _CONSENSUS = Field(description="Community consensus level")
+    freshness: _FRESHNESS = Field(description="Stability: stable / semi_stable / volatile")
+    target_scope: _TARGET_SCOPE = Field(description="Scope: global / stage / edge")
     stage_ids: list[str] = Field(
         default_factory=list,
-        description="target_scope=stage 时必填的阶段 ID 列表",
+        description="Stage ID list, REQUIRED when target_scope=stage",
     )
     edge_ids: list[str] = Field(
         default_factory=list,
-        description="target_scope=edge 时填写的边 ID 列表",
+        description="Edge ID list for target_scope=edge",
     )
     evidence_summary: str = Field(
         min_length=5,
-        description="证据摘要；非 expert_reasoning 时必须含 file:line 引用（以 ':' 分隔）",
+        description="Evidence summary; MUST contain file:line ref (colon-separated) except expert_reasoning",
     )
     machine_checkable: bool = Field(
         default=False,
-        description="约束是否可通过 grep/regex/静态检查自动验证",
+        description="Whether verifiable via grep/regex/static analysis",
     )
     promote_to_acceptance: bool = Field(
         default=False,
-        description="是否晋升为验收标准",
+        description="Whether to promote to acceptance criterion",
     )
     validation_threshold: str | None = Field(
         default=None,
         description=(
-            "当 machine_checkable=true 且 severity=fatal 时必填。"
-            "格式：grep/regex 条件 → PASS/FAIL/WARN。"
-            "示例：'macd_fast != 12 OR macd_slow != 26 → FAIL'"
+            "REQUIRED when machine_checkable=true AND severity=fatal. "
+            "Format: grep/regex condition → PASS/FAIL/WARN. "
+            "Example: 'macd_fast != 12 OR macd_slow != 26 → FAIL'"
         ),
     )
-    # SOP v2.3: rationalization_guard 专有字段
+    # SOP v2.3: rationalization_guard specific field
     guard_pattern: dict | None = Field(
         default=None,
         description=(
-            "仅 rationalization_guard 使用。格式：{excuse, rebuttal, red_flags, violation_detector}"
+            "Only for rationalization_guard. Format: {excuse, rebuttal, red_flags, violation_detector}"
         ),
     )
 
@@ -200,26 +199,28 @@ class RawConstraint(BaseModel):
     def action_no_vague_words(cls, v: str) -> str:
         found = [w for w in _VAGUE_WORDS if w in v]
         if found:
-            raise ValueError(f"action 含模糊词 {found!r}，必须改为具体可执行的行为描述")
+            raise ValueError(
+                f"action contains vague words {found!r} — rewrite as specific actionable behavior"
+            )
         return v
 
     @field_validator("evidence_summary")
     @classmethod
     def evidence_needs_ref(cls, v: str, info) -> str:
-        # Access source_type via info.data (field validated before this one
-        # only if source_type was declared first; we guard with .get)
         source_type = (info.data or {}).get("source_type")
         if source_type and source_type != "expert_reasoning" and ":" not in v:
             raise ValueError(
-                f"source_type={source_type!r} 的 evidence_summary 必须包含 file:line 引用"
-                f"（':'），当前值：{v!r}"
+                f"evidence_summary for source_type={source_type!r} MUST contain file:line "
+                f"reference (with ':'), current value: {v!r}"
             )
         return v
 
     @model_validator(mode="after")
     def scope_stage_ids_check(self) -> RawConstraint:
         if self.target_scope == "stage" and not self.stage_ids:
-            raise ValueError("target_scope='stage' 时 stage_ids 不能为空，请填写对应的阶段 ID")
+            raise ValueError(
+                "stage_ids MUST NOT be empty when target_scope='stage' — fill in the corresponding stage IDs"
+            )
         return self
 
 
@@ -230,15 +231,15 @@ class ConstraintExtractionResult(BaseModel):
     """
 
     constraints: list[RawConstraint] = Field(
-        description="提取到的所有约束列表",
+        description="All extracted constraints",
     )
     coverage_report: dict[str, int] = Field(
         default_factory=dict,
-        description="按 constraint_kind 统计的约束数量，keys 必须是合法 constraint_kind 值",
+        description="Count by constraint_kind; keys MUST be valid constraint_kind values",
     )
     missed_hints: list[str] = Field(
         default_factory=list,
-        description="未被约束覆盖的 acceptance_hints（用于质量审计）",
+        description="acceptance_hints not covered by constraints (for quality audit)",
     )
 
     @model_validator(mode="before")
@@ -280,11 +281,11 @@ class ConstraintExtractionResult(BaseModel):
 class DeriveSource(BaseModel):
     """Provenance record linking a derived constraint back to its blueprint decision."""
 
-    blueprint_id: str = Field(description="蓝图 ID，如 finance-bp-009")
-    business_decision_id: str = Field(description="被派生的 business_decision ID 或名称")
+    blueprint_id: str = Field(description="Blueprint ID, e.g. finance-bp-009")
+    business_decision_id: str = Field(description="Source business_decision ID or name")
     derivation_version: str = Field(
         default="sop-v2.3",
-        description="派生所用的 SOP 版本",
+        description="SOP version used for derivation",
     )
 
 
@@ -296,7 +297,7 @@ class DerivedConstraint(RawConstraint):
     """
 
     derived_from: DeriveSource = Field(
-        description="派生溯源：蓝图 ID + business_decision ID + SOP 版本",
+        description="Derivation provenance: blueprint ID + business_decision ID + SOP version",
     )
 
 
@@ -366,15 +367,15 @@ class DeriveExtractionResult(BaseModel):
     )
     skipped_decisions: list[str] = Field(
         default_factory=list,
-        description="跳过派生的 business_decision ID（纯技术选择 T / 无影响 DK 等）",
+        description="Skipped business_decision IDs (pure technical choice T / no-impact DK, etc.)",
     )
 
 
 class AuditSource(BaseModel):
     """Provenance record for audit-finding-derived constraints (Step 2.5)."""
 
-    source: str = Field(description="审计来源，如 'audit_checklist_summary'")
-    item: str = Field(description="审计项名称或 ID")
+    source: str = Field(description="Audit source, e.g. 'audit_checklist_summary'")
+    item: str = Field(description="Audit item name or ID")
     sop_version: str = Field(default="sop-v2.2", description="SOP 版本")
 
 
@@ -386,7 +387,7 @@ class AuditConstraint(RawConstraint):
     """
 
     derived_from: AuditSource = Field(
-        description="审计溯源：来源 + 审计项 + SOP 版本",
+        description="Audit provenance: source + audit item + SOP version",
     )
 
 
@@ -398,11 +399,11 @@ class AuditConstraintResult(BaseModel):
 
     constraints: list[AuditConstraint] = Field(
         default_factory=list,
-        description="审计发现转化后的约束列表",
+        description="Constraints converted from audit findings",
     )
     skipped_items: list[str] = Field(
         default_factory=list,
-        description="跳过转化的审计项（⚠️/✅ 或已被 Step 2.4 覆盖）",
+        description="Audit items skipped (⚠️/✅ level, or already covered by Step 2.4)",
     )
 
 
@@ -412,45 +413,45 @@ class AuditConstraintResult(BaseModel):
 class ExternalService(BaseModel):
     """An external API, data source, or service used by the project."""
 
-    name: str = Field(description="服务/工具名称")
+    name: str = Field(description="Service/tool name")
     type: str = Field(
         default="", description="data_api / broker_api / storage_backend / transformer"
     )
-    usage: str = Field(min_length=5, description="用途说明")
-    install: str = Field(default="", description="安装命令，如 pip install xxx")
-    api_example: str = Field(default="", description="最小可运行代码示例")
-    known_issues: list[str] = Field(default_factory=list, description="已知陷阱/限制")
-    fit_for: list[str] = Field(default_factory=list, description="适用场景")
-    not_fit_for: list[str] = Field(default_factory=list, description="不适用场景")
-    required: bool = Field(default=True, description="是否必选")
-    source_stage_id: str = Field(default="", description="来自哪个 stage 的 replaceable_point")
+    usage: str = Field(min_length=5, description="Usage description")
+    install: str = Field(default="", description="Install command, e.g. pip install xxx")
+    api_example: str = Field(default="", description="Minimal runnable code example")
+    known_issues: list[str] = Field(default_factory=list, description="Known pitfalls/limitations")
+    fit_for: list[str] = Field(default_factory=list, description="Suitable scenarios")
+    not_fit_for: list[str] = Field(default_factory=list, description="Unsuitable scenarios")
+    required: bool = Field(default=True, description="Whether required")
+    source_stage_id: str = Field(default="", description="From which stage's replaceable_point")
 
 
 class Dependency(BaseModel):
     """A Python package dependency."""
 
-    package: str = Field(description="包名")
-    version: str = Field(default="", description="版本约束，如 >=1.5.0")
-    usage: str = Field(default="", description="用途说明")
-    install: str = Field(default="", description="安装命令")
-    critical: bool = Field(default=False, description="缺失则系统完全不能运行")
+    package: str = Field(description="Package name")
+    version: str = Field(default="", description="Version constraint, e.g. >=1.5.0")
+    usage: str = Field(default="", description="Usage description")
+    install: str = Field(default="", description="Install command")
+    critical: bool = Field(default=False, description="System cannot run without this")
 
 
 class Infrastructure(BaseModel):
     """Infrastructure requirement (storage, cache, etc.)."""
 
     type: str = Field(description="local_file_system / database / cache / api_endpoint")
-    path: str = Field(default="", description="路径")
-    cache_path: str = Field(default="", description="缓存路径")
-    note: str = Field(default="", description="备注")
+    path: str = Field(default="", description="Path")
+    cache_path: str = Field(default="", description="Cache path")
+    note: str = Field(default="", description="Note")
 
 
 class OptionalResource(BaseModel):
     """An optional tool/library needed only in specific scenarios."""
 
-    name: str = Field(description="资源名称")
-    install: str = Field(default="", description="安装命令")
-    when: str = Field(default="", description="何时需要")
+    name: str = Field(description="Resource name")
+    install: str = Field(default="", description="Install command")
+    when: str = Field(default="", description="When needed")
 
 
 class ResourceExtractionResult(BaseModel):
@@ -465,7 +466,7 @@ class ResourceExtractionResult(BaseModel):
 class SynthesizedConstraint(BaseModel):
     """A single constraint reviewed during synthesis, possibly with upgraded kind."""
 
-    original_index: int = Field(description="在 merged list 中的原始索引")
+    original_index: int = Field(description="Original index in the merged list")
     constraint_kind: Literal[
         "domain_rule",
         "resource_boundary",
@@ -473,17 +474,17 @@ class SynthesizedConstraint(BaseModel):
         "architecture_guardrail",
         "claim_boundary",
         "rationalization_guard",
-    ] = Field(description="审查后的 constraint_kind（可能已升级）")
-    severity: Literal["fatal", "high", "medium", "low"] = Field(description="审查后的 severity")
-    upgrade_reason: str = Field(default="", description="如果 kind 被修改，说明理由")
+    ] = Field(description="Reviewed constraint_kind (may have been upgraded)")
+    severity: Literal["fatal", "high", "medium", "low"] = Field(description="Reviewed severity")
+    upgrade_reason: str = Field(default="", description="Reason if kind was modified")
 
 
 class ConstraintSynthesisResult(BaseModel):
     """Output of con_constraint_synthesis: kind rebalance + severity calibration."""
 
     reviewed_constraints: list[SynthesizedConstraint] = Field(
-        description="所有需要修改 kind/severity 的约束条目"
+        description="All constraints requiring kind/severity modification"
     )
     rebalance_actions: list[str] = Field(
-        default_factory=list, description="执行的 rebalance 操作摘要"
+        default_factory=list, description="Summary of rebalance operations performed"
     )

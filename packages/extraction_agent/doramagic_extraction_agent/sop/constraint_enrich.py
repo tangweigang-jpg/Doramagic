@@ -380,8 +380,14 @@ def _patch_enum_fix(constraints: list[dict[str, Any]]) -> int:
 # Vague words lists (Patch 8)
 # ---------------------------------------------------------------------------
 
-_VAGUE_WORDS_ZH: list[str] = ["考虑", "注意", "建议", "适当", "尽量", "酌情"]
-_VAGUE_WORDS_EN: list[str] = ["try to", "consider", "be careful", "appropriate", "if possible"]
+_VAGUE_WORDS_EN: list[str] = [
+    "try to",
+    "consider",
+    "be careful",
+    "appropriate",
+    "if possible",
+    "as needed",
+]
 
 
 def _patch_commit_hash(constraints: list[dict[str, Any]], commit_hash: str) -> int:
@@ -441,7 +447,7 @@ def _patch_vague_words(constraints: list[dict[str, Any]]) -> int:
             continue
         found: list[str] = []
         action_lower = action.lower()
-        for w in _VAGUE_WORDS_ZH + _VAGUE_WORDS_EN:
+        for w in _VAGUE_WORDS_EN:
             if w in action_lower:
                 found.append(w)
         if found:
@@ -669,24 +675,25 @@ def _patch_stage_id_override(
 # v3 新增 Patches P11-P15
 # ---------------------------------------------------------------------------
 
-_RUNTIME_ZH_PATTERNS = [
-    (re.compile(r"当(.*?)被调用时"), lambda m: f"编写{m.group(1)}时"),
-    (re.compile(r"当(.*?)执行时"), lambda m: f"实现{m.group(1)}时"),
-    (re.compile(r"is called"), lambda _: "is implemented"),
-    (re.compile(r"at runtime"), lambda _: "during implementation"),
+_RUNTIME_PERSPECTIVE_PATTERNS = [
+    (re.compile(r"[Ww]hen\s+(.*?)\s+is called"), lambda m: f"When implementing {m.group(1)}"),
+    (re.compile(r"[Ww]hen\s+(.*?)\s+executes"), lambda m: f"When implementing {m.group(1)}"),
+    (re.compile(r"[Aa]t runtime"), lambda _: "during implementation"),
+    (re.compile(r"[Ww]hen invoked"), lambda _: "When implementing"),
 ]
 
 
 def _patch_when_perspective(constraints: list[dict[str, Any]]) -> int:
     """P11: Fix runtime perspective → coding-time perspective in 'when' field.
 
-    SOP rule: when 必须用编码时视角（"编写/实现 X 时"），不用运行时视角（"X 被调用时"）。
+    SOP rule: when MUST use coding-time perspective ("When implementing X"),
+    NOT runtime perspective ("When X is called").
     """
     count = 0
     for raw in constraints:
         when = raw.get("when", "")
         original = when
-        for pattern, replacer in _RUNTIME_ZH_PATTERNS:
+        for pattern, replacer in _RUNTIME_PERSPECTIVE_PATTERNS:
             when = pattern.sub(replacer, when)
         if when != original:
             raw["when"] = when
@@ -719,7 +726,15 @@ def _patch_consequence_quality(constraints: list[dict[str, Any]]) -> int:
         needs_fix = (
             len(desc) < 20
             or desc.strip().lower() in _CONSEQUENCE_ENUM_WORDS
-            or any(w in desc for w in ("结果不正确", "程序出错", "性能下降", "不可预期"))
+            or any(
+                w in desc.lower()
+                for w in (
+                    "incorrect results",
+                    "program error",
+                    "performance degradation",
+                    "unpredictable",
+                )
+            )
         )
         if needs_fix:
             tags = raw.setdefault("tags", [])
