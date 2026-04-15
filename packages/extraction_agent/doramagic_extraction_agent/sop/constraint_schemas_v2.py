@@ -174,10 +174,18 @@ class RawConstraint(BaseModel):
         if isinstance(ck, str):
             normalized = ck.lower().strip().replace(" ", "_").replace("-", "_")
             if normalized not in _VALID_CONSTRAINT_KINDS:
-                for valid in _VALID_CONSTRAINT_KINDS:
-                    if normalized in valid or valid in normalized:
-                        data["constraint_kind"] = valid
-                        break
+                # Exact suffix match: e.g. "guard" → "rationalization_guard" only if
+                # exactly one valid kind ends with the normalized value.
+                suffix_matches = [v for v in _VALID_CONSTRAINT_KINDS if v.endswith(normalized)]
+                if len(suffix_matches) == 1:
+                    data["constraint_kind"] = suffix_matches[0]
+                else:
+                    # Prefix match: e.g. "domain" → "domain_rule"
+                    prefix_matches = [
+                        v for v in _VALID_CONSTRAINT_KINDS if v.startswith(normalized)
+                    ]
+                    if len(prefix_matches) == 1:
+                        data["constraint_kind"] = prefix_matches[0]
         sev = data.get("severity")
         if isinstance(sev, str):
             sev_lower = sev.lower().strip()

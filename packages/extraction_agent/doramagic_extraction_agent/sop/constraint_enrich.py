@@ -670,8 +670,8 @@ def _patch_stage_id_override(
 # ---------------------------------------------------------------------------
 
 _RUNTIME_ZH_PATTERNS = [
-    (re.compile(r"当.*?被调用时"), lambda m: m.group().replace("被调用时", "的调用逻辑时")),
-    (re.compile(r"当.*?执行时"), lambda m: m.group().replace("执行时", "的实现逻辑时")),
+    (re.compile(r"当(.*?)被调用时"), lambda m: f"编写{m.group(1)}时"),
+    (re.compile(r"当(.*?)执行时"), lambda m: f"实现{m.group(1)}时"),
     (re.compile(r"is called"), lambda _: "is implemented"),
     (re.compile(r"at runtime"), lambda _: "during implementation"),
 ]
@@ -816,14 +816,14 @@ def enrich_constraints(
     commit_hash: str,
     sop_version: str = "2.3",
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Apply 10 deterministic enrichment patches to raw constraints.
+    """Apply 15 deterministic enrichment patches (P1-P15) to raw constraints.
 
     Args:
         raw_list:    List of raw constraint dicts (from agentic extraction).
         blueprint:   Parsed blueprint YAML dict (provides id, stages, etc.).
         manifest:    con_build_manifest dict — contains replaceable_points_by_stage.
         commit_hash: Repository commit hash for provenance injection.
-        sop_version: Constraint SOP version string (default "2.2").
+        sop_version: Constraint SOP version string (default "2.3").
 
     Returns:
         A tuple of (enriched_list, patch_stats) where:

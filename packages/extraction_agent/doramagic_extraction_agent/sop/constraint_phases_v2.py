@@ -1111,12 +1111,10 @@ async def _con_synthesize_handler(state: AgentState, repo_path: Path) -> PhaseRe
     run_dir = Path(state.run_dir)
     manifest = _get_manifest(state)
     stage_ids = manifest.get("stage_ids", [])
-    edge_ids = manifest.get("edge_ids", [])
 
     merged: list[dict[str, Any]] = []
 
     # 1. Per-stage artifacts
-    valid_stage_ids = set(stage_ids)
     for sid in stage_ids:
         artifact_name = f"constraints_{sid}.json"
         items = _read_artifact_json(run_dir, artifact_name)
@@ -1172,6 +1170,27 @@ async def _con_synthesize_handler(state: AgentState, repo_path: Path) -> PhaseRe
         merged.append(item)
     logger.debug("Synthesize: %d items from constraints_audit.json", len(audit_items))
 
+    # 6. v3 document extraction artifact (SOP v2.3 Step 2.1-s)
+    doc_items = _read_artifact_json(run_dir, "ct_doc_constraints.json")
+    for item in doc_items:
+        if not item.get("target_scope"):
+            item["target_scope"] = "global"
+        merged.append(item)
+    if doc_items:
+        logger.debug("Synthesize: %d items from ct_doc_constraints.json", len(doc_items))
+
+    # 7. v3 rationalization guard artifact (SOP v2.3 Step 2.6)
+    ration_items = _read_artifact_json(run_dir, "ct_rationalization_constraints.json")
+    for item in ration_items:
+        if not item.get("target_scope"):
+            item["target_scope"] = "global"
+        merged.append(item)
+    if ration_items:
+        logger.debug(
+            "Synthesize: %d items from ct_rationalization_constraints.json",
+            len(ration_items),
+        )
+
     if not merged:
         return PhaseResult(
             phase_name="con_synthesize",
@@ -1187,11 +1206,13 @@ async def _con_synthesize_handler(state: AgentState, repo_path: Path) -> PhaseRe
         encoding="utf-8",
     )
 
+    stage_total = sum(len(_read_artifact_json(run_dir, f"constraints_{s}.json")) for s in stage_ids)
     summary = (
         f"Merged {len(merged)} constraints "
-        f"(stages={sum(len(_read_artifact_json(run_dir, f'constraints_{s}.json')) for s in stage_ids)} "
-        f"edges={len(edge_items)} global={len(global_items)} "
-        f"derived={len(derived_items)} audit={len(audit_items)})"
+        f"(stages={stage_total} edges={len(edge_items)} "
+        f"global={len(global_items)} derived={len(derived_items)} "
+        f"audit={len(audit_items)} doc={len(doc_items)} "
+        f"rationalization={len(ration_items)})"
     )
     logger.info("con_synthesize: %s", summary)
 

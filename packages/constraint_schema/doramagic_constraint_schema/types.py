@@ -252,13 +252,18 @@ class Constraint(BaseModel):
     def model_post_init(self, __context: object) -> None:
         """自动计算 content hash。
 
-        v0.2 规定：hash = sha256(core + scope)[:16]，不含 applies_to。
+        hash = sha256(when + modality + action + consequence_kind +
+        consequence_description)[:16]。与 enrichment P15 使用相同的 5 字段公式，
+        确保无论从 raw dict 还是 Constraint 对象计算，结果一致。
         """
         if not self.hash:
             content = json.dumps(
                 {
-                    "core": self.core.model_dump(mode="json"),
-                    "scope": self.scope.model_dump(mode="json"),
+                    "when": self.core.when,
+                    "modality": str(self.core.modality),
+                    "action": self.core.action,
+                    "consequence_kind": str(self.core.consequence.kind),
+                    "consequence_description": self.core.consequence.description,
                 },
                 sort_keys=True,
                 ensure_ascii=False,

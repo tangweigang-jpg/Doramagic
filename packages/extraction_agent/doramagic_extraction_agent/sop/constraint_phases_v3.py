@@ -16,7 +16,6 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..core.agent_loop import PhaseResult
 from ..sop.constraint_phases_v2 import build_constraint_phases_v2
 from ..sop.executor import Phase
 from ..state.schema import AgentState
@@ -160,25 +159,6 @@ def _build_ct_extract_rationalization_message(state: AgentState, repo_path: Path
 # ---------------------------------------------------------------------------
 
 
-async def _con_evaluate_handler(state: AgentState, repo_path: Path) -> PhaseResult:
-    """Independent constraint evaluation — this is a Python handler that
-    delegates to the agentic evaluator phase.
-
-    The evaluator is actually an agentic phase (needs read_file/grep_codebase),
-    so this handler is not used directly. Instead, we define the phase with
-    system_prompt and let the agent loop run it.
-    """
-    # This handler is a placeholder — the actual evaluator runs as an agentic
-    # phase with system_prompt + tools. This function exists only for the
-    # fallback case where the phase completes without producing an artifact.
-    return PhaseResult(
-        phase_name="con_evaluate",
-        status="completed",
-        iterations=0,
-        total_tokens=0,
-    )
-
-
 def _build_ct_evaluate_message(state: AgentState, repo_path: Path) -> str:
     """Build initial message for the independent evaluator."""
     bp_id = state.extra.get("blueprint_id", state.blueprint_id)
@@ -301,13 +281,13 @@ def build_constraint_phases_v3(
     # Assemble final phase list:
     # v2_phases[:merge_idx] = pre-processing + all v2 extract phases
     # + new extract phases (doc + rationalization)
-    # + v2_phases[merge_idx] = con_merge
+    # + v2_phases[merge_idx:synthesis_idx] = con_merge + any phases between merge and synthesis
     # + evaluate_phase
-    # + v2_phases[merge_idx+1:] = synthesis + enrich + dedup + ingest + postprocess + validate
+    # + v2_phases[synthesis_idx:] = con_constraint_synthesis onward
     result = (
         v2_phases[:merge_idx]
         + new_extract_phases
-        + [v2_phases[merge_idx]]  # con_merge
+        + v2_phases[merge_idx:synthesis_idx]  # con_merge + any intermediate phases
         + [evaluate_phase]  # independent evaluator
         + v2_phases[synthesis_idx:]  # con_constraint_synthesis onward
     )

@@ -1343,7 +1343,7 @@ when + modality + action + consequence 是否完整且非循环？
 
 ## 评估流程
 
-1. 使用 get_artifact 读取 ct_merged_constraints.json（或 constraints_merged.json）
+1. 使用 get_artifact 读取 constraints_merged.json
 2. 随机抽样最多 20 条约束（优先 severity=fatal 和 constraint_kind=claim_boundary）
 3. 对每条约束，使用 read_file 和 grep_codebase 独立验证 4 项契约
 4. 使用 write_artifact 写入 ct_evaluation_report.json
