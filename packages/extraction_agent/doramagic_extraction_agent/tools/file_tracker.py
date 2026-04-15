@@ -41,6 +41,14 @@ class FileAccessTracker:
             indent=2,
         )
 
+    def coverage_ratio(self, must_visit_dirs: list[str]) -> float:
+        """Return fraction of must_visit_dirs that have been visited."""
+        if not must_visit_dirs:
+            return 1.0
+        visited_dirs = self.get_visited_dirs()
+        covered = sum(1 for d in must_visit_dirs if d in visited_dirs)
+        return covered / len(must_visit_dirs)
+
     @classmethod
     def from_json(cls, text: str) -> FileAccessTracker:
         data = json.loads(text)

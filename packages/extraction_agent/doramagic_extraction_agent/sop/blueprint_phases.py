@@ -1710,22 +1710,25 @@ def _build_worker_audit_message(s: AgentState, r: str) -> str:
 
 
 def _compute_iter_scale(file_count: int) -> float:
-    """Return an iteration scale factor based on repository size (Python file count).
+    """Return an iteration scale factor based on repository size.
 
-    Tiers:
-        < 100  files → 1.0  (small repo, default)
-        100–300       → 1.25
-        300–800       → 1.5
-        > 800         → 2.0  (large mono-repo)
+    v10: continuous function replacing discrete tiers. Yields higher
+    ceilings for large repos so convergence-based stopping has room.
+
+    Mapping:
+        < 50   files → 1.0
+        50–150        → 1.0 – 1.5  (linear)
+        150–500       → 1.5 – 2.0  (linear)
+        500+          → 2.0 – 3.0  (linear, capped)
     """
-    if file_count < 100:
+    if file_count < 50:
         return 1.0
-    elif file_count < 300:
-        return 1.25
-    elif file_count <= 800:
-        return 1.5
+    elif file_count < 150:
+        return 1.0 + (file_count - 50) / 200
+    elif file_count < 500:
+        return 1.5 + (file_count - 150) / 700
     else:
-        return 2.0
+        return min(2.0 + (file_count - 500) / 1000, 3.0)
 
 
 def build_blueprint_phases_v5(
@@ -3710,6 +3713,7 @@ def build_blueprint_phases_v5(
             required_artifacts=["worker_docs.md"],
             blocking=False,
             parallel_group="explore",
+            enable_convergence=True,
         ),
         Phase(
             name="worker_arch",
@@ -3724,6 +3728,7 @@ def build_blueprint_phases_v5(
             required_artifacts=["worker_arch.json"],
             blocking=True,
             parallel_group="explore",
+            enable_convergence=True,
         ),
         Phase(
             name="worker_workflow",
@@ -3738,6 +3743,7 @@ def build_blueprint_phases_v5(
             required_artifacts=["worker_workflow.json"],
             blocking=True,
             parallel_group="explore",
+            enable_convergence=True,
         ),
         Phase(
             name="worker_math",
@@ -3756,6 +3762,7 @@ def build_blueprint_phases_v5(
             required_artifacts=["worker_math.json"],
             blocking=False,
             parallel_group="explore",
+            enable_convergence=True,
         ),
         Phase(
             name="worker_arch_deep",
@@ -3768,6 +3775,7 @@ def build_blueprint_phases_v5(
             required_artifacts=["worker_arch_deep.json"],
             blocking=False,
             parallel_group="explore",
+            enable_convergence=True,
         ),
         # v6: dedicated resource Worker (parallel with arch workers)
         Phase(
@@ -3791,6 +3799,7 @@ def build_blueprint_phases_v5(
             required_artifacts=["worker_resource.json"],
             blocking=True,
             parallel_group="explore",
+            enable_convergence=True,
         ),
         # v7: structural extraction from document knowledge sources (SOP 2a-s)
         # Conditionally activated: only runs when knowledge_sources contains "document".
@@ -3813,6 +3822,7 @@ def build_blueprint_phases_v5(
             required_artifacts=["worker_structural.json"],
             blocking=False,
             parallel_group="explore",
+            enable_convergence=True,
         ),
         Phase(
             name="worker_verify",

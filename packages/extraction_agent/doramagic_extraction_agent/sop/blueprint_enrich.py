@@ -150,9 +150,12 @@ STAGE_MAPPING: dict[str, str] = {
 }
 
 # Regex patterns for evidence parsing (Patch 5)
-_EVIDENCE_FULL_RE = re.compile(r"^(?P<path>[\w./\-]+\.\w+):(?P<line>\d+)\((?P<fn>[^)]+)\)$")
+# v10: support line ranges like file:10-50(fn) and file:42,100(fn)
+_EVIDENCE_FULL_RE = re.compile(
+    r"^(?P<path>[\w./\-]+\.\w+):(?P<line>\d+(?:[,\-]\d+)*)\((?P<fn>[^)]+)\)$"
+)
 _EVIDENCE_FILE_LINE_RE = re.compile(
-    r"^(?P<path>[\w./\-]+\.py):(?P<line>\d+)(?P<rest>.*)$",
+    r"^(?P<path>[\w./\-]+\.py):(?P<line>\d+(?:[,\-]\d+)*)(?P<rest>.*)$",
     re.DOTALL,
 )
 
@@ -1094,7 +1097,8 @@ def _patch_evidence_verify(bp: dict[str, Any], repo_path: str) -> int:
     verified = 0
     invalid = 0
     auto_fixed = 0
-    _ev_pattern = re.compile(r"^(.+?):(\d+)\((.+?)\)$")
+    # v10: support line ranges like file:10-50(fn)
+    _ev_pattern = re.compile(r"^(.+?):(\d+(?:[,\-]\d+)*)\((.+?)\)$")
     # v6.3: valid Python identifier pre-check — reject constants, formulas,
     # natural language before attempting AST lookup
     _ident_pattern = re.compile(r"^[\w.]+$")
@@ -1111,7 +1115,8 @@ def _patch_evidence_verify(bp: dict[str, Any], repo_path: str) -> int:
         if not m:
             continue
         file_path, line_str, fn_name = m.group(1), m.group(2), m.group(3)
-        line_no = int(line_str)
+        # v10: extract first line number from ranges like "10-50" or "42,100"
+        line_no = int(line_str.split("-")[0].split(",")[0])
         full_path = Path(repo_path) / file_path
 
         # Check 1: file exists
@@ -1404,7 +1409,11 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
     return injected
 
 
-def _patch_missing_gaps_from_audit(bp: dict[str, Any], artifacts_dir: Path) -> int:
+def _patch_missing_gaps_from_audit(
+    bp: dict[str, Any],
+    artifacts_dir: Path,
+    state: Any = None,
+) -> int:
     """P15: deterministic missing gap generation from audit findings.
 
     Cross-references worker_audit.md ❌ FAIL items against existing BDs.
@@ -1500,6 +1509,102 @@ def _patch_missing_gaps_from_audit(bp: dict[str, Any], artifacts_dir: Path) -> i
     if not fail_items:
         logger.debug("P15 (missing_gaps): no FAIL items found in audit")
         return 0
+
+    # v10: filter out audit items from subdomains with no code backing
+    def _item_has_code_backing(item_text: str, repo_files: set[str]) -> bool:
+        """Check if audit item references concepts present in actual code.
+
+        v10 fix: search both subdomain abbreviations AND full concept names
+        in file paths (e.g. 'pricing', 'black_scholes', 'credit', 'ifrs9').
+        """
+        _subdomain_terms: dict[str, tuple[set[str], set[str]]] = {
+            # (audit keywords → trigger, file path keywords → verify)
+            "prc": (
+                {
+                    "implied volatility",
+                    "greeks",
+                    "black-scholes",
+                    "finite difference",
+                    "no-arbitrage",
+                    "day count convention",
+                    "act/360",
+                    "yield curve",
+                    "option pricing",
+                    "monte carlo",
+                    "binomial tree",
+                },
+                {
+                    "prc",
+                    "pricing",
+                    "option",
+                    "black_scholes",
+                    "greeks",
+                    "volatil",
+                    "derivative",
+                    "finite_diff",
+                    "binomial",
+                    "monte_carlo",
+                },
+            ),
+            "crd": (
+                {
+                    "pd/lgd/ead",
+                    "ifrs 9",
+                    "expected credit loss",
+                    "vasicek",
+                    "npl",
+                    "credit scoring",
+                    "probability of default",
+                    "loss given default",
+                },
+                {
+                    "crd",
+                    "credit",
+                    "ifrs",
+                    "lgd",
+                    "ead",
+                    "scoring",
+                    "default",
+                    "loss_given",
+                    "vasicek",
+                },
+            ),
+            "trs": (
+                {
+                    "lcr",
+                    "nsfr",
+                    "interest rate gap",
+                    "cash pool",
+                    "alm",
+                    "liquidity coverage",
+                    "asset liability",
+                },
+                {
+                    "trs",
+                    "treasury",
+                    "alm",
+                    "liquidity",
+                    "lcr",
+                    "nsfr",
+                    "asset_liability",
+                    "cash_pool",
+                    "interest_rate",
+                },
+            ),
+        }
+        item_lower = item_text.lower()
+        for terms, file_keywords in _subdomain_terms.values():
+            if any(term in item_lower for term in terms):
+                if not any(kw in f.lower() for f in repo_files for kw in file_keywords):
+                    return False
+        return True
+
+    # Apply filter if structural_index is available
+    if hasattr(state, "extra") and state is not None and state.extra.get("structural_index"):
+        _repo_files = set(state.extra["structural_index"].get("files", {}).keys())
+        fail_items = [
+            item for item in fail_items if _item_has_code_backing(item["item"], _repo_files)
+        ]
 
     # Check which fail items are already covered by existing BDs
     bds = bp.get("business_decisions", [])
@@ -2108,6 +2213,15 @@ def enrich_blueprint(
             if bare not in file_path_map:
                 file_path_map[bare] = rel
 
+    # v10: build file_path_map from structural_index for bare filename resolution
+    _structural_idx = (
+        state.extra.get("structural_index", {}) if hasattr(state, "extra") and state.extra else {}
+    )
+    for _full_path in _structural_idx.get("files", {}):
+        _bare = _full_path.rsplit("/", 1)[-1]
+        if _bare not in file_path_map:
+            file_path_map[_bare] = _full_path
+
     patch_stats["p5_evidence_format"] = _patch_evidence_format(bp, file_path_map=file_path_map)
     # P5.5: deterministic evidence verification (v6)
     if repo_path:
@@ -2134,7 +2248,7 @@ def enrich_blueprint(
     patch_stats["p14_resource_injection"] = _patch_resource_injection(bp, artifacts_dir)
 
     # v6: Deterministic missing gap generation from audit findings
-    patch_stats["p15_missing_gaps"] = _patch_missing_gaps_from_audit(bp, artifacts_dir)
+    patch_stats["p15_missing_gaps"] = _patch_missing_gaps_from_audit(bp, artifacts_dir, state=state)
 
     # v6: Deterministic multi-type annotation enhancement
     patch_stats["p16_multi_type"] = _patch_multi_type_annotation(bp)

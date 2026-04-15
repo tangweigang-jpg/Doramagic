@@ -77,7 +77,7 @@ Write your findings as a single JSON object to artifact
   Do NOT speculate or invent resources.
 - Every claim must have a file:line evidence reference.
 - For alternative providers, only list mainstream, actively maintained options.
-- Budget: keep total output ≤ 10 KB.
+- Write artifact when comprehensive, then update if you discover more resources.
 """
 
 

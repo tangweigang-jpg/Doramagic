@@ -156,7 +156,6 @@ Architecture-level decisions spanning multiple modules: ordering contracts, inhe
 - Use get_skeleton() and get_dependencies() to navigate efficiently — these give you the full picture WITHOUT reading every file
 - Focus on DECISIONS, not exhaustive listings — do NOT list every class and method
 - Each design_decision entry: ≤ 200 chars, must contain WHY + evidence
-- Target: 8-12 stages, 20-30 design decisions total, 5-10 cross-cutting findings
 
 ## Evidence Format (CRITICAL — wrong format causes downstream failures):
 - MUST be: `src/module/file.py:42(ClassName.method_name)` or `src/file.py:42(function_name)`
@@ -166,11 +165,12 @@ Architecture-level decisions spanning multiple modules: ordering contracts, inhe
 - ❌ WRONG: `"file.py"`, `"line 42"`, `"see trader.py"`, `"42(43)"`
 - ✅ RIGHT: `"src/zvt/trader/trader.py:247(on_profit_control)"`
 
-## EXPLORATION LIMITS (CRITICAL):
-- Read at most 15 source files with read_file. Use get_skeleton() for the rest.
-- You MUST write your artifact by iteration 12. Do NOT keep exploring past 12 iterations.
-- Strategy: get_skeleton() on 3-4 key packages first → identify stages → read_file only the 10-15 most important files → write artifact.
-- If you have gathered 6+ stages and 15+ decisions, STOP exploring and write the artifact immediately.
+## EXPLORATION STRATEGY:
+- Start with get_skeleton() on key packages to map the architecture landscape.
+- Use read_file for files that contain important design decisions (abstract base classes, core services, configuration, entrypoints).
+- Write your artifact when you have a comprehensive picture. Then CONTINUE exploring uncovered areas and UPDATE the artifact with new findings.
+- The system will tell you which modules you haven't explored yet — follow those coverage signals.
+- Prioritize DEPTH on decision-rich modules (many classes, business logic) over breadth on utility code.
 
 ## Output: JSON object with this structure:
 
@@ -197,8 +197,6 @@ Architecture-level decisions spanning multiple modules: ordering contracts, inhe
 }
 ```
 
-## BUDGET: Total output MUST be ≤ 12 KB. Prioritize depth over breadth.
-
 ## CRITICAL: You MUST call write_artifact(name="worker_arch.json") as your FINAL action.
 """
 
@@ -217,9 +215,10 @@ You are a business workflow analyst. Your ONLY job is to extract business decisi
 - Use read_file to examine each example completely
 - Then grep_codebase to trace into the implementation
 - Extract RAW decisions — do NOT classify as T/B/M/etc (that's done later)
-- Target: 25-35 raw decisions (prioritize non-trivial decisions over exhaustive listing)
+- Extract all meaningful workflow decisions — prioritize non-trivial decisions over exhaustive listing
 - Each decision's context field: ≤ 150 chars
 - Each alternatives field: ≤ 100 chars
+- Write artifact when comprehensive, then update if you discover more
 
 ## Evidence Format (CRITICAL):
 - MUST be: `src/module/file.py:42(function_name)`
@@ -228,8 +227,6 @@ You are a business workflow analyst. Your ONLY job is to extract business decisi
 
 ## Output: JSON array of objects with fields:
   id, decision, stage, evidence, source, alternatives, context
-
-## BUDGET: Total output MUST be ≤ 10 KB. Drop trivial technical decisions (import style, logging format) to stay within budget.
 
 ## CRITICAL: You MUST call write_artifact(name="worker_workflow.json") as your FINAL action.
 """
@@ -253,14 +250,12 @@ You are a quantitative analyst. Your ONLY job is to extract mathematical and alg
 ## Key Rules:
 - EVERY math-related file must contribute at least one decision
 - Include file:line(function) evidence
-- Target: 15-20 math decisions
+- Extract all math-related decisions — write artifact when comprehensive, then update with new findings
 - Each assumptions field: ≤ 100 chars
 - Each alternatives field: ≤ 80 chars
 
 ## Output: JSON array with fields:
   id, decision, math_method, alternatives, parameters, assumptions, evidence, source
-
-## BUDGET: Total output MUST be ≤ 8 KB. Merge similar decisions (e.g., multiple MA windows → one entry with parameter list).
 
 ## CRITICAL: You MUST call write_artifact(name="worker_math.json") as your FINAL action.
 """

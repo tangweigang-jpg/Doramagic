@@ -162,6 +162,59 @@ Do NOT wrap in markdown code fences.
 # ---------------------------------------------------------------------------
 
 
+def _repair_json(text: str) -> str | None:
+    """Attempt to repair common MiniMax JSON output issues.
+
+    Fixes (applied in order):
+    - Markdown code fences wrapping
+    - Missing commas between adjacent objects (BEFORE truncation)
+    - Trailing commas before } or ]
+    - Extra data after valid JSON (truncate, string-aware)
+    """
+    s = text.strip()
+    s = re.sub(r"^```(?:json)?\s*\n?", "", s)
+    s = re.sub(r"\n?```\s*$", "", s)
+
+    # Fix missing commas between objects (before truncation so we don't lose data)
+    s = re.sub(r"}\s*{", "},{", s)
+
+    # Fix trailing commas
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+
+    # Fix extra data after valid JSON — string-aware bracket matching
+    depth = 0
+    end_pos = None
+    in_string = False
+    escape_next = False
+    for i, c in enumerate(s):
+        if escape_next:
+            escape_next = False
+            continue
+        if c == "\\":
+            escape_next = True
+            continue
+        if c == '"' and not escape_next:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c in "{[":
+            depth += 1
+        elif c in "}]":
+            depth -= 1
+            if depth == 0:
+                end_pos = i + 1
+                break
+    if end_pos and end_pos < len(s):
+        s = s[:end_pos]
+
+    try:
+        json.loads(s)
+        return s
+    except json.JSONDecodeError:
+        return None
+
+
 def _safe_read(path: Path, default: str = "") -> str:
     """Read a file if it exists; return *default* otherwise."""
     try:
@@ -356,10 +409,34 @@ def build_local_synthesis_handler(agent: ExtractionAgent) -> Callable:
             # Parse with WorkerBDOutput (handles legacy formats via coerce)
             try:
                 raw_data = json.loads(raw_text)
+            except json.JSONDecodeError as initial_err:
+                # v10: attempt JSON repair before giving up
+                repaired = _repair_json(raw_text)
+                if repaired is not None:
+                    try:
+                        raw_data = json.loads(repaired)
+                        logger.info("local_synthesis: repaired JSON for worker_%s", worker_name)
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "local_synthesis: JSON repair failed for worker_%s: %s — skipping",
+                            worker_name,
+                            initial_err,
+                        )
+                        local_results[worker_name] = []
+                        continue
+                else:
+                    logger.warning(
+                        "local_synthesis: failed to parse worker_%s.json: %s — skipping",
+                        worker_name,
+                        initial_err,
+                    )
+                    local_results[worker_name] = []
+                    continue
+            try:
                 worker_output = WorkerBDOutput.model_validate(raw_data)
             except Exception as parse_exc:
                 logger.warning(
-                    "local_synthesis: failed to parse worker_%s.json: %s — skipping",
+                    "local_synthesis: failed to validate worker_%s.json: %s — skipping",
                     worker_name,
                     parse_exc,
                 )

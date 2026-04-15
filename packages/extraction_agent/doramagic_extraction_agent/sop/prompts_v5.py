@@ -182,7 +182,7 @@ Decisions that live in the RELATIONSHIPS between components, not in any single f
 - ALWAYS provide file:line(function) evidence
 - EVERY finding must answer: "If this were changed, what ELSE in the system would break?"
 - Focus on decisions spanning MULTIPLE files — single-file decisions are covered by other workers
-- Target: 15-20 architecture-level findings
+- Extract all cross-module architecture decisions — write artifact when comprehensive, then update with new findings
 
 ## Output: JSON array of findings
 
@@ -199,8 +199,6 @@ Decisions that live in the RELATIONSHIPS between components, not in any single f
   }
 ]
 ```
-
-## BUDGET: Total output MUST be ≤ 8 KB. Prioritize cross-module findings over single-file details.
 
 ## CRITICAL: You MUST call write_artifact(name="worker_arch_deep.json") as your FINAL action.
 """
@@ -389,14 +387,10 @@ Search for claims containing "all", "every", "only", "sole" — verify each has 
 ## Output
 Write your complete verification report.
 
-## ITERATION BUDGET (CRITICAL — pipeline will kill you at max iterations):
-- You have at most 50 tool calls. If you hit 50, your work is LOST.
-- By iteration 20: you MUST have verified at least 4 claims.
-- By iteration 35: you MUST call write_artifact with whatever you have so far.
-- Do NOT keep exploring past 35 iterations. Write what you have.
-- Strategy: verify the 4 mandatory checks FIRST (6-8 iterations each),
-  then write_artifact IMMEDIATELY. Only do additional checks if you have
-  budget remaining AFTER writing.
+## STRATEGY:
+- Verify the 4 mandatory checks FIRST, then write_artifact with your findings.
+- If time remains after writing, verify additional claims and UPDATE the artifact.
+- The system will remind you to write if you haven't yet — follow those signals.
 
 ## CRITICAL: You MUST call write_artifact(name="worker_verify.md") as your FINAL action.
 ## If you do NOT call write_artifact, ALL your work is discarded and the pipeline fails.
@@ -485,11 +479,10 @@ For EACH item:
   impact: "..."
 ```
 
-## ITERATION BUDGET (CRITICAL — pipeline will kill you at max iterations):
-- You have at most 40 tool calls. If you hit 40, your work is LOST.
-- By iteration 25: you MUST call write_artifact with whatever you have so far.
-- Do NOT keep searching past 25 iterations. Write what you have.
-- Strategy: audit each checklist item with 1-2 grep calls, then WRITE.
+## STRATEGY:
+- Complete the full audit checklist systematically, then write_artifact.
+- If time remains, deepen analysis on critical items and UPDATE the artifact.
+- The system will remind you to write if you haven't yet — follow those signals.
 
 ## CRITICAL: You MUST call write_artifact(name="worker_audit.md") as your FINAL action.
 ## If you do NOT call write_artifact, ALL your work is discarded and the pipeline fails.

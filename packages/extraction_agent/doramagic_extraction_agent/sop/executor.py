@@ -162,6 +162,12 @@ class Phase:
         quality_gate: Optional callable ``(state, repo_path) -> (passed, detail)``
             evaluated after phase completion.  A failing gate is recorded as a
             warning but does **not** stop execution.
+        enable_convergence: When ``True``, the agent loop activates
+            ``ConvergenceDetector`` for this phase.  The executor also reads
+            ``state.extra["coverage_manifest"]`` at execution time and passes it
+            as ``coverage_context`` to ``run_phase`` so worker phases can track
+            directory coverage.  Should be set on all ``parallel_group="explore"``
+            phases.
     """
 
     name: str
@@ -177,6 +183,7 @@ class Phase:
     required_artifacts: list[str] = field(default_factory=list)
     blocking: bool = False
     parallel_group: str | None = None  # phases with same group run concurrently
+    enable_convergence: bool = False  # v10: activate ConvergenceDetector + coverage tracking
 
 
 @dataclass
@@ -699,6 +706,9 @@ class SOPExecutor:
         # Determine which agent to use (primary)
         agent = self._get_agent_for_phase(phase.name)
 
+        # v10: resolve coverage_context at execution time from state.extra
+        coverage_context = self._build_coverage_context(phase)
+
         # --- Primary attempt ---
         phase_result = await agent.run_phase(
             phase_name=phase.name,
@@ -706,6 +716,8 @@ class SOPExecutor:
             initial_user_message=initial_msg,
             allowed_tools=phase.allowed_tools,
             max_iterations=phase.max_iterations,
+            coverage_context=coverage_context,
+            enable_convergence=phase.enable_convergence,
         )
 
         # Success or no failover available → return as-is
@@ -761,6 +773,8 @@ class SOPExecutor:
             initial_user_message=initial_msg,
             allowed_tools=phase.allowed_tools,
             max_iterations=phase.max_iterations,
+            coverage_context=coverage_context,
+            enable_convergence=phase.enable_convergence,
         )
 
         # Combine token counts from both attempts
@@ -820,13 +834,34 @@ class SOPExecutor:
             self._state,
             self._repo_path,
         )
+        coverage_context = self._build_coverage_context(phase)
         return await fallback_agent.run_phase(
             phase_name=phase.name,
             system_prompt=phase.system_prompt,
             initial_user_message=initial_msg,
             allowed_tools=phase.allowed_tools,
             max_iterations=phase.max_iterations,
+            coverage_context=coverage_context,
+            enable_convergence=phase.enable_convergence,
         )
+
+    def _build_coverage_context(self, phase: Phase) -> dict | None:
+        """Build coverage_context scoped to the worker's responsibility.
+
+        v10: specialized workers (docs, structural) skip directory coverage
+        since they read non-code files.  All others get the full manifest.
+        """
+        if not phase.enable_convergence:
+            return None
+        manifest = self._state.extra.get("coverage_manifest")
+        if not manifest:
+            return None
+        must_dirs = list(manifest.get("must_visit_dirs", []))
+        # Workers that read non-code files don't benefit from dir coverage
+        _SKIP_DIR_COVERAGE = {"worker_docs", "worker_structural"}
+        if phase.name in _SKIP_DIR_COVERAGE:
+            must_dirs = []
+        return {"must_visit_dirs": must_dirs}
 
     def _get_agent_for_phase(self, phase_name: str) -> ExtractionAgent:
         """Return the appropriate agent for a phase."""

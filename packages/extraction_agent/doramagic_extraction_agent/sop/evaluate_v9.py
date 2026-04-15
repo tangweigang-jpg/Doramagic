@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Evidence pattern — same regex used by _patch_evidence_verify in blueprint_enrich
 # ---------------------------------------------------------------------------
 
-_EV_PATTERN = re.compile(r"^(.+?):(\d+)\((.+?)\)$")
+_EV_PATTERN = re.compile(r"^(.+?):(\d+(?:[,\-]\d+)*)\((.+?)\)$")
 
 # ---------------------------------------------------------------------------
 # System prompt for Track B (semantic evaluator)
@@ -206,7 +206,8 @@ async def deterministic_eval(
         fn_name: str = m.group(3)
 
         try:
-            line_no = int(line_str)
+            # v10: support line ranges like "10-50" or "42,100" — use first number
+            line_no = int(line_str.split("-")[0].split(",")[0])
         except ValueError:
             verdicts.append(
                 {

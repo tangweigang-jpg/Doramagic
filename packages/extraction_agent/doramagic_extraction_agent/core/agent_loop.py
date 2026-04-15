@@ -193,11 +193,11 @@ _MAX_TOOL_RESULTS_KEPT = 8  # LRU cap for microcompact
 class ConvergenceDetector:
     """Detect when a Worker has exhausted useful information.
 
-    Tracks artifact size across iterations.  When consecutive growth
-    drops below *threshold* for *patience* rounds, signals convergence.
+    Tracks TWO signals: artifact content growth AND file access growth.
+    When both stall for *patience* consecutive rounds, signals convergence.
 
-    Design source: Claude Code ``tokenBudget.ts`` — diminishing-returns
-    early stopping saves 15-30 % Worker-phase tokens.
+    v10: Only begins tracking after the first artifact write.  Never
+    converges on zero-to-zero (worker still exploring but hasn't written).
     """
 
     def __init__(
@@ -208,21 +208,37 @@ class ConvergenceDetector:
         self.patience = patience
         self.threshold = threshold
         self._prev_size: int = 0
+        self._prev_files: int = 0
         self._small_delta_count: int = 0
+        self._first_write_seen: bool = False
 
-    def update(self, artifacts: dict[str, str]) -> bool:
-        """Return ``True`` when the Worker should stop early."""
+    def update(self, artifacts: dict[str, str], files_accessed: int = 0) -> bool:
+        """Return ``True`` when the Worker should stop early.
+
+        Args:
+            artifacts: Current artifact name→content mapping.
+            files_accessed: Number of distinct files the worker has read.
+        """
         current_size = sum(len(v) for v in artifacts.values())
-        if self._prev_size > 0:
-            delta = current_size - self._prev_size
-            if delta < self._prev_size * self.threshold:
-                self._small_delta_count += 1
-            else:
-                self._small_delta_count = 0
-        elif self._prev_size == 0 and current_size == 0 and self._small_delta_count >= 0:
-            # Worker producing nothing across iterations — count as small delta
+        # Never converge before first artifact write
+        if current_size == 0:
+            return False
+        if not self._first_write_seen:
+            self._first_write_seen = True
+            self._prev_size = current_size
+            self._prev_files = files_accessed
+            return False
+
+        artifact_growth = (current_size - self._prev_size) / max(self._prev_size, 1)
+        file_delta = files_accessed - self._prev_files
+
+        if artifact_growth < self.threshold and file_delta <= 1:
             self._small_delta_count += 1
+        else:
+            self._small_delta_count = 0
+
         self._prev_size = current_size
+        self._prev_files = files_accessed
         return self._small_delta_count >= self.patience
 
 
@@ -419,11 +435,20 @@ class ExtractionAgent:
         *,
         allowed_tools: list[str] | None = None,
         max_iterations: int | None = None,
+        coverage_context: dict | None = None,
+        enable_convergence: bool = False,
     ) -> PhaseResult:
         """Run one phase of the extraction SOP.
 
         Drives the tool_use loop until the model stops calling tools, a
-        circuit-breaker limit fires, or the iteration cap is reached.
+        circuit-breaker limit fires, the iteration cap is reached, or
+        (v10) the worker converges with adequate coverage.
+
+        Args:
+            coverage_context: Optional dict with ``must_visit_dirs`` list
+                for coverage-aware stopping.
+            enable_convergence: If True, activate ConvergenceDetector to
+                allow early stopping based on diminishing returns.
         """
         effective_max = max_iterations if max_iterations is not None else self._max_iterations
         registry = (
@@ -458,12 +483,17 @@ class ExtractionAgent:
             max_total=effective_max,
         )
 
+        # v10: convergence detector + coverage feedback
+        _convergence = ConvergenceDetector() if enable_convergence else None
+        _coverage_check_interval = 8  # inject coverage status every N iterations
+
         logger.info(
-            "ExtractionAgent.run_phase(%r) start — model=%s tools=%d max_iter=%d",
+            "ExtractionAgent.run_phase(%r) start — model=%s tools=%d max_iter=%d convergence=%s",
             phase_name,
             self._model_id,
             len(registry),
             effective_max,
+            "on" if _convergence else "off",
         )
 
         _checkpoint_interval = 10  # inject write reminder every N iterations
@@ -667,6 +697,72 @@ class ExtractionAgent:
                         len(messages),
                     )
 
+            # --- v10: Convergence check (before circuit breaker) ---
+            if _convergence is not None:
+                from ..tools.file_tracker import get_active_tracker as _get_tracker
+
+                _tracker = _get_tracker()
+                _files_count = len(_tracker.get_visited_files()) if _tracker else 0
+                _arts = self._read_current_artifacts(
+                    getattr(self._checkpoint_mgr, "artifacts_dir", None)
+                    if self._checkpoint_mgr
+                    else None,
+                    phase_name=phase_name,
+                )
+                if _convergence.update(_arts, _files_count):
+                    _allow_stop = True
+                    if coverage_context and _tracker:
+                        _must = coverage_context.get("must_visit_dirs", [])
+                        _ratio = _tracker.coverage_ratio(_must)
+                        if _ratio < 0.5:
+                            _uncovered = sorted(set(_must) - _tracker.get_visited_dirs())[:8]
+                            messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        f"COVERAGE ALERT: Only {_ratio:.0%} of key modules covered. "
+                                        f"Unexplored: {', '.join(_uncovered)}. "
+                                        f"Explore these directories before finalizing."
+                                    ),
+                                }
+                            )
+                            _convergence._small_delta_count = 0
+                            _allow_stop = False
+                    if _allow_stop:
+                        logger.info(
+                            "Phase %r converged after %d iterations (%d files accessed)",
+                            phase_name,
+                            cb.stats["total_iterations"],
+                            _files_count,
+                        )
+                        return PhaseResult(
+                            phase_name=phase_name,
+                            status="completed",
+                            iterations=cb.stats["total_iterations"],
+                            total_tokens=cb.stats["total_tokens"],
+                            final_text="converged — discovery rate diminished",
+                        )
+
+            # --- v10: Periodic coverage feedback ---
+            if coverage_context and iters > 0 and iters % _coverage_check_interval == 0:
+                from ..tools.file_tracker import get_active_tracker as _get_tracker2
+
+                _tracker2 = _get_tracker2()
+                if _tracker2:
+                    _must2 = coverage_context.get("must_visit_dirs", [])
+                    _ratio2 = _tracker2.coverage_ratio(_must2)
+                    _uncovered2 = sorted(set(_must2) - _tracker2.get_visited_dirs())[:5]
+                    if _uncovered2:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"COVERAGE: {_ratio2:.0%} of key modules explored. "
+                                    f"Not yet visited: {', '.join(_uncovered2)}"
+                                ),
+                            }
+                        )
+
             # --- Check circuit breaker ---
             should_stop, reason = cb.should_break()
             if should_stop:
@@ -678,6 +774,38 @@ class ExtractionAgent:
                     total_tokens=cb.stats["total_tokens"],
                     error=reason,
                 )
+
+    # ------------------------------------------------------------------
+    # v10 helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _read_current_artifacts(checkpoint_dir: Any, phase_name: str = "") -> dict[str, str]:
+        """Read artifact files written by *this* phase from the checkpoint dir.
+
+        v10 fix: only track artifacts whose name contains the phase_name
+        (e.g. ``worker_arch.json`` for phase ``worker_arch``).  This prevents
+        pre-existing shared artifacts (repo_index.json, coverage_manifest.json)
+        from triggering ``_first_write_seen`` prematurely.
+        """
+        if not checkpoint_dir:
+            return {}
+        from pathlib import Path as _ArtP
+
+        result: dict[str, str] = {}
+        p = _ArtP(checkpoint_dir)
+        if p.exists():
+            for f in p.iterdir():
+                if f.suffix not in (".md", ".json") or f.stat().st_size == 0:
+                    continue
+                # Only include artifacts belonging to this phase
+                if phase_name and phase_name not in f.name:
+                    continue
+                try:
+                    result[f.name] = f.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    pass
+        return result
 
     # ------------------------------------------------------------------
     # Anthropic backend
