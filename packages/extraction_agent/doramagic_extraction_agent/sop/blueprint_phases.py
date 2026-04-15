@@ -4519,6 +4519,16 @@ def build_blueprint_phases_v9(
             )
             result.append(updated_assemble)
         else:
+            # Update dependency references for renamed phases
+            if phase.depends_on:
+                _dep_renames = {
+                    "bp_synthesis_v5": "bp_global_synthesis_v9",
+                    "bp_evaluate": "bp_evaluate_v9",
+                    "bp_coverage_gap": "bp_coverage_classify_v9",
+                }
+                new_deps = [_dep_renames.get(d, d) for d in phase.depends_on]
+                if new_deps != phase.depends_on:
+                    phase = _dc_replace(phase, depends_on=new_deps)
             result.append(phase)
 
     return result
