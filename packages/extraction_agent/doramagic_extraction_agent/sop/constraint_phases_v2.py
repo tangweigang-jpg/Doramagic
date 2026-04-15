@@ -740,7 +740,7 @@ async def _derive_single_chunk(
     """
     import asyncio as _asyncio
 
-    from .constraint_schemas_v2 import DeriveExtractionResult, RawFallback
+    from .constraint_schemas_v2 import DeriveChunkResult, RawFallback
 
     bd_count = sum(len(bds) for bds in bds_chunk.values())
     user_msg = _build_derive_user_message(
@@ -762,9 +762,8 @@ async def _derive_single_chunk(
             agent.run_structured_call(
                 prompts_v2.CON_DERIVE_V2_SYSTEM,
                 user_msg,
-                DeriveExtractionResult,
-                max_retries=2,  # Allow 1 schema-correction retry (fast, ~seconds);
-                # retries=1 caused 5/6 L3 fallback in R9
+                DeriveChunkResult,  # Solution B: flat list instead of 5 grouped lists
+                max_retries=2,
             ),
             timeout=_DERIVE_CHUNK_TIMEOUT,
         )
@@ -793,24 +792,52 @@ def _accumulate_derive_result(
     all_derived: list[dict[str, Any]],
     totals: list[int],
 ) -> None:
-    """Expand a DeriveExtractionResult into the flat list and update counters."""
-    all_derived.extend(c.model_dump() for c in result.rc_constraints)
-    all_derived.extend(c.model_dump() for c in result.ba_constraints)
-    all_derived.extend(c.model_dump() for c in result.m_constraints)
-    all_derived.extend(c.model_dump() for c in result.b_constraints)
-    for pair in result.missing_gap_pairs:
-        all_derived.append(pair.boundary.model_dump())
-        all_derived.append(pair.remedy.model_dump())
-    totals[0] += len(result.rc_constraints)
-    totals[1] += len(result.ba_constraints)
-    totals[2] += len(result.m_constraints)
-    totals[3] += len(result.b_constraints)
-    totals[4] += len(result.missing_gap_pairs)
-    totals[5] += len(result.skipped_decisions)
+    """Expand a DeriveChunkResult into the flat list and update counters.
+
+    Supports both DeriveChunkResult (flat) and legacy DeriveExtractionResult (grouped).
+    """
+    if hasattr(result, "constraints"):
+        # DeriveChunkResult (Solution B) — flat list
+        all_derived.extend(c.model_dump() for c in result.constraints)
+        for pair in result.missing_gap_pairs:
+            all_derived.append(pair.boundary.model_dump())
+            all_derived.append(pair.remedy.model_dump())
+        # Classify into totals by constraint_kind for reporting
+        for c in result.constraints:
+            kind = c.constraint_kind
+            if kind == "domain_rule":
+                totals[0] += 1  # rc + m + b → domain_rule
+            elif kind == "operational_lesson":
+                totals[1] += 1  # ba
+            elif kind == "architecture_guardrail":
+                totals[2] += 1  # m
+            else:
+                totals[3] += 1  # b / other
+        totals[4] += len(result.missing_gap_pairs)
+        totals[5] += len(result.skipped_decisions)
+    else:
+        # Legacy DeriveExtractionResult (grouped)
+        all_derived.extend(c.model_dump() for c in result.rc_constraints)
+        all_derived.extend(c.model_dump() for c in result.ba_constraints)
+        all_derived.extend(c.model_dump() for c in result.m_constraints)
+        all_derived.extend(c.model_dump() for c in result.b_constraints)
+        for pair in result.missing_gap_pairs:
+            all_derived.append(pair.boundary.model_dump())
+            all_derived.append(pair.remedy.model_dump())
+        totals[0] += len(result.rc_constraints)
+        totals[1] += len(result.ba_constraints)
+        totals[2] += len(result.m_constraints)
+        totals[3] += len(result.b_constraints)
+        totals[4] += len(result.missing_gap_pairs)
+        totals[5] += len(result.skipped_decisions)
 
 
 def _count_derive_result(result: Any) -> int:
-    """Count total constraints in a DeriveExtractionResult."""
+    """Count total constraints in a derive result (chunk or legacy)."""
+    if hasattr(result, "constraints"):
+        # DeriveChunkResult
+        return len(result.constraints) + len(result.missing_gap_pairs) * 2
+    # Legacy DeriveExtractionResult
     return (
         len(result.rc_constraints)
         + len(result.ba_constraints)

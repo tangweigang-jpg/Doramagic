@@ -11,9 +11,39 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from doramagic_extraction_agent.sop.schemas_v5 import RawFallback  # noqa: F401
+
+# ---------------------------------------------------------------------------
+# MiniMax schema compatibility: force all fields to "required"
+# ---------------------------------------------------------------------------
+
+
+def _force_all_required(schema: dict[str, Any]) -> None:
+    """Walk a JSON Schema and force ALL properties into required lists.
+
+    MiniMax API doc: "所有字段或函数参数都必须指定为 required".
+    Without this, MiniMax skips fields with defaults, causing persistent
+    "Field required [type=missing]" validation failures.
+
+    Applied via model_config.json_schema_extra on response models that
+    go through Instructor structured calls to MiniMax.
+    """
+    if "properties" in schema:
+        schema["required"] = sorted(schema["properties"].keys())
+    # Recurse into property definitions
+    for prop in schema.get("properties", {}).values():
+        if isinstance(prop, dict):
+            _force_all_required(prop)
+    # Recurse into array items
+    if isinstance(schema.get("items"), dict):
+        _force_all_required(schema["items"])
+    # Recurse into $defs (referenced sub-models)
+    for defn in schema.get("$defs", {}).values():
+        if isinstance(defn, dict):
+            _force_all_required(defn)
+
 
 # ── Literal type aliases (mirrors enums in constraint_schema types.py) ──
 
@@ -427,11 +457,13 @@ class MissingGapPair(BaseModel):
 
 
 class DeriveExtractionResult(BaseModel):
-    """Full output of Step 2.4: business-decision derivation.
+    """Full output of Step 2.4: business-decision derivation (legacy grouped schema).
 
     Separates derived constraints by source BD type so downstream pipeline
     steps can audit coverage per type without re-parsing.
     """
+
+    model_config = ConfigDict(json_schema_extra=_force_all_required)
 
     rc_constraints: list[DerivedConstraint] = Field(
         default_factory=list,
@@ -447,7 +479,7 @@ class DeriveExtractionResult(BaseModel):
     )
     b_constraints: list[DerivedConstraint] = Field(
         default_factory=list,
-        description="B（业务决策）→ domain_rule / architecture_guardrail 约束",
+        description="B (business decision) → domain_rule / architecture_guardrail constraints",
     )
     missing_gap_pairs: list[MissingGapPair] = Field(
         default_factory=list,
@@ -462,6 +494,45 @@ class DeriveExtractionResult(BaseModel):
     @classmethod
     def coerce_skipped_decisions(cls, data: Any) -> Any:
         """GLM-5 sometimes puts full BD dicts instead of ID strings in skipped_decisions."""
+        if not isinstance(data, dict):
+            return data
+        skipped = data.get("skipped_decisions")
+        if isinstance(skipped, list):
+            data["skipped_decisions"] = [
+                item.get("id", str(item)) if isinstance(item, dict) else str(item)
+                for item in skipped
+            ]
+        return data
+
+
+class DeriveChunkResult(BaseModel):
+    """Simplified derive output — flat constraint list per chunk (Solution B).
+
+    Replaces DeriveExtractionResult's 5 grouped lists with a single flat list.
+    LLM only needs to output constraints + optional gap pairs, without sorting
+    into rc/ba/m/b categories. Type info is preserved in constraint_kind +
+    derived_from fields.
+    """
+
+    model_config = ConfigDict(json_schema_extra=_force_all_required)
+
+    constraints: list[DerivedConstraint] = Field(
+        default_factory=list,
+        description="All derived constraints (RC/BA/M/B types, flat list)",
+    )
+    missing_gap_pairs: list[MissingGapPair] = Field(
+        default_factory=list,
+        description="Missing gap dual constraint pairs (boundary + remedy)",
+    )
+    skipped_decisions: list[str] = Field(
+        default_factory=list,
+        description="Skipped BD IDs with reasons",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_skipped_decisions(cls, data: Any) -> Any:
+        """Same coercion as DeriveExtractionResult."""
         if not isinstance(data, dict):
             return data
         skipped = data.get("skipped_decisions")
@@ -503,6 +574,8 @@ class AuditConstraintResult(BaseModel):
 
     Only High/Critical findings are converted; warnings and passes are skipped.
     """
+
+    model_config = ConfigDict(json_schema_extra=_force_all_required)
 
     constraints: list[AuditConstraint] = Field(
         default_factory=list,
@@ -588,6 +661,8 @@ class SynthesizedConstraint(BaseModel):
 
 class ConstraintSynthesisResult(BaseModel):
     """Output of con_constraint_synthesis: kind rebalance + severity calibration."""
+
+    model_config = ConfigDict(json_schema_extra=_force_all_required)
 
     reviewed_constraints: list[SynthesizedConstraint] = Field(
         description="All constraints requiring kind/severity modification"
