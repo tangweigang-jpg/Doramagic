@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,6 +19,7 @@ from ..sop.blueprint_phases import (
     _compute_iter_scale,
     build_blueprint_phases_v4,
     build_blueprint_phases_v5,
+    build_blueprint_phases_v9,
 )
 from ..sop.executor import SOPExecutor
 from ..state.checkpoint import CheckpointManager
@@ -406,11 +408,18 @@ class BatchOrchestrator:
         if not job.skip_blueprint:
             state.current_pipeline = "blueprint"
             if self._config.blueprint_version == "v5":
-                bp_phases = build_blueprint_phases_v5(
-                    job.blueprint_id,
-                    agent=agent,
-                    iter_scale=iter_scale,
-                )
+                if os.environ.get("DORAMAGIC_AGENT_VERSION") == "v9":
+                    bp_phases = build_blueprint_phases_v9(
+                        job.blueprint_id,
+                        agent=agent,
+                        iter_scale=iter_scale,
+                    )
+                else:
+                    bp_phases = build_blueprint_phases_v5(
+                        job.blueprint_id,
+                        agent=agent,
+                        iter_scale=iter_scale,
+                    )
             else:
                 bp_phases = build_blueprint_phases_v4(job.blueprint_id)
             bp_executor = SOPExecutor(

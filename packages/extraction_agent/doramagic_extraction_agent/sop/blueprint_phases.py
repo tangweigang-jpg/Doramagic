@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -1831,9 +1832,9 @@ def build_blueprint_phases_v5(
         )
 
         # v8: Append visited files manifest for anti-hallucination grounding
-        # Always list file-level paths so BQ-10 grounding stays consistent.
-        # Cap at 500 paths to stay within MiniMax context budget (~5K tokens).
-        if all_visited:
+        # v9 ablation: set INJECT_MANIFEST=False to test without manifest
+        _INJECT_MANIFEST = os.environ.get("DORAMAGIC_INJECT_MANIFEST", "1") != "0"
+        if all_visited and _INJECT_MANIFEST:
             manifest_lines = sorted(all_visited)[:500]
             truncated = len(all_visited) > 500
             header = (
@@ -3975,3 +3976,99 @@ def build_blueprint_phases_v5(
             depends_on=["bp_consistency_check"],
         ),
     ]
+
+
+def build_blueprint_phases_v9(
+    blueprint_id: str,
+    *,
+    agent: ExtractionAgent,
+    strict_quality_gate: bool = True,
+    iter_scale: float = 1.0,
+) -> list[Phase]:
+    """Build v9 blueprint extraction phases.
+
+    Reuses v5/v8 phases for everything except synthesis.
+    Replaces monolithic synthesis with Map-Reduce pattern:
+      - bp_local_synthesis_v9:  per-worker local synthesis (Map)
+      - bp_global_synthesis_v9: merge + cross-module reasoning (Reduce)
+    Also inserts bp_fixer_v9 after bp_evaluate for targeted evidence repair.
+    """
+    # Get all v5 phases as baseline
+    v5_phases = build_blueprint_phases_v5(
+        blueprint_id,
+        agent=agent,
+        strict_quality_gate=strict_quality_gate,
+        iter_scale=iter_scale,
+    )
+
+    # Import v9 synthesis builders
+    from .synthesis_v9 import (
+        build_fixer_handler,
+        build_global_synthesis_handler,
+        build_local_synthesis_handler,
+    )
+
+    # Build v9 replacement phases
+    local_synth = Phase(
+        name="bp_local_synthesis_v9",
+        description="v9 Map: per-worker local synthesis",
+        system_prompt="",
+        initial_message_builder=lambda s, r: "",
+        requires_llm=False,
+        python_handler=build_local_synthesis_handler(agent),
+        depends_on=[
+            "worker_arch",
+            "worker_workflow",
+            "worker_math",
+            "worker_arch_deep",
+            "worker_resource",
+            "worker_verify",
+            "worker_audit",
+        ],
+        required_artifacts=["bd_list.json"],
+    )
+
+    global_synth = Phase(
+        name="bp_global_synthesis_v9",
+        description="v9 Reduce: merge + cross-module reasoning",
+        system_prompt="",
+        initial_message_builder=lambda s, r: "",
+        requires_llm=False,
+        python_handler=build_global_synthesis_handler(agent),
+        depends_on=["bp_local_synthesis_v9"],
+        required_artifacts=["bd_list.json"],
+    )
+
+    fixer = Phase(
+        name="bp_fixer_v9",
+        description="v9 Fixer: targeted evidence repair",
+        system_prompt="",
+        initial_message_builder=lambda s, r: "",
+        requires_llm=False,
+        python_handler=build_fixer_handler(agent),
+        depends_on=["bp_evaluate"],
+        required_artifacts=[],  # Optional — fixer may find nothing to fix
+    )
+
+    # Replace synthesis phase with Map-Reduce and insert fixer after evaluate
+    result: list[Phase] = []
+    for phase in v5_phases:
+        if phase.name == "bp_synthesis_v5":
+            # Replace monolithic synthesis with v9 Map-Reduce
+            result.append(local_synth)
+            result.append(global_synth)
+        elif phase.name == "bp_evaluate":
+            # Update evaluate's depends_on to point at v9 global synth
+            from dataclasses import replace as _dc_replace
+
+            updated_evaluate = _dc_replace(
+                phase,
+                depends_on=["bp_global_synthesis_v9"],
+            )
+            result.append(updated_evaluate)
+            # Insert fixer AFTER evaluate
+            result.append(fixer)
+        else:
+            result.append(phase)
+
+    return result
