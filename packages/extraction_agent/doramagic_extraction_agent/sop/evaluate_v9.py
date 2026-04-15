@@ -19,9 +19,9 @@ import random
 import re
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from doramagic_extraction_agent.core.agent_loop import ExtractionAgent, PhaseResult
 from doramagic_extraction_agent.sop.schemas_v5 import RawFallback
@@ -62,14 +62,54 @@ Return a SemanticEvalResult JSON. Do NOT wrap in markdown code fences.
 
 
 class BDSemanticVerdict(BaseModel):
-    bd_id: str
-    rationale_verdict: Literal["PASS", "SHALLOW", "MISSING_BOUNDARY"]
-    type_verdict: Literal["CORRECT", "OVER_CLASSIFIED", "UNDER_CLASSIFIED"]
+    bd_id: str = ""
+    rationale_verdict: str = "PASS"
+    type_verdict: str = "CORRECT"
     note: str = ""
+
+    @field_validator("rationale_verdict", mode="before")
+    @classmethod
+    def coerce_rationale(cls, v: Any) -> str:
+        """Fuzzy-match MiniMax output to valid verdicts."""
+        if not isinstance(v, str):
+            return "PASS"
+        v = v.strip().upper()
+        if "SHALLOW" in v:
+            return "SHALLOW"
+        if "MISSING" in v or "BOUNDARY" in v:
+            return "MISSING_BOUNDARY"
+        return "PASS"
+
+    @field_validator("type_verdict", mode="before")
+    @classmethod
+    def coerce_type_verdict(cls, v: Any) -> str:
+        """Fuzzy-match MiniMax output to valid verdicts."""
+        if not isinstance(v, str):
+            return "CORRECT"
+        v = v.strip().upper()
+        if "OVER" in v:
+            return "OVER_CLASSIFIED"
+        if "UNDER" in v:
+            return "UNDER_CLASSIFIED"
+        return "CORRECT"
 
 
 class SemanticEvalResult(BaseModel):
-    evaluations: list[BDSemanticVerdict]
+    evaluations: list[BDSemanticVerdict] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_minimax_quirks(cls, data: Any) -> Any:
+        """Handle MiniMax output variations."""
+        if isinstance(data, list):
+            return {"evaluations": data}
+        if isinstance(data, dict) and "evaluations" not in data:
+            # MiniMax may use different key names
+            for key in ("results", "verdicts", "items", "data"):
+                if key in data and isinstance(data[key], list):
+                    data["evaluations"] = data.pop(key)
+                    break
+        return data
 
 
 # ---------------------------------------------------------------------------

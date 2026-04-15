@@ -196,14 +196,34 @@ class WorkerBDOutput(BaseModel):
     def coerce_from_legacy_format(cls, data: Any) -> Any:
         """Accept legacy worker output formats.
 
-        Legacy worker_arch.json has {stages: [...]}, not {candidates: [...]}.
-        Legacy worker_workflow.json is a bare list, not a dict.
+        Legacy formats handled:
+        - worker_arch.json: {stages: [...]} with design_decisions
+        - worker_workflow/math.json: bare list of BD dicts
+        - worker_arch_deep.json: bare list with {finding, type_hint, ...}
+        - worker_resource.json: {data_sources: [...]} — no BD candidates
         """
         if isinstance(data, list):
-            # Bare list → treat as candidates
-            return {"candidates": data, "worker_name": "unknown"}
-        if isinstance(data, dict) and "stages" in data and "candidates" not in data:
-            # Extract design_decisions from each stage as candidates
+            # Bare list — could be workflow BDs or arch_deep findings
+            coerced = []
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                # arch_deep format: finding → content, type_hint → type
+                if "finding" in item and "content" not in item:
+                    item["content"] = item.pop("finding")
+                if "type_hint" in item and "candidate_type" not in item:
+                    item["candidate_type"] = item.pop("type_hint")
+                if "category" in item and "module" not in item:
+                    item["module"] = item.get("category", "")
+                coerced.append(item)
+            return {"candidates": coerced, "worker_name": "unknown"}
+        if not isinstance(data, dict):
+            return data
+        # Already has candidates — pass through
+        if "candidates" in data:
+            return data
+        # worker_arch format: {stages: [...]}
+        if "stages" in data:
             candidates = []
             for stage in data.get("stages", []):
                 for dd in stage.get("design_decisions", []):
@@ -214,6 +234,12 @@ class WorkerBDOutput(BaseModel):
                 "candidates": candidates,
                 "modules_visited": [s.get("name", "") for s in data.get("stages", [])],
                 "worker_name": "arch",
+            }
+        # worker_resource format: {data_sources: [...]} — no BD candidates
+        if "data_sources" in data:
+            return {
+                "candidates": [],
+                "worker_name": "resource",
             }
         return data
 
