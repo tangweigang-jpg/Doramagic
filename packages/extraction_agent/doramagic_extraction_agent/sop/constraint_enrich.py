@@ -819,6 +819,37 @@ def _patch_hash_compute(constraints: list[dict[str, Any]]) -> int:
     return count
 
 
+def _patch_guard_pattern(constraints: list[dict[str, Any]]) -> int:
+    """P16: Auto-construct guard_pattern for rationalization_guard missing it.
+
+    When con_extract_rationalization produces constraints with
+    constraint_kind=rationalization_guard but no guard_pattern, this patch
+    constructs one from the existing when/action/consequence fields.
+    """
+    count = 0
+    for raw in constraints:
+        if raw.get("constraint_kind") != "rationalization_guard":
+            continue
+        if raw.get("guard_pattern"):
+            continue  # already has one
+        # Construct guard_pattern from existing fields
+        action = raw.get("action", "")
+        when = raw.get("when", "")
+        consequence = raw.get("consequence_description", "")
+        raw["guard_pattern"] = {
+            "excuse": f"Rationalization scenario: {when}",
+            "rebuttal": action,
+            "red_flags": [
+                f"Skipping the rule because: {when}",
+            ],
+            "violation_detector": consequence[:200] if consequence else "",
+        }
+        count += 1
+    if count:
+        logger.info("Patch 16 (guard_pattern): %d rationalization_guard constraints patched", count)
+    return count
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -831,7 +862,7 @@ def enrich_constraints(
     commit_hash: str,
     sop_version: str = "2.3",
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Apply 15 deterministic enrichment patches (P1-P15) to raw constraints.
+    """Apply 16 deterministic enrichment patches (P1-P16) to raw constraints.
 
     Args:
         raw_list:    List of raw constraint dicts (from agentic extraction).
@@ -872,6 +903,7 @@ def enrich_constraints(
     patch_stats["p12_consequence_quality"] = _patch_consequence_quality(raw_list)
     patch_stats["p13_absolute_words"] = _patch_absolute_words(raw_list)
     patch_stats["p14_hardcoded_constants"] = _patch_hardcoded_constants(raw_list)
+    patch_stats["p16_guard_pattern"] = _patch_guard_pattern(raw_list)
     patch_stats["p15_hash_compute"] = _patch_hash_compute(raw_list)  # MUST be last
 
     total_affected = sum(patch_stats.values())

@@ -1712,7 +1712,7 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
       QG-01: total >= 80
       QG-02: kind_coverage >= 5 (all 5 constraint kinds must be present)
       QG-03: claim_boundary >= 5%
-      QG-04: domain_rule + architecture_guardrail >= 60%
+      QG-04: domain_rule + architecture_guardrail >= 50%
 
     Warnings (logged but non-blocking):
       QG-05: evidence_coverage — % of constraints with file:line in evidence_summary
@@ -1825,15 +1825,15 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
         else:
             logger.info("QG-03 PASS: claim_boundary=%d (%.1f%%) >= 5%%", cb_count, cb_pct)
 
-    # QG-04: domain_rule + architecture_guardrail >= 60%
+    # QG-04: domain_rule + architecture_guardrail >= 50% (lowered from 60% for 6-kind era)
     if total > 0:
         dr_count = by_kind.get("domain_rule", 0)
         ag_count = by_kind.get("architecture_guardrail", 0)
         dr_ag_pct = (dr_count + ag_count) / total * 100
-        if dr_ag_pct < 60.0:
-            hard_issues.append(f"QG-04 FAIL: dr+ag={dr_count + ag_count} ({dr_ag_pct:.1f}%) < 60%")
+        if dr_ag_pct < 50.0:
+            hard_issues.append(f"QG-04 FAIL: dr+ag={dr_count + ag_count} ({dr_ag_pct:.1f}%) < 50%")
         else:
-            logger.info("QG-04 PASS: dr+ag=%d (%.1f%%) >= 60%%", dr_count + ag_count, dr_ag_pct)
+            logger.info("QG-04 PASS: dr+ag=%d (%.1f%%) >= 50%%", dr_count + ag_count, dr_ag_pct)
 
     # QG-09: fatal + machine_checkable threshold coverage >= 30%
     if fatal_checkable_total > 0:

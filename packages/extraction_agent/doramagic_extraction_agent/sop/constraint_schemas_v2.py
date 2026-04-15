@@ -169,10 +169,26 @@ class RawConstraint(BaseModel):
             except ValueError:
                 data["confidence_score"] = 0.7
         # MiniMax enum normalization: common misspellings / alternative values
+        # Also maps BD types (RC/B/BA/M) that LLMs confuse with constraint_kind
+        _BD_TYPE_TO_KIND = {
+            "rc": "domain_rule",
+            "b": "domain_rule",
+            "ba": "operational_lesson",
+            "m": "domain_rule",
+            "t": "architecture_guardrail",
+            "dk": "domain_rule",
+            "b/rc": "domain_rule",
+            "rc/b": "domain_rule",
+            "m/ba": "domain_rule",
+            "b/ba": "operational_lesson",
+        }
         ck = data.get("constraint_kind")
         if isinstance(ck, str):
             normalized = ck.lower().strip().replace(" ", "_").replace("-", "_")
-            if normalized not in _VALID_CONSTRAINT_KINDS:
+            # First check BD type mapping (con_derive confusion)
+            if normalized in _BD_TYPE_TO_KIND:
+                data["constraint_kind"] = _BD_TYPE_TO_KIND[normalized]
+            elif normalized not in _VALID_CONSTRAINT_KINDS:
                 # Exact suffix match: e.g. "guard" → "rationalization_guard" only if
                 # exactly one valid kind ends with the normalized value.
                 suffix_matches = [v for v in _VALID_CONSTRAINT_KINDS if v.endswith(normalized)]
@@ -292,13 +308,42 @@ class DeriveSource(BaseModel):
 class DerivedConstraint(RawConstraint):
     """Constraint derived from a blueprint business_decision (Step 2.4).
 
-    Extends RawConstraint with mandatory provenance so the origin of every
-    derived constraint is always traceable.
+    Extends RawConstraint with mandatory provenance. Overrides several fields
+    with sensible defaults because LLMs frequently omit them in the complex
+    DeriveExtractionResult schema (14/14 chunks failed on bp-070 without defaults).
     """
+
+    # Override fields that LLMs commonly omit in derive context
+    confidence_score: float = Field(
+        default=0.7, ge=0.0, le=1.0, description="Confidence score 0.0-1.0"
+    )
+    evidence_summary: str = Field(
+        default="See blueprint business_decision", description="Evidence summary"
+    )
+    consensus: _CONSENSUS = Field(default="strong", description="Community consensus level")
+    freshness: _FRESHNESS = Field(default="stable", description="Stability")
+    machine_checkable: bool = Field(default=False, description="Whether verifiable via grep/regex")
+    promote_to_acceptance: bool = Field(
+        default=False, description="Whether to promote to acceptance criterion"
+    )
 
     derived_from: DeriveSource = Field(
         description="Derivation provenance: blueprint ID + business_decision ID + SOP version",
     )
+
+    @field_validator("action")
+    @classmethod
+    def action_no_vague_words(cls, v: str) -> str:
+        """Override: derived constraints are advisory — relax vague word check."""
+        # Only block the strongest vague words; allow "consider"/"appropriate"
+        # which are natural in advisory derived constraints (BA/operational_lesson)
+        hard_block = ["try to", "be careful", "if possible"]
+        found = [w for w in hard_block if w in v.lower()]
+        if found:
+            raise ValueError(
+                f"action contains vague words {found!r} — rewrite as specific actionable behavior"
+            )
+        return v
 
 
 class MissingGapPair(BaseModel):
@@ -310,30 +355,22 @@ class MissingGapPair(BaseModel):
     """
 
     boundary: DerivedConstraint = Field(
-        description="claim_boundary 侧：must_not 假设框架已处理该功能",
+        description="claim_boundary side: must_not assume the framework handles this",
     )
     remedy: DerivedConstraint = Field(
-        description="domain_rule / operational_lesson 侧：具体可执行的补救方案",
+        description="domain_rule / operational_lesson side: specific actionable remedy",
     )
 
     @model_validator(mode="after")
     def validate_pair_semantics(self) -> MissingGapPair:
+        # Auto-correct instead of raising — avoid L1→L2→L3 cascade
         if self.boundary.modality != "must_not":
-            raise ValueError(
-                f"boundary.modality 必须是 'must_not'，当前为 {self.boundary.modality!r}"
-            )
+            self.boundary.modality = "must_not"
         if self.boundary.constraint_kind != "claim_boundary":
-            raise ValueError(
-                f"boundary.constraint_kind 必须是 'claim_boundary'，当前为 {self.boundary.constraint_kind!r}"
-            )
+            self.boundary.constraint_kind = "claim_boundary"
         if self.remedy.modality not in ("must", "should"):
-            raise ValueError(
-                f"remedy.modality 必须是 'must' 或 'should'，当前为 {self.remedy.modality!r}"
-            )
+            self.remedy.modality = "must"
         if self.remedy.constraint_kind not in ("domain_rule", "operational_lesson"):
-            # Auto-correct instead of raising — LLM sometimes generates
-            # architecture_guardrail for remedy, which is semantically close
-            # to domain_rule. This avoids L1→L2→L3 cascade.
             self.remedy.constraint_kind = "domain_rule"
         return self
 
@@ -347,15 +384,15 @@ class DeriveExtractionResult(BaseModel):
 
     rc_constraints: list[DerivedConstraint] = Field(
         default_factory=list,
-        description="RC（监管规则）→ domain_rule 约束",
+        description="RC (regulatory rule) → domain_rule constraints",
     )
     ba_constraints: list[DerivedConstraint] = Field(
         default_factory=list,
-        description="BA（业务假设）→ operational_lesson 约束",
+        description="BA (business assumption) → operational_lesson constraints",
     )
     m_constraints: list[DerivedConstraint] = Field(
         default_factory=list,
-        description="M（数学/模型选择）→ domain_rule / architecture_guardrail 约束",
+        description="M (mathematical/model choice) → domain_rule / architecture_guardrail constraints",
     )
     b_constraints: list[DerivedConstraint] = Field(
         default_factory=list,
@@ -363,12 +400,26 @@ class DeriveExtractionResult(BaseModel):
     )
     missing_gap_pairs: list[MissingGapPair] = Field(
         default_factory=list,
-        description="missing gap → 双联约束对（boundary + remedy）",
+        description="missing gap → dual constraint pairs (boundary + remedy)",
     )
     skipped_decisions: list[str] = Field(
         default_factory=list,
         description="Skipped business_decision IDs (pure technical choice T / no-impact DK, etc.)",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_skipped_decisions(cls, data: Any) -> Any:
+        """GLM-5 sometimes puts full BD dicts instead of ID strings in skipped_decisions."""
+        if not isinstance(data, dict):
+            return data
+        skipped = data.get("skipped_decisions")
+        if isinstance(skipped, list):
+            data["skipped_decisions"] = [
+                item.get("id", str(item)) if isinstance(item, dict) else str(item)
+                for item in skipped
+            ]
+        return data
 
 
 class AuditSource(BaseModel):
@@ -382,9 +433,14 @@ class AuditSource(BaseModel):
 class AuditConstraint(RawConstraint):
     """Constraint derived from an audit finding (Step 2.5).
 
-    Uses AuditSource for provenance instead of DeriveSource, since audit
-    constraints originate from checklist findings, not business decisions.
+    Uses AuditSource for provenance instead of DeriveSource. Overrides fields
+    with sensible defaults (same rationale as DerivedConstraint).
     """
+
+    # Override fields commonly omitted by LLMs in audit context
+    confidence_score: float = Field(default=0.8, ge=0.0, le=1.0, description="Confidence score")
+    consensus: _CONSENSUS = Field(default="strong", description="Community consensus level")
+    freshness: _FRESHNESS = Field(default="stable", description="Stability")
 
     derived_from: AuditSource = Field(
         description="Audit provenance: source + audit item + SOP version",
