@@ -666,6 +666,145 @@ def _patch_stage_id_override(
 
 
 # ---------------------------------------------------------------------------
+# v3 新增 Patches P11-P15
+# ---------------------------------------------------------------------------
+
+_RUNTIME_ZH_PATTERNS = [
+    (re.compile(r"当.*?被调用时"), lambda m: m.group().replace("被调用时", "的调用逻辑时")),
+    (re.compile(r"当.*?执行时"), lambda m: m.group().replace("执行时", "的实现逻辑时")),
+    (re.compile(r"is called"), lambda _: "is implemented"),
+    (re.compile(r"at runtime"), lambda _: "during implementation"),
+]
+
+
+def _patch_when_perspective(constraints: list[dict[str, Any]]) -> int:
+    """P11: Fix runtime perspective → coding-time perspective in 'when' field.
+
+    SOP rule: when 必须用编码时视角（"编写/实现 X 时"），不用运行时视角（"X 被调用时"）。
+    """
+    count = 0
+    for raw in constraints:
+        when = raw.get("when", "")
+        original = when
+        for pattern, replacer in _RUNTIME_ZH_PATTERNS:
+            when = pattern.sub(replacer, when)
+        if when != original:
+            raw["when"] = when
+            count += 1
+    if count:
+        logger.info("Patch 11 (when_perspective): %d constraints corrected", count)
+    return count
+
+
+def _patch_consequence_quality(constraints: list[dict[str, Any]]) -> int:
+    """P12: Enforce consequence_description quality.
+
+    Tags constraints where consequence_description is <20 chars, equals the
+    consequence_kind enum value, or contains vague words.
+    """
+    _CONSEQUENCE_ENUM_WORDS = {
+        "bug",
+        "performance",
+        "financial_loss",
+        "data_corruption",
+        "service_disruption",
+        "operational_failure",
+        "compliance",
+        "safety",
+        "false_claim",
+    }
+    count = 0
+    for raw in constraints:
+        desc = raw.get("consequence_description", "")
+        needs_fix = (
+            len(desc) < 20
+            or desc.strip().lower() in _CONSEQUENCE_ENUM_WORDS
+            or any(w in desc for w in ("结果不正确", "程序出错", "性能下降", "不可预期"))
+        )
+        if needs_fix:
+            tags = raw.setdefault("tags", [])
+            if "P12_consequence_needs_fix" not in tags:
+                tags.append("P12_consequence_needs_fix")
+            count += 1
+    if count:
+        logger.info("Patch 12 (consequence_quality): %d constraints tagged", count)
+    return count
+
+
+_ABSOLUTE_WORD_RE = re.compile(r"\ball\s+(\w+)", re.IGNORECASE)
+
+
+def _patch_absolute_words(constraints: list[dict[str, Any]]) -> int:
+    """P13: Replace 'all X' with 'each X' in when/action fields.
+
+    Mirrors blueprint P17. Prevents over-generalization in constraint language.
+    """
+    count = 0
+    for raw in constraints:
+        for field in ("when", "action"):
+            text = raw.get(field, "")
+            new_text = _ABSOLUTE_WORD_RE.sub(r"each \1", text)
+            if new_text != text:
+                raw[field] = new_text
+                count += 1
+    if count:
+        logger.info("Patch 13 (absolute_words): %d replacements", count)
+    return count
+
+
+_HARDCODED_RE = re.compile(r"row\[\w+_IDX\]|self\.__\w+|_[A-Z]{2,}_IDX")
+
+
+def _patch_hardcoded_constants(constraints: list[dict[str, Any]]) -> int:
+    """P14: Tag constraints with hardcoded source-code constants in action.
+
+    SOP rule: action 中用业务语义，不用源码常量。
+    """
+    count = 0
+    for raw in constraints:
+        action = raw.get("action", "")
+        if _HARDCODED_RE.search(action):
+            tags = raw.setdefault("tags", [])
+            if "P14_hardcoded_constant" not in tags:
+                tags.append("P14_hardcoded_constant")
+            count += 1
+    if count:
+        logger.info("Patch 14 (hardcoded_constants): %d constraints tagged", count)
+    return count
+
+
+def _patch_hash_compute(constraints: list[dict[str, Any]]) -> int:
+    """P15: Compute content hash for constraints missing one.
+
+    hash = sha256(when + modality + action + consequence_kind + consequence_description)[:16]
+    Must run LAST since hash depends on all content fields.
+    """
+    import hashlib
+    import json as _json
+
+    count = 0
+    for raw in constraints:
+        if raw.get("hash"):
+            continue
+        content = _json.dumps(
+            {
+                "when": raw.get("when", ""),
+                "modality": raw.get("modality", ""),
+                "action": raw.get("action", ""),
+                "consequence_kind": raw.get("consequence_kind", ""),
+                "consequence_description": raw.get("consequence_description", ""),
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        raw["hash"] = hashlib.sha256(content.encode()).hexdigest()[:16]
+        count += 1
+    if count:
+        logger.info("Patch 15 (hash_compute): %d hashes computed", count)
+    return count
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -675,7 +814,7 @@ def enrich_constraints(
     blueprint: dict[str, Any],
     manifest: dict[str, Any],
     commit_hash: str,
-    sop_version: str = "2.2",
+    sop_version: str = "2.3",
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Apply 10 deterministic enrichment patches to raw constraints.
 
@@ -712,6 +851,13 @@ def enrich_constraints(
     patch_stats["p7_commit_hash"] = _patch_commit_hash(raw_list, commit_hash)
     patch_stats["p8_vague_words"] = _patch_vague_words(raw_list)
     patch_stats["p10_stage_id"] = _patch_stage_id_override(raw_list, blueprint)
+
+    # v3 patches (P11-P15) — content quality + hash
+    patch_stats["p11_when_perspective"] = _patch_when_perspective(raw_list)
+    patch_stats["p12_consequence_quality"] = _patch_consequence_quality(raw_list)
+    patch_stats["p13_absolute_words"] = _patch_absolute_words(raw_list)
+    patch_stats["p14_hardcoded_constants"] = _patch_hardcoded_constants(raw_list)
+    patch_stats["p15_hash_compute"] = _patch_hash_compute(raw_list)  # MUST be last
 
     total_affected = sum(patch_stats.values())
     logger.info(

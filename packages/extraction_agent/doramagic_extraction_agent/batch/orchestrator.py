@@ -347,10 +347,10 @@ class BatchOrchestrator:
         for tool in create_artifact_tools(checkpoint.artifacts_dir):
             registry.register(tool)
 
-        # Register index tools when blueprint OR constraint v2 phases need them.
-        # get_skeleton is used by constraint v2 extract phases even with skip_blueprint.
+        # Register index tools when blueprint OR constraint v2/v3 phases need them.
+        # get_skeleton is used by constraint v2/v3 extract phases even with skip_blueprint.
         need_index_tools = (not job.skip_blueprint) or (
-            not job.skip_constraint and self._config.constraint_version == "v2"
+            not job.skip_constraint and self._config.constraint_version in ("v2", "v3")
         )
 
         if need_index_tools:
@@ -523,7 +523,11 @@ class BatchOrchestrator:
         if not job.skip_constraint:
             # Import dynamically to avoid circular deps at module load time
             try:
-                if self._config.constraint_version == "v2":
+                if self._config.constraint_version == "v3":
+                    from ..sop.constraint_phases_v3 import (
+                        build_constraint_phases_v3,
+                    )
+                elif self._config.constraint_version == "v2":
                     from ..sop.constraint_phases_v2 import (
                         build_constraint_phases_v2,
                     )
@@ -543,7 +547,7 @@ class BatchOrchestrator:
                     bp_path = Path(state.blueprint_path)
                 if not bp_path.exists():
                     bp_path = output_mgr.output_dir / "blueprint.yaml"  # legacy fallback
-                if self._config.constraint_version == "v2":
+                if self._config.constraint_version in ("v2", "v3"):
                     # Build fallback agent for derive chunk retry.
                     # Skip if fallback is the same model as primary (no point retrying).
                     fb_agent = None
@@ -551,16 +555,24 @@ class BatchOrchestrator:
                         fb_spec = model_router.get_fallback("con_derive")
                         if fb_spec and fb_spec.model_id != self._config.llm_model:
                             fb_agent = agent_factory(fb_spec)
-                    con_phases = build_constraint_phases_v2(
-                        job.blueprint_id,
-                        bp_path,
-                        agent,
-                        fallback_agent=fb_agent,
-                    )
+                    if self._config.constraint_version == "v3":
+                        con_phases = build_constraint_phases_v3(
+                            job.blueprint_id,
+                            bp_path,
+                            agent,
+                            fallback_agent=fb_agent,
+                        )
+                    else:
+                        con_phases = build_constraint_phases_v2(
+                            job.blueprint_id,
+                            bp_path,
+                            agent,
+                            fallback_agent=fb_agent,
+                        )
                 else:
                     con_phases = build_constraint_phases(job.blueprint_id, bp_path)
-                # v2 has 14+ parallel phases; limit concurrency to avoid API rate limits
-                max_par = 4 if self._config.constraint_version == "v2" else 5
+                # v2/v3 have 14+ parallel phases; limit concurrency to avoid API rate limits
+                max_par = 4 if self._config.constraint_version in ("v2", "v3") else 5
                 con_executor = SOPExecutor(
                     con_phases,
                     agent,
@@ -602,9 +614,7 @@ class BatchOrchestrator:
 
         # 9. Write manifest — reload from disk to preserve version entries
         #    added by _finalize_handler's OutputManager during the pipeline.
-        final_mgr = OutputManager(
-            output_mgr.output_dir, job.blueprint_id, repo_slug=repo_slug
-        )
+        final_mgr = OutputManager(output_mgr.output_dir, job.blueprint_id, repo_slug=repo_slug)
         final_mgr.write_manifest(
             blueprint_id=job.blueprint_id,
             domain=job.domain,

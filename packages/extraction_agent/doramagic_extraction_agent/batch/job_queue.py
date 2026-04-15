@@ -40,8 +40,8 @@ class BatchConfig:
     model_overrides: dict[str, dict] = field(default_factory=dict)
     # v5: blueprint phase version ("v4" or "v5")
     blueprint_version: str = "v4"
-    # v2: constraint phase version ("v1" or "v2")
-    constraint_version: str = "v1"
+    # v3: constraint phase version ("v1", "v2", or "v3")
+    constraint_version: str = "v3"
 
 
 def load_batch_config(path: Path) -> BatchConfig:

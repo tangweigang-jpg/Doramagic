@@ -9,7 +9,7 @@ Import RawFallback from schemas_v5 rather than redefining it.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -35,10 +35,12 @@ _CONSTRAINT_KIND = Literal[
     "operational_lesson",
     "architecture_guardrail",
     "claim_boundary",
+    "rationalization_guard",
 ]
 _SEVERITY = Literal["fatal", "high", "medium", "low"]
 _SOURCE_TYPE = Literal[
     "code_analysis",
+    "document_extraction",
     "community_issue",
     "official_doc",
     "api_changelog",
@@ -56,6 +58,7 @@ _VALID_CONSTRAINT_KINDS: frozenset[str] = frozenset(
         "operational_lesson",
         "architecture_guardrail",
         "claim_boundary",
+        "rationalization_guard",
     ]
 )
 _VAGUE_WORDS = [
@@ -121,6 +124,68 @@ class RawConstraint(BaseModel):
             "示例：'macd_fast != 12 OR macd_slow != 26 → FAIL'"
         ),
     )
+    # SOP v2.3: rationalization_guard 专有字段
+    guard_pattern: dict | None = Field(
+        default=None,
+        description=(
+            "仅 rationalization_guard 使用。格式：{excuse, rebuttal, red_flags, violation_detector}"
+        ),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_minimax_quirks(cls, data: Any) -> Any:
+        """MiniMax M2.7 output normalization.
+
+        Named coercions for known model-specific output quirks.
+        Each coercion cites which model/step triggers it.
+        """
+        if not isinstance(data, dict):
+            return data
+        # MiniMax field name aliases
+        _ALIASES = {
+            "kind": "constraint_kind",
+            "type": "constraint_kind",
+            "score": "confidence_score",
+            "confidence": "confidence_score",
+            "scope": "target_scope",
+            "stages": "stage_ids",
+            "evidence": "evidence_summary",
+            "consequence": "consequence_description",
+            "checkable": "machine_checkable",
+        }
+        for alias, canonical in _ALIASES.items():
+            if alias in data and canonical not in data:
+                data[canonical] = data.pop(alias)
+        # MiniMax bool coercion: writes descriptive strings for bool fields
+        for bool_field in ("machine_checkable", "promote_to_acceptance"):
+            v = data.get(bool_field)
+            if isinstance(v, str):
+                data[bool_field] = v.lower() in ("true", "yes", "1", "是")
+        # MiniMax confidence_score as string
+        cs = data.get("confidence_score")
+        if isinstance(cs, str):
+            try:
+                data["confidence_score"] = float(cs)
+            except ValueError:
+                data["confidence_score"] = 0.7
+        # MiniMax enum normalization: common misspellings / alternative values
+        ck = data.get("constraint_kind")
+        if isinstance(ck, str):
+            normalized = ck.lower().strip().replace(" ", "_").replace("-", "_")
+            if normalized not in _VALID_CONSTRAINT_KINDS:
+                for valid in _VALID_CONSTRAINT_KINDS:
+                    if normalized in valid or valid in normalized:
+                        data["constraint_kind"] = valid
+                        break
+        sev = data.get("severity")
+        if isinstance(sev, str):
+            sev_lower = sev.lower().strip()
+            if sev_lower in ("critical", "blocker"):
+                data["severity"] = "fatal"
+            elif sev_lower in ("warning", "minor"):
+                data["severity"] = "medium"
+        return data
 
     @field_validator("action")
     @classmethod
@@ -160,6 +225,7 @@ class ConstraintExtractionResult(BaseModel):
         description="提取到的所有约束列表",
     )
     coverage_report: dict[str, int] = Field(
+        default_factory=dict,
         description="按 constraint_kind 统计的约束数量，keys 必须是合法 constraint_kind 值",
     )
     missed_hints: list[str] = Field(
@@ -167,8 +233,27 @@ class ConstraintExtractionResult(BaseModel):
         description="未被约束覆盖的 acceptance_hints（用于质量审计）",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_top_level(cls, data: Any) -> Any:
+        """Handle MiniMax returning bare list instead of dict."""
+        if isinstance(data, list):
+            return {"constraints": data}
+        if isinstance(data, dict):
+            if "results" in data and "constraints" not in data:
+                data["constraints"] = data.pop("results")
+            if "items" in data and "constraints" not in data:
+                data["constraints"] = data.pop("items")
+            # Make coverage_report optional — MiniMax often omits it
+            if "coverage_report" not in data:
+                data["coverage_report"] = {}
+        return data
+
     @model_validator(mode="after")
     def validate_coverage_report(self) -> ConstraintExtractionResult:
+        # Skip validation if coverage_report is empty (auto-filled)
+        if not self.coverage_report:
+            return self
         for key in self.coverage_report:
             if key not in _VALID_CONSTRAINT_KINDS:
                 raise ValueError(
@@ -190,7 +275,7 @@ class DeriveSource(BaseModel):
     blueprint_id: str = Field(description="蓝图 ID，如 finance-bp-009")
     business_decision_id: str = Field(description="被派生的 business_decision ID 或名称")
     derivation_version: str = Field(
-        default="sop-v2.2",
+        default="sop-v2.3",
         description="派生所用的 SOP 版本",
     )
 
@@ -379,6 +464,7 @@ class SynthesizedConstraint(BaseModel):
         "operational_lesson",
         "architecture_guardrail",
         "claim_boundary",
+        "rationalization_guard",
     ] = Field(description="审查后的 constraint_kind（可能已升级）")
     severity: Literal["fatal", "high", "medium", "low"] = Field(description="审查后的 severity")
     upgrade_reason: str = Field(default="", description="如果 kind 被修改，说明理由")
