@@ -1594,6 +1594,13 @@ async def _con_ingest_v2_handler(state: AgentState, repo_path: Path) -> PhaseRes
             errors.append(f"Pydantic validation failed: {exc} — when={item.get('when', '?')!r}")
             continue
 
+        # Structural invariant: target_scope=edge requires non-empty edge_ids
+        if c.applies_to.target_scope.value == "edge" and not c.applies_to.edge_ids:
+            errors.append(
+                f"target_scope=edge but edge_ids is empty — when={item.get('when', '?')!r}"
+            )
+            continue
+
         # Fix #5: SOP Step 3.4 business validation (scope, evidence, fuzzy-words).
         if valid_stage_ids or valid_edge_ids:
             vr = validate_constraint(

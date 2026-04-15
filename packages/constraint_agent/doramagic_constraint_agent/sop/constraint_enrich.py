@@ -387,6 +387,8 @@ _VAGUE_WORDS_EN: list[str] = [
     "appropriate",
     "if possible",
     "as needed",
+    "ensure",
+    "make sure",
 ]
 
 
@@ -852,6 +854,37 @@ def _patch_guard_pattern(constraints: list[dict[str, Any]]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Patch 17: modality/severity consistency
+# ---------------------------------------------------------------------------
+
+
+def _patch_modality_severity(constraints: list[dict[str, Any]]) -> int:
+    """Patch 17: upgrade modality when severity contradicts it.
+
+    Rule: severity=high or fatal implies the constraint is mandatory,
+    so modality should be must or must_not (not should/should_not).
+    """
+    count = 0
+    for raw in constraints:
+        severity = raw.get("severity", "")
+        modality = raw.get("modality", "")
+        if severity in ("high", "fatal") and modality in ("should", "should_not"):
+            old = modality
+            raw["modality"] = "must" if modality == "should" else "must_not"
+            count += 1
+            logger.info(
+                "P17: %s modality %s→%s (severity=%s)",
+                raw.get("constraint_kind", "?"),
+                old,
+                raw["modality"],
+                severity,
+            )
+    if count:
+        logger.info("Patch 17 (modality_severity): %d constraints upgraded", count)
+    return count
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -905,6 +938,7 @@ def enrich_constraints(
     patch_stats["p13_absolute_words"] = _patch_absolute_words(raw_list)
     patch_stats["p14_hardcoded_constants"] = _patch_hardcoded_constants(raw_list)
     patch_stats["p16_guard_pattern"] = _patch_guard_pattern(raw_list)
+    patch_stats["p17_modality_severity"] = _patch_modality_severity(raw_list)
     patch_stats["p15_hash_compute"] = _patch_hash_compute(raw_list)  # MUST be last
 
     total_affected = sum(patch_stats.values())

@@ -57,8 +57,18 @@ def _cmd_run(args: argparse.Namespace, project_root: Path) -> None:
         print(f"Error: repo not found: {repo_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Derive blueprint_id from filename
-    bp_id = blueprint_path.stem  # e.g. "finance-bp-070"
+    # Derive blueprint_id: explicit arg > YAML content > filename
+    bp_id = getattr(args, "blueprint_id", None)
+    if not bp_id:
+        import yaml
+
+        try:
+            bp_data = yaml.safe_load(blueprint_path.read_text(encoding="utf-8"))
+            bp_id = bp_data.get("id", "") if isinstance(bp_data, dict) else ""
+        except Exception:
+            bp_id = ""
+    if not bp_id:
+        bp_id = blueprint_path.stem
 
     job = ConstraintJob(
         blueprint_id=bp_id,
@@ -173,6 +183,9 @@ def main() -> None:
     # -- run: single blueprint --
     run_cmd = sub.add_parser("run", help="Extract constraints for one blueprint")
     run_cmd.add_argument("--blueprint", required=True, help="Path to blueprint YAML")
+    run_cmd.add_argument(
+        "--blueprint-id", default=None, help="Override blueprint ID (auto-detected from YAML)"
+    )
     run_cmd.add_argument("--repo-path", required=True, help="Path to local repo clone")
     run_cmd.add_argument("--domain", default="finance")
     run_cmd.add_argument(
