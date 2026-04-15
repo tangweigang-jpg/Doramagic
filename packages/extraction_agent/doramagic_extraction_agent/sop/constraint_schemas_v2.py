@@ -171,16 +171,27 @@ class RawConstraint(BaseModel):
         # MiniMax enum normalization: common misspellings / alternative values
         # Also maps BD types (RC/B/BA/M) that LLMs confuse with constraint_kind
         _BD_TYPE_TO_KIND = {
+            # Single types
             "rc": "domain_rule",
             "b": "domain_rule",
             "ba": "operational_lesson",
             "m": "domain_rule",
             "t": "architecture_guardrail",
             "dk": "domain_rule",
+            # Compound types (first type dominates the mapping)
             "b/rc": "domain_rule",
             "rc/b": "domain_rule",
+            "rc/ba": "domain_rule",
             "m/ba": "domain_rule",
+            "m/b": "domain_rule",
+            "m/dk": "domain_rule",
             "b/ba": "operational_lesson",
+            "ba/dk": "operational_lesson",
+            "b/dk": "domain_rule",
+            "b/m": "domain_rule",
+            "rc/dk": "domain_rule",
+            "t/b": "architecture_guardrail",
+            "t/dk": "architecture_guardrail",
         }
         ck = data.get("constraint_kind")
         if isinstance(ck, str):
@@ -331,13 +342,29 @@ class DerivedConstraint(RawConstraint):
         description="Derivation provenance: blueprint ID + business_decision ID + SOP version",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _backfill_stage_from_bd(cls, data: Any) -> Any:
+        """Try to recover stage_ids from derived_from context before validation."""
+        if not isinstance(data, dict):
+            return data
+        # If the BD name hints at a stage, backfill stage_ids
+        derived = data.get("derived_from")
+        if isinstance(derived, dict):
+            bd_id = derived.get("business_decision_id", "")
+            # Common pattern: BD names contain stage hints like "filing_*", "xbrl_*"
+            if bd_id and not data.get("stage_ids"):
+                data.setdefault("stage_ids", [])
+        return data
+
     @model_validator(mode="after")
     def scope_stage_ids_check(self) -> DerivedConstraint:
         """Override: auto-correct stage+empty→global instead of raising.
 
         GLM-5 consistently generates target_scope="stage" without stage_ids
-        in derived constraints (7/7 chunks on bp-070). Since derived constraints
-        come from blueprint BDs (not code analysis), global scope is the safe default.
+        in derived constraints (7/7 chunks on bp-070). Fallback to global
+        rather than failing — downstream enrichment P10 can re-assign stage_ids
+        from the blueprint's stage mapping.
         """
         if self.target_scope == "stage" and not self.stage_ids:
             self.target_scope = "global"
@@ -378,10 +405,24 @@ class MissingGapPair(BaseModel):
             self.boundary.modality = "must_not"
         if self.boundary.constraint_kind != "claim_boundary":
             self.boundary.constraint_kind = "claim_boundary"
+        if self.boundary.source_type != "code_analysis":
+            self.boundary.source_type = "code_analysis"
         if self.remedy.modality not in ("must", "should"):
             self.remedy.modality = "must"
         if self.remedy.constraint_kind not in ("domain_rule", "operational_lesson"):
             self.remedy.constraint_kind = "domain_rule"
+        if self.remedy.source_type not in ("expert_reasoning", "code_analysis"):
+            self.remedy.source_type = "expert_reasoning"
+        # Ensure both sides share the same derived_from provenance
+        if (
+            self.boundary.derived_from
+            and self.remedy.derived_from
+            and self.remedy.derived_from.business_decision_id
+            != self.boundary.derived_from.business_decision_id
+        ):
+            self.remedy.derived_from.business_decision_id = (
+                self.boundary.derived_from.business_decision_id
+            )
         return self
 
 

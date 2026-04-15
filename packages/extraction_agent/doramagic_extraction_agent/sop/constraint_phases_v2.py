@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -1600,10 +1602,19 @@ async def _con_ingest_v2_handler(state: AgentState, repo_path: Path) -> PhaseRes
     artifacts_dir = run_dir / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     ingest_path = artifacts_dir / "constraints_ingested.json"
-    ingest_path.write_text(
-        json.dumps(valid_dicts, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    # Use atomic write (tmpfile → fsync → rename) to prevent partial writes on crash
+    content = json.dumps(valid_dicts, ensure_ascii=False, indent=2)
+    fd, tmp_path = tempfile.mkstemp(dir=str(artifacts_dir), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, str(ingest_path))
+    except BaseException:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
     stats = {
         "deduped_input": len(deduped_list),

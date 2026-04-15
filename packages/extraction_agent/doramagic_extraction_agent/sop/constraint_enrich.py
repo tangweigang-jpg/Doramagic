@@ -843,6 +843,7 @@ def _patch_guard_pattern(constraints: list[dict[str, Any]]) -> int:
                 f"Skipping the rule because: {when}",
             ],
             "violation_detector": consequence[:200] if consequence else "",
+            "_auto_generated": True,  # Mark as synthetic — LLM-extracted values should override
         }
         count += 1
     if count:
