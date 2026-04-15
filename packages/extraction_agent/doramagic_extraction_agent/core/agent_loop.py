@@ -66,6 +66,73 @@ _TOKEN_BUDGET_MAX = 120_000  # error level: hard budget
 
 
 # ---------------------------------------------------------------------------
+# L3 deep key extraction (Strategy A2)
+# ---------------------------------------------------------------------------
+
+
+def _l3_deep_key_extract(
+    parsed: dict[str, Any],
+    model: type[BaseModel],
+) -> dict[str, Any] | None:
+    """Restructure a parsed dict when LLM outputs correct data at wrong nesting.
+
+    Common MiniMax failure: assembly outputs ``{"stages": [...]}`` but omits
+    top-level ``name``/``applicability``/``data_flow``.  The data exists in a
+    single wrapper key — this function checks for that pattern and unwraps it.
+
+    Safety: only searches immediate children (depth 1) to avoid pulling
+    stage-level fields like ``name`` into the top-level object.
+
+    Returns a restructured dict if improvements were made, or None if nothing
+    could be rescued.
+    """
+    required_fields = {name for name, info in model.model_fields.items() if info.is_required()}
+    present_fields = set(parsed.keys())
+    missing = required_fields - present_fields
+
+    if not missing:
+        return None  # nothing to fix; Strategy A should have worked
+
+    restructured = dict(parsed)
+    rescued = 0
+
+    # Pattern 1: LLM wrapped entire output in a single key.
+    # E.g. {"result": {"name": ..., "stages": [...]}} instead of
+    #      {"name": ..., "stages": [...]}.
+    # Only unwrap if the inner dict covers more required fields.
+    for _k, _v in parsed.items():
+        if isinstance(_v, dict):
+            inner_hits = required_fields & set(_v.keys())
+            if len(inner_hits) > len(required_fields & present_fields):
+                # The inner dict has more required fields — merge it up
+                restructured = {**_v, **{k: v for k, v in parsed.items() if k != _k}}
+                rescued += len(inner_hits - present_fields)
+                break
+
+    # Pattern 2: flatten stage objects with single-key wrappers.
+    # E.g. stages[*] = {"contract": {"id": ..., "name": ...}}
+    # → stages[*] = {"id": ..., "name": ...}
+    stages = restructured.get("stages", [])
+    if isinstance(stages, list) and stages:
+        flattened_stages = []
+        for stage in stages:
+            if isinstance(stage, dict) and len(stage) == 1:
+                inner = next(iter(stage.values()))
+                if isinstance(inner, dict) and len(inner) > 2:
+                    flattened_stages.append(inner)
+                    rescued += 1
+                    continue
+            flattened_stages.append(stage)
+        if flattened_stages:
+            restructured["stages"] = flattened_stages
+
+    if rescued == 0:
+        return None
+
+    return restructured
+
+
+# ---------------------------------------------------------------------------
 # L2 example instance builder
 # ---------------------------------------------------------------------------
 
@@ -100,7 +167,7 @@ def _build_example_instance(model: type[BaseModel]) -> dict[str, Any]:
             else:
                 result[name] = [f"<{name}_item>"]
         elif origin is dict:
-            result[name] = {f"<key>": f"<value>"}
+            result[name] = {"<key>": "<value>"}
         elif isinstance(annotation, type) and issubclass(annotation, BaseModel):
             result[name] = _build_example_instance(annotation)
         else:
@@ -112,6 +179,7 @@ def _build_example_instance(model: type[BaseModel]) -> dict[str, Any]:
             else:
                 result[name] = f"<{name}>"
     return result
+
 
 # ---------------------------------------------------------------------------
 # Convergence detection (Diminishing Returns)
@@ -313,8 +381,8 @@ class ExtractionAgent:
         if trace_dir is None:
             return  # No checkpoint manager, skip trace
 
+        from datetime import UTC, datetime
         from pathlib import Path
-        from datetime import datetime, UTC
 
         traces_path = Path(trace_dir).parent / "traces"
         traces_path.mkdir(parents=True, exist_ok=True)
@@ -418,22 +486,28 @@ class ExtractionAgent:
                 if checkpoint_dir:
                     from pathlib import Path as _P
 
-                    has_artifact = any(
-                        (_P(checkpoint_dir) / f).exists()
-                        for f in (_P(checkpoint_dir).iterdir())
-                        if f.suffix in (".md", ".json")
-                    ) if _P(checkpoint_dir).exists() else False
+                    has_artifact = (
+                        any(
+                            (_P(checkpoint_dir) / f).exists()
+                            for f in (_P(checkpoint_dir).iterdir())
+                            if f.suffix in (".md", ".json")
+                        )
+                        if _P(checkpoint_dir).exists()
+                        else False
+                    )
                     if not has_artifact:
                         remaining = effective_max - iters
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                f"CHECKPOINT: {iters} iterations used, {remaining} remaining. "
-                                f"You have NOT written your artifact yet. "
-                                f"Call write_artifact NOW with your findings so far. "
-                                f"If you run out of iterations, ALL work is lost."
-                            ),
-                        })
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"CHECKPOINT: {iters} iterations used, {remaining} remaining. "
+                                    f"You have NOT written your artifact yet. "
+                                    f"Call write_artifact NOW with your findings so far. "
+                                    f"If you run out of iterations, ALL work is lost."
+                                ),
+                            }
+                        )
 
             should_stop, reason = cb.should_break()
             if should_stop and "max iterations" in reason:
@@ -892,8 +966,7 @@ class ExtractionAgent:
         # Skip L1 for models known to be incompatible with Instructor
         # (thinking mode + tool_choice=required conflict, never succeeds)
         _skip_l1 = any(
-            tag in self._model_id.lower()
-            for tag in ("glm-5", "glm-4", "deepseek", "minimax")
+            tag in self._model_id.lower() for tag in ("glm-5", "glm-4", "deepseek", "minimax")
         )
 
         # Outer transport-layer retry loop: 529/429/5xx are retried here with
@@ -1021,8 +1094,7 @@ class ExtractionAgent:
             example_json = json.dumps(example, indent=2, ensure_ascii=False)
             # List required field names for explicit instruction
             required_fields = [
-                name for name, f in response_model.model_fields.items()
-                if f.is_required()
+                name for name, f in response_model.model_fields.items() if f.is_required()
             ]
             schema_hint = (
                 f"\n\n## REQUIRED OUTPUT FORMAT\n"
@@ -1120,6 +1192,7 @@ class ExtractionAgent:
         fallback_text = raw_text or l1_partial_text
         if fallback_text:
             import re as _re
+
             import yaml as _yaml_recover
 
             from doramagic_extraction_agent.sop.executor import _extract_json as _l3_extract
@@ -1140,9 +1213,7 @@ class ExtractionAgent:
                     last_complete = cleaned.rfind("},")
                     if last_complete > 0:
                         try:
-                            parsed = json.loads(
-                                cleaned[:last_complete + 1] + "\n  ]\n}"
-                            )
+                            parsed = json.loads(cleaned[: last_complete + 1] + "\n  ]\n}")
                         except (json.JSONDecodeError, ValueError):
                             pass
 
@@ -1159,6 +1230,23 @@ class ExtractionAgent:
                     except Exception:
                         pass
 
+                # Strategy A2: deep key extraction — when LLM outputs correct
+                # data but with wrong nesting (e.g. wrapping stage fields under
+                # a "contract" key).  Searches for required fields deeper in the
+                # parsed dict and pulls them up to the top level.
+                if isinstance(parsed, dict):
+                    try:
+                        restructured = _l3_deep_key_extract(parsed, response_model)
+                        if restructured is not None:
+                            validated = response_model.model_validate(restructured)
+                            logger.info(
+                                "run_structured_call L3 recovery success: %s (deep key extraction)",
+                                response_model.__name__,
+                            )
+                            return validated, total_tokens
+                    except Exception:
+                        pass
+
                 # Strategy B: parsed is a list or unwrapped item — wrap it
                 # Find the main list field in the model and wrap accordingly
                 for field_name, field_info in response_model.model_fields.items():
@@ -1167,9 +1255,7 @@ class ExtractionAgent:
                         items = parsed if isinstance(parsed, list) else [parsed]
                         # Try full list first
                         try:
-                            validated = response_model.model_validate(
-                                {field_name: items}
-                            )
+                            validated = response_model.model_validate({field_name: items})
                             logger.info(
                                 "run_structured_call L3 recovery success: %s "
                                 "(wrapped %d items in '%s')",

@@ -2639,9 +2639,17 @@ def build_blueprint_phases_v5(
         # ---- Warnings (BQ-05 ~ BQ-09) ----
 
         # BQ-05: stages count in [2, 30]
+        # stages=0 is a hard fail — indicates assembly completely failed,
+        # producing a structurally useless blueprint for downstream crystal
+        # compilation.  Non-zero but out-of-range remains a warning.
         checks["BQ-05_stages_range"] = 2 <= stage_count <= 30
         details["BQ-05_stages_range"] = f"stages={stage_count} (target 2..30)"
-        if not checks["BQ-05_stages_range"]:
+        if stage_count == 0:
+            hard_issues.append(
+                "BQ-05 FAIL: stages=0 — assembly produced no stages. "
+                "Blueprint is structurally incomplete."
+            )
+        elif not checks["BQ-05_stages_range"]:
             warnings.append(f"BQ-05 WARN: stages={stage_count} outside [2, 30]")
 
         # BQ-06: evidence coverage >= 50%
