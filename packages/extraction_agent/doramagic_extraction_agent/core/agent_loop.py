@@ -798,9 +798,13 @@ class ExtractionAgent:
             for f in p.iterdir():
                 if f.suffix not in (".md", ".json") or f.stat().st_size == 0:
                     continue
-                # Only include artifacts belonging to this phase
-                if phase_name and phase_name not in f.name:
-                    continue
+                # Only include artifacts belonging to this phase.
+                # Use exact stem match to avoid worker_arch matching
+                # worker_arch_deep.json or visited_files_worker_arch.json
+                if phase_name:
+                    stem = f.stem  # e.g. "worker_arch" from "worker_arch.json"
+                    if stem != phase_name:
+                        continue
                 try:
                     result[f.name] = f.read_text(encoding="utf-8", errors="replace")
                 except OSError:

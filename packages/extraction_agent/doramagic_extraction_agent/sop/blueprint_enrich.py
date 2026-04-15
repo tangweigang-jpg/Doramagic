@@ -151,9 +151,7 @@ STAGE_MAPPING: dict[str, str] = {
 
 # Regex patterns for evidence parsing (Patch 5)
 # v10: support line ranges like file:10-50(fn) and file:42,100(fn)
-_EVIDENCE_FULL_RE = re.compile(
-    r"^(?P<path>[\w./\-]+\.\w+):(?P<line>\d+(?:[,\-]\d+)*)\((?P<fn>[^)]+)\)$"
-)
+_EVIDENCE_FULL_RE = re.compile(r"^(?P<path>.+?):(?P<line>\d+(?:[,\-]\d+)*)\((?P<fn>[^)]+)\)$")
 _EVIDENCE_FILE_LINE_RE = re.compile(
     r"^(?P<path>[\w./\-]+\.py):(?P<line>\d+(?:[,\-]\d+)*)(?P<rest>.*)$",
     re.DOTALL,
@@ -1595,7 +1593,10 @@ def _patch_missing_gaps_from_audit(
         item_lower = item_text.lower()
         for terms, file_keywords in _subdomain_terms.values():
             if any(term in item_lower for term in terms):
-                if not any(kw in f.lower() for f in repo_files for kw in file_keywords):
+                # Require ≥2 file keyword hits to count as "has backing"
+                # (prevents e.g. a single 'default' match from passing CRD)
+                hits = sum(1 for kw in file_keywords if any(kw in f.lower() for f in repo_files))
+                if hits < 2:
                     return False
         return True
 

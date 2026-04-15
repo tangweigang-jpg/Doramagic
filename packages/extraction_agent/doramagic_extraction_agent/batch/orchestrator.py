@@ -408,7 +408,8 @@ class BatchOrchestrator:
         if not job.skip_blueprint:
             state.current_pipeline = "blueprint"
             if self._config.blueprint_version == "v5":
-                if os.environ.get("DORAMAGIC_AGENT_VERSION") == "v9":
+                _agent_ver = os.environ.get("DORAMAGIC_AGENT_VERSION", "")
+                if _agent_ver in ("v9", "v10"):
                     bp_phases = build_blueprint_phases_v9(
                         job.blueprint_id,
                         agent=agent,
@@ -420,6 +421,11 @@ class BatchOrchestrator:
                         agent=agent,
                         iter_scale=iter_scale,
                     )
+                logger.info(
+                    "Blueprint phases: version=%s iter_scale=%.2f",
+                    _agent_ver or "v5",
+                    iter_scale,
+                )
             else:
                 bp_phases = build_blueprint_phases_v4(job.blueprint_id)
             bp_executor = SOPExecutor(

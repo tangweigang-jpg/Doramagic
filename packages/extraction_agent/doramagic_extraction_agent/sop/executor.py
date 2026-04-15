@@ -848,8 +848,8 @@ class SOPExecutor:
     def _build_coverage_context(self, phase: Phase) -> dict | None:
         """Build coverage_context scoped to the worker's responsibility.
 
-        v10: specialized workers (docs, structural) skip directory coverage
-        since they read non-code files.  All others get the full manifest.
+        v10: specialized workers skip repo-wide directory coverage because
+        their prompts target specific file subsets (non-code, math, resources).
         """
         if not phase.enable_convergence:
             return None
@@ -857,8 +857,13 @@ class SOPExecutor:
         if not manifest:
             return None
         must_dirs = list(manifest.get("must_visit_dirs", []))
-        # Workers that read non-code files don't benefit from dir coverage
-        _SKIP_DIR_COVERAGE = {"worker_docs", "worker_structural"}
+        # Workers whose prompts target specific file types, not repo-wide dirs
+        _SKIP_DIR_COVERAGE = {
+            "worker_docs",  # reads non-code files (README, docs/)
+            "worker_structural",  # reads doc knowledge sources (SKILL.md etc)
+            "worker_resource",  # inventories dependencies/APIs, not code dirs
+            "worker_math",  # driven by math-file list, not dir coverage
+        }
         if phase.name in _SKIP_DIR_COVERAGE:
             must_dirs = []
         return {"must_visit_dirs": must_dirs}
