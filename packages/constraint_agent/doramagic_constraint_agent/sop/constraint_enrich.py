@@ -435,20 +435,39 @@ def _patch_commit_hash(constraints: list[dict[str, Any]], commit_hash: str) -> i
 
 
 def _patch_vague_words(constraints: list[dict[str, Any]]) -> int:
-    """Patch 8: tag constraints with vague action words for manual review.
+    """Patch 8: detect and rewrite vague action words.
 
-    Checks the 'action' field for known vague Chinese and English phrases.
-    Appends a 'P4_vague_words:<word,...>' tag to the 'tags' list when found.
+    Checks the 'action' field for known vague phrases.
+    Rewrites common patterns (Ensure X → Verify X, make sure → verify)
+    and tags any remaining vague words for manual review.
 
-    Returns the number of constraints tagged.
+    Returns the number of constraints affected.
     """
+    import re as _re
+
     count = 0
     for raw in constraints:
         action = raw.get("action", "")
         if not action:
             continue
-        found: list[str] = []
+
+        original = action
+        # Rewrite "Ensure X" at start → "Verify X"
+        action = _re.sub(r"^Ensure\b", "Verify", action)
+        action = _re.sub(r"^ensure\b", "verify", action)
+        # Rewrite mid-sentence "ensure" → "verify"
+        action = _re.sub(r"(?<=\s)ensure\b", "verify", action)
+        # Rewrite "make sure" → "verify"
+        action = _re.sub(r"[Mm]ake sure", "verify", action)
+        # Rewrite "appropriate" → "specified" (context-safe)
+        action = _re.sub(r"\bappropriate\b", "specified", action)
+
+        if action != original:
+            raw["action"] = action
+
+        # Tag any remaining vague words
         action_lower = action.lower()
+        found: list[str] = []
         for w in _VAGUE_WORDS_EN:
             if w in action_lower:
                 found.append(w)
@@ -458,9 +477,11 @@ def _patch_vague_words(constraints: list[dict[str, Any]]) -> int:
                 tags = []
             tags.append(f"P4_vague_words:{','.join(found)}")
             raw["tags"] = tags
+
+        if action != original or found:
             count += 1
 
-    logger.info("Patch 8 (vague_words): %d constraints tagged for manual review", count)
+    logger.info("Patch 8 (vague_words): %d constraints rewritten/tagged", count)
     return count
 
 

@@ -131,7 +131,10 @@ def _raw_to_constraint(
                 action=raw["action"],
                 consequence={
                     "kind": raw["consequence_kind"],
-                    "description": raw["consequence_description"],
+                    "description": raw.get(
+                        "consequence_description",
+                        f"Violation of {kind_str} constraint",
+                    ),
                 },
             ),
             constraint_kind=constraint_kind,
