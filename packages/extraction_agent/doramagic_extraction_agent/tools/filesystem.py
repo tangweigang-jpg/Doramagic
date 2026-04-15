@@ -26,6 +26,8 @@ from pathlib import Path
 
 from doramagic_extraction_agent.core.tool_registry import ToolDef
 
+from .file_tracker import get_active_tracker
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -140,6 +142,9 @@ def create_filesystem_tools(repo_path: Path) -> list[ToolDef]:
 
         selected = all_lines[lo - 1 : hi]
         header = f"# {resolved.relative_to(repo_root)}  (lines {lo}–{hi} of {total})\n"
+        tracker = get_active_tracker()
+        if tracker is not None:
+            tracker.record(str(resolved.relative_to(repo_root)))
         return header + _prefix_lines(selected, lo)
 
     read_file_tool = ToolDef(
@@ -221,7 +226,6 @@ def create_filesystem_tools(repo_path: Path) -> list[ToolDef]:
                 if len(lines) >= _MAX_LIST_ENTRIES:
                     truncated = True
                     return
-                indent_level = depth - (max_depth - (max_depth if not recursive else depth))
                 # Compute indent relative to the starting dir
                 rel = entry.relative_to(resolved)
                 indent = len(rel.parts) - 1
@@ -329,12 +333,18 @@ def create_filesystem_tools(repo_path: Path) -> list[ToolDef]:
                 except ValueError:
                     rel = fpath
 
+                file_matched = False
                 for lineno, line in enumerate(text.splitlines(), start=1):
                     if len(matches) >= max_results:
                         partial = True
                         break
                     if compiled.search(line):
                         matches.append(f"{rel}:{lineno}:{line}")
+                        file_matched = True
+                if file_matched:
+                    tracker = get_active_tracker()
+                    if tracker is not None:
+                        tracker.record(str(rel))
 
             if partial:
                 break
@@ -344,7 +354,10 @@ def create_filesystem_tools(repo_path: Path) -> list[ToolDef]:
 
         header = f"# grep {pattern!r} — {len(matches)} match(es)"
         if partial:
-            header += f" (partial results; limit={max_results} or timeout={_GREP_TIMEOUT_SECONDS}s reached)"
+            header += (
+                f" (partial results; limit={max_results}"
+                f" or timeout={_GREP_TIMEOUT_SECONDS}s reached)"
+            )
         return header + "\n" + "\n".join(matches)
 
     grep_codebase_tool = ToolDef(

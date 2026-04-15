@@ -1708,11 +1708,31 @@ def _build_worker_audit_message(s: AgentState, r: str) -> str:
     )
 
 
+def _compute_iter_scale(file_count: int) -> float:
+    """Return an iteration scale factor based on repository size (Python file count).
+
+    Tiers:
+        < 100  files → 1.0  (small repo, default)
+        100–300       → 1.25
+        300–800       → 1.5
+        > 800         → 2.0  (large mono-repo)
+    """
+    if file_count < 100:
+        return 1.0
+    elif file_count < 300:
+        return 1.25
+    elif file_count <= 800:
+        return 1.5
+    else:
+        return 2.0
+
+
 def build_blueprint_phases_v5(
     blueprint_id: str,
     *,
     agent: ExtractionAgent,
     strict_quality_gate: bool = True,
+    iter_scale: float = 1.0,
 ) -> list[Phase]:
     """Build the v5/v6 blueprint extraction phases.
 
@@ -1764,6 +1784,24 @@ def build_blueprint_phases_v5(
         # v7: worker_structural provides document-extracted architecture
         worker_structural = _safe_read(artifacts_dir / "worker_structural.json")
 
+        # v8: Load visited files manifest for anti-hallucination
+        all_visited: set[str] = set()
+        for wname in [
+            "worker_docs",
+            "worker_arch",
+            "worker_workflow",
+            "worker_math",
+            "worker_arch_deep",
+            "worker_resource",
+            "worker_structural",
+            "worker_verify",
+            "worker_audit",
+        ]:
+            vf_path = artifacts_dir / f"visited_files_{wname}.json"
+            if vf_path.exists():
+                vf_data = json.loads(vf_path.read_text(encoding="utf-8"))
+                all_visited.update(vf_data.get("files", []))
+
         if not worker_arch and not worker_workflow and not worker_structural:
             return PhaseResult(
                 phase_name="bp_synthesis_v5",
@@ -1791,6 +1829,24 @@ def build_blueprint_phases_v5(
             worker_math,
             state,
         )
+
+        # v8: Append visited files manifest for anti-hallucination grounding
+        # Always list file-level paths so BQ-10 grounding stays consistent.
+        # Cap at 500 paths to stay within MiniMax context budget (~5K tokens).
+        if all_visited:
+            manifest_lines = sorted(all_visited)[:500]
+            truncated = len(all_visited) > 500
+            header = (
+                f"\n## Visited Files Manifest"
+                f" ({len(all_visited)} files"
+                f"{', showing first 500' if truncated else ''})\n"
+                "CRITICAL: Only cite evidence from files in this list. "
+                "Do NOT fabricate file:line references for files"
+                " not listed.\n"
+            )
+            manifest_text = header + "\n".join(f"- {line}" for line in manifest_lines)
+            step1a_msg = step1a_msg + manifest_text
+            step1b_msg = step1b_msg + manifest_text
 
         # Run both calls (sequential to avoid MiniMax rate limits)
         step1a_result, tokens1a = await agent.run_structured_call(
@@ -2682,6 +2738,54 @@ def build_blueprint_phases_v5(
         if not checks["BQ-09_audit_checklist"]:
             warnings.append("BQ-09 WARN: audit_checklist_summary missing")
 
+        # --- BQ-10: Evidence grounded in visited files (v8) ---
+        visited_union: set[str] = set()
+        for wname in [
+            "worker_arch",
+            "worker_workflow",
+            "worker_math",
+            "worker_arch_deep",
+            "worker_resource",
+            "worker_structural",
+            "worker_verify",
+            "worker_audit",
+            "worker_docs",
+        ]:
+            vf_path = artifacts_dir / f"visited_files_{wname}.json"
+            if vf_path.exists():
+                vf_data = json.loads(vf_path.read_text(encoding="utf-8"))
+                visited_union.update(vf_data.get("files", []))
+
+        if visited_union:
+            grounded = 0
+            ungrounded = 0
+            for bd in non_t:
+                ev = getattr(bd, "evidence", "")
+                if not ev or ev.startswith("N/A") or "§" in ev:
+                    continue
+                ev_file = ev.split(":")[0] if ":" in ev else ""
+                if ev_file and ev_file in visited_union:
+                    grounded += 1
+                elif ev_file:
+                    ungrounded += 1
+
+            total_checked = grounded + ungrounded
+            grounded_ratio = grounded / total_checked if total_checked > 0 else 1.0
+            checks["BQ-10_evidence_grounded"] = grounded_ratio >= 0.50
+            details["BQ-10_evidence_grounded"] = (
+                f"grounded={grounded}/{total_checked} ({grounded_ratio:.1%}, target ≥50%)"
+            )
+            if not checks["BQ-10_evidence_grounded"]:
+                logger.warning(
+                    "bp_quality_gate: BQ-10 FAIL: evidence_grounded=%s < 50%%."
+                    " %d BDs cite files no worker visited.",
+                    f"{grounded_ratio:.1%}",
+                    ungrounded,
+                )
+                warnings.append(f"BQ-10 WARN: evidence_grounded={grounded_ratio:.1%} < 50%")
+            else:
+                logger.info("BQ-10 PASS: evidence_grounded=%s", f"{grounded_ratio:.1%}")
+
         # ---- Emit warnings ----
         for w in warnings:
             logger.warning("bp_quality_gate: %s", w)
@@ -3112,14 +3216,38 @@ def build_blueprint_phases_v5(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         all_dirs = set(manifest.get("must_visit_dirs", []))
 
-        # Extract directories covered by BD evidence
+        # v8: Hybrid coverage — union of tracker dirs + evidence dirs
+        # Tracker alone under-counts because list_dir and negative grep
+        # are not recorded; evidence alone hallucinates. Union is safest.
+        from pathlib import PurePosixPath as _PurePath
+
         covered_dirs: set[str] = set()
+
+        # Source 1: tracker-based visited dirs (file-level precision)
+        for wname in [
+            "worker_arch",
+            "worker_workflow",
+            "worker_math",
+            "worker_arch_deep",
+            "worker_resource",
+            "worker_verify",
+            "worker_audit",
+            "worker_docs",
+        ]:
+            vf_path = artifacts_dir / f"visited_files_{wname}.json"
+            if vf_path.exists():
+                vf_data = json.loads(vf_path.read_text(encoding="utf-8"))
+                for f in vf_data.get("files", []):
+                    if "/" in f:
+                        covered_dirs.add(str(_PurePath(f).parent))
+
+        # Source 2: BD evidence string dirs (v7 fallback, always applied)
         for bd in bd_result.decisions:
             ev = bd.evidence
             if "/" in ev:
-                parts = ev.split("/")
-                for i in range(1, len(parts)):
-                    covered_dirs.add("/".join(parts[:i]))
+                ev_parts = ev.split("/")
+                for i in range(1, len(ev_parts)):
+                    covered_dirs.add("/".join(ev_parts[:i]))
 
         uncovered = sorted(all_dirs - covered_dirs)
 
@@ -3157,8 +3285,11 @@ def build_blueprint_phases_v5(
                 final_text="Full coverage — no gaps",
             )
 
-        # Process up to 10 directories (raised from 5)
-        uncovered = uncovered[:10]
+        # Dynamic cap: max(10, min(30, total_dirs // 3)) (v8)
+        must_visit_dirs = manifest.get("must_visit_dirs", [])
+        total_dirs = len(must_visit_dirs) if must_visit_dirs else len(all_dirs)
+        max_gaps = max(10, min(30, total_dirs // 3))
+        uncovered = uncovered[:max_gaps]
         logger.info("bp_coverage_gap: %d uncovered dirs — %s", len(uncovered), uncovered)
 
         # Read skeletons for uncovered directories (index already loaded above)
@@ -3573,7 +3704,7 @@ def build_blueprint_phases_v5(
             system_prompt=prompts_v4.WORKER_DOCS_SYSTEM,
             initial_message_builder=_build_worker_docs_message,
             allowed_tools=["read_file", "list_dir", "grep_codebase", "write_artifact"],
-            max_iterations=30,
+            max_iterations=int(30 * iter_scale),
             depends_on=["bp_mine_sources"],
             required_artifacts=["worker_docs.md"],
             blocking=False,
@@ -3585,7 +3716,9 @@ def build_blueprint_phases_v5(
             system_prompt=prompts_v4.WORKER_ARCH_SYSTEM,
             initial_message_builder=_build_worker_arch_message,
             allowed_tools=all_tools,
-            max_iterations=40,  # v6.3: raised from 20 — complex repos (zvt) need more exploration rounds
+            max_iterations=int(
+                40 * iter_scale
+            ),  # v6.3: raised from 20 — complex repos (zvt) need more exploration rounds
             depends_on=["bp_coverage_manifest"],
             required_artifacts=["worker_arch.json"],
             blocking=True,
@@ -3597,7 +3730,9 @@ def build_blueprint_phases_v5(
             system_prompt=prompts_v4.WORKER_WORKFLOW_SYSTEM,
             initial_message_builder=_build_worker_workflow_message,
             allowed_tools=all_tools,
-            max_iterations=30,  # Reduced: budget-capped output needs fewer iterations
+            max_iterations=int(
+                30 * iter_scale
+            ),  # Reduced: budget-capped output needs fewer iterations
             depends_on=["bp_coverage_manifest"],
             required_artifacts=["worker_workflow.json"],
             blocking=True,
@@ -3615,7 +3750,7 @@ def build_blueprint_phases_v5(
                 "get_skeleton",
                 "list_by_type",
             ],
-            max_iterations=40,
+            max_iterations=int(40 * iter_scale),
             depends_on=["bp_coverage_manifest"],
             required_artifacts=["worker_math.json"],
             blocking=False,
@@ -3627,7 +3762,7 @@ def build_blueprint_phases_v5(
             system_prompt=prompts_v5.WORKER_ARCH_DEEP_SYSTEM,
             initial_message_builder=_build_worker_arch_message,
             allowed_tools=all_tools,
-            max_iterations=50,
+            max_iterations=int(50 * iter_scale),
             depends_on=["bp_coverage_manifest"],
             required_artifacts=["worker_arch_deep.json"],
             blocking=False,
@@ -3650,7 +3785,7 @@ def build_blueprint_phases_v5(
                 "write_artifact",
                 "get_skeleton",
             ],
-            max_iterations=30,
+            max_iterations=int(30 * iter_scale),
             depends_on=["bp_coverage_manifest"],
             required_artifacts=["worker_resource.json"],
             blocking=True,
@@ -3672,7 +3807,7 @@ def build_blueprint_phases_v5(
                 "get_artifact",
                 "write_artifact",
             ],
-            max_iterations=40,
+            max_iterations=int(40 * iter_scale),
             depends_on=["bp_structural_index"],
             required_artifacts=["worker_structural.json"],
             blocking=False,
@@ -3692,7 +3827,9 @@ def build_blueprint_phases_v5(
                 "get_artifact",
                 "write_artifact",
             ],
-            max_iterations=50,  # increased from 30 — MiniMax sometimes over-explores
+            max_iterations=int(
+                50 * iter_scale
+            ),  # increased from 30 — MiniMax sometimes over-explores
             depends_on=["worker_arch"],
             parallel_group="workers",
             blocking=True,
@@ -3709,7 +3846,9 @@ def build_blueprint_phases_v5(
                 "get_artifact",
                 "write_artifact",
             ],
-            max_iterations=50,  # increased from 40 — MiniMax sometimes over-explores
+            max_iterations=int(
+                50 * iter_scale
+            ),  # increased from 40 — MiniMax sometimes over-explores
             depends_on=["bp_clone"],
             parallel_group="workers",
             blocking=True,  # v6: audit results feed into synthesis Step 3

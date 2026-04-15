@@ -15,6 +15,7 @@ from ..core.context_manager import ContextManager
 from ..core.model_router import ModelRouter, ModelSpec, build_model_router
 from ..core.tool_registry import ToolRegistry
 from ..sop.blueprint_phases import (
+    _compute_iter_scale,
     build_blueprint_phases_v4,
     build_blueprint_phases_v5,
 )
@@ -361,6 +362,12 @@ class BatchOrchestrator:
                 structural_index["stats"]["total_py_files"],
                 structural_index["stats"]["math_related_files"],
             )
+            iter_scale = _compute_iter_scale(structural_index["stats"]["total_py_files"])
+            logger.info(
+                "Repo size tier: %d py files → iter_scale=%.2f",
+                structural_index["stats"]["total_py_files"],
+                iter_scale,
+            )
             for tool in create_index_tools(structural_index):
                 registry.register(tool)
 
@@ -402,6 +409,7 @@ class BatchOrchestrator:
                 bp_phases = build_blueprint_phases_v5(
                     job.blueprint_id,
                     agent=agent,
+                    iter_scale=iter_scale,
                 )
             else:
                 bp_phases = build_blueprint_phases_v4(job.blueprint_id)

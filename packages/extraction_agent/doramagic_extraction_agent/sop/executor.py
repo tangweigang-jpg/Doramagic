@@ -23,6 +23,7 @@ from ..core.agent_loop import ExtractionAgent, PhaseResult
 from ..core.model_router import ModelRouter, ModelSpec
 from ..state.checkpoint import CheckpointManager
 from ..state.schema import AgentState
+from ..tools.file_tracker import _ACTIVE_TRACKER, FileAccessTracker, set_active_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -487,6 +488,12 @@ class SOPExecutor:
         phase: Phase,
     ) -> PhaseResult | Exception:
         """Execute a phase and return result or exception."""
+        tracker = None
+        token = None
+        # v8: track file access for all worker phases (explore + workers groups)
+        if phase.parallel_group in ("explore", "workers"):
+            tracker = FileAccessTracker()
+            token = set_active_tracker(tracker)
         try:
             if not phase.requires_llm and phase.python_handler is not None:
                 return await phase.python_handler(
@@ -496,6 +503,12 @@ class SOPExecutor:
             return await self._run_agentic_phase_with_failover(phase)
         except Exception as exc:
             return exc
+        finally:
+            if tracker is not None and token is not None:
+                _ACTIVE_TRACKER.reset(token)  # Proper ContextVar restore
+                # Persist visited files
+                vf_path = self._checkpoint.artifacts_dir / f"visited_files_{phase.name}.json"
+                vf_path.write_text(tracker.to_json(), encoding="utf-8")
 
     def _process_phase_result(
         self,
