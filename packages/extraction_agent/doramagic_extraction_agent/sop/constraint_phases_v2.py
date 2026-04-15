@@ -954,12 +954,14 @@ async def _con_derive_v2_handler(state: AgentState, repo_path: Path) -> PhaseRes
 
     logger.info("con_derive: %s", summary)
 
-    # Fail only if ALL chunks failed (no derived constraints at all)
+    # If ALL chunks failed, log warning but do NOT kill the pipeline —
+    # con_derive is supplementary; per-stage extraction is the primary source.
     if not all_derived:
+        logger.warning("con_derive: all chunks failed — 0 derived constraints (non-fatal)")
         return PhaseResult(
             phase_name="con_derive",
-            status="error",
-            error=summary,
+            status="completed",
+            final_text=f"[WARNING] {summary}",
             total_tokens=total_tokens,
         )
 
@@ -2182,7 +2184,7 @@ def build_constraint_phases_v2(
                 requires_llm=False,
                 python_handler=_derive_with_agent_injection,
                 depends_on=["con_build_manifest"],
-                blocking=True,
+                blocking=False,
                 parallel_group="extract",
             )
         )

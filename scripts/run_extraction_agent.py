@@ -100,7 +100,7 @@ def _make_adapter(
     model: str | None,
     base_url: str | None,
     api_key: str | None,
-) -> "LLMAdapter":
+) -> LLMAdapter:
     """Create a configured :class:`LLMAdapter`.
 
     Priority: CLI argument > environment variable > SDK default.
@@ -113,18 +113,12 @@ def _make_adapter(
     Returns:
         Ready-to-use :class:`LLMAdapter` instance.
     """
-    from doramagic_shared_utils.llm_adapter import LLMAdapter  # noqa: PLC0415
+    from doramagic_shared_utils.llm_adapter import LLMAdapter
 
-    resolved_model = (
-        model
-        or os.environ.get("LLM_MODEL", "")
-        or "MiniMax-M2.7"
-    )
+    resolved_model = model or os.environ.get("LLM_MODEL", "") or "MiniMax-M2.7"
     resolved_base_url = base_url or os.environ.get("LLM_BASE_URL", "")
     resolved_api_key = (
-        api_key
-        or os.environ.get("LLM_API_KEY", "")
-        or os.environ.get("MINIMAX_API_KEY", "")
+        api_key or os.environ.get("LLM_API_KEY", "") or os.environ.get("MINIMAX_API_KEY", "")
     )
 
     adapter = LLMAdapter(provider_override="anthropic")
@@ -169,8 +163,8 @@ def cmd_single(args: argparse.Namespace) -> None:
 
     # --- Imports (deferred so sys.path insertions above take effect first) ---
     try:
-        from doramagic_extraction_agent.batch.job_queue import RepoJob, BatchConfig  # noqa: PLC0415
-        from doramagic_extraction_agent.batch.orchestrator import BatchOrchestrator  # noqa: PLC0415
+        from doramagic_extraction_agent.batch.job_queue import BatchConfig, RepoJob
+        from doramagic_extraction_agent.batch.orchestrator import BatchOrchestrator
     except ImportError as exc:
         print(f"Error: cannot import extraction_agent — {exc}", file=sys.stderr)
         print("Ensure all packages are installed: uv sync", file=sys.stderr)
@@ -191,7 +185,9 @@ def cmd_single(args: argparse.Namespace) -> None:
     fb_model = getattr(args, "fallback_model", None) or os.environ.get("FALLBACK_MODEL", "")
     fb_url = getattr(args, "fallback_base_url", None) or os.environ.get("FALLBACK_BASE_URL", "")
     fb_key = getattr(args, "fallback_api_key", None) or os.environ.get("FALLBACK_API_KEY", "")
-    fb_format = getattr(args, "fallback_api_format", None) or os.environ.get("FALLBACK_API_FORMAT", "openai")
+    fb_format = getattr(args, "fallback_api_format", None) or os.environ.get(
+        "FALLBACK_API_FORMAT", "openai"
+    )
     if fb_model:
         fb_spec: dict = {"model_id": fb_model, "api_format": fb_format}
         if fb_url:
@@ -239,12 +235,12 @@ def cmd_single(args: argparse.Namespace) -> None:
     print(f"Extraction Agent — Single Run: {args.blueprint_id}")
     print("=" * 60)
     if result.completed:
-        print(f"  Status       : completed")
+        print("  Status       : completed")
         print(f"  Total tokens : {result.total_tokens:,}")
         run_dir = PROJECT_ROOT / "_runs" / args.blueprint_id / "output"
         print(f"  Output dir   : {run_dir}")
     else:
-        print(f"  Status       : FAILED")
+        print("  Status       : FAILED")
         print(f"  Total tokens : {result.total_tokens:,}")
         print(f"  Check logs   : {log_dir / 'extraction.log'}")
         sys.exit(1)
@@ -280,8 +276,8 @@ def cmd_batch(args: argparse.Namespace) -> None:
     )
 
     try:
-        from doramagic_extraction_agent.batch.job_queue import load_batch_config  # noqa: PLC0415
-        from doramagic_extraction_agent.batch.orchestrator import BatchOrchestrator  # noqa: PLC0415
+        from doramagic_extraction_agent.batch.job_queue import load_batch_config
+        from doramagic_extraction_agent.batch.orchestrator import BatchOrchestrator
     except ImportError as exc:
         print(f"Error: cannot import extraction_agent — {exc}", file=sys.stderr)
         print("Ensure all packages are installed: uv sync", file=sys.stderr)
@@ -356,7 +352,8 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog=__doc__,
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Enable DEBUG-level logging.",
     )
@@ -467,9 +464,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     single_p.add_argument(
         "--constraint-version",
-        choices=["v1", "v2"],
-        default="v1",
-        help="Constraint phase version: 'v1' (serial) or 'v2' (parallel + Instructor). Default: v1.",
+        choices=["v1", "v2", "v3"],
+        default="v3",
+        help=(
+            "Constraint phase version: 'v1' (serial), 'v2' (parallel + Instructor), "
+            "'v3' (v2 + doc extraction + evaluator). Default: v3."
+        ),
     )
     single_p.set_defaults(func=cmd_single)
 
