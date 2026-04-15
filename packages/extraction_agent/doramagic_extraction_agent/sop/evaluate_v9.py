@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _EV_PATTERN = re.compile(r"^(.+?):(\d+(?:[,\-]\d+)*)\((.+?)\)$")
+# v10: fallback for evidence without (function) suffix, e.g. "file.py:42" or "file.py:10-50"
+_EV_PATTERN_NO_FN = re.compile(r"^(.+?):(\d+(?:[,\-]\d+)*)$")
 
 # ---------------------------------------------------------------------------
 # System prompt for Track B (semantic evaluator)
@@ -187,23 +189,29 @@ async def deterministic_eval(
             continue
 
         m = _EV_PATTERN.match(evidence)
-        if not m:
-            # Cannot parse — treat as missing file
-            verdicts.append(
-                {
-                    "bd_id": bd_id,
-                    "file_exists": False,
-                    "line_valid": False,
-                    "function_found": False,
-                    "verdict": "FILE_MISSING",
-                    "note": f"cannot parse evidence format: {evidence!r}",
-                }
-            )
-            continue
-
-        file_rel: str = m.group(1)
-        line_str: str = m.group(2)
-        fn_name: str = m.group(3)
+        fn_name: str = ""
+        if m:
+            file_rel = m.group(1)
+            line_str = m.group(2)
+            fn_name = m.group(3)
+        else:
+            # v10: fallback for file:line without (function)
+            m2 = _EV_PATTERN_NO_FN.match(evidence)
+            if not m2:
+                verdicts.append(
+                    {
+                        "bd_id": bd_id,
+                        "file_exists": False,
+                        "line_valid": False,
+                        "function_found": False,
+                        "verdict": "FILE_MISSING",
+                        "note": f"cannot parse evidence format: {evidence!r}",
+                    }
+                )
+                continue
+            file_rel = m2.group(1)
+            line_str = m2.group(2)
+            # No function name — skip function check later
 
         try:
             # v10: support line ranges like "10-50" or "42,100" — use first number
