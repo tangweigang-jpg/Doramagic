@@ -3978,6 +3978,416 @@ def build_blueprint_phases_v5(
     ]
 
 
+# ---------------------------------------------------------------------------
+# Stage 4 — Coverage Classification (v9)
+# ---------------------------------------------------------------------------
+
+
+def _build_coverage_classify_handler(
+    agent: ExtractionAgent,
+):
+    """Factory returning the bp_coverage_classify_v9 async handler.
+
+    Mirrors the synthesis_v9 builder pattern: the returned coroutine captures
+    ``agent`` for the one LLM call needed on gap modules.
+    """
+    from pathlib import PurePosixPath as _PPP
+
+    from .prompts_v9 import COVERAGE_CLASSIFY_SYSTEM as _CC_SYS
+    from .schemas_v5 import BDExtractionResult as _BDE
+    from .schemas_v5 import BusinessDecision as _BD
+    from .schemas_v5 import CoverageGapResult as _CGR
+    from .schemas_v5 import RawFallback as _RF
+    from .schemas_v9 import ModuleClassification as _MC
+
+    _PHASE = "bp_coverage_classify_v9"
+
+    async def _handler(
+        state: AgentState,
+        repo_path: Path,
+    ) -> PhaseResult:
+        """Classify every visited module; do targeted LLM extraction for gaps.
+
+        Classification labels (deterministic Python, no LLM):
+          has_bd      — module has >= 1 BD referencing it
+          test_only   — all files are test files or module is under tests/
+          config_only — all files are config/boilerplate
+          non_decision— utility/vendor naming OR < 3 Python files
+          gap         — has real code, visited, but 0 BDs extracted
+
+        Only "gap" modules trigger an LLM call (reuses coverage_gap pattern).
+        Outputs:
+          - module_classifications.json  (full map)
+          - bd_list.json updated with any new gap-extracted BDs
+        """
+        artifacts_dir = Path(state.run_dir) / "artifacts"
+
+        # ------------------------------------------------------------------
+        # 1. Load BD list
+        # ------------------------------------------------------------------
+        bd_path = artifacts_dir / "bd_list.json"
+        if not bd_path.exists():
+            return PhaseResult(
+                phase_name=_PHASE,
+                status="completed",
+                final_text="No bd_list.json — skipping coverage classify",
+            )
+
+        bd_result = _BDE.model_validate_json(
+            bd_path.read_text(encoding="utf-8"),
+        )
+
+        # ------------------------------------------------------------------
+        # 2. Collect all visited modules
+        # ------------------------------------------------------------------
+        visited_modules: set[str] = set()
+
+        # Source A: coverage_manifest.json must_visit_dirs
+        manifest_path = artifacts_dir / "coverage_manifest.json"
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for d in manifest.get("must_visit_dirs", []):
+                visited_modules.add(d)
+
+        # Source B: visited_files_*.json tracker data
+        for wname in [
+            "worker_arch",
+            "worker_workflow",
+            "worker_math",
+            "worker_arch_deep",
+            "worker_resource",
+            "worker_verify",
+            "worker_audit",
+            "worker_docs",
+        ]:
+            vf_path = artifacts_dir / f"visited_files_{wname}.json"
+            if vf_path.exists():
+                vf_data = json.loads(vf_path.read_text(encoding="utf-8"))
+                for f in vf_data.get("files", []):
+                    if "/" in f:
+                        visited_modules.add(str(_PPP(f).parent))
+
+        if not visited_modules:
+            return PhaseResult(
+                phase_name=_PHASE,
+                status="completed",
+                final_text="No visited modules found — skipping coverage classify",
+            )
+
+        # ------------------------------------------------------------------
+        # 3. Count BDs per module (credit parent dirs too)
+        # ------------------------------------------------------------------
+        bd_module_counts: dict[str, int] = {}
+        for bd in bd_result.decisions:
+            ev = bd.evidence
+            ev_file = ev.split(":")[0] if ":" in ev else ev
+            mod = str(_PPP(ev_file).parent) if "/" in ev_file else ev_file
+            bd_module_counts[mod] = bd_module_counts.get(mod, 0) + 1
+            parts = mod.split("/")
+            for depth in range(1, len(parts)):
+                parent = "/".join(parts[:depth])
+                bd_module_counts[parent] = bd_module_counts.get(parent, 0) + 1
+
+        # ------------------------------------------------------------------
+        # 4. Load repo index for file-level inspection
+        # ------------------------------------------------------------------
+        index_path = artifacts_dir / "repo_index.json"
+        if not index_path.exists():
+            return PhaseResult(
+                phase_name=_PHASE,
+                status="completed",
+                final_text="repo_index.json missing — skipping coverage classify",
+            )
+
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+        files_index: dict[str, dict] = index.get("files", {})
+
+        module_files: dict[str, list[str]] = {}
+        for fpath in files_index:
+            if "/" in fpath:
+                mod = str(_PPP(fpath).parent)
+                module_files.setdefault(mod, []).append(fpath)
+
+        # ------------------------------------------------------------------
+        # 5. Classification helpers (deterministic)
+        # ------------------------------------------------------------------
+        _CONFIG_FILES = {
+            "setup.py",
+            "__init__.py",
+            "conftest.py",
+            "pyproject.toml",
+            "setup.cfg",
+            "MANIFEST.in",
+            "__main__.py",
+            "_version.py",
+        }
+        _NON_DECISION_KW = {
+            "util",
+            "utils",
+            "helper",
+            "helpers",
+            "compat",
+            "internal",
+            "vendor",
+            "third_party",
+            "thirdparty",
+            "_compat",
+            "_vendor",
+        }
+
+        def _is_test_file(fname: str) -> bool:
+            base = fname.rsplit("/", 1)[-1]
+            return base.startswith("test_") or base.endswith("_test.py") or base == "conftest.py"
+
+        def _is_config_file(fname: str) -> bool:
+            return fname.rsplit("/", 1)[-1] in _CONFIG_FILES
+
+        def _is_test_module(mod: str) -> bool:
+            parts = mod.lower().split("/")
+            return any(p in ("test", "tests", "testing") for p in parts)
+
+        def _is_non_decision_name(mod: str) -> bool:
+            parts = mod.lower().split("/")
+            return any(any(kw in p for kw in _NON_DECISION_KW) for p in parts)
+
+        def _classify(mod: str) -> tuple[str, str]:
+            if bd_module_counts.get(mod, 0) > 0:
+                return "has_bd", f"{bd_module_counts[mod]} BD(s) reference module"
+
+            files = module_files.get(mod, [])
+            py_files = [f for f in files if f.endswith(".py")]
+
+            if _is_test_module(mod):
+                return "test_only", "module path is under tests/"
+            if py_files and all(_is_test_file(f) for f in py_files):
+                return "test_only", "all Python files match test patterns"
+
+            all_files = py_files + [f for f in files if not f.endswith(".py")]
+            if all_files and all(_is_config_file(f) for f in all_files):
+                return "config_only", "all files are config/boilerplate"
+            if py_files and all(_is_config_file(f) for f in py_files):
+                return "config_only", "all Python files are config/boilerplate"
+
+            if _is_non_decision_name(mod):
+                return (
+                    "non_decision",
+                    "module name contains utility/helper/compat/vendor keyword",
+                )
+            if len(py_files) < 3:
+                return (
+                    "non_decision",
+                    f"< 3 Python files ({len(py_files)}) — likely thin wrapper",
+                )
+
+            return "gap", "real code module with 0 BDs extracted"
+
+        # ------------------------------------------------------------------
+        # 6. Classify every visited module
+        # ------------------------------------------------------------------
+        classifications: list[_MC] = []
+        label_counts: dict[str, int] = {
+            "has_bd": 0,
+            "gap": 0,
+            "non_decision": 0,
+            "test_only": 0,
+            "config_only": 0,
+        }
+        gap_modules: list[str] = []
+
+        for mod in sorted(visited_modules):
+            label, reason = _classify(mod)
+            classifications.append(
+                _MC(
+                    module=mod,
+                    classification=label,  # type: ignore[arg-type]
+                    reason=reason,
+                    bd_count=bd_module_counts.get(mod, 0),
+                )
+            )
+            label_counts[label] = label_counts.get(label, 0) + 1
+            if label == "gap":
+                gap_modules.append(mod)
+
+        # Write module_classifications.json
+        cls_path = artifacts_dir / "module_classifications.json"
+        cls_path.write_text(
+            json.dumps(
+                [c.model_dump() for c in classifications],
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        summary_parts = [f"{v} {k}" for k, v in label_counts.items()]
+        logger.info(
+            "%s: %d modules — %s",
+            _PHASE,
+            len(classifications),
+            ", ".join(summary_parts),
+        )
+
+        # ------------------------------------------------------------------
+        # 7. Targeted LLM extraction for gap modules
+        # ------------------------------------------------------------------
+        if not gap_modules:
+            return PhaseResult(
+                phase_name=_PHASE,
+                status="completed",
+                final_text=(
+                    f"{len(classifications)} modules classified: "
+                    + ", ".join(summary_parts)
+                    + " — no gaps"
+                ),
+            )
+
+        # Cap gap count (same formula as bp_coverage_gap)
+        max_gaps = max(10, min(30, len(visited_modules) // 3))
+        gap_modules = sorted(gap_modules)[:max_gaps]
+        logger.info(
+            "%s: %d gap modules → LLM extraction — %s",
+            _PHASE,
+            len(gap_modules),
+            gap_modules,
+        )
+
+        # Build code skeletons for gap modules (reuses coverage_gap pattern)
+        gap_context = ""
+        for mod in gap_modules:
+            gap_context += f"\n## Module: {mod}/\n"
+            for fpath, finfo in files_index.items():
+                if fpath.startswith(mod + "/"):
+                    classes = finfo.get("classes", [])
+                    funcs = finfo.get("functions", [])
+                    gap_context += f"\n### {fpath}\n"
+                    if classes:
+                        gap_context += f"  Classes: {classes}\n"
+                    if funcs:
+                        gap_context += f"  Functions: {funcs[:10]}\n"
+
+        gap_prompt = (
+            "The following modules have code but produced ZERO Business Decisions.\n"
+            "For each module, identify architectural decisions, design patterns, "
+            "and business logic choices.\n\n"
+            f"{gap_context}\n\n"
+            "Extract business decisions with proper type classification "
+            "(T/B/BA/DK/RC/M).\n"
+            "Each decision MUST have file:line(function) evidence format."
+        )
+
+        result, tokens = await agent.run_structured_call(
+            _CC_SYS,
+            gap_prompt,
+            _CGR,
+            max_tokens=32768,
+        )
+
+        # Salvage fallback (mirrors _coverage_gap_handler salvage logic)
+        if isinstance(result, _RF):
+            logger.warning("%s: Instructor L2/L3 failed — attempting salvage", _PHASE)
+            from .schemas_v5 import GapBusinessDecision as _GBD
+
+            salvaged_bds: list = []
+            try:
+                from doramagic_extraction_agent.sop.executor import (
+                    _extract_json as _gap_extract,
+                )
+
+                parsed = _gap_extract(result.text)
+                if parsed is not None:
+                    items: list[dict] = []
+                    if isinstance(parsed, list):
+                        items = [i for i in parsed if isinstance(i, dict)]
+                    elif isinstance(parsed, dict):
+                        items = parsed.get("decisions", [])
+                        if not isinstance(items, list):
+                            items = [parsed]
+                    for raw_item in items:
+                        if not isinstance(raw_item, dict):
+                            continue
+                        try:
+                            salvaged_bds.append(_GBD.model_validate(raw_item))
+                        except Exception:
+                            continue
+            except Exception as exc:
+                logger.warning("%s: salvage parse error: %s", _PHASE, exc)
+
+            if salvaged_bds:
+                logger.info(
+                    "%s: salvaged %d BDs from raw text",
+                    _PHASE,
+                    len(salvaged_bds),
+                )
+                result = _CGR(decisions=salvaged_bds)
+            else:
+                logger.warning("%s: salvage yielded 0 valid BDs", _PHASE)
+                return PhaseResult(
+                    phase_name=_PHASE,
+                    status="completed",
+                    total_tokens=tokens,
+                    final_text=(
+                        f"{len(classifications)} modules classified; "
+                        f"{len(gap_modules)} gap modules but extraction failed"
+                    ),
+                )
+
+        # ------------------------------------------------------------------
+        # 8. Merge gap BDs into bd_list.json
+        # ------------------------------------------------------------------
+        existing_ids = {bd.id for bd in bd_result.decisions}
+        new_bds: list[_BD] = []
+        for gap_bd in result.decisions:
+            if gap_bd.id in existing_ids:
+                continue
+            try:
+                new_bds.append(_BD.model_validate(gap_bd.model_dump()))
+            except Exception:
+                continue
+
+        if new_bds:
+            merged = list(bd_result.decisions) + new_bds
+            merged_missing = [d for d in merged if d.status == "missing"]
+            from collections import Counter as _Counter
+
+            type_counts = _Counter(d.type for d in merged)
+            merged_result = _BDE(
+                decisions=merged,
+                type_summary=dict(type_counts),
+                missing_gaps=merged_missing,
+            )
+            bd_path.write_text(
+                merged_result.model_dump_json(indent=2),
+                encoding="utf-8",
+            )
+            # Update markdown summary
+            md = _bd_to_markdown(merged_result)
+            (artifacts_dir / "step2c_business_decisions.md").write_text(
+                md,
+                encoding="utf-8",
+            )
+            logger.info(
+                "%s: +%d BDs from %d gap modules → total %d",
+                _PHASE,
+                len(new_bds),
+                len(gap_modules),
+                len(merged),
+            )
+
+        return PhaseResult(
+            phase_name=_PHASE,
+            status="completed",
+            iterations=1,
+            total_tokens=tokens,
+            final_text=(
+                f"{len(classifications)} modules: "
+                + ", ".join(summary_parts)
+                + f"; +{len(new_bds)} gap BDs"
+            ),
+        )
+
+    return _handler
+
+
 def build_blueprint_phases_v9(
     blueprint_id: str,
     *,
@@ -3987,12 +4397,20 @@ def build_blueprint_phases_v9(
 ) -> list[Phase]:
     """Build v9 blueprint extraction phases.
 
-    Reuses v5/v8 phases for everything except synthesis.
+    Reuses v5/v8 phases for everything except synthesis and evaluation.
     Replaces monolithic synthesis with Map-Reduce pattern:
-      - bp_local_synthesis_v9:  per-worker local synthesis (Map)
-      - bp_global_synthesis_v9: merge + cross-module reasoning (Reduce)
-    Also inserts bp_fixer_v9 after bp_evaluate for targeted evidence repair.
+      - bp_local_synthesis_v9:   per-worker local synthesis (Map)
+      - bp_global_synthesis_v9:  merge + cross-module reasoning (Reduce)
+    Replaces agentic evaluator with split-track evaluation (Stage 5):
+      - bp_evaluate_v9: Track A (deterministic) + Track B (semantic), parallel
+    Inserts bp_fixer_v9 after bp_evaluate_v9 for targeted evidence repair.
+    Replaces bp_coverage_gap with bp_coverage_classify_v9 (Stage 4):
+      - Classifies every visited module as has_bd/gap/non_decision/
+        test_only/config_only (deterministic Python, no LLM).
+      - Triggers targeted LLM extraction only for gap modules.
     """
+    from dataclasses import replace as _dc_replace
+
     # Get all v5 phases as baseline
     v5_phases = build_blueprint_phases_v5(
         blueprint_id,
@@ -4002,6 +4420,8 @@ def build_blueprint_phases_v9(
     )
 
     # Import v9 synthesis builders
+    # Import v9 evaluation builder (Stage 5: Evaluation Separation)
+    from .evaluate_v9 import build_evaluate_v9_handler
     from .synthesis_v9 import (
         build_fixer_handler,
         build_global_synthesis_handler,
@@ -4039,6 +4459,18 @@ def build_blueprint_phases_v9(
         required_artifacts=["bd_list.json"],
     )
 
+    v9_evaluate = Phase(
+        name="bp_evaluate_v9",
+        description="v9 Evaluation: Track A (deterministic) + Track B (semantic LLM)",
+        system_prompt="",
+        initial_message_builder=lambda s, r: "",
+        requires_llm=False,  # manages LLM call internally via run_structured_call
+        python_handler=build_evaluate_v9_handler(agent),
+        depends_on=["bp_global_synthesis_v9"],
+        required_artifacts=["evaluation_report.json"],
+        blocking=True,
+    )
+
     fixer = Phase(
         name="bp_fixer_v9",
         description="v9 Fixer: targeted evidence repair",
@@ -4046,11 +4478,23 @@ def build_blueprint_phases_v9(
         initial_message_builder=lambda s, r: "",
         requires_llm=False,
         python_handler=build_fixer_handler(agent),
-        depends_on=["bp_evaluate"],
+        depends_on=["bp_evaluate_v9"],  # updated: v9 evaluate, not agentic evaluate
         required_artifacts=[],  # Optional — fixer may find nothing to fix
     )
 
-    # Replace synthesis phase with Map-Reduce and insert fixer after evaluate
+    # Stage 4: build Coverage Classify phase using module-level factory
+    coverage_classify = Phase(
+        name="bp_coverage_classify_v9",
+        description="v9 Stage 4: classify all visited modules + fill gaps",
+        system_prompt="",
+        initial_message_builder=lambda s, r: "",
+        requires_llm=False,
+        python_handler=_build_coverage_classify_handler(agent),
+        depends_on=["bp_global_synthesis_v9"],
+        blocking=True,
+    )
+
+    # Replace phases from the v5 baseline
     result: list[Phase] = []
     for phase in v5_phases:
         if phase.name == "bp_synthesis_v5":
@@ -4058,16 +4502,22 @@ def build_blueprint_phases_v9(
             result.append(local_synth)
             result.append(global_synth)
         elif phase.name == "bp_evaluate":
-            # Update evaluate's depends_on to point at v9 global synth
-            from dataclasses import replace as _dc_replace
-
-            updated_evaluate = _dc_replace(
-                phase,
-                depends_on=["bp_global_synthesis_v9"],
-            )
-            result.append(updated_evaluate)
-            # Insert fixer AFTER evaluate
+            # Replace agentic evaluator with v9 split-track evaluate + fixer
+            result.append(v9_evaluate)
             result.append(fixer)
+        elif phase.name == "bp_coverage_gap":
+            # Stage 4: replace legacy gap detection with classification phase
+            result.append(coverage_classify)
+        elif phase.name == "bp_assemble":
+            # Update depends_on: bp_coverage_gap → bp_coverage_classify_v9
+            updated_assemble = _dc_replace(
+                phase,
+                depends_on=[
+                    dep if dep != "bp_coverage_gap" else "bp_coverage_classify_v9"
+                    for dep in (phase.depends_on or [])
+                ],
+            )
+            result.append(updated_assemble)
         else:
             result.append(phase)
 
