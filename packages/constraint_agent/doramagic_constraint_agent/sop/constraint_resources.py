@@ -16,11 +16,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import yaml
-
-from ..core.agent_loop import PhaseResult
+from doramagic_agent_core.core.agent_loop import PhaseResult
 
 if TYPE_CHECKING:
-    from ..core.agent_loop import ExtractionAgent
+    from doramagic_agent_core.core.agent_loop import ExtractionAgent
 
 logger = logging.getLogger(__name__)
 

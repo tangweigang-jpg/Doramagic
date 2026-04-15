@@ -18,13 +18,14 @@ from collections import Counter
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from doramagic_extraction_agent.sop.constraint_schemas_v2 import (
+from doramagic_agent_core.core.fallback import RawFallback
+
+from doramagic_constraint_agent.sop.constraint_schemas_v2 import (
     ConstraintSynthesisResult,
 )
-from doramagic_extraction_agent.sop.schemas_v5 import RawFallback
 
 if TYPE_CHECKING:
-    from doramagic_extraction_agent.core.agent_loop import ExtractionAgent
+    from doramagic_agent_core.core.agent_loop import ExtractionAgent
 
 logger = logging.getLogger(__name__)
 

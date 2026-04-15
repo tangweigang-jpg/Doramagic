@@ -536,26 +536,57 @@ class BatchOrchestrator:
                     output_dir=str(output_mgr.output_dir),
                 )
 
-        # 8. Constraint pipeline
+        # 8. Constraint pipeline — delegate to independent constraint_agent (v2/v3)
+        #    or use inline v1 legacy phases as fallback
         if not job.skip_constraint:
-            # Import dynamically to avoid circular deps at module load time
-            try:
-                if self._config.constraint_version == "v3":
-                    from ..sop.constraint_phases_v3 import (
-                        build_constraint_phases_v3,
+            _con_imported = False
+            if self._config.constraint_version in ("v2", "v3"):
+                try:
+                    if self._config.constraint_version == "v3":
+                        from doramagic_constraint_agent.sop.constraint_phases_v3 import (
+                            build_constraint_phases_v3,
+                        )
+                    else:
+                        from doramagic_constraint_agent.sop.constraint_phases_v2 import (
+                            build_constraint_phases_v2,
+                        )
+                    _con_imported = True
+                except ImportError:
+                    error_msg = (
+                        f"doramagic_constraint_agent not installed; "
+                        f"cannot run constraint {self._config.constraint_version} "
+                        f"for {job.blueprint_id}. "
+                        f"Install with: uv pip install -e packages/constraint_agent/"
                     )
-                elif self._config.constraint_version == "v2":
-                    from ..sop.constraint_phases_v2 import (
-                        build_constraint_phases_v2,
+                    logger.error(error_msg)
+                    errors.append(error_msg)
+                    output_mgr.write_manifest(
+                        blueprint_id=job.blueprint_id,
+                        domain=job.domain,
+                        commit_hash=state.commit_hash,
+                        llm_model=self._config.llm_model,
+                        total_tokens=state.total_tokens,
                     )
-                else:
-                    from ..sop.constraint_phases import build_constraint_phases
-            except ImportError:
-                logger.warning(
-                    "constraint_phases module not found; skipping constraint pipeline for %s",
-                    job.blueprint_id,
-                )
+                    return RepoResult(
+                        blueprint_id=job.blueprint_id,
+                        status="failed",
+                        total_tokens=state.total_tokens,
+                        errors=errors,
+                        output_dir=str(output_mgr.output_dir),
+                    )
             else:
+                # v1 legacy fallback (inline)
+                try:
+                    from ..sop.constraint_phases import build_constraint_phases
+
+                    _con_imported = True
+                except ImportError:
+                    logger.warning(
+                        "constraint_phases v1 not found; skipping for %s",
+                        job.blueprint_id,
+                    )
+
+            if _con_imported:
                 state.current_pipeline = "constraint"
                 # Use LATEST.yaml (symlink to versioned blueprint.vN.yaml)
                 # or fall back to state.blueprint_path set by bp_finalize

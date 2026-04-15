@@ -27,15 +27,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import yaml
+from doramagic_agent_core.core.agent_loop import PhaseResult
+from doramagic_agent_core.sop.executor import Phase
+from doramagic_agent_core.state.output import OutputManager
+from doramagic_agent_core.state.schema import AgentState
 
-from ..core.agent_loop import PhaseResult
-from ..sop.executor import Phase
-from ..state.output import OutputManager
-from ..state.schema import AgentState
 from . import constraint_prompts_v2 as prompts_v2
 
 if TYPE_CHECKING:
-    from ..core.agent_loop import ExtractionAgent
+    from doramagic_agent_core.core.agent_loop import ExtractionAgent
 
 logger = logging.getLogger(__name__)
 

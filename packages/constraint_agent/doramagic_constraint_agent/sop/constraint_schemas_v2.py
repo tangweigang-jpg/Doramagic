@@ -11,9 +11,8 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+from doramagic_agent_core.core.fallback import RawFallback  # noqa: F401
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-
-from doramagic_extraction_agent.sop.schemas_v5 import RawFallback  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # MiniMax schema compatibility: force all fields to "required"

@@ -16,13 +16,14 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..sop.constraint_phases_v2 import build_constraint_phases_v2
-from ..sop.executor import Phase
-from ..state.schema import AgentState
+from doramagic_agent_core.sop.executor import Phase
+from doramagic_agent_core.state.schema import AgentState
+
 from . import constraint_prompts_v2 as prompts_v2
+from .constraint_phases_v2 import build_constraint_phases_v2
 
 if TYPE_CHECKING:
-    from ..core.agent_loop import ExtractionAgent
+    from doramagic_agent_core.core.agent_loop import ExtractionAgent
 
 logger = logging.getLogger(__name__)
 

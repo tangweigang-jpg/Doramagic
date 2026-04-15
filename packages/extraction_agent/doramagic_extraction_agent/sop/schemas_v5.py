@@ -8,7 +8,6 @@ rather than relying on prompt luck.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -736,17 +735,8 @@ class ResourceInventory(BaseModel):
     replaceable_resource_matrix: list[ResourceSlot] = Field(default_factory=list)
 
 
-@dataclass
-class RawFallback:
-    """Sentinel returned when both Instructor and JSON extraction fail.
-
-    The synthesis handler checks ``isinstance(result, RawFallback)`` to
-    decide whether to abort or degrade gracefully.
-    """
-
-    text: str
-    stage: str  # "l1_instructor_failed" | "l2_extract_failed" | "l3_raw"
-
+# Re-exported from agent_core for backward compatibility
+from doramagic_agent_core.core.fallback import RawFallback  # noqa: F401, E402
 
 # ---------------------------------------------------------------------------
 # v7: Structural extraction schemas (non-code knowledge sources)

@@ -325,7 +325,8 @@ Do NOT start by reading entire large files.
 - NEVER skip evidence_summary (every constraint MUST have evidence)
 - NEVER fabricate file paths or line numbers that do not exist
 - NEVER express multiple independent rules in a single constraint
-- **CRITICAL: stage_ids MUST use real stage IDs from the blueprint (provided in the "Stage Context" above).
+- **CRITICAL: stage_ids MUST use real stage IDs from the blueprint
+  (provided in the "Stage Context" above).
   NEVER invent stage names (e.g., technical_indicator, risk_management, etc.).
   If unsure of the stage ID, use target_scope="global" instead — do NOT fabricate stage_ids.**
 """
@@ -362,7 +363,8 @@ Follow this sequence — do NOT skip steps:
 
 ## Edge-specific Focus Areas
 
-Edge constraints differ from stage constraints: they focus on **data transformation rules during flow**, not internal stage logic.
+Edge constraints differ from stage constraints: they focus on
+**data transformation rules during flow**, not internal stage logic.
 
 ### Required edge-specific dimensions
 
@@ -477,7 +479,8 @@ The constraint core triad: **When [condition], MUST/MUST NOT [action], otherwise
 
 Follow this sequence — do NOT skip steps:
 
-1. **Understand structure**: Call `get_skeleton(file_path)` to understand the project entry point and core module structure
+1. **Understand structure**: Call `get_skeleton(file_path)` to understand the project entry point
+   and core module structure
 2. **Read global config**: Call `read_file(file_path, start_line, end_line)` to read
    global config files, initialization code, global state management code
 3. **Search global patterns**: Call `grep_codebase(pattern)` to search for global keywords
@@ -490,8 +493,10 @@ Follow this sequence — do NOT skip steps:
 ## Typical Sources for Global Constraints
 
 ### Cross-stage invariants
-- Data format conventions spanning the entire pipeline (all stages use the same timezone, same date format)
-- Global initialization order (config load → DB connection → module init — no stage may break this order)
+- Data format conventions spanning the entire pipeline
+  (all stages use the same timezone, same date format)
+- Global initialization order (config load → DB connection → module init
+  — no stage may break this order)
 - Concurrency safety constraints (which resources are globally shared; access MUST be locked)
 - Logging and audit trail conventions (event recording format all stages MUST follow)
 
@@ -534,9 +539,11 @@ confidence_score ≤ 0.7 — file:line evidence is NOT required.
 ```
 when: "When presenting or reporting this system's backtested returns to users"
 modality: "must_not"
-action: "Claim that backtested returns equal expected live returns — backtesting ignores market impact, financing costs, and execution delays"
+action: "Claim that backtested returns equal expected live returns — backtesting ignores
+  market impact, financing costs, and execution delays"
 consequence_kind: "false_claim"
-consequence_description: "Users make live capital allocation decisions based on inflated backtest returns, leading to severe underperformance in live trading and potential financial loss"
+consequence_description: "Users make live capital allocation decisions based on inflated backtest
+  returns, leading to severe underperformance in live trading and potential financial loss"
 constraint_kind: "claim_boundary"
 severity: "high"
 source_type: "expert_reasoning"
@@ -602,9 +609,11 @@ target_scope MUST be "global", with stage_ids and edge_ids both as empty lists.
 
 - NEVER invent enum values outside the lists above
 - NEVER set target_scope to "stage" or "edge" (this prompt is exclusively for global constraints)
-- NEVER skip the claim_boundary special focus — even if README has no disclaimer, extract from domain common knowledge
+- NEVER skip the claim_boundary special focus — even if README has no disclaimer,
+  extract from domain common knowledge
 - NEVER use vague words in action
-- claim_boundary constraints do NOT require file:line evidence — source_type="expert_reasoning" is valid
+- claim_boundary constraints do NOT require file:line evidence
+  — source_type="expert_reasoning" is valid
 """
 )
 
