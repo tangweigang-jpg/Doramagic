@@ -2985,6 +2985,35 @@ def build_blueprint_phases_v5(
                     if "__pycache__" not in str(p) and ".ipynb_checkpoints" not in str(p)
                 )
 
+        # v10: if no traditional examples found, discover entry points as UC sources
+        # (main.py, cli.py, __main__.py, app/main.py, scripts/, test_*.py)
+        if not examples:
+            _entry_patterns = [
+                "main.py",
+                "*/main.py",
+                "cli.py",
+                "*/cli.py",
+                "*/__main__.py",
+                "scripts/*.py",
+                "app/*.py",
+                "bin/*.py",
+            ]
+            for pat in _entry_patterns:
+                for p in repo_path.glob(pat):
+                    rel = str(p.relative_to(repo_path))
+                    if "__pycache__" not in rel and rel not in examples:
+                        examples.append(rel)
+            # Also include top-level test files as UC indicators
+            for p in repo_path.glob("test_*.py"):
+                rel = str(p.relative_to(repo_path))
+                if rel not in examples:
+                    examples.append(rel)
+            if examples:
+                logger.info(
+                    "bp_uc_extract: no traditional examples, found %d entry points",
+                    len(examples),
+                )
+
         if not examples:
             logger.warning("bp_uc_extract: no example files found — writing empty UC list")
             (artifacts_dir / "uc_list.json").write_text("[]", encoding="utf-8")
