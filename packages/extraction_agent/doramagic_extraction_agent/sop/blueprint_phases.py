@@ -2989,24 +2989,23 @@ def build_blueprint_phases_v5(
         # (main.py, cli.py, __main__.py, app/main.py, scripts/, test_*.py)
         if not examples:
             _entry_patterns = [
-                "main.py",
-                "*/main.py",
-                "cli.py",
-                "*/cli.py",
-                "*/__main__.py",
-                "scripts/*.py",
-                "app/*.py",
-                "bin/*.py",
+                "**/main.py",
+                "**/cli.py",
+                "**/cli/*.py",
+                "**/__main__.py",
+                "scripts/**/*.py",
+                "app/**/*.py",
+                "bin/**/*.py",
             ]
             for pat in _entry_patterns:
                 for p in repo_path.glob(pat):
                     rel = str(p.relative_to(repo_path))
                     if "__pycache__" not in rel and rel not in examples:
                         examples.append(rel)
-            # Also include top-level test files as UC indicators
-            for p in repo_path.glob("test_*.py"):
+            # Include test files at any depth as UC indicators
+            for p in repo_path.glob("**/test_*.py"):
                 rel = str(p.relative_to(repo_path))
-                if rel not in examples:
+                if "__pycache__" not in rel and rel not in examples:
                     examples.append(rel)
             if examples:
                 logger.info(

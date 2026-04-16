@@ -21,6 +21,7 @@ QUEUE=(
     "finance-bp-072:lending"
     "finance-bp-069:tqsdk-python"
     "finance-bp-084:eastmoney"
+    "finance-bp-078:fava_investor"
     "finance-bp-004:daily_stock_analysis"
 )
 
