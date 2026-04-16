@@ -736,11 +736,17 @@ async def _derive_single_chunk(
 ) -> tuple[Any | None, int, str | None]:
     """Run derive Instructor call for a single BD chunk.
 
+    Uses ConstraintExtractionResult (same schema as per-stage extraction,
+    proven 9/9 on MiniMax) instead of DeriveChunkResult which has nested
+    DerivedConstraint/MissingGapPair schemas that MiniMax can't handle.
+
+    derived_from is injected post-hoc from the BD context.
+
     Returns (result, tokens, error_msg).
     """
     import asyncio as _asyncio
 
-    from .constraint_schemas_v2 import DeriveChunkResult, RawFallback
+    from .constraint_schemas_v2 import ConstraintExtractionResult, RawFallback
 
     bd_count = sum(len(bds) for bds in bds_chunk.values())
     user_msg = _build_derive_user_message(
@@ -762,7 +768,7 @@ async def _derive_single_chunk(
             agent.run_structured_call(
                 prompts_v2.CON_DERIVE_V2_SYSTEM,
                 user_msg,
-                DeriveChunkResult,  # Solution B: flat list instead of 5 grouped lists
+                ConstraintExtractionResult,
                 max_retries=2,
             ),
             timeout=_DERIVE_CHUNK_TIMEOUT,
@@ -792,29 +798,32 @@ def _accumulate_derive_result(
     all_derived: list[dict[str, Any]],
     totals: list[int],
 ) -> None:
-    """Expand a DeriveChunkResult into the flat list and update counters.
+    """Expand a derive result into the flat list and update counters.
 
-    Supports both DeriveChunkResult (flat) and legacy DeriveExtractionResult (grouped).
+    Supports ConstraintExtractionResult (current, uses RawConstraint),
+    DeriveChunkResult (flat DerivedConstraint), and legacy DeriveExtractionResult (grouped).
     """
     if hasattr(result, "constraints"):
-        # DeriveChunkResult (Solution B) — flat list
         all_derived.extend(c.model_dump() for c in result.constraints)
-        for pair in result.missing_gap_pairs:
-            all_derived.append(pair.boundary.model_dump())
-            all_derived.append(pair.remedy.model_dump())
-        # Classify into totals by constraint_kind for reporting
+        # Handle missing_gap_pairs if present (DeriveChunkResult)
+        if hasattr(result, "missing_gap_pairs"):
+            for pair in result.missing_gap_pairs:
+                all_derived.append(pair.boundary.model_dump())
+                all_derived.append(pair.remedy.model_dump())
+            totals[4] += len(result.missing_gap_pairs)
+        if hasattr(result, "skipped_decisions"):
+            totals[5] += len(result.skipped_decisions)
+        # Classify into totals by constraint_kind
         for c in result.constraints:
             kind = c.constraint_kind
             if kind == "domain_rule":
-                totals[0] += 1  # rc + m + b → domain_rule
+                totals[0] += 1
             elif kind == "operational_lesson":
-                totals[1] += 1  # ba
+                totals[1] += 1
             elif kind == "architecture_guardrail":
-                totals[2] += 1  # m
+                totals[2] += 1
             else:
-                totals[3] += 1  # b / other
-        totals[4] += len(result.missing_gap_pairs)
-        totals[5] += len(result.skipped_decisions)
+                totals[3] += 1
     else:
         # Legacy DeriveExtractionResult (grouped)
         all_derived.extend(c.model_dump() for c in result.rc_constraints)
@@ -833,10 +842,12 @@ def _accumulate_derive_result(
 
 
 def _count_derive_result(result: Any) -> int:
-    """Count total constraints in a derive result (chunk or legacy)."""
+    """Count total constraints in a derive result."""
     if hasattr(result, "constraints"):
-        # DeriveChunkResult
-        return len(result.constraints) + len(result.missing_gap_pairs) * 2
+        count = len(result.constraints)
+        if hasattr(result, "missing_gap_pairs"):
+            count += len(result.missing_gap_pairs) * 2
+        return count
     # Legacy DeriveExtractionResult
     return (
         len(result.rc_constraints)

@@ -930,18 +930,20 @@ Example (derived from missing "price limit handling"):
 
 ## Output Format
 
-Return a DeriveChunkResult JSON object (Instructor schema):
+Return a ConstraintExtractionResult JSON object (same schema as stage extraction):
 
 ```json
 {
-  "constraints": [...],              // ALL derived constraints (RC/BA/M/B mixed in flat list)
-  "missing_gap_pairs": [...],        // missing → MissingGapPair dual pair list
-  "skipped_decisions": [...]         // Skipped BD IDs with reasons
+  "constraints": [...],              // ALL derived constraints in a flat list
+  "coverage_report": {"domain_rule": 3, "claim_boundary": 2, ...}
 }
 ```
 
-**IMPORTANT**: All constraint types (RC/BA/M/B) go into the single `constraints` list.
-Do NOT create separate lists per BD type — use one flat list.
+**IMPORTANT**:
+- ALL constraint types (RC/BA/M/B/missing) go into the single `constraints` list
+- For missing gap BDs, produce 2 separate constraints (boundary + remedy) in the same list
+- Do NOT create separate lists per BD type — use one flat list
+- Include `derived_from` as a JSON string in each constraint's evidence_summary
 
 Every constraint MUST include derived_from:
 ```json
