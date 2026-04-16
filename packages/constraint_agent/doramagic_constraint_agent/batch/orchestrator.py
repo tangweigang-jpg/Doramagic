@@ -7,6 +7,7 @@ Input contract: blueprint YAML path + repo path -> constraint JSONL output.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from collections.abc import Callable
@@ -229,6 +230,9 @@ class ConstraintBatchOrchestrator:
         state.run_dir = str(run_dir)
         state.output_dir = str(output_mgr.output_dir)
         state.blueprint_path = str(blueprint_path)
+
+        # Mark as extracting (prevent discover from re-triggering)
+        self.set_extracting_status(output_mgr.output_dir)
         state.current_pipeline = "constraint"
 
         # Read commit_hash from blueprint YAML
@@ -331,7 +335,8 @@ class ConstraintBatchOrchestrator:
             logger.error(error_msg)
             errors.append(error_msg)
 
-        # 10. Write manifest
+        # 10. Write manifest with source_blueprint_version for discover mode
+        bp_version = self._get_blueprint_version(output_mgr.output_dir)
         final_mgr = OutputManager(output_mgr.output_dir, job.blueprint_id, repo_slug=repo_slug)
         final_mgr.write_manifest(
             blueprint_id=job.blueprint_id,
@@ -339,6 +344,13 @@ class ConstraintBatchOrchestrator:
             commit_hash=state.commit_hash,
             llm_model=self._config.llm_model,
             total_tokens=state.total_tokens,
+        )
+        # Write extraction status into manifest for discover coordination
+        extraction_status = "failed" if con_result.failed_phase else "done"
+        self._update_extraction_status(
+            final_mgr,
+            extraction_status,
+            bp_version,
         )
 
         status = "failed" if con_result.failed_phase else "completed"
@@ -420,6 +432,57 @@ class ConstraintBatchOrchestrator:
     # ------------------------------------------------------------------
     # LLM adapter factory
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_blueprint_version(output_dir: Path) -> int:
+        """Read the latest blueprint version from manifest.json."""
+        manifest_path = output_dir / "manifest.json"
+        if not manifest_path.exists():
+            return 0
+        try:
+            m = json.loads(manifest_path.read_text(encoding="utf-8"))
+            versions = m.get("blueprint_versions", [])
+            if versions:
+                return versions[0].get("version", 0)
+        except (json.JSONDecodeError, OSError):
+            pass
+        return 0
+
+    @staticmethod
+    def _update_extraction_status(
+        output_mgr: OutputManager,
+        status: str,
+        source_blueprint_version: int,
+    ) -> None:
+        """Write constraint_extraction_status into manifest.json."""
+        manifest_path = output_mgr.output_dir / "manifest.json"
+        try:
+            m = json.loads(manifest_path.read_text(encoding="utf-8"))
+            m["constraint_extraction_status"] = status
+            if m.get("constraint_versions"):
+                m["constraint_versions"][0]["source_blueprint_version"] = source_blueprint_version
+            manifest_path.write_text(
+                json.dumps(m, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Failed to update extraction status: %s", exc)
+
+    @staticmethod
+    def set_extracting_status(output_dir: Path) -> None:
+        """Mark a project as 'extracting' in manifest.json (for discover)."""
+        manifest_path = output_dir / "manifest.json"
+        if not manifest_path.exists():
+            return
+        try:
+            m = json.loads(manifest_path.read_text(encoding="utf-8"))
+            m["constraint_extraction_status"] = "extracting"
+            manifest_path.write_text(
+                json.dumps(m, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        except (json.JSONDecodeError, OSError):
+            pass
 
     def _create_adapter(self) -> LLMAdapter:
         """Create a configured LLMAdapter from batch config."""
