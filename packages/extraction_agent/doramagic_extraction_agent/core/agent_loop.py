@@ -478,13 +478,13 @@ class ExtractionAgent:
         _overflow_retries: int = 0
         _MAX_OVERFLOW_RETRIES: int = 3
 
-        # v10: scale token budget with max_iterations so large-project workers
-        # don't hit the 500K default before convergence.  Base ratio: 500K / 50 iter
-        # = 10K tokens/iter.  effective_max already incorporates iter_scale.
-        _base_token_budget = 500_000
+        # v10: scale token budget with max_iterations so workers don't hit
+        # budget before convergence.  MiniMax averages ~15-20K tokens/iteration
+        # for complex files, so 15K/iter is a safe ratio.
+        _base_token_budget = 800_000
         _scaled_token_budget = max(
             _base_token_budget,
-            effective_max * 10_000,  # 10K tokens per allowed iteration
+            effective_max * 15_000,  # 15K tokens per allowed iteration
         )
         cb = CircuitBreaker(
             max_consecutive=self._max_consecutive_failures,
