@@ -848,10 +848,13 @@ def _patch_uc_normalize(bp: dict[str, Any]) -> int:
 
     Returns the number of use cases that were modified.
     """
-    ucs: list[Any] = bp.get("known_use_cases") or []
+    # v2 uses "use_cases", legacy used "known_use_cases"
+    ucs: list[Any] = bp.get("use_cases") or bp.get("known_use_cases") or []
     if not isinstance(ucs, list):
         ucs = []
-        bp["known_use_cases"] = ucs
+    # Store back under whichever key exists
+    uc_key = "use_cases" if "use_cases" in bp else "known_use_cases"
+    bp[uc_key] = ucs
 
     _keyword_re = re.compile(r"[A-Z][a-z]{2,}|[A-Z]{2,}|[\u4e00-\u9fff]{2,}|\b[a-z]{4,}\b")
 
@@ -868,6 +871,16 @@ def _patch_uc_normalize(bp: dict[str, Any]) -> int:
                 uc["source"] = uc["source_file"]
             del uc["source_file"]
             changed = True
+
+        # v10: fill required disambiguation fields with defaults
+        for _field, _default in [
+            ("negative_keywords", []),
+            ("disambiguation", ""),
+            ("data_domain", "general"),
+        ]:
+            if not uc.get(_field):
+                uc[_field] = _default
+                changed = True
 
         # Step 2: auto-generate intent_keywords
         if not uc.get("intent_keywords"):
