@@ -24,6 +24,7 @@ QUEUE=(
     "finance-bp-078:fava_investor"
     "finance-bp-064:insurance_python"
     "finance-bp-065:pyliferisk"
+    "finance-bp-080:FinDKG"
     "finance-bp-004:daily_stock_analysis"
 )
 
