@@ -1095,8 +1095,9 @@ def _patch_evidence_verify(bp: dict[str, Any], repo_path: str) -> int:
     verified = 0
     invalid = 0
     auto_fixed = 0
-    # v10: support line ranges like file:10-50(fn)
+    # v10: support line ranges like file:10-50(fn) AND file:line without (fn)
     _ev_pattern = re.compile(r"^(.+?):(\d+(?:[,\-]\d+)*)\((.+?)\)$")
+    _ev_pattern_no_fn = re.compile(r"^(.+?):(\d+(?:[,\-]\d+)*)$")
     # v6.3: valid Python identifier pre-check — reject constants, formulas,
     # natural language before attempting AST lookup
     _ident_pattern = re.compile(r"^[\w.]+$")
@@ -1110,9 +1111,15 @@ def _patch_evidence_verify(bp: dict[str, Any], repo_path: str) -> int:
             verified += 1
             continue
         m = _ev_pattern.match(ev)
-        if not m:
-            continue
-        file_path, line_str, fn_name = m.group(1), m.group(2), m.group(3)
+        fn_name = ""
+        if m:
+            file_path, line_str, fn_name = m.group(1), m.group(2), m.group(3)
+        else:
+            # v10: fallback for file:line without (function)
+            m2 = _ev_pattern_no_fn.match(ev)
+            if not m2:
+                continue
+            file_path, line_str = m2.group(1), m2.group(2)
         # v10: extract first line number from ranges like "10-50" or "42,100"
         line_no = int(line_str.split("-")[0].split(",")[0])
         full_path = Path(repo_path) / file_path
@@ -1260,6 +1267,18 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
                     )
                 except json.JSONDecodeError:
                     pass
+        if not repaired:
+            # v10: try generic _repair_json (handles extra data, trailing commas)
+            try:
+                from doramagic_extraction_agent.sop.synthesis_v9 import _repair_json
+
+                repaired_text = _repair_json(raw_text)
+                if repaired_text:
+                    resource_data = json.loads(repaired_text)
+                    repaired = True
+                    logger.info("P14 (resource_injection): repaired JSON via _repair_json")
+            except Exception:
+                pass
         if not repaired:
             logger.warning(
                 "P14 (resource_injection): failed to read resource data: %s",
@@ -1517,6 +1536,7 @@ def _patch_missing_gaps_from_audit(
         """
         _subdomain_terms: dict[str, tuple[set[str], set[str]]] = {
             # (audit keywords → trigger, file path keywords → verify)
+            # v10.1: added Chinese trigger terms for audit items written in Chinese
             "prc": (
                 {
                     "implied volatility",
@@ -1530,6 +1550,15 @@ def _patch_missing_gaps_from_audit(
                     "option pricing",
                     "monte carlo",
                     "binomial tree",
+                    # Chinese triggers
+                    "定价模型",
+                    "波动率曲面",
+                    "隐含波动率",
+                    "无套利",
+                    "日计数",
+                    "复利约定",
+                    "模型校准",
+                    "收敛诊断",
                 },
                 {
                     "prc",
@@ -1542,6 +1571,26 @@ def _patch_missing_gaps_from_audit(
                     "finite_diff",
                     "binomial",
                     "monte_carlo",
+                },
+            ),
+            "rsk": (
+                {
+                    # Risk management terms (PRC-adjacent)
+                    "协方差矩阵",
+                    "协方差估计",
+                    "var/cvar",
+                    "压力测试",
+                    "转移矩阵",
+                    "covariance",
+                    "stress test",
+                },
+                {
+                    "risk",
+                    "var",
+                    "cvar",
+                    "covariance",
+                    "stress",
+                    "portfolio_opt",
                 },
             ),
             "crd": (
@@ -1576,6 +1625,11 @@ def _patch_missing_gaps_from_audit(
                     "alm",
                     "liquidity coverage",
                     "asset liability",
+                    # Chinese triggers
+                    "利率缺口",
+                    "资金转移定价",
+                    "现金池",
+                    "ftp",
                 },
                 {
                     "trs",
