@@ -783,14 +783,102 @@ async def _derive_single_chunk(
         return None, 0, f"chunk {chunk_index + 1}/{total_chunks} timed out"
 
     if isinstance(result, RawFallback):
+        # L3 recovery: MiniMax produced text with constraint data but
+        # validation failed (often old grouped format or field mismatches).
+        # Try manual extraction from the raw text.
+        recovered = _recover_derive_from_raw(result.text, chunk_index, total_chunks)
+        if recovered:
+            logger.info(
+                "con_derive chunk %d/%d: L3 recovery extracted %d constraints",
+                chunk_index + 1,
+                total_chunks,
+                len(recovered.constraints),
+            )
+            return recovered, tokens, None
         logger.warning(
-            "con_derive chunk %d/%d: L3 fallback",
+            "con_derive chunk %d/%d: L3 fallback (recovery failed)",
             chunk_index + 1,
             total_chunks,
         )
-        return None, tokens, f"chunk {chunk_index + 1}/{total_chunks} L3 fallback"
+        return None, tokens, f"chunk {chunk_index + 1}/{total_chunks} failed (no fallback)"
 
     return result, tokens, None
+
+
+def _recover_derive_from_raw(
+    raw_text: str,
+    chunk_index: int,
+    total_chunks: int,
+) -> Any | None:
+    """Try to recover constraints from L3 raw text.
+
+    Handles two common MiniMax failure modes:
+    1. Old grouped format (rc_constraints/ba_constraints/etc.)
+    2. Valid constraint JSON objects embedded in markdown/text
+    """
+    import json
+    import re
+
+    from .constraint_schemas_v2 import ConstraintExtractionResult, RawConstraint
+
+    # Try to find JSON in the text
+    json_match = re.search(r"\{[\s\S]*\}", raw_text)
+    if not json_match:
+        return None
+
+    try:
+        data = json.loads(json_match.group())
+    except json.JSONDecodeError:
+        return None
+
+    # Coerce old grouped format → flat list
+    all_constraints: list[dict] = []
+    if isinstance(data, dict):
+        # Check for grouped format keys
+        for key in (
+            "rc_constraints",
+            "ba_constraints",
+            "m_constraints",
+            "b_constraints",
+            "constraints",
+        ):
+            items = data.get(key, [])
+            if isinstance(items, list):
+                all_constraints.extend(items)
+        # Handle missing_gap_pairs
+        for pair in data.get("missing_gap_pairs", []):
+            if isinstance(pair, dict):
+                if "boundary" in pair and isinstance(pair["boundary"], dict):
+                    all_constraints.append(pair["boundary"])
+                if "remedy" in pair and isinstance(pair["remedy"], dict):
+                    all_constraints.append(pair["remedy"])
+    elif isinstance(data, list):
+        all_constraints = data
+
+    if not all_constraints:
+        return None
+
+    # Validate each constraint individually, skip invalid ones
+    valid: list[RawConstraint] = []
+    for item in all_constraints:
+        if not isinstance(item, dict):
+            continue
+        try:
+            valid.append(RawConstraint.model_validate(item))
+        except Exception:
+            continue
+
+    if not valid:
+        return None
+
+    logger.info(
+        "con_derive chunk %d/%d: L3 recovery: %d/%d constraints valid",
+        chunk_index + 1,
+        total_chunks,
+        len(valid),
+        len(all_constraints),
+    )
+    return ConstraintExtractionResult(constraints=valid)
 
 
 def _accumulate_derive_result(
