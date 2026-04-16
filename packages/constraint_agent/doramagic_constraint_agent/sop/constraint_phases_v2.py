@@ -821,14 +821,24 @@ def _recover_derive_from_raw(
 
     from .constraint_schemas_v2 import ConstraintExtractionResult, RawConstraint
 
-    # Try to find JSON in the text
-    json_match = re.search(r"\{[\s\S]*\}", raw_text)
-    if not json_match:
-        return None
+    # Strip markdown code fences before JSON extraction
+    cleaned = re.sub(r"```(?:json)?\s*\n?", "", raw_text)
+    cleaned = re.sub(r"\n?```", "", cleaned)
 
-    try:
-        data = json.loads(json_match.group())
-    except json.JSONDecodeError:
+    # Try to find JSON (object or array) in the text
+    import contextlib
+
+    data = None
+    json_match = re.search(r"\{[\s\S]*\}", cleaned)
+    if json_match:
+        with contextlib.suppress(json.JSONDecodeError):
+            data = json.loads(json_match.group())
+    if data is None:
+        arr_match = re.search(r"\[[\s\S]*\]", cleaned)
+        if arr_match:
+            with contextlib.suppress(json.JSONDecodeError):
+                data = json.loads(arr_match.group())
+    if data is None:
         return None
 
     # Coerce old grouped format → flat list
@@ -858,14 +868,31 @@ def _recover_derive_from_raw(
     if not all_constraints:
         return None
 
-    # Fill defaults for metadata fields that derive prompt doesn't produce
-    # (per-stage prompt includes these, derive prompt focuses on core fields)
+    # Strip markdown code fences that wrap JSON
+    import re as _md_re
+
+    for i, item in enumerate(all_constraints):
+        if isinstance(item, str):
+            item = _md_re.sub(r"^```(?:json)?\s*\n?", "", item)
+            item = _md_re.sub(r"\n?```\s*$", "", item)
+            try:
+                all_constraints[i] = json.loads(item)
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+    # Fill defaults for metadata fields that derive prompt doesn't produce.
+    # Preserve derived_from separately (RawConstraint drops it via extra=ignore).
+    derived_from_map: list[dict | None] = []
     for item in all_constraints:
         if not isinstance(item, dict):
+            derived_from_map.append(None)
             continue
         derived_bd = ""
-        if isinstance(item.get("derived_from"), dict):
-            derived_bd = item["derived_from"].get("business_decision_id", "")
+        df = item.get("derived_from")
+        if isinstance(df, dict):
+            derived_bd = df.get("business_decision_id", "")
+        derived_from_map.append(df if isinstance(df, dict) else None)
+
         item.setdefault("confidence_score", 0.7)
         item.setdefault("consensus", "mixed")
         item.setdefault("freshness", "stable")
@@ -878,18 +905,25 @@ def _recover_derive_from_raw(
         item.setdefault("machine_checkable", False)
         item.setdefault("promote_to_acceptance", False)
 
-    # Validate each constraint individually, skip invalid ones
+    # Validate each constraint individually, skip invalid ones.
+    # Re-inject derived_from after validation (RawConstraint drops it).
     valid: list[RawConstraint] = []
-    for item in all_constraints:
+    valid_derived_from: list[dict | None] = []
+    for i, item in enumerate(all_constraints):
         if not isinstance(item, dict):
             continue
         try:
             valid.append(RawConstraint.model_validate(item))
+            valid_derived_from.append(derived_from_map[i])
         except Exception:
             continue
 
     if not valid:
         return None
+
+    # Attach derived_from metadata so _accumulate can re-inject it
+    result = ConstraintExtractionResult(constraints=valid)
+    result._derive_metadata = valid_derived_from  # type: ignore[attr-defined]
 
     logger.info(
         "con_derive chunk %d/%d: L3 recovery: %d/%d constraints valid",
@@ -898,7 +932,7 @@ def _recover_derive_from_raw(
         len(valid),
         len(all_constraints),
     )
-    return ConstraintExtractionResult(constraints=valid)
+    return result
 
 
 def _accumulate_derive_result(
@@ -912,7 +946,13 @@ def _accumulate_derive_result(
     DeriveChunkResult (flat DerivedConstraint), and legacy DeriveExtractionResult (grouped).
     """
     if hasattr(result, "constraints"):
-        all_derived.extend(c.model_dump() for c in result.constraints)
+        # Re-inject derived_from metadata (RawConstraint drops it)
+        derive_meta = getattr(result, "_derive_metadata", [None] * len(result.constraints))
+        for i, c in enumerate(result.constraints):
+            d = c.model_dump()
+            if i < len(derive_meta) and derive_meta[i]:
+                d["derived_from"] = derive_meta[i]
+            all_derived.append(d)
         # Handle missing_gap_pairs if present (DeriveChunkResult)
         if hasattr(result, "missing_gap_pairs"):
             for pair in result.missing_gap_pairs:
@@ -1044,9 +1084,71 @@ async def _con_derive_v2_handler(state: AgentState, repo_path: Path) -> PhaseRes
             _count_derive_result(result),
         )
 
-    # --- Failover: retry failed chunks with fallback agent ---
-    fallback_agent = state.extra.get("fallback_agent")
+    # --- Retry: split failed chunks in half and retry with primary agent ---
     retried_chunks: list[str] = []
+    still_failed: list[tuple[int, dict[str, list[dict[str, Any]]]]] = []
+    if failed_chunks:
+        logger.info(
+            "con_derive: %d chunk(s) failed — retrying with half chunk size",
+            len(failed_chunks),
+        )
+        for i, chunk in failed_chunks:
+            # Split the chunk's BDs into 2 smaller sub-chunks
+            all_bds_flat: list[dict[str, Any]] = []
+            for bds in chunk.values():
+                all_bds_flat.extend(bds)
+            mid = max(len(all_bds_flat) // 2, 1)
+            sub_chunks = [all_bds_flat[:mid], all_bds_flat[mid:]]
+            recovered_any = False
+            for si, sub in enumerate(sub_chunks):
+                if not sub:
+                    continue
+                # Wrap as single-type dict for _build_derive_user_message
+                sub_chunk: dict[str, list[dict[str, Any]]] = {"mixed": sub}
+                result, tokens, err = await _derive_single_chunk(
+                    agent,
+                    sub_chunk,
+                    state.blueprint_id,
+                    i,
+                    len(chunks),
+                )
+                total_tokens += tokens
+                if err:
+                    continue
+                _accumulate_derive_result(
+                    result,
+                    all_derived,
+                    totals := [
+                        total_rc,
+                        total_ba,
+                        total_m,
+                        total_b,
+                        total_gap,
+                        total_skipped,
+                    ],
+                )
+                (
+                    total_rc,
+                    total_ba,
+                    total_m,
+                    total_b,
+                    total_gap,
+                    total_skipped,
+                ) = totals
+                recovered_any = True
+                logger.info(
+                    "con_derive chunk %d/%d sub-%d: +%d constraints (retry)",
+                    i + 1,
+                    len(chunks),
+                    si + 1,
+                    _count_derive_result(result),
+                )
+            if not recovered_any:
+                still_failed.append((i, chunk))
+
+    # --- Failover: retry still-failed chunks with fallback agent ---
+    failed_chunks = still_failed
+    fallback_agent = state.extra.get("fallback_agent")
     if failed_chunks and fallback_agent:
         fb_model = getattr(fallback_agent, "_model_id", "fallback")
         logger.warning(
