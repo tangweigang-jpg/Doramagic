@@ -322,7 +322,7 @@ class ConstraintBatchOrchestrator:
             repo_path,
             model_router=model_router,
             agent_factory=agent_factory,
-            max_parallel=2,
+            max_parallel=3,
         )
         con_result = await con_executor.run()
 
