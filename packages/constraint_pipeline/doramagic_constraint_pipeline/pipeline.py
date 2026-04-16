@@ -94,19 +94,60 @@ def _raw_to_constraint(
         except ValueError:
             source_type = SourceType.EXPERT_REASONING
 
-        # 构建 evidence_refs
+        # 构建 evidence_refs — prefer P1-enriched structured refs over raw rebuild
         evidence_refs: list[EvidenceRef] = []
         evidence_summary = raw.get("evidence_summary", "")
-        if evidence_summary:
+        project = "unknown"
+        projects = blueprint.source.get("projects")
+        if projects and len(projects) > 0:
+            project = projects[0]
+
+        import re as _evidence_re
+
+        enriched = raw.get("evidence_refs", [])
+        if enriched and isinstance(enriched, list):
+            for ref in enriched:
+                if not isinstance(ref, dict):
+                    continue
+                ref_type_val = ref.get("type", "source_code")
+                path = ref.get("path", "")
+                line = ref.get("line", 0)
+                # Use existing locator if present, otherwise build from path:line
+                locator = ref.get("locator") or (
+                    f"{path}:{line}" if path and line else evidence_summary[:200]
+                )
+                # Strip commit hash + file:line prefix from summary
+                desc = ref.get("summary", evidence_summary[:200])
+                if path:
+                    desc = (
+                        _evidence_re.sub(
+                            r"^[a-f0-9]{7,}\s+\S+:\d+[-–\d()]*\s*",
+                            "",
+                            desc,
+                        ).strip()
+                        or desc
+                    )
+                evidence_refs.append(
+                    EvidenceRef(
+                        type=(
+                            EvidenceRefType.SOURCE_CODE
+                            if ref_type_val == "source_code"
+                            else EvidenceRefType.DOC
+                        ),
+                        source=project,
+                        locator=locator[:200],
+                        summary=desc[:200],
+                    )
+                )
+
+        # Fallback: enriched refs empty/malformed → build from evidence_summary
+        if not evidence_refs and evidence_summary:
+            # Fallback: no enriched refs, build from evidence_summary
             ref_type = (
                 EvidenceRefType.SOURCE_CODE
                 if source_type == SourceType.CODE_ANALYSIS
                 else EvidenceRefType.DOC
             )
-            project = "unknown"
-            projects = blueprint.source.get("projects")
-            if projects and len(projects) > 0:
-                project = projects[0]
             evidence_refs.append(
                 EvidenceRef(
                     type=ref_type,

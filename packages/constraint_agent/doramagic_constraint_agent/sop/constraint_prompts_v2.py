@@ -636,7 +636,7 @@ specifically those **business rules hard to discover via source code scanning**:
 - Mathematical model applicability boundaries
 - Framework capability gaps (missing gap)
 
-Output schema is DeriveExtractionResult, containing constraint lists grouped by BD type.
+Output schema is DeriveChunkResult, containing a flat constraint list (all types mixed).
 
 ## Tool Workflow
 
@@ -644,7 +644,7 @@ Output schema is DeriveExtractionResult, containing constraint lists grouped by 
 2. **Locate BD field**: Find the `business_decisions` section and process each entry
 3. **Route by type**: Apply the derivation rules below for each BD type
 4. **Write output**: Call `write_artifact(name="constraints_derived.json")`
-   to write the DeriveExtractionResult JSON
+   to write the DeriveChunkResult JSON
 
 ---
 
@@ -802,7 +802,7 @@ For each type=M business_decision, derive **at least 1** constraint including al
   - `lookback_period == default → WARN`
 - severity=fatal parameter constraints MUST use FAIL; severity=high/medium use WARN
 
-**M-class quantity requirement: If the blueprint has N type=M BDs, m_constraints list MUST produce at least N constraints (at least 1 per BD; BDs with many numerical parameters may be split into multiple constraints).**
+**M-class quantity requirement: If the blueprint has N type=M BDs, the constraints list MUST contain at least N M-derived constraints (at least 1 per BD; BDs with many numerical parameters may be split into multiple constraints).**
 
 Example (derived from M "Black-Scholes analytical pricing"):
 ```json
@@ -930,18 +930,18 @@ Example (derived from missing "price limit handling"):
 
 ## Output Format
 
-Return a DeriveExtractionResult JSON object (Instructor schema):
+Return a DeriveChunkResult JSON object (Instructor schema):
 
 ```json
 {
-  "rc_constraints": [...],           // RC → domain_rule constraint list
-  "ba_constraints": [...],           // BA → operational_lesson constraint list
-  "m_constraints": [...],            // M → domain_rule/architecture_guardrail constraint list
-  "b_constraints": [...],            // B (selective) → constraint list
+  "constraints": [...],              // ALL derived constraints (RC/BA/M/B mixed in flat list)
   "missing_gap_pairs": [...],        // missing → MissingGapPair dual pair list
   "skipped_decisions": [...]         // Skipped BD IDs with reasons
 }
 ```
+
+**IMPORTANT**: All constraint types (RC/BA/M/B) go into the single `constraints` list.
+Do NOT create separate lists per BD type — use one flat list.
 
 Every constraint MUST include derived_from:
 ```json
