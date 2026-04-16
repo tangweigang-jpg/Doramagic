@@ -858,6 +858,26 @@ def _recover_derive_from_raw(
     if not all_constraints:
         return None
 
+    # Fill defaults for metadata fields that derive prompt doesn't produce
+    # (per-stage prompt includes these, derive prompt focuses on core fields)
+    for item in all_constraints:
+        if not isinstance(item, dict):
+            continue
+        derived_bd = ""
+        if isinstance(item.get("derived_from"), dict):
+            derived_bd = item["derived_from"].get("business_decision_id", "")
+        item.setdefault("confidence_score", 0.7)
+        item.setdefault("consensus", "mixed")
+        item.setdefault("freshness", "stable")
+        item.setdefault("target_scope", "global")
+        item.setdefault("stage_ids", [])
+        item.setdefault(
+            "evidence_summary",
+            f"Derived from BD: {derived_bd}" if derived_bd else "BD-derived",
+        )
+        item.setdefault("machine_checkable", False)
+        item.setdefault("promote_to_acceptance", False)
+
     # Validate each constraint individually, skip invalid ones
     valid: list[RawConstraint] = []
     for item in all_constraints:
