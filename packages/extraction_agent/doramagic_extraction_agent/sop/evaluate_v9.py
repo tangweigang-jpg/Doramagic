@@ -229,6 +229,21 @@ async def deterministic_eval(
             )
             continue
 
+        # v10: guard against absurdly long evidence strings (MiniMax sometimes
+        # dumps entire file line lists into evidence, causing ENAMETOOLONG)
+        if len(file_rel) > 250:
+            verdicts.append(
+                {
+                    "bd_id": bd_id,
+                    "file_exists": False,
+                    "line_valid": False,
+                    "function_found": False,
+                    "verdict": "FILE_MISSING",
+                    "note": f"evidence path too long ({len(file_rel)} chars)",
+                }
+            )
+            continue
+
         full_path = repo_path / file_rel
 
         # Check 1: file exists
