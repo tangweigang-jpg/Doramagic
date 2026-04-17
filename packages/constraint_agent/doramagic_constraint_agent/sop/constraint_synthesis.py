@@ -487,6 +487,7 @@ def _normalize_synthesis_item(item: object) -> object:
             out["constraint_kind"] = kind_val
 
     out.setdefault("upgrade_reason", "")
+    out.setdefault("severity", "medium")
     return out
 
 
