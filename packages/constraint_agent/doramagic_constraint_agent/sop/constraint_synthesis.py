@@ -490,57 +490,77 @@ def _normalize_synthesis_item(item: object) -> object:
     return out
 
 
+_KIND_VOCAB = (
+    "domain_rule",
+    "architecture_guardrail",
+    "operational_lesson",
+    "claim_boundary",
+    "resource_boundary",
+    "rationalization_guard",
+)
+_SEVERITY_VOCAB = ("fatal", "high", "medium", "low")
+
+
 def _parse_synthesis_from_markdown(text: str) -> ConstraintSynthesisResult | None:
-    """Parse kind-upgrade decisions out of a markdown report.
+    """Parse kind-upgrade decisions out of a free-form markdown report.
 
-    Handles pattern::
+    Tolerant of several LLM-emitted formats, e.g.::
 
-        ### [13] kind=claim_boundary → kind=domain_rule
-        ### [169] kind=claim_boundary → kind=domain_rule (severity=fatal)
-        - **upgrade_reason**: ...
+        ### [13] kind=claim_boundary → kind=domain_rule (severity=fatal)
+        **[13]** `operational_lesson` → **`domain_rule`**
+        [13] operational_lesson → domain_rule
 
-    Severity defaults to ``medium`` when not specified; upgrade_reason is
-    captured from the following bullet if present.
+    Strategy: split the text into sections on ``[N]`` boundaries. In each
+    section look for the first kind-vocab word after an arrow (→/->/—>) —
+    that is the new kind. Severity is the first vocab word appearing in
+    the section; defaults to ``medium``. Items without an arrow+new-kind
+    are dropped.
     """
     import re
 
     from pydantic import ValidationError
 
-    # Match: [N] kind=A → kind=B optionally (severity=X)
-    # Accept →, ->, and en-dash variants
-    header_re = re.compile(
-        r"\[(\d+)\][^\n]*?kind\s*=\s*([a-z_]+)\s*(?:→|->|—>)\s*kind\s*=\s*([a-z_]+)"
-        r"(?:[^\n]*?severity\s*=\s*([a-z]+))?",
-        re.IGNORECASE,
-    )
+    section_re = re.compile(r"\[(\d+)\]", re.MULTILINE)
+    positions = [(m.start(), int(m.group(1))) for m in section_re.finditer(text)]
+    if not positions:
+        return None
+    positions.append((len(text), -1))
+
+    kind_alt = "|".join(_KIND_VOCAB)
+    # Allow short token (e.g. "kind=", "**`") between arrow and kind name
+    arrow_kind_re = re.compile(rf"(?:→|->|—>)[^\n]{{0,30}}?({kind_alt})\b", re.IGNORECASE)
+    severity_re = re.compile(rf"\b({'|'.join(_SEVERITY_VOCAB)})\b", re.IGNORECASE)
     reason_re = re.compile(r"\*\*upgrade[_\s]reason\*\*\s*[:：]\s*([^\n]+)", re.IGNORECASE)
 
     items: list[dict] = []
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        m = header_re.search(line)
-        if not m:
+    seen: set[int] = set()
+    for i in range(len(positions) - 1):
+        start, idx = positions[i]
+        end = positions[i + 1][0]
+        if idx < 0 or idx in seen:
             continue
-        idx, _old_kind, new_kind, severity = m.groups()
-        # Look ahead a few lines for upgrade_reason
-        reason = ""
-        for look in lines[i + 1 : i + 6]:
-            rm = reason_re.search(look)
-            if rm:
-                reason = rm.group(1).strip()
-                break
-            # Stop scanning if we hit another header
-            if look.strip().startswith("#"):
-                break
+        section = text[start:end]
+
+        km = arrow_kind_re.search(section)
+        if not km:
+            continue
+        new_kind = km.group(1).lower()
+
+        sm = severity_re.search(section)
+        severity = sm.group(1).lower() if sm else "medium"
+
+        rm = reason_re.search(section)
+        reason = rm.group(1).strip() if rm else ""
 
         items.append(
             {
-                "original_index": int(idx),
+                "original_index": idx,
                 "constraint_kind": new_kind,
-                "severity": (severity or "medium").lower(),
+                "severity": severity,
                 "upgrade_reason": reason,
             }
         )
+        seen.add(idx)
 
     if not items:
         return None
