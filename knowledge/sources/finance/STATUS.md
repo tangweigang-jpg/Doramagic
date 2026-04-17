@@ -91,6 +91,7 @@ _无_ 🎉
 
 - **`finance-bp-009--zvt/`** — 使用 v3~v17 老命名（无 `blueprint.v1.yaml`），验收时读 `blueprint.v17.yaml`
 - **`finance-bp-066--wealthbot/`** — PHP 项目，v10 重跑后 evidence 接地率仍偏弱（agent indexer 主要面向 Python）
+- **`finance-bp-115--mlfinlab/`** — UC=1 是 **upstream 限制**：mlfinlab 已转商业化，GitHub 只留 public-facing 空壳 repo（README 明确说明仅用于提 issue），无 examples/notebooks/ipynb/tests；UC discovery patterns 已覆盖标准目录，但 repo 本身无可提取内容；蓝图主体（124 BDs / 12 stages）质量良好，保留 WARN 状态
 
 ## bp_assemble placeholder bug 修复记录
 
@@ -102,6 +103,7 @@ _无_ 🎉
 
 ## 事件日志
 
+- **2026-04-17 23:20** — bp-115 mlfinlab UC 调查：确认 repo 是商业化后的 public-facing 空壳，UC=1 为 upstream 限制而非 agent 缺陷，接受 WARN 状态
 - **2026-04-17 23:09** — Wave 4 验收完成：**3 PASS / 3 WARN**（bp-105/106/110 PASS，bp-108/115/117 WARN）
 - 2026-04-17 23:03 — Wave 4 批次完成（6 项全 WARN 以上，0 FAIL，2h25min）
 - 2026-04-17 20:38 — Wave 4 批次启动（open-climate-investing / pyfolio-reloaded / finmarketpy / cryptofeed / mlfinlab / Riskfolio-Lib）
