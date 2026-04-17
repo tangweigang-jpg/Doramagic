@@ -407,7 +407,8 @@ def _try_extract_synthesis_result(raw_text: str) -> ConstraintSynthesisResult | 
         except (ValidationError, ValueError):
             continue
 
-    return None
+    # JSON extraction exhausted — try markdown parser as last resort
+    return _parse_synthesis_from_markdown(cleaned)
 
 
 def _normalize_synthesis_item(item: object) -> object:
@@ -445,5 +446,74 @@ def _normalize_synthesis_item(item: object) -> object:
         if "severity" not in out and "severity" in original:
             out["severity"] = original["severity"]
 
+    # Flat variant: {id, kind, upgrade_kind, severity, upgrade_reason}
+    if "constraint_kind" not in out:
+        kind_val = out.get("upgrade_kind") or out.get("new_kind") or out.get("kind")
+        if kind_val:
+            out["constraint_kind"] = kind_val
+
     out.setdefault("upgrade_reason", "")
     return out
+
+
+def _parse_synthesis_from_markdown(text: str) -> ConstraintSynthesisResult | None:
+    """Parse kind-upgrade decisions out of a markdown report.
+
+    Handles pattern::
+
+        ### [13] kind=claim_boundary → kind=domain_rule
+        ### [169] kind=claim_boundary → kind=domain_rule (severity=fatal)
+        - **upgrade_reason**: ...
+
+    Severity defaults to ``medium`` when not specified; upgrade_reason is
+    captured from the following bullet if present.
+    """
+    import re
+
+    from pydantic import ValidationError
+
+    # Match: [N] kind=A → kind=B optionally (severity=X)
+    # Accept →, ->, and en-dash variants
+    header_re = re.compile(
+        r"\[(\d+)\][^\n]*?kind\s*=\s*([a-z_]+)\s*(?:→|->|—>)\s*kind\s*=\s*([a-z_]+)"
+        r"(?:[^\n]*?severity\s*=\s*([a-z]+))?",
+        re.IGNORECASE,
+    )
+    reason_re = re.compile(r"\*\*upgrade[_\s]reason\*\*\s*[:：]\s*([^\n]+)", re.IGNORECASE)
+
+    items: list[dict] = []
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = header_re.search(line)
+        if not m:
+            continue
+        idx, _old_kind, new_kind, severity = m.groups()
+        # Look ahead a few lines for upgrade_reason
+        reason = ""
+        for look in lines[i + 1 : i + 6]:
+            rm = reason_re.search(look)
+            if rm:
+                reason = rm.group(1).strip()
+                break
+            # Stop scanning if we hit another header
+            if look.strip().startswith("#"):
+                break
+
+        items.append(
+            {
+                "original_index": int(idx),
+                "constraint_kind": new_kind,
+                "severity": (severity or "medium").lower(),
+                "upgrade_reason": reason,
+            }
+        )
+
+    if not items:
+        return None
+
+    try:
+        return ConstraintSynthesisResult.model_validate(
+            {"reviewed_constraints": items, "rebalance_actions": []}
+        )
+    except (ValidationError, ValueError):
+        return None
