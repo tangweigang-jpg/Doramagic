@@ -174,10 +174,20 @@ async def run_constraint_synthesis(
                 rebalanced_count,
             )
         else:
-            logger.error(
-                "constraint_synthesis: JSON extraction failed — "
-                "skipping rebalance, writing merged unchanged"
-            )
+            # Persist raw text for post-mortem
+            raw_dump = output_path.parent / "constraints_synthesis_raw.txt"
+            try:
+                raw_dump.write_text(result.text, encoding="utf-8")
+                logger.error(
+                    "constraint_synthesis: JSON extraction failed — "
+                    "skipping rebalance, writing merged unchanged; raw text dumped to %s",
+                    raw_dump,
+                )
+            except OSError:
+                logger.error(
+                    "constraint_synthesis: JSON extraction failed — "
+                    "skipping rebalance, writing merged unchanged"
+                )
     else:
         rebalanced_count = _apply_synthesis(merged, result)
         logger.info(
@@ -336,29 +346,56 @@ def _log_kind_distribution(label: str, counts: Counter, total: int) -> None:
 def _try_extract_synthesis_result(raw_text: str) -> ConstraintSynthesisResult | None:
     """Attempt to extract a ConstraintSynthesisResult from raw LLM text.
 
-    Tries to find a JSON object inside triple-backtick blocks or bare JSON.
+    Robust recovery mirroring ``_recover_derive_from_raw``:
+    1. Strip markdown code fences
+    2. Greedy object match ``\\{[\\s\\S]*\\}`` to capture from first ``{`` to last ``}``
+    3. Greedy array match as fallback (bare ``reviewed_constraints`` list)
+    4. Validate the result; if only a bare list is present, wrap it
+
     Returns ``None`` if extraction or validation fails.
     """
     import re
 
     from pydantic import ValidationError
 
-    # Try ```json ... ``` block first
-    block_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw_text, re.DOTALL)
-    candidates: list[str] = []
-    if block_match:
-        candidates.append(block_match.group(1))
+    # 1. Strip all markdown fences first
+    cleaned = re.sub(r"```(?:json)?\s*\n?", "", raw_text)
+    cleaned = re.sub(r"\n?```", "", cleaned)
 
-    # Also try the first top-level {...} span
-    brace_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
-    if brace_match:
-        candidates.append(brace_match.group(0))
+    candidates: list[tuple[str, bool]] = []  # (text, is_bare_list)
 
-    for candidate in candidates:
+    # 2. Greedy top-level object
+    obj_match = re.search(r"\{[\s\S]*\}", cleaned)
+    if obj_match:
+        candidates.append((obj_match.group(0), False))
+
+    # 3. Greedy top-level array (bare reviewed_constraints list)
+    arr_match = re.search(r"\[[\s\S]*\]", cleaned)
+    if arr_match:
+        candidates.append((arr_match.group(0), True))
+
+    for candidate, is_bare_list in candidates:
         try:
             data = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        # Wrap bare list into expected schema shape
+        if is_bare_list and isinstance(data, list):
+            data = {"reviewed_constraints": data, "rebalance_actions": []}
+        elif isinstance(data, dict) and "reviewed_constraints" not in data:
+            # Some models return {"constraints": [...]} or similar — try to adapt
+            for key in ("constraints", "items", "reviewed"):
+                if isinstance(data.get(key), list):
+                    data = {
+                        "reviewed_constraints": data[key],
+                        "rebalance_actions": data.get("rebalance_actions", []),
+                    }
+                    break
+
+        try:
             return ConstraintSynthesisResult.model_validate(data)
-        except (json.JSONDecodeError, ValidationError, ValueError):
+        except (ValidationError, ValueError):
             continue
 
     return None
