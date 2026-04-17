@@ -393,9 +393,57 @@ def _try_extract_synthesis_result(raw_text: str) -> ConstraintSynthesisResult | 
                     }
                     break
 
+        # Normalize item shape variants — MiniMax sometimes emits
+        # {id, original:{kind,severity,...}, modified:{kind,severity}, upgrade_reason}
+        # instead of the flat expected shape.
+        if isinstance(data, dict) and isinstance(data.get("reviewed_constraints"), list):
+            data["reviewed_constraints"] = [
+                _normalize_synthesis_item(item) for item in data["reviewed_constraints"]
+            ]
+            data.setdefault("rebalance_actions", [])
+
         try:
             return ConstraintSynthesisResult.model_validate(data)
         except (ValidationError, ValueError):
             continue
 
     return None
+
+
+def _normalize_synthesis_item(item: object) -> object:
+    """Coerce LLM shape variants to SynthesizedConstraint fields.
+
+    Maps ``id`` → ``original_index`` and flattens ``modified.{kind,severity}``
+    to top-level ``constraint_kind`` / ``severity`` when present.
+    Unknown shapes pass through unchanged.
+    """
+    if not isinstance(item, dict):
+        return item
+    out = dict(item)
+
+    # id → original_index
+    if "original_index" not in out and "id" in out:
+        out["original_index"] = out.pop("id")
+
+    # Flatten modified.{kind,severity} if present
+    modified = out.get("modified")
+    if isinstance(modified, dict):
+        if "constraint_kind" not in out:
+            kind_val = modified.get("kind") or modified.get("constraint_kind")
+            if kind_val:
+                out["constraint_kind"] = kind_val
+        if "severity" not in out and "severity" in modified:
+            out["severity"] = modified["severity"]
+
+    # Fallback: pull from original if modified absent
+    original = out.get("original")
+    if isinstance(original, dict):
+        if "constraint_kind" not in out:
+            kind_val = original.get("kind") or original.get("constraint_kind")
+            if kind_val:
+                out["constraint_kind"] = kind_val
+        if "severity" not in out and "severity" in original:
+            out["severity"] = original["severity"]
+
+    out.setdefault("upgrade_reason", "")
+    return out
