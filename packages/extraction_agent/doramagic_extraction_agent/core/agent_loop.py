@@ -481,7 +481,7 @@ class ExtractionAgent:
         # v10: scale token budget with max_iterations so workers don't hit
         # budget before convergence.  MiniMax averages ~15-20K tokens/iteration
         # for complex files, so 15K/iter is a safe ratio.
-        _base_token_budget = 1_200_000
+        _base_token_budget = 2_000_000
         _scaled_token_budget = max(
             _base_token_budget,
             effective_max * 15_000,  # 15K tokens per allowed iteration
