@@ -1095,8 +1095,14 @@ async def _con_derive_v2_handler(state: AgentState, repo_path: Path) -> PhaseRes
         for i, chunk in failed_chunks:
             # Split the chunk's BDs into 2 smaller sub-chunks
             all_bds_flat: list[dict[str, Any]] = []
-            for bds in chunk.values():
-                all_bds_flat.extend(bds)
+            try:
+                for bds in chunk.values():
+                    if isinstance(bds, list):
+                        all_bds_flat.extend(bds)
+            except (TypeError, AttributeError) as exc:
+                logger.warning("con_derive retry: malformed chunk %d: %s", i, exc)
+                still_failed.append((i, chunk))
+                continue
             mid = max(len(all_bds_flat) // 2, 1)
             sub_chunks = [all_bds_flat[:mid], all_bds_flat[mid:]]
             recovered_any = False

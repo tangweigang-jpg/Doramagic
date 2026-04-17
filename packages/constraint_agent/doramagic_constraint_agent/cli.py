@@ -212,7 +212,12 @@ def _scan_stale_projects(sources_dir: Path, project_root: Path) -> list[dict]:
         if con_versions:
             source_bp_version = con_versions[0].get("source_blueprint_version", 0)
 
-        if latest_bp_version > source_bp_version:
+        # STALE if blueprint is newer OR previous extraction failed
+        extraction_status = m.get("constraint_extraction_status", "")
+        is_stale = latest_bp_version > source_bp_version
+        is_failed = extraction_status == "failed"
+
+        if is_stale or is_failed:
             # Resolve repo_path from blueprint YAML
             import yaml
 
@@ -242,9 +247,11 @@ def _scan_stale_projects(sources_dir: Path, project_root: Path) -> list[dict]:
                     "source_bp_version": source_bp_version,
                 }
             )
+            reason = "FAILED (retry)" if is_failed and not is_stale else "STALE"
             logger.info(
-                "  %s: STALE (blueprint v%d, constraints based on v%d)",
+                "  %s: %s (blueprint v%d, constraints based on v%d)",
                 project_dir.name,
+                reason,
                 latest_bp_version,
                 source_bp_version,
             )
