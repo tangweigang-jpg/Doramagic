@@ -358,6 +358,38 @@ def _try_extract_synthesis_result(raw_text: str) -> ConstraintSynthesisResult | 
 
     from pydantic import ValidationError
 
+    # 0. Multi-fenced-block variant: several ```json {...}``` blocks scattered
+    #    in a markdown report, each describing ONE reviewed constraint. Try this
+    #    before fence-stripping because stripping merges all objects into an
+    #    invalid concatenation.
+    fenced_blocks = re.findall(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw_text)
+    if len(fenced_blocks) >= 2:
+        aggregated: list[dict] = []
+        for block in fenced_blocks:
+            try:
+                parsed = json.loads(block)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                # Accept both single items and wrapper objects
+                if "reviewed_constraints" in parsed and isinstance(
+                    parsed["reviewed_constraints"], list
+                ):
+                    aggregated.extend(
+                        p for p in parsed["reviewed_constraints"] if isinstance(p, dict)
+                    )
+                else:
+                    aggregated.append(parsed)
+        if aggregated:
+            data = {
+                "reviewed_constraints": [_normalize_synthesis_item(it) for it in aggregated],
+                "rebalance_actions": [],
+            }
+            try:
+                return ConstraintSynthesisResult.model_validate(data)
+            except (ValidationError, ValueError):
+                pass  # fall through to other recovery strategies
+
     # 1. Strip all markdown fences first
     cleaned = re.sub(r"```(?:json)?\s*\n?", "", raw_text)
     cleaned = re.sub(r"\n?```", "", cleaned)
