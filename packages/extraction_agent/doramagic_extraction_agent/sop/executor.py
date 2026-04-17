@@ -597,8 +597,24 @@ class SOPExecutor:
                 for artifact_name in phase.required_artifacts:
                     artifact_path = artifacts_dir / artifact_name
                     if not artifact_path.is_file() or artifact_path.stat().st_size == 0:
-                        # Generate format-appropriate placeholder
-                        if artifact_name.endswith(".yaml"):
+                        # Generate format-appropriate placeholder.
+                        # For blueprint.yaml specifically, we embed the real
+                        # blueprint_id and a sentinel flag (_assemble_failed: true)
+                        # so downstream quality gates can detect the failure and
+                        # report passed=false rather than silently treating an
+                        # empty-stages placeholder as a valid blueprint.
+                        if artifact_name == "blueprint.yaml":
+                            placeholder = (
+                                f"# {phase.name} — placeholder (assemble 失败自动生成)\n"
+                                f"# WARNING: This is an auto-generated failure placeholder.\n"
+                                f"# The bp_quality_gate BQ-05 check (stages≥2) will FAIL.\n"
+                                f"id: {self._state.blueprint_id}\n"
+                                f"name: 'UNASSEMBLED: assemble 失败'\n"
+                                f"sop_version: '3.4'\n"
+                                f"stages: []\n"
+                                f"_assemble_failed: true\n"
+                            )
+                        elif artifact_name.endswith(".yaml"):
                             placeholder = (
                                 f"# {phase.name} — placeholder\n"
                                 f"id: placeholder\nname: placeholder\nstages: []\n"

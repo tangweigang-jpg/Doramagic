@@ -2415,6 +2415,75 @@ def build_blueprint_phases_v5(
             # Strip markdown code fences
             raw = _re.sub(r"^```(?:json|yaml)?\s*\n?", "", raw)
             raw = _re.sub(r"\n?```\s*$", "", raw)
+            # Keep a reference to result.stage before we potentially reassign result
+            _raw_fallback_stage = result.stage
+
+            def _extract_stages_from_truncated_json(text: str) -> list | None:
+                """Rescue stages array from a truncated JSON string.
+
+                When LLM output is cut off mid-JSON, yaml.safe_load fails
+                (unclosed strings/brackets).  This walks character-by-character
+                to find complete stage objects and returns them.
+
+                Returns a list of parsed stage dicts if ≥1 complete stage found,
+                else None.
+                """
+                import json as _json2
+                import re as _re2
+
+                m = _re2.search(r'"stages"\s*:\s*\[', text)
+                if not m:
+                    return None
+                start = m.end()  # index just after the opening '['
+
+                in_str = False
+                escape_next = False
+                depth = 0  # counts '{' and '[' inside the array
+                last_complete_pos: int | None = None  # end of last complete stage object
+                i = start
+                n = len(text)
+                while i < n:
+                    ch = text[i]
+                    if escape_next:
+                        escape_next = False
+                        i += 1
+                        continue
+                    if ch == "\\" and in_str:
+                        escape_next = True
+                        i += 1
+                        continue
+                    if ch == '"':
+                        in_str = not in_str
+                        i += 1
+                        continue
+                    if in_str:
+                        i += 1
+                        continue
+                    if ch in ("{", "["):
+                        depth += 1
+                    elif ch in ("}", "]"):
+                        depth -= 1
+                        if depth == 0 and ch == "}":
+                            # Just closed a top-level stage object
+                            last_complete_pos = i + 1
+                        elif depth < 0:
+                            # Hit the closing ']' of the stages array
+                            break
+                    i += 1
+
+                if last_complete_pos is None:
+                    return None
+
+                # Reconstruct a minimal valid JSON fragment
+                fragment = "[" + text[start:last_complete_pos] + "]"
+                try:
+                    stages = _json2.loads(fragment)
+                    if isinstance(stages, list) and len(stages) >= 1:
+                        return stages
+                except _json2.JSONDecodeError:
+                    pass
+                return None
+
             try:
                 import json as _json
 
@@ -2424,7 +2493,13 @@ def build_blueprint_phases_v5(
                 try:
                     parsed_raw = _json.loads(raw)
                 except _json.JSONDecodeError:
-                    parsed_raw = _yaml.safe_load(raw)
+                    # yaml.safe_load fails on truncated JSON (unclosed strings).
+                    # Attempt it anyway; if it also fails, fall through to the
+                    # truncated-JSON rescue strategy below.
+                    try:
+                        parsed_raw = _yaml.safe_load(raw)
+                    except Exception:
+                        parsed_raw = None
 
                 if isinstance(parsed_raw, dict) and "stages" in parsed_raw:
                     logger.info(
@@ -2434,18 +2509,127 @@ def build_blueprint_phases_v5(
                     # Skip Pydantic validation, build blueprint directly
                     result = None  # sentinel: use parsed_raw below
                 else:
-                    raise ValueError("No 'stages' key in parsed output")
+                    # L3 fallback: try to rescue stages from truncated JSON.
+                    # This handles the common case where MiniMax output is cut
+                    # off mid-JSON (unclosed brackets/strings), losing the
+                    # trailing '}' that would close the top-level object.
+                    rescued_stages = _extract_stages_from_truncated_json(raw)
+                    if rescued_stages:
+                        import re as _re_name
+
+                        # Try to pull name/applicability from the raw text with
+                        # simple regex — these fields appear early and are often
+                        # intact even in truncated output.
+                        _name_m = _re_name.search(r'"name"\s*:\s*"([^"]+)"', raw)
+                        _appl_m = _re_name.search(r'"applicability"\s*:\s*(\{[^}]*\})', raw)
+                        rescued_name = _name_m.group(1) if _name_m else "unknown"
+                        rescued_appl: dict = {}
+                        if _appl_m:
+                            try:
+                                rescued_appl = _json.loads(_appl_m.group(1))
+                            except Exception:
+                                pass
+                        parsed_raw = {
+                            "name": rescued_name,
+                            "applicability": rescued_appl,
+                            "stages": rescued_stages,
+                            "data_flow": [],
+                            "global_contracts": [],
+                        }
+                        logger.warning(
+                            "bp_assemble: L3 truncation rescue — recovered %d stages "
+                            "(yaml.safe_load failed, used depth-scanner fallback)",
+                            len(rescued_stages),
+                        )
+                        result = None  # sentinel: use parsed_raw below
+                    else:
+                        raise ValueError(
+                            "No 'stages' key in parsed output and truncation rescue failed"
+                        )
             except Exception as parse_exc:
                 logger.warning(
-                    "bp_assemble: L3 recovery failed (%s) — cannot assemble",
+                    "bp_assemble: L3 recovery failed (%s) — trying inline YAML rescue",
                     parse_exc,
+                )
+                # Last-resort: try to extract a YAML mapping from the raw text
+                # (mirrors executor._extract_yaml / _auto_save_artifact logic
+                # but inlined here to avoid circular imports).  If the raw text
+                # happens to contain a valid YAML blueprint with stages, save it
+                # directly and return completed so executor does NOT write the
+                # generic placeholder that would misreport quality_gate.
+                _rescued_bp: dict | None = None
+                try:
+                    import re as _re_yaml
+
+                    import yaml as _yaml_rescue
+
+                    # Try fenced YAML blocks first (descending by length)
+                    _yaml_blocks = _re_yaml.findall(r"```(?:ya?ml)?\s*\n(.*?)```", raw, re.DOTALL)
+                    for _blk in sorted(_yaml_blocks, key=len, reverse=True):
+                        _d = _yaml_rescue.safe_load(_blk)
+                        if isinstance(_d, dict) and "stages" in _d and _d["stages"]:
+                            _rescued_bp = _d
+                            break
+                    # Fall back to treating the whole text as YAML
+                    if _rescued_bp is None:
+                        _d = _yaml_rescue.safe_load(raw)
+                        if isinstance(_d, dict) and "stages" in _d and _d["stages"]:
+                            _rescued_bp = _d
+                except Exception:
+                    pass
+
+                if _rescued_bp is not None:
+                    import yaml as _yaml_write
+
+                    logger.warning(
+                        "bp_assemble: inline YAML rescue succeeded (%d stages)",
+                        len(_rescued_bp.get("stages", [])),
+                    )
+                    # Build a minimal blueprint dict and write it
+                    _bp_rescue: dict = {
+                        "id": state.blueprint_id,
+                        "name": _rescued_bp.get("name", "unknown"),
+                        "sop_version": "3.2",
+                        "source": {"projects": [], "extraction_method": "semi_auto"},
+                        "applicability": _rescued_bp.get("applicability", {}),
+                        "stages": _rescued_bp["stages"],
+                        "data_flow": _rescued_bp.get("data_flow", []),
+                        "global_contracts": _rescued_bp.get("global_contracts", []),
+                        "business_decisions": [],
+                        "known_use_cases": [],
+                    }
+                    from datetime import date as _date_rescue
+
+                    _rescue_content = (
+                        "# Extraction pipeline: SOP v3.4 [inline YAML rescue]\n"
+                        f"# Extracted: {_date_rescue.today().isoformat()}\n"
+                    )
+                    _rescue_content += _yaml_write.dump(
+                        _bp_rescue,
+                        allow_unicode=True,
+                        default_flow_style=False,
+                        sort_keys=False,
+                        width=100,
+                    )
+                    (artifacts_dir / "blueprint.yaml").write_text(_rescue_content, encoding="utf-8")
+                    return PhaseResult(
+                        phase_name="bp_assemble",
+                        status="completed",
+                        total_tokens=total_tokens,
+                        final_text=(f"Inline YAML rescue: {len(_rescued_bp['stages'])} stages"),
+                    )
+
+                # All recovery strategies exhausted — return error so executor
+                # writes the _assemble_failed placeholder (not generic placeholder).
+                logger.warning(
+                    "bp_assemble: all recovery strategies exhausted — returning error",
                 )
                 return PhaseResult(
                     phase_name="bp_assemble",
                     status="error",
                     total_tokens=total_tokens,
-                    error=f"Assembly returned raw fallback ({result.stage})",
-                    final_text=result.text[:500],
+                    error=f"Assembly returned raw fallback ({_raw_fallback_stage})",
+                    final_text=raw[:500],
                 )
 
         # --- Build blueprint dict from structured result or L3 parsed JSON ---

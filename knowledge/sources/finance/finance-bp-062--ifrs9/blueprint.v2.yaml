@@ -1,0 +1,3270 @@
+id: finance-bp-062
+name: IFRS 9 Impairment Model
+stages:
+- id: transaction_staging
+  name: Transaction Staging
+  order: 1
+  responsibility: Processes raw transaction data into time-series format for credit analysis. Creates forward-looking 12-month performance windows and backward-looking aging buckets to establish the foundation
+    for all downstream PD calculations.
+  interface:
+    inputs: Raw parquet transaction files with AccountID, Status, Monthkey, Aging, writeOff flags
+    outputs: Processed transaction DataFrame with 12-month forward windows and status transitions
+  required_methods:
+  - name: backwardTransaction.ipynb
+    description: Main notebook processing backward transaction data for staging criteria and historical aging shifts
+    evidence: Staging/backwardTransaction.ipynb:1
+  key_behaviors:
+  - behavior: Entity-level isolation via groupby before shift
+    description: All shift operations group by AccountID first to ensure temporal shifts stay within each account's timeline and do not cross account boundaries
+    evidence: PD/transitionMatrix.ipynb:133(groupby)
+  - behavior: Forward window creation via negative shift
+    description: Uses pandas shift(-i) with negative periods to create forward-looking columns for 12-month performance tracking
+    evidence: PD/transitionMatrix.ipynb:133(shift)
+  - behavior: Account exclusion based on minimum observation window
+    description: Excludes accounts with less than 12-month observation window (maxMonthkey-12) to ensure reliable 12M PD calculation
+    evidence: PD/transitionMatrix.ipynb:196(query)
+  replaceable_points:
+  - name: lag_period
+    description: Forward performance window length determines how many periods ahead to track status
+    options:
+    - name: '12'
+      traits:
+      - 12-month standard
+      - IFRS 9 aligned
+      - common Basel horizon
+      fit_for:
+      - Standard retail portfolios
+      - Annual reporting cycles
+      not_fit_for:
+      - Short-term facilities
+      - Trade finance
+    - name: '24'
+      traits:
+      - 24-month extended
+      - Broader coverage
+      - Higher data requirements
+      fit_for:
+      - Commercial real estate
+      - Long-term project finance
+      not_fit_for:
+      - Revolving credit
+      - High turnover portfolios
+    - name: '36'
+      traits:
+      - 36-month long-term
+      - Maximum coverage
+      - Significant data history required
+      fit_for:
+      - Mortgage portfolios
+      - Infrastructure lending
+      not_fit_for:
+      - Consumer lending
+      - Limited history portfolios
+    default: '12'
+  - name: exclusion_rules
+    description: Account filtering criteria for minimum observation requirements
+    options:
+    - name: standard
+      traits:
+      - 12-month minimum
+      - Default IFRS 9 criteria
+      fit_for:
+      - Most retail portfolios
+      - Standard credit products
+      not_fit_for:
+      - New originations
+      - Thin file accounts
+    - name: strict
+      traits:
+      - 24-month minimum
+      - More conservative filtering
+      fit_for:
+      - High-risk portfolios
+      - Regulatory scrutiny
+      not_fit_for:
+      - New portfolios
+      - Rapidly growing books
+    - name: relaxed
+      traits:
+      - 6-month minimum
+      - Inclusive filtering
+      fit_for:
+      - New portfolios
+      - Short-track accounts
+      not_fit_for:
+      - Historical calibration
+      - Conservative estimation
+    default: standard
+  design_decisions:
+  - decision: Use .shift(-i) for forward window creation
+    evidence: PD/transitionMatrix.ipynb:133(shift)
+    rationale: pandas shift with negative periods creates forward-looking columns for 12M performance tracking
+  - decision: Group by AccountID before shifting
+    evidence: PD/transitionMatrix.ipynb:133(groupby)
+    rationale: Ensures shifts stay within each account's timeline, not crossing account boundaries
+  - decision: Exclusion rules filter maxMonthkey-12
+    evidence: PD/transitionMatrix.ipynb:196(query)
+    rationale: Requires minimum 12-month observation window to calculate reliable 12M PD
+  acceptance_hints:
+  - All accounts have complete 12-month forward windows with no cross-account contamination
+  - Shift operations preserve temporal ordering within each AccountID group
+  - Excluded accounts are properly documented and don't bias the calibration sample
+- id: transition_matrix
+  name: Transition Matrix Estimation
+  order: 2
+  responsibility: Builds migration/transition matrices showing probability of accounts moving between aging states (0=current, 1-3=delinquency, 4=default) over performance periods, serving as the foundation
+    for conditional PD calculations.
+  interface:
+    inputs: Processed transaction data with 12MStatus flags and Segment groupings
+    outputs: Transition probability matrix by Segment x Aging bucket
+  required_methods:
+  - name: transitionMatrix.ipynb
+    description: Pivot table construction for count matrices and transition probability calculations
+    evidence: PD/transitionMatrix.ipynb:370
+  - name: NRTMatrix.ipynb
+    description: Non-retail transition matrix construction with reference row handling
+    evidence: PD/NRTMatrix.ipynb:1
+  key_behaviors:
+  - behavior: Worst-status capture via max aggregation
+    description: 12MStatus uses max(aging) across the 12-month window to capture any default event during the performance period
+    evidence: PD/transitionMatrix.ipynb:165(max)
+  - behavior: Censored loan handling with last known status
+    description: Accounts still performing at observation end have last known status propagated forward using mapping
+    evidence: PD/transitionMatrix.ipynb:181(map)
+  - behavior: Pivot table aggregation for count matrices
+    description: Uses pivot_table with aggfunc=sum to aggregate counts across accounts per Segment/Aging combination
+    evidence: PD/transitionMatrix.ipynb:371(pivot)
+  replaceable_points:
+  - name: status_mapping
+    description: How aging states map to final status determines PD definition
+    options:
+    - name: ever_default
+      traits:
+      - Conservative
+      - Captures any default event
+      fit_for:
+      - Regulatory reporting
+      - Conservative provisioning
+      not_fit_for:
+      - Optimistic scenarios
+      - Low-default portfolios
+    - name: max_status
+      traits:
+      - Moderate
+      - Uses worst observed status
+      fit_for:
+      - Standard IFRS 9
+      - General purpose
+      not_fit_for:
+      - Non-performing loan analysis
+    - name: first_default
+      traits:
+      - Moderate
+      - Captures first default event
+      fit_for:
+      - Default timing analysis
+      - Recovery analysis
+      not_fit_for:
+      - Aggregate default rates
+    default: ever_default
+  - name: matrix_normalization
+    description: Row vs column normalization affects probability interpretation
+    options:
+    - name: row
+      traits:
+      - From-state normalization
+      - Most common in credit risk
+      fit_for:
+      - Migration probability interpretation
+      - Standard credit risk models
+      not_fit_for:
+      - Flow analysis
+      - Inventory models
+    - name: column
+      traits:
+      - To-state normalization
+      - Useful for flows
+      fit_for:
+      - Flow analysis
+      - Entry/exit analysis
+      not_fit_for:
+      - Migration probability interpretation
+    - name: double
+      traits:
+      - Both normalizations
+      - Comprehensive view
+      fit_for:
+      - Validation purposes
+      - Model comparison
+      not_fit_for:
+      - Production systems
+      - Simple interpretation
+    default: row
+  design_decisions:
+  - decision: Status mapping uses max(axis=1) for 12M status
+    evidence: PD/transitionMatrix.ipynb:165(max)
+    rationale: Takes worst status observed in 12-month window; 12MStatus=max(aging) captures any default during window
+  - decision: Fill with lastStatus for censored performing loans
+    evidence: PD/transitionMatrix.ipynb:181(map)
+    rationale: Accounts still performing at observation end need last known status propagated
+  - decision: Use pivot_table with aggfunc=sum for matrix
+    evidence: PD/transitionMatrix.ipynb:371(pivot)
+    rationale: Aggregates counts across accounts per Segment/Aging/Aging12Adj combination
+  acceptance_hints:
+  - Transition matrices are row-stochastic (rows sum to 1.0)
+  - Default state (4) is absorbing (100% self-transition or exit to closure)
+  - Matrix multiplication produces valid lifetime PD estimates
+- id: survival_analysis
+  name: Survival Analysis for PD
+  order: 3
+  responsibility: Non-parametric survival analysis to estimate marginal and conditional PD term structures from historical cohort data, providing unbiased 12-month PD estimates that form the TTC baseline.
+  interface:
+    inputs: Cohort transaction data with dfFlag for default events and time-to-event information
+    outputs: Lifetime marginal PD curves by segment
+  required_methods:
+  - name: survivalAnalysis.ipynb
+    description: Forward survival computation using shift operations for survival probability estimation
+    evidence: PD/survivalAnalysis.ipynb:141
+  - name: lifetimeCalibration.ipynb
+    description: Marginal PD calculation from conditional PD using survival function approach
+    evidence: PD/lifetimeCalibration.ipynb:274
+  key_behaviors:
+  - behavior: Marginal PD via conditional PD times survival to period t-1
+    description: Marginal PD at period t = conditional PD at t * survival probability to t-1, calculated via cumPD.shift(1)
+    evidence: PD/lifetimeCalibration.ipynb:274(shift)
+  - behavior: Lifetime PD via survival function product
+    description: Lifetime PD = 1 - product of (1 - conditional PDs); standard survival function approach using cumprod
+    evidence: PD/lifetimeCalibration.ipynb:286(cumprod)
+  - behavior: Numerical calibration using fsolve
+    description: Root-finding to calibrate lifetime curves to observed central tendency when analytical solutions unavailable
+    evidence: PD/lifetimeCalibration.ipynb:58(fsolve)
+  replaceable_points:
+  - name: survival_function
+    description: Method for survival probability estimation affects PD precision
+    options:
+    - name: manual
+      traits:
+      - Custom implementation
+      - Full control
+      - Requires validation
+      fit_for:
+      - Research
+      - Custom distributions
+      - Audited methodology
+      not_fit_for:
+      - Quick implementation
+      - Standard reporting
+    - name: lifelines_km
+      traits:
+      - Kaplan-Meier estimator
+      - Industry standard
+      - Well-tested
+      fit_for:
+      - Production systems
+      - Regulatory acceptance
+      not_fit_for:
+      - Censored data with covariates
+      - Complex survival patterns
+    - name: numpy
+      traits:
+      - Vectorized numpy
+      - High performance
+      - Basic survival
+      fit_for:
+      - Large datasets
+      - Simple survival patterns
+      not_fit_for:
+      - Censored data
+      - Complex survival
+    default: manual
+  - name: calibration_method
+    description: Lifetime calibration approach for fitting curves to observed data
+    options:
+    - name: fsolve
+      traits:
+      - Root-finding
+      - Fast convergence
+      - Single solution
+      fit_for:
+      - Standard calibration
+      - Production use
+      not_fit_for:
+      - Multiple solutions
+      - Non-convex problems
+    - name: scipy_minimize
+      traits:
+      - Optimization-based
+      - Flexible
+      - Multiple local minima
+      fit_for:
+      - Complex calibrations
+      - Multiple optima
+      not_fit_for:
+      - Simple calibrations
+      - Speed requirements
+    - name: grid_search
+      traits:
+      - Exhaustive search
+      - Robust
+      - Computationally expensive
+      fit_for:
+      - Small parameter spaces
+      - Robustness testing
+      not_fit_for:
+      - Large parameter spaces
+      - Production calibration
+    default: fsolve
+  design_decisions:
+  - decision: cumPD.shift(1) for marginal PD calculation
+    evidence: PD/lifetimeCalibration.ipynb:274(shift)
+    rationale: Marginal PD at period t = conditional PD at t * survival probability to t-1
+  - decision: conPD * np.cumprod(1 - conPD) pattern
+    evidence: PD/lifetimeCalibration.ipynb:286(cumprod)
+    rationale: Lifetime PD = 1 - product of (1 - conditional PDs); standard survival function approach
+  - decision: Use fsolve for lifetime calibration
+    evidence: PD/lifetimeCalibration.ipynb:58(fsolve)
+    rationale: Numerical root-finding to calibrate lifetime curves to observed central tendency
+  acceptance_hints:
+  - Marginal PDs are non-negative and decrease over time (survival effect)
+  - Cumulative PD approaches 1.0 as time horizon extends
+  - Calibration residuals are within acceptable tolerance
+- id: forward_looking_adjustment
+  name: Forward-Looking PD Adjustment
+  order: 4
+  responsibility: Incorporates macroeconomic variables (CCI, macro factors) to create Point-in-Time (PIT) PD from Through-the-Cycle (TTC) estimates, ensuring IFRS 9 forward-looking requirement.
+  interface:
+    inputs: TTC PD curves, macroeconomic indicator time series (CCI, NPL ratio)
+    outputs: PIT PD term structure adjusted for forward-looking macro expectations
+  required_methods:
+  - name: cci.ipynb
+    description: Credit Cycle Index calculation with survival adjustment for macro-PD linkage
+    evidence: PD/cci.ipynb:190
+  - name: vasicekTransitionMatrix.ipynb
+    description: Vasicek single-factor model for conditional transition matrices under macro stress
+    evidence: PD/vasicekTransitionMatrix.ipynb:1
+  - name: simplifiedCCI.ipynb
+    description: Simplified CCI with single rho parameter for systematic risk loading
+    evidence: PD/simplifiedCCI.ipynb:792
+  key_behaviors:
+  - behavior: CCI incorporates lagged survival rates
+    description: Credit cycle index uses survive shift(1) with fillna(0) to create prior period reference for macro linkage
+    evidence: PD/simplifiedCCI.ipynb:792(shift)
+  - behavior: Vasicek single-factor model for systematic correlation
+    description: Basel asset correlation (rho) provides systematic factor loading for macro stress scenarios
+    evidence: PD/vasicekBaselRho.ipynb:1
+  - behavior: Efficient groupby without sorting
+    description: Group by Aging with sort=False to avoid expensive sort operations, assuming data already ordered by time
+    evidence: PD/cci.ipynb:190(groupby)
+  replaceable_points:
+  - name: macro_model
+    description: Macro variable integration method affects PIT adjustment granularity
+    options:
+    - name: CCI
+      traits:
+      - Credit Cycle Index
+      - Composite indicator
+      - Sector-specific
+      fit_for:
+      - Standard IFRS 9
+      - Multi-sector portfolios
+      not_fit_for:
+      - Single-factor models
+      - Regulatory stress testing
+    - name: vasicek
+      traits:
+      - Single-factor Gaussian
+      - Regulatory aligned
+      - Conditional PD
+      fit_for:
+      - Regulatory capital alignment
+      - Stress testing
+      not_fit_for:
+      - Multi-factor dependencies
+      - Tail dependence
+    - name: regression
+      traits:
+      - Statistical regression
+      - Data-driven
+      - Explainable
+      fit_for:
+      - Economic research
+      - Variable selection
+      not_fit_for:
+      - Real-time updates
+      - Non-linear relationships
+    default: CCI
+  - name: correlation_parameter
+    description: Systematic risk factor loading determines portfolio correlation
+    options:
+    - name: basel_rho
+      traits:
+      - Basel regulatory values
+      - Product-based
+      - Validated
+      fit_for:
+      - Regulatory alignment
+      - Capital calculation
+      not_fit_for:
+      - Internal model validation
+      - Portfolio-specific correlation
+    - name: calibrated_rho
+      traits:
+      - Internal calibration
+      - Portfolio-specific
+      - Data-driven
+      fit_for:
+      - Internal models
+      - Peer comparison
+      not_fit_for:
+      - Regulatory submission
+      - Quick implementation
+    - name: historical
+      traits:
+      - Historical estimation
+      - Observable correlation
+      - Retrospective
+      fit_for:
+      - Backtesting
+      - Model validation
+      not_fit_for:
+      - Forward-looking scenarios
+      - New portfolios
+    default: basel_rho
+  design_decisions:
+  - decision: CCI uses survive shift(1) with fillna(0)
+    evidence: PD/simplifiedCCI.ipynb:792(shift)
+    rationale: Credit cycle index incorporates lagged survival rates; shift(1) creates prior period reference
+  - decision: Vasicek single-factor model for rho
+    evidence: PD/vasicekBaselRho.ipynb:1
+    rationale: Basel asset correlation provides systematic factor loading for macro stress
+  - decision: Group by Aging with sort=False for efficiency
+    evidence: PD/cci.ipynb:190(groupby)
+    rationale: Avoids expensive sort operation; assumes data already ordered by time
+  acceptance_hints:
+  - PIT PDs are higher than TTC in downturn scenarios and lower in upturns
+  - CCI values move counter-cyclically with credit conditions
+  - Forward-looking adjustment is applied AFTER TTC PD calibration (DEEP-009 invariant)
+- id: lgd_estimation
+  name: LGD Model Estimation
+  order: 5
+  responsibility: Estimates Loss Given Default using recovery data with EIR discounting. Models include direct cost but exclude indirect costs per IFRS 9 unbias requirement.
+  interface:
+    inputs: Recovery amounts, direct costs, EIR, aging flags, ACCOUNT_ID time series
+    outputs: Unbiased LGD estimates by segment and time-to-recovery
+  required_methods:
+  - name: LGDFunctionModel.ipynb
+    description: Multi-period recovery projection with EIR discounting for present value calculation
+    evidence: LGD/LGDFunctionModel.ipynb:2019
+  key_behaviors:
+  - behavior: EIR discounting for IFRS 9 compliance
+    description: IFRS 9 requires discounting recovery cash flows at original EIR to get present value of expected recoveries
+    evidence: LGD/LGDFunctionModel.ipynb:2019(EIR)
+  - behavior: Indirect costs excluded per IFRS 9 unbias requirement
+    description: IFRS 9 requires unbiased LGD estimates; indirect costs excluded from regulatory LGD but not Basel LGD
+    evidence: LGD/README.md:22
+  - behavior: Account-level recovery tracking via groupby shift
+    description: Each account's recovery timeline tracked separately via groupby shift operations on ACCOUNT_ID
+    evidence: LGD/LGDFunctionModel.ipynb:463(shift)
+  replaceable_points:
+  - name: lgd_definition
+    description: LGD calculation basis determines recovery measurement approach
+    options:
+    - name: workout
+      traits:
+      - Workout-based
+      - Internal data
+      - Bank-specific
+      fit_for:
+      - Banks with workout operations
+      - Collateral-heavy portfolios
+      not_fit_for:
+      - Trading book
+      - Market-based recoveries
+    - name: market
+      traits:
+      - Market price based
+      - Observable prices
+      - Mark-to-market
+      fit_for:
+      - Trading portfolios
+      - Traded debt instruments
+      not_fit_for:
+      - Illiquid positions
+      - Workout-intensive portfolios
+    - name: hybrid
+      traits:
+      - Combination approach
+      - Blend of methods
+      - Flexible
+      fit_for:
+      - Mixed portfolios
+      - Best practice
+      not_fit_for:
+      - Simple requirements
+      - Regulatory simplicity
+    default: workout
+  - name: discount_method
+    description: Discount rate selection affects LGD present value calculation
+    options:
+    - name: EIR
+      traits:
+      - IFRS 9 compliant
+      - Contractual rate
+      - Original EIR
+      fit_for:
+      - IFRS 9 reporting
+      - General purpose
+      not_fit_for:
+      - Market-based valuation
+      - Fair value disclosure
+    - name: risk_free
+      traits:
+      - Government yield
+      - No credit spread
+      - Conservative
+      fit_for:
+      - Conservative estimates
+      - Regulatory comparisons
+      not_fit_for:
+      - IFRS 9 compliance
+      - Economic value
+    - name: original_rate
+      traits:
+      - Contractual rate
+      - Similar to EIR
+      - Simple
+      fit_for:
+      - Simple implementation
+      - Validation purposes
+      not_fit_for:
+      - Complex fee structures
+      - Variable rate loans
+    default: EIR
+  design_decisions:
+  - decision: EIR discounting required per IFRS 9
+    evidence: LGD/LGDFunctionModel.ipynb:2019(EIR)
+    rationale: IFRS 9 requires discounting recovery cash flows at original EIR to get present value
+  - decision: Exclude indirect costs from LGD
+    evidence: LGD/README.md:22
+    rationale: IFRS 9 unbias requirement; indirect costs excluded from regulatory LGD but not IFRS 9 LGD
+  - decision: Shift by ACCOUNT_ID for recovery tracking
+    evidence: LGD/LGDFunctionModel.ipynb:463(shift)
+    rationale: Each account's recovery timeline tracked separately via groupby shift operations
+  acceptance_hints:
+  - LGD values are between 0% and 100%
+  - EIR discounting produces lower LGD than undiscounted for long recovery periods
+  - Unbiased LGD (excluding indirect costs) is lower than regulatory LGD
+- id: ead_estimation
+  name: Exposure at Default (EAD) Estimation
+  order: 6
+  responsibility: Calculates outstanding balance at default, accounting for limit utilization and drawdown patterns for revolving facilities and hybrid loan structures.
+  interface:
+    inputs: Account limits, outstanding balances, utilization history by ACCOUNT_ID
+    outputs: EAD estimates by account and time bucket
+  required_methods:
+  - name: ECLLimitLevel_Truncate.ipynb
+    description: Limit utilization with cumsum shift for available balance calculation and EAD projection
+    evidence: ECL/ECLLimitLevel_Truncate.ipynb:6119
+  key_behaviors:
+  - behavior: Running limit calculation via cumsum.shift().fillna(0)
+    description: Available limit accumulates installments paid; shift aligns with period boundaries for EAD tracking
+    evidence: ECL/ECLLimitLevel_Truncate.ipynb:6119(shift)
+  - behavior: Hybrid loan handling for TL/RP conversion
+    description: Accounts can convert between term loan and revolving; limit/truncate logic varies by product type
+    evidence: ECL/ECLLimitLevel_Truncate.ipynb:6119
+  - behavior: Hierarchical LimitID vs AccountID structure
+    description: One limit can cover multiple accounts; hierarchical structure needed for consolidated EAD calculation
+    evidence: ECL/ECLLimitLevel_Truncate.ipynb:76
+  replaceable_points:
+  - name: ead_model
+    description: EAD calculation method determines how undrawn amounts are treated
+    options:
+    - name: ccf
+      traits:
+      - Credit Conversion Factor
+      - Regulatory aligned
+      - Drawdown estimate
+      fit_for:
+      - Revolving facilities
+      - Regulatory reporting
+      not_fit_for:
+      - Term loans
+      - Fixed exposure instruments
+    - name: fixed_ratio
+      traits:
+      - Fixed percentage
+      - Simple
+      - Conservative
+      fit_for:
+      - Limited data
+      - Quick implementation
+      not_fit_for:
+      - Revolving facilities
+      - Variable utilization
+    - name: historical
+      traits:
+      - Historical averages
+      - Data-driven
+      - Product-specific
+      fit_for:
+      - Mature portfolios
+      - Validation purposes
+      not_fit_for:
+      - New products
+      - Rapidly changing portfolios
+    default: ccf
+  - name: limit_treatment
+    description: How unused limits are treated for revolving exposure
+    options:
+    - name: truncate
+      traits:
+      - Cap at limit
+      - Standard Basel
+      - Conservative
+      fit_for:
+      - Standard revolving
+      - Regulatory alignment
+      not_fit_for:
+      - Over-limit facilities
+      - Soft limits
+    - name: hybrid
+      traits:
+      - Adaptive treatment
+      - Product-specific
+      - Flexible
+      fit_for:
+      - Mixed portfolios
+      - Custom implementations
+      not_fit_for:
+      - Simple requirements
+      - Regulatory simplicity
+    - name: term_only
+      traits:
+      - No revolving component
+      - Simple
+      - No CCF
+      fit_for:
+      - Term loans only
+      - Simple portfolios
+      not_fit_for:
+      - Revolving facilities
+      - Credit cards
+    default: truncate
+  design_decisions:
+  - decision: cumsum.shift().fillna(0) for running limit
+    evidence: ECL/ECLLimitLevel_Truncate.ipynb:6119(shift)
+    rationale: Available limit accumulates installments paid; shift aligns with period boundaries
+  - decision: Hybrid loan handling (TL/RP conversion)
+    evidence: ECL/ECLLimitLevel_Truncate.ipynb:6119
+    rationale: Accounts can convert between term loan and revolving; limit/truncate logic varies
+  - decision: Separate LimitID vs AccountID tracking
+    evidence: ECL/ECLLimitLevel_Truncate.ipynb:76
+    rationale: One limit can cover multiple accounts; need hierarchical structure for EAD
+  acceptance_hints:
+  - EAD does not exceed committed limit for revolving facilities
+  - Hybrid loan conversions are properly tracked across product types
+  - EAD for term loans equals outstanding balance (no undrawn component)
+- id: staging_classification
+  name: IFRS 9 Staging Classification
+  order: 7
+  responsibility: Classifies accounts into Stage 1 (12-month ECL), Stage 2 (lifetime ECL), or Stage 3 (credit-impaired) based on SICR (Significant Increase in Credit Risk) criteria.
+  interface:
+    inputs: Account IDs, aging status, historical PDs, macro conditions
+    outputs: Stage assignment (1, 2, or 3) per account per reporting date
+  required_methods:
+  - name: backwardTransaction.ipynb
+    description: Backward-looking aging shift for staging historical assessment and bucket-based staging criteria
+    evidence: Staging/backwardTransaction.ipynb:150,205
+  key_behaviors:
+  - behavior: Backward shift for historical staging assessment
+    description: Staging at time t requires knowing status at t-1, t-2 for SICR assessment using backward shift operations
+    evidence: Staging/backwardTransaction.ipynb:150(shift)
+  - behavior: Bucket-based staging thresholds via aging migration
+    description: SICR determined by bucket migration (0->1 triggers stage 2, 4 triggers stage 3) for objective classification
+    evidence: Staging/backwardTransaction.ipynb:205
+  - behavior: 30-day past due as rebuttable presumption backstop
+    description: IFRS 9 allows 30dpd as rebuttable presumption for SICR determination if not rebutted with supporting analysis
+    evidence: README.md:19
+  replaceable_points:
+  - name: sicr_method
+    description: SICR assessment method determines how credit risk increase is measured
+    options:
+    - name: relative
+      traits:
+      - PD ratio comparison
+      - Threshold-based
+      - Relative to origination
+      fit_for:
+      - Standard IFRS 9
+      - Low-default portfolios
+      not_fit_for:
+      - High-default portfolios
+      - Rapid migration
+    - name: absolute
+      traits:
+      - Absolute PD thresholds
+      - Quantitative
+      - Fixed cutoffs
+      fit_for:
+      - Simple implementation
+      - Clear risk appetite
+      not_fit_for:
+      - Varying origination PDs
+      - Segment-specific
+    - name: backstop
+      traits:
+      - 30dpd rule
+      - Regulatory safe harbor
+      - Conservative
+      fit_for:
+      - Regulatory compliance
+      - Simple rules
+      not_fit_for:
+      - Early detection
+      - Sophisticated risk management
+    default: relative
+  - name: stage_thresholds
+    description: PD migration thresholds determine stage boundaries
+    options:
+    - name: ifrs9_default
+      traits:
+      - Standard IFRS 9
+      - 2x threshold
+      - Regulatory accepted
+      fit_for:
+      - General purpose
+      - Regulatory reporting
+      not_fit_for:
+      - Custom risk appetite
+      - Internal models
+    - name: basel_based
+      traits:
+      - Basel-inspired
+      - Regulatory aligned
+      - Conservative
+      fit_for:
+      - Capital optimization
+      - Regulatory alignment
+      not_fit_for:
+      - Pure IFRS 9
+      - Economic provisioning
+    - name: internal
+      traits:
+      - Internal calibration
+      - Custom thresholds
+      - Data-driven
+      fit_for:
+      - Advanced models
+      - Custom risk appetite
+      not_fit_for:
+      - Regulatory submission
+      - Simple requirements
+    default: ifrs9_default
+  design_decisions:
+  - decision: Backward shift for historical staging
+    evidence: Staging/backwardTransaction.ipynb:150(shift)
+    rationale: Staging at time t requires knowing status at t-1, t-2 for SICR assessment
+  - decision: Bucket-based staging thresholds
+    evidence: Staging/backwardTransaction.ipynb:205
+    rationale: SICR determined by bucket migration (0->1 triggers stage 2, 4 triggers stage 3)
+  - decision: 30-day past due as backstop
+    evidence: README.md:19
+    rationale: IFRS 9 allows 30dpd as rebuttable presumption for SICR
+  acceptance_hints:
+  - Stage 3 (credit-impaired) accounts use lifetime ECL with 100% PD
+  - Stage 2 accounts that cure for 12 consecutive months return to Stage 1
+  - Stage determination precedes PD/LGD/EAD computation (DEEP-001 invariant)
+- id: amortization_scheduling
+  name: Amortization Schedule Generation
+  order: 8
+  responsibility: Computes contractual cash flows (principal, interest, fees) over loan lifetime for ECL discounting. Handles normal and abnormal amortization patterns.
+  interface:
+    inputs: Interest rate, terms, principal balance, EIR
+    outputs: Period-by-period payment schedule with Beginning_Balance, Payment, Principal, Interest, Ending_Balance
+  required_methods:
+  - name: amortization.ipynb
+    description: Standard amortization using numpy-financial pmt/ppmt/ipmt for regular loan schedules
+    evidence: ECL/amortization.ipynb:93
+  - name: abAmortization.ipynb
+    description: Abnormal amortization for inconsistent term/rate/installment hybrid loan structures
+    evidence: ECL/abAmortization.ipynb:1
+  key_behaviors:
+  - behavior: Standard amortization via numpy-financial
+    description: Standard PMT/IPMT/PPMT functions handle annuity calculations correctly for regular payment schedules
+    evidence: ECL/amortization.ipynb:99(pmt)
+  - behavior: Monthly rate convention for banking
+    description: Monthly rate = annual_rate/12 following banking convention for installment loans with monthly compounding
+    evidence: ECL/amortization.ipynb:99
+  - behavior: Ending balance via cumulative principal
+    description: Ending_Balance = balance + cumsum(Principal); principal values are negative in numpy-financial convention
+    evidence: ECL/amortization.ipynb:102
+  - behavior: Separate abnormal amortization for edge cases
+    description: Hybrid loans with inconsistent terms need different calculation logic than standard annuities
+    evidence: ECL/abAmortization.ipynb:1
+  replaceable_points:
+  - name: compounding
+    description: Interest compounding frequency affects payment calculations
+    options:
+    - name: monthly
+      traits:
+      - 12 periods/year
+      - Banking standard
+      - Common
+      fit_for:
+      - Standard loans
+      - IFRS 9 reporting
+      not_fit_for:
+      - Daily accrual
+      - Continuous compounding
+    - name: daily
+      traits:
+      - 365 periods/year
+      - Accrual-based
+      - Precise
+      fit_for:
+      - Accrual accounting
+      - Variable rate loans
+      not_fit_for:
+      - Simple loans
+      - Computational efficiency
+    - name: continuous
+      traits:
+      - Infinite periods
+      - Mathematical
+      - Theoretical
+      fit_for:
+      - Mathematical modeling
+      - Derivative pricing
+      not_fit_for:
+      - Banking practice
+      - IFRS 9 compliance
+    default: monthly
+  - name: schedule_type
+    description: Amortization schedule variant for different loan structures
+    options:
+    - name: standard
+      traits:
+      - Equal payments
+      - Annuity-based
+      - Simple
+      fit_for:
+      - Consumer loans
+      - Standard mortgages
+      not_fit_for:
+      - Balloon payments
+      - Step-rate loans
+    - name: abnormal
+      traits:
+      - Irregular payments
+      - Flexible
+      - Complex
+      fit_for:
+      - Hybrid loans
+      - Custom structures
+      not_fit_for:
+      - Standard loans
+      - Regulatory simplicity
+    - name: bullet
+      traits:
+      - Interest-only
+      - Balloon principal
+      - Zero amortization
+      fit_for:
+      - Bridge loans
+      - Project finance
+      not_fit_for:
+      - Standard amortization
+      - Principal paydown
+    default: standard
+  design_decisions:
+  - decision: Use numpy-financial for standard amortization
+    evidence: ECL/amortization.ipynb:99(pmt)
+    rationale: Standard PMT/IPMT/PPMT functions handle annuity calculations correctly
+  - decision: Monthly rate = annual_rate/12
+    evidence: ECL/amortization.ipynb:99
+    rationale: Banking convention for installment loans; monthly compounding period
+  - decision: Ending_Balance = balance + cumsum(Principal)
+    evidence: ECL/amortization.ipynb:102
+    rationale: Principal values are negative; cumulative sum tracks net reduction from original balance
+  - decision: Separate abnormal amortization for edge cases
+    evidence: ECL/abAmortization.ipynb:1
+    rationale: Hybrid loans with inconsistent terms need different calculation logic
+  acceptance_hints:
+  - Final ending balance equals zero for fully amortizing loans
+  - Sum of principal payments equals original loan amount
+  - EIR must be expressed as annual rate for pmt but divided by 12 for monthly periods
+- id: ecl_calculation
+  name: ECL Computation
+  order: 9
+  responsibility: Calculates Expected Credit Loss as ECL = PD × LGD × EAD, discounted at EIR. Applies stage-appropriate PD (12-month for Stage 1, lifetime for Stage 2/3) per IFRS 9 requirements.
+  interface:
+    inputs: PD term structure, LGD estimates, EAD schedules, staging, discount rates
+    outputs: 12-month ECL and Lifetime ECL by account and time bucket
+  required_methods:
+  - name: ECLLimitLevel_Truncate.ipynb
+    description: Main ECL calculation with stage-specific PD application, limit-level aggregation, and truncation logic
+    evidence: ECL/ECLLimitLevel_Truncate.ipynb:1
+  key_behaviors:
+  - behavior: Stage-specific PD application
+    description: Stage 1 accounts use 12-month PD; Stage 2 and 3 accounts use lifetime PD per IFRS 9.5.5.3 requirement
+    evidence: README.md:19-20
+  - behavior: ECL discounted at original EIR
+    description: IFRS 9 definition of credit loss uses EIR discounting for present value calculation
+    evidence: README.md:24
+  - behavior: Unbiased estimates required
+    description: Regulatory floors and downturn adjustments must be removed from Basel models for IFRS 9 compliance
+    evidence: README.md:21
+  replaceable_points:
+  - name: discount_rate
+    description: ECL discounting rate affects present value of expected losses
+    options:
+    - name: EIR
+      traits:
+      - IFRS 9 compliant
+      - Original rate
+      - Standard
+      fit_for:
+      - IFRS 9 reporting
+      - General purpose
+      not_fit_for:
+      - Market-based valuation
+      - Fair value disclosure
+    - name: risk_free_plus
+      traits:
+      - Risk-free plus spread
+      - Market-based
+      - Conservative
+      fit_for:
+      - Conservative estimates
+      - Stress scenarios
+      not_fit_for:
+      - IFRS 9 compliance
+      - Standard reporting
+    - name: original_effective
+      traits:
+      - Effective rate
+      - Contractual
+      - Simple
+      fit_for:
+      - Simple implementation
+      - Validation
+      not_fit_for:
+      - Variable rate
+      - Complex fee structures
+    default: EIR
+  - name: probability_weighting
+    description: Multi-scenario ECL weighting for macroeconomic scenarios
+    options:
+    - name: base
+      traits:
+      - Base case weighting
+      - Single scenario
+      - Central estimate
+      fit_for:
+      - Simple reporting
+      - Model validation
+      not_fit_for:
+      - Regulatory submission
+      - Comprehensive scenarios
+    - name: optimistic
+      traits:
+      - Optimistic scenarios weighted
+      - Best case
+      - Lower provisions
+      fit_for:
+      - Management overlays
+      - Upside scenarios
+      not_fit_for:
+      - Regulatory compliance
+      - Conservatism
+    - name: downturn
+      traits:
+      - Downturn scenarios weighted
+      - Conservative
+      - Higher provisions
+      fit_for:
+      - Regulatory compliance
+      - Conservative provisioning
+      not_fit_for:
+      - Economic upturn
+      - Capital optimization
+    default: base
+  design_decisions:
+  - decision: Stage 1 uses 12M PD, Stage 2/3 uses lifetime PD
+    evidence: README.md:19-20
+    rationale: IFRS 9.5.5.3 requirement; Stage 1 accounts with low risk use 12-month horizon
+  - decision: ECL discounted at original EIR
+    evidence: README.md:24
+    rationale: IFRS 9 definition of credit loss uses EIR discounting for present value
+  - decision: Unbiased estimates required
+    evidence: README.md:21
+    rationale: Remove floors, downturn adjustments from regulatory models
+  acceptance_hints:
+  - Stage 1 ECL = PD_12M × LGD × EAD × discount factor
+  - Stage 2/3 ECL = Σ(PD_lifetime_t × LGD × EAD_t × discount_factor_t)
+  - Final ECL provisions flow to accounting systems for financial reporting
+source:
+  commit_hash: 0614c825d53ae1293a7f7ed76206b9bcf025ea7d
+  extraction_methods:
+  - semi_auto
+  projects:
+  - ifrs9
+sop_version: '3.6'
+business_decisions:
+- id: BD-001
+  type: B/BA
+  content: Use pandas .shift(-i) for forward window creation to generate 12-month performance status flags
+  rationale: 'Negative shift creates forward-looking columns that capture account status over the next 12 months. This enables cohort-based PD calculation from historical data. BREAKS IF: The shift operation
+    assumes chronological ordering of monthkey values; unsorted data produces incorrect temporal associations.'
+  evidence: PD/transitionMatrix.ipynb:133(shift)
+  stage: transaction_staging
+  alternative_considered: Rolling window functions were not considered but could provide equivalent forward-looking aggregation
+- id: BD-002
+  type: BA
+  content: Group by AccountID before applying shift operations to prevent cross-account data contamination
+  rationale: 'Without groupby, pandas shift would move rows across account boundaries, mixing timeline data from different borrowers. This is a hidden assumption about data structure that could silently
+    corrupt results. BREAKS IF: Account identifiers are missing or duplicated in the dataset.'
+  evidence: PD/transitionMatrix.ipynb:133(groupby)
+  stage: transaction_staging
+  alternative_considered: Row-by-row iteration with account boundary checks was rejected for performance reasons
+- id: BD-003
+  type: B/DK
+  content: Exclude accounts with fewer than 12 months of observation using maxMonthkey-12 filter
+  rationale: 'Requires minimum 12-month window to calculate reliable 12M PD. Accounts with shorter histories cannot contribute to cohort analysis. BREAKS IF: Business requirement changes to shorter performance
+    windows or if data quality issues cause premature account termination.'
+  evidence: PD/transitionMatrix.ipynb:196(query)
+  stage: transaction_staging
+  alternative_considered: Dynamic window based on data availability was not implemented
+- id: BD-004
+  type: B/BA
+  content: Use max(axis=1) aggregation for 12M status determination, capturing worst status observed in the performance window
+  rationale: 'Taking the maximum aging code across the 12-month window identifies if account ever defaulted during observation period. This implements ''ever-default'' logic. BREAKS IF: Business switches
+    to ''first-default'' or ''last-default'' semantics for staging.'
+  evidence: PD/transitionMatrix.ipynb:165(max)
+  stage: transition_matrix
+  alternative_considered: First default (minimum period) or last default tracking were not evaluated
+- id: BD-005
+  type: BA
+  content: Propagate last known status to censored performing accounts using .map() with status dictionary
+  rationale: 'Accounts still performing at observation cutoff have no 12M status yet; propagating lastStatus assumes no deterioration occurs after observation end. BREAKS IF: Economic conditions deteriorate
+    sharply after the observation date.'
+  evidence: PD/transitionMatrix.ipynb:181(map)
+  stage: transition_matrix
+  alternative_considered: Conservative assumption of deterioration for censored accounts was not implemented
+- id: BD-006
+  type: B
+  content: Use pivot_table with aggfunc=sum to aggregate count matrices by Segment/Aging/Aging12Adj
+  rationale: 'Summation aggregation counts accounts moving between aging states for transition probability calculation. BREAKS IF: Segmentation variables change or if counts need weighted rather than simple
+    aggregation.'
+  evidence: PD/transitionMatrix.ipynb:371(pivot)
+  stage: transition_matrix
+  alternative_considered: Weighted average by exposure was not considered
+- id: BD-007
+  type: M/B
+  content: Calculate marginal PD as conditional PD at period t multiplied by survival probability to t-1
+  rationale: 'This implements the actuarial survival function: marginal_PD(t) = S(t-1) * q(t) where S is survival and q is hazard. Changes to this formula directly affect lifetime PD precision. BREAKS IF:
+    Alternative survival function formulations are used.'
+  evidence: PD/lifetimeCalibration.ipynb:274(shift)
+  stage: survival_analysis
+  alternative_considered: Kaplan-Meier estimator was referenced but not implemented for 12M PD
+- id: BD-008
+  type: M/BA
+  content: 'Apply survival function formula: Lifetime PD = 1 - product of (1 - conditional PDs) using np.cumprod'
+  rationale: 'Standard survival function: P(default by T) = 1 - ∏(1 - q_t). This is a named mathematical theory. BREAKS IF: Conditional PDs are not independently distributed or if time dependency exists.'
+  evidence: PD/lifetimeCalibration.ipynb:286(cumprod)
+  stage: survival_analysis
+  alternative_considered: Alternative survival function formulations (exponential, Weibull) were not evaluated
+- id: BD-009
+  type: B/BA
+  content: Use scipy.optimize.fsolve for numerical root-finding to calibrate lifetime curves to observed central tendency
+  rationale: 'Calibration ensures model outputs match historical portfolio behavior. fsolve finds parameter values that minimize deviation from targets. BREAKS IF: Initial parameter guesses are poor or
+    function is non-convex.'
+  evidence: PD/lifetimeCalibration.ipynb:58(fsolve)
+  stage: survival_analysis
+  alternative_considered: scipy.minimize or grid search were listed as alternatives but not implemented
+- id: BD-010
+  type: B/BA
+  content: Credit Cycle Index (CCI) incorporates lagged survival rates using survive.shift(1) with fillna(0)
+  rationale: 'Lagged survival creates prior-period reference for CCI calculation, enabling cycle identification. fillna(0) handles first period. BREAKS IF: Fill strategy changes or lag period differs, altering
+    cycle phase identification.'
+  evidence: PD/simplifiedCCI.ipynb:792(shift)
+  stage: forward_looking_adjustment
+  alternative_considered: Multiple lag periods or adaptive lag were not evaluated
+- id: BD-011
+  type: M/DK
+  content: Vasicek single-factor model with Basel rho values for systematic asset correlation
+  rationale: 'Vasicek model is a named mathematical theory for credit portfolio risk. Basel rho provides standardized correlation parameters. Changes affect PIT PD precision significantly. BREAKS IF: Asset
+    correlations are regime-dependent or Basel parameters are outdated.'
+  evidence: N/A:0(see_rationale)
+  stage: forward_looking_adjustment
+  alternative_considered: Regime-switching or time-varying correlation models were not implemented
+- id: BD-012
+  type: T/BA
+  content: Group by Aging with sort=False assumption for computational efficiency
+  rationale: 'Skipping sort assumes input data is already chronologically ordered, saving expensive sorting operation. This is a hidden assumption. BREAKS IF: Input data arrives out of order, causing incorrect
+    temporal associations.'
+  evidence: PD/cci.ipynb:190(groupby)
+  stage: forward_looking_adjustment
+  alternative_considered: Explicit sort with validation overhead was rejected for performance
+- id: BD-013
+  type: B/RC
+  content: Discount recovery cash flows at original Effective Interest Rate (EIR) per IFRS 9 requirement
+  rationale: 'IFRS 9 paragraph 5.5.17 mandates EIR discounting for credit loss calculation. This is a regulatory requirement. BREAKS IF: Regulatory definition changes or if EIR is miscalculated.'
+  evidence: N/A:0(see_rationale)
+  stage: lgd_estimation
+  alternative_considered: Risk-free rate discounting was rejected as non-compliant with IFRS 9
+- id: BD-014
+  type: B/RC/BA
+  content: Exclude indirect costs from LGD calculation per IFRS 9 unbias requirement
+  rationale: 'IFRS 9 requires unbiased estimates; indirect costs (overhead, collection effort) would bias LGD upward. BREAKS IF: Audit interpretation differs or if indirect costs become directly attributable.'
+  evidence: N/A:0(see_rationale)
+  stage: lgd_estimation
+  alternative_considered: Hybrid approach with partial indirect cost allocation was not implemented
+- id: BD-015
+  type: B/BA
+  content: Use cumsum.shift().fillna(0) pattern for running available limit calculation per account
+  rationale: 'Cumulative sum tracks installment payments; shift aligns with period boundaries; fillna handles first period. BREAKS IF: Payments are not recorded sequentially or if account transfers occur
+    mid-period.'
+  evidence: ECL/ECLLimitLevel_Truncate.ipynb:6119(shift)
+  stage: ead_estimation
+  alternative_considered: Event-driven limit tracking was not implemented
+- id: BD-016
+  type: DK
+  content: Handle hybrid loan products (term loan to revolving conversion) with separate truncation logic
+  rationale: 'Product conversion requires different EAD treatment for each phase. This is market-specific product knowledge. BREAKS IF: New conversion pathways are introduced or regulatory treatment of
+    hybrids changes.'
+  evidence: N/A:0(see_rationale)
+  stage: ead_estimation
+  alternative_considered: Unified EAD model for each product types was not implemented
+- id: BD-017
+  type: B
+  content: Maintain separate LimitID and AccountID hierarchies for EAD calculation
+  rationale: 'One limit facility can cover multiple accounts; hierarchical structure needed for proper exposure attribution. BREAKS IF: Data model changes to flat account structure or if facility relationships
+    are mischaracterized.'
+  evidence: N/A:0(see_rationale)
+  stage: ead_estimation
+  alternative_considered: Account-level limit allocation without facility structure was rejected
+- id: BD-018
+  type: B
+  content: Use backward shift for historical staging criteria, requiring status at t-1 and t-2 for SICR assessment
+  rationale: 'SICR determination requires trajectory over time; backward shift creates lagged status columns for comparison. BREAKS IF: SICR definition changes to single-period assessment or requires different
+    lookback.'
+  evidence: Staging/backwardTransaction.ipynb:150(shift)
+  stage: staging_classification
+  alternative_considered: Point-in-time assessment without history was not compliant with IFRS 9
+- id: BD-019
+  type: BA
+  content: Implement bucket-based staging thresholds where aging migration triggers stage transitions
+  rationale: 'SICR determined by observable bucket movement (0->1 triggers Stage 2, 4 triggers Stage 3). This assumes observable delinquencies are leading indicators. BREAKS IF: Early warning indicators
+    exist before bucket migration.'
+  evidence: N/A:0(see_rationale)
+  stage: staging_classification
+  alternative_considered: ML-based early warning system was not implemented
+- id: BD-020
+  type: B/RC
+  content: Use 30-day past due as rebuttable presumption for SICR per IFRS 9 paragraph B5.5.1
+  rationale: 'IFRS 9 allows 30dpd as backstop; this is explicitly mentioned in standard. BREAKS IF: Regulatory interpretation changes or if jurisdiction-specific rules differ.'
+  evidence: N/A:0(see_rationale)
+  stage: staging_classification
+  alternative_considered: Shorter (60dpd) or longer (90dpd) backstop was not evaluated
+- id: BD-021
+  type: T
+  content: Use numpy-financial library PMT/IPMT/PPMT functions for standard amortization calculation
+  rationale: 'Standard library implementation of annuity formulas; equivalent to manual calculation. Using this library vs implementing formulas manually produces identical business output. BREAKS IF: Library
+    is unavailable or has bugs.'
+  evidence: ECL/amortization.ipynb:99(pmt)
+  stage: amortization_scheduling
+  alternative_considered: Manual PMT/IPMT/PPMT implementation using standard formulas
+- id: BD-022
+  type: B/BA
+  content: Divide annual interest rate by 12 for monthly payment calculation (banking convention)
+  rationale: 'Standard banking convention for installment loans uses monthly compounding period. BREAKS IF: Product uses daily or continuous compounding.'
+  evidence: N/A:0(see_rationale)
+  stage: amortization_scheduling
+  alternative_considered: Daily compounding (rate/365) was not implemented
+- id: BD-023
+  type: B/BA
+  content: Use cumulative sum of negative principal values to track ending balance reduction
+  rationale: 'Principal payments are negative (cash outflow); cumsum tracks net reduction. BREAKS IF: Convention changes to positive principal values or if fees are included in principal calculation.'
+  evidence: ECL/amortization.ipynb:102(cumsum)
+  stage: amortization_scheduling
+  alternative_considered: Separate fee tracking was not considered in core amortization
+- id: BD-024
+  type: DK/B
+  content: Implement separate abnormal amortization logic for inconsistent term/rate/installment products
+  rationale: 'Hybrid loans with variable parameters cannot use standard annuity formula. This handles market-specific product complexity. BREAKS IF: New irregular payment patterns emerge without corresponding
+    logic.'
+  evidence: N/A:0(see_rationale)
+  stage: amortization_scheduling
+  alternative_considered: General numerical amortization method for each product types was not implemented
+- id: BD-025
+  type: B/RC
+  content: 'Apply Stage 1/2/3 PD rules: 12-month PD for Stage 1, lifetime PD for Stage 2/3'
+  rationale: 'IFRS 9 paragraph 5.5.3 mandates lifetime ECL for significant credit risk increase. This is a regulatory requirement. BREAKS IF: Stage boundaries change or if lifetime calculation is unavailable.'
+  evidence: N/A:0(see_rationale)
+  stage: ecl_calculation
+  alternative_considered: Probability-weighted scenarios across stages were not implemented
+- id: BD-026
+  type: B/RC
+  content: Calculate ECL as PD × LGD × EAD, discounted at original EIR
+  rationale: 'ECL definition in IFRS 9 paragraph 5.5.17 specifies three-factor multiplication with EIR discounting. BREAKS IF: Any factor uses book value instead of present value.'
+  evidence: N/A:0(see_rationale)
+  stage: ecl_calculation
+  alternative_considered: Simplified approach without discounting was rejected as non-compliant
+- id: BD-027
+  type: B/RC
+  content: Require unbiased ECL estimates by removing regulatory floors and downturn LGD adjustments
+  rationale: 'IFRS 9 unbias principle conflicts with Basel conservative floors. Regulatory LGD must be adjusted for accounting purposes. BREAKS IF: Unbias adjustment is incorrectly implemented or omitted.'
+  evidence: N/A:0(see_rationale)
+  stage: ecl_calculation
+  alternative_considered: Partial unbias approach was not evaluated
+- id: BD-028
+  type: B
+  content: Stage determination MUST precede PD/LGD/EAD computation in processing pipeline
+  rationale: 'PD selection depends on stage assignment; computing in wrong order produces incorrect stage-specific ECL. BREAKS IF: Parallel processing or different ordering is attempted.'
+  evidence: N/A:0(see_rationale)
+  stage: ecl_calculation
+  alternative_considered: Iterative refinement was not considered
+- id: BD-029
+  type: DK
+  content: Default LGD assumption of 50% when portfolio recovery data is insufficient
+  rationale: 'Conservative but reasonable fallback based on typical recovery experience. This is domain knowledge from credit markets. BREAKS IF: Actual portfolio recovery differs significantly from 50%.'
+  evidence: N/A:0(see_rationale)
+  stage: lgd_estimation
+  alternative_considered: Sector-specific LGD assumptions were not implemented
+- id: BD-030
+  type: M/B
+  content: Cumulative PD must be computed BEFORE marginal PD via diff() operation
+  rationale: 'Mathematical dependency: marginal_PD(t) = cumPD(t) - cumPD(t-1). Reversing breaks denominator for conditional PD. BREAKS IF: Parallel computation is attempted.'
+  evidence: N/A:0(see_rationale)
+  stage: survival_analysis
+  alternative_considered: Alternative hazard function formulations were not evaluated
+- id: BD-031
+  type: B
+  content: CCI forward-looking adjustment MUST be applied AFTER TTC PD calibration
+  rationale: 'CCI modifies TTC estimates; applying before calibration would amplify errors. BREAKS IF: Order is reversed or parallelized.'
+  evidence: N/A:0(see_rationale)
+  stage: forward_looking_adjustment
+  alternative_considered: Joint calibration of TTC and CCI parameters was not implemented
+- id: BD-032
+  type: DK
+  content: Use 15-year lifetime horizon as default for non-retail PD term structure
+  rationale: 'Non-retail products typically have longer maturities; 15 years is conservative industry practice. BREAKS IF: Product mix shifts to longer or shorter duration.'
+  evidence: N/A:0(see_rationale)
+  stage: survival_analysis
+  alternative_considered: Dynamic horizon based on remaining term was not implemented
+- id: BD-033
+  type: M/B
+  content: Transition matrix multiplication used for lifetime PD aggregation across periods
+  rationale: 'Matrix multiplication chains transition probabilities: P(lifetime) = P(1) × P(2) × ... × P(n). Named mathematical operation. BREAKS IF: Alternative aggregation method is used.'
+  evidence: N/A:0(see_rationale)
+  stage: transition_matrix
+  alternative_considered: Monte Carlo simulation for lifetime aggregation was not evaluated
+- id: BD-034
+  type: B
+  content: Univariate analysis filtering MUST precede multivariate analysis to avoid multicollinearity
+  rationale: 'Screening variables individually before combining prevents estimation instability. BREAKS IF: Multivariate analysis is attempted without screening.'
+  evidence: N/A:0(see_rationale)
+  stage: transition_matrix
+  alternative_considered: Simultaneous variable selection was not implemented
+- id: BD-035
+  type: M/DK
+  content: Use Gamma distribution fitting to extend lifetime PD curves beyond observed data
+  rationale: 'Gamma distribution is named mathematical theory for extrapolation. Assumes tail behavior matches Gamma. BREAKS IF: Actual tail differs or distribution is misspecified.'
+  evidence: N/A:0(see_rationale)
+  stage: survival_analysis
+  alternative_considered: Weibull, lognormal distributions were not compared
+- id: BD-036
+  type: M/DK
+  content: Use Nelson-Siegel curve fitting for lifetime marginal PD extrapolation
+  rationale: 'Nelson-Siegel is named mathematical framework for yield curve (and PD curve) extrapolation. BREAKS IF: Term structure has non-monotonic behavior that Nelson-Siegel cannot capture.'
+  evidence: N/A:0(see_rationale)
+  stage: survival_analysis
+  alternative_considered: Spline-based extrapolation was not evaluated
+- id: BD-037
+  type: DK/B
+  content: CHAID algorithm for borrower segmentation creating mutually exclusive groups
+  rationale: 'CHAID is market-standard decision tree for credit segmentation. Market knowledge encoded in tree structure. BREAKS IF: Segments become non-homogeneous or if new segmentation variables emerge.'
+  evidence: N/A:0(see_rationale)
+  stage: transition_matrix
+  alternative_considered: Alternative algorithms (CART, random forest) were not compared
+- id: BD-038
+  type: M/DK
+  content: Non-parametric survival analysis used for 12-month unbias PD estimation
+  rationale: 'Non-parametric approach avoids distributional assumptions. Market knowledge about unbias requirement encoded. BREAKS IF: Parametric method is used or if censoring assumptions are violated.'
+  evidence: N/A:0(see_rationale)
+  stage: survival_analysis
+  alternative_considered: Kaplan-Meier estimator was referenced but not implemented
+- id: BD-039
+  type: B
+  content: Clustering of macro variables MUST be completed before regression model fitting
+  rationale: 'Regression models require properly grouped predictors; clustering provides structure. BREAKS IF: Clustering is skipped or uses wrong number of clusters.'
+  evidence: N/A:0(see_rationale)
+  stage: forward_looking_adjustment
+  alternative_considered: Unstructured regression with each macro variables was not evaluated
+- id: BD-040
+  type: T
+  content: Use np.where via dictionary mapping instead of .mask().ffill() for pandas efficiency
+  rationale: 'Pure performance optimization: dictionary mapping is ~10x faster on large datasets. Swapping to mask would produce identical results with worse performance. BREAKS IF: Performance is not a
+    concern.'
+  evidence: PD/transitionMatrix.ipynb:177(mask comment)
+  stage: transition_matrix
+  alternative_considered: Pandas mask approach was rejected for performance
+- id: BD-041
+  type: DK
+  content: Backward transaction flow processed BEFORE forward flow in staging pipeline
+  rationale: 'Historical staging requires backward-looking data before forward performance can be assessed. Market-specific processing order. BREAKS IF: Business rules change to require simultaneous processing.'
+  evidence: N/A:0(see_rationale)
+  stage: transaction_staging
+  alternative_considered: Parallel bidirectional processing was not implemented
+- id: BD-042
+  type: BA
+  content: Shift results require fillna(0) for first-period values; NaN propagates through cumsum/cumprod breaking survival functions
+  rationale: 'First period has no prior observation; NaN would break cumulative calculations. Hidden assumption about data completeness. BREAKS IF: Fillna strategy changes or if data has structural gaps.'
+  evidence: PD/lifetimeCalibration.ipynb:274(shift fillna)
+  stage: survival_analysis
+  alternative_considered: Forward-fill or interpolation were not evaluated
+- id: BD-043
+  type: B/BA
+  content: EIR must be expressed as annual rate for PMT calculation but divided by 12 for monthly compounding
+  rationale: 'Finance convention: EIR annual → monthly rate conversion for installment calculations. BREAKS IF: Daily or continuous compounding is used instead.'
+  evidence: ECL/amortization.ipynb:99(rate/12)
+  stage: amortization_scheduling
+  alternative_considered: Daily compounding was not implemented
+- id: BD-044
+  type: B/BA
+  content: EAD model selection defaults to CCF (Credit Conversion Factor) approach
+  rationale: 'CCF method converts undrawn commitments to EAD based on historical drawdown patterns. BREAKS IF: Historical CCF is unavailable or if drawdown patterns change.'
+  evidence: N/A:0(see_rationale)
+  stage: ead_estimation
+  alternative_considered: Fixed proportion (100%) was rejected as overly conservative
+- id: BD-045
+  type: RC
+  content: 'IFRS 9 three-stage impairment model: Stage 1 applies 12-month ECL, Stages 2-3 apply Lifetime ECL based on significant credit risk increase'
+  rationale: IFRS 9 accounting standard mandates the three-stage framework for credit loss recognition. This is a regulatory requirement that cannot be changed without violating accounting standards. The
+    framework establishes how expected credit losses are recognized based on credit risk deterioration since initial recognition.
+  evidence: N/A:0(see_rationale)
+  stage: ECL Framework
+  alternative_considered: Simplified approach vs General approach - General approach chosen per IFRS 9 requirements
+- id: BD-046
+  type: M/BA
+  content: ECL = PD × LGD × EAD, discounted at EIR or credit-adjusted EIR
+  rationale: The fundamental mathematical decomposition of credit loss into probability of default, loss given default, and exposure at default components, discounted at the effective interest rate. Changing
+    this formula would directly alter loss reserve calculations with different numerical outputs.
+  evidence: N/A:0(see_rationale)
+  stage: ECL Calculation
+  alternative_considered: Individual assessment vs collective assessment - both use same core formula
+- id: BD-047
+  type: B
+  content: 'Stage 1 EAD amortization: 12-month cap for term loans with tenor > 12 months, full tenor for Stage 2'
+  rationale: The 12-month amortization cap for Stage 1 term loans represents a specific implementation choice for EAD calculation. This approach caps the exposure for early-stage accounts, but an alternative
+    (full tenor) could be used. The choice affects EAD magnitude and consequently ECL amounts.
+  evidence: N/A:0(see_rationale)
+  stage: EAD Calculation
+  alternative_considered: Full tenor vs 12-month cap - 12-month cap chosen for Stage 1 conservatism
+- id: BD-048
+  type: M
+  content: EAD for revolving facilities = Outstanding + (Available Limit × CCF), where CCF accounts for undrawn portion
+  rationale: The EAD formula for revolving facilities uses a credit conversion factor to estimate expected future drawdowns on undrawn commitments. The CCF methodology is a standard approach in credit risk
+    modeling. Different CCF values would produce different EAD estimates.
+  evidence: N/A:0(see_rationale)
+  stage: EAD Calculation
+  alternative_considered: CCF vs undrawn amount only - CCF approach chosen for forward-looking estimate
+- id: BD-049
+  type: T
+  content: Discount time = index + 1 (1-based months after reporting date)
+  rationale: The 1-based indexing for discount time periods is a technical implementation detail for array indexing. Swapping to 0-based indexing would require corresponding code changes but would produce
+    identical mathematical results with proper offset adjustment. No impact on business output.
+  evidence: ECL/ECLLimitLevel_Truncate.ipynb:623(AMT function)
+  stage: ECL Calculation
+  alternative_considered: Month-end vs period-end timing - these are equivalent representations
+- id: BD-050
+  type: RC/DK
+  content: Default flag = 1 when Aging >= 4 (90+ days past due)
+  rationale: The 90-day past due threshold aligns with IFRS 9 and Basel regulatory requirements for default definition. However, the specific 90DPD vs 60DPD choice reflects market practice and portfolio
+    characteristics in the specific jurisdiction - this is domain knowledge specific to this credit portfolio.
+  evidence: N/A:0(see_rationale)
+  stage: Default Definition
+  alternative_considered: 60 DPD vs 90 DPD threshold - 90DPD chosen per regulatory requirements
+- id: BD-051
+  type: RC
+  content: LGD Model excludes indirect costs, includes only direct costs per IFRS 9
+  rationale: IFRS 9 requires unbiased estimates excluding regulatory conservatism. The standard explicitly requires removal of indirect costs and regulatory adjustments to arrive at an unbiased loss given
+    default estimate that reflects economic reality.
+  evidence: N/A:0(see_rationale)
+  stage: LGD Calculation
+  alternative_considered: Include indirect costs per Basel vs exclude per IFRS 9 - IFRS 9 unbias approach chosen
+- id: BD-052
+  type: M
+  content: LGD = Flow Rate(Closed) × Expected Loss Rate(Closed) + Flow Rate(Open) × Expected Loss Rate(Open)
+  rationale: This formula calculates LGD as a weighted average across Closed (liquidated) and Open (ongoing) recovery pathways. The mathematical structure ensures the LGD reflects the mixture of recovery
+    outcomes. Different pathway weights or rates would produce different LGD estimates.
+  evidence: N/A:0(see_rationale)
+  stage: LGD Calculation
+  alternative_considered: Single pathway vs multiple pathways - multiple pathways capture recovery heterogeneity
+- id: BD-053
+  type: RC
+  content: Recovery calculation uses EIR for discounting cashflows (IFRS 9 requirement)
+  rationale: IFRS 9 mandates using the effective interest rate for discounting expected cash flows. The EIR reflects the original contract rate adjusted for fees and transaction costs, ensuring consistent
+    discounting methodology across the portfolio.
+  evidence: N/A:0(see_rationale)
+  stage: LGD Calculation
+  alternative_considered: EIR vs origination rate - EIR mandated per IFRS 9
+- id: BD-054
+  type: DK/B
+  content: Survival analysis uses 12-month forward performance window with 72-month observation period
+  rationale: The 12-month forward performance window and 72-month observation period are choices driven by the available data period (2014-2019) and portfolio characteristics. These represent domain knowledge
+    about the specific credit portfolio and data availability, not universal mathematical truths.
+  evidence: N/A:0(see_rationale)
+  stage: PD Estimation
+  alternative_considered: Shorter/longer observation periods - constrained by data availability 2014-2019
+- id: BD-055
+  type: B/DK
+  content: Survival curves exclude write-offs, inactive accounts, and accounts with <12 month performance window
+  rationale: These exclusion rules represent implementation choices about which accounts to include in PD estimation. Write-offs may still have recovery value, and the <12 month exclusion limits sample
+    size. These choices affect PD estimates and could be modified.
+  evidence: N/A:0(see_rationale)
+  stage: PD Data Filtering
+  alternative_considered: Include vs exclude these populations - exclusion chosen to focus on performing accounts
+- id: BD-056
+  type: M/BA
+  content: Central Tendency calibration uses Bayesian techniques to estimate long-run historical default rate
+  rationale: The Bayesian approach to Central Tendency estimation uses prior information and observed data to estimate the long-run default rate. This is a named statistical methodology (Bayesian inference)
+    where changing the method would affect the precision and stability of estimates.
+  evidence: N/A:0(see_rationale)
+  stage: PD Calibration
+  alternative_considered: Simple average vs Bayesian CT estimation - Bayesian chosen for modern structured approach
+- id: BD-057
+  type: M/DK
+  content: 'PD Calibration formula: PD_calibrated = (PD_bucket × PD_ttc/PD_target) / (PD_bucket × PD_ttc/PD_target + (1-PD_bucket) × (1-PD_ttc)/(1-PD_target))'
+  rationale: This is a specific Bayesian calibration formula combining bucket-level TTC PD with target overall level PD. The mathematical structure derives from Bayes' theorem application. Different calibration
+    approaches would produce different adjusted PD values.
+  evidence: N/A:0(see_rationale)
+  stage: PD Calibration
+  alternative_considered: Scaling method vs Bayesian formula - Bayesian formula chosen
+- id: BD-058
+  type: M
+  content: Credit Cycle Index (CCI) used for forward-looking PD adjustment in transition matrix model
+  rationale: The CCI methodology incorporates macroeconomic conditions into conditional transition matrices. This is a named quantitative approach for forward-looking PD estimation. Different macro adjustments
+    would produce different conditional PD estimates.
+  evidence: N/A:0(see_rationale)
+  stage: Forward-Looking PD
+  alternative_considered: CCI vs direct macro regression - CCI chosen for cycle adjustment
+- id: BD-059
+  type: M/DK
+  content: Vasicek single factor model used for lifetime PD term structure with forward-looking information
+  rationale: The Vasicek single-factor model is a named mathematical model from credit risk literature that generates lifetime PD term structures using asset correlation. This model has specific mathematical
+    assumptions (normal distribution, single systematic factor) that affect PD precision. Changing to a different model would affect lifetime PD estimates.
+  evidence: N/A:0(see_rationale)
+  stage: Lifetime PD Estimation
+  alternative_considered: Basel rho vs estimated rho - asset correlation parameter choice
+- id: BD-060
+  type: M
+  content: Gamma distribution fitting used to extrapolate lifetime curves for longer periods
+  rationale: Gamma distribution is a named statistical distribution used for lifetime curve extrapolation. The choice of distribution family affects the shape of extrapolated curves and consequently lifetime
+    PD estimates. Different distributions (Weibull, lognormal) would produce different extrapolations.
+  evidence: N/A:0(see_rationale)
+  stage: Lifetime PD Estimation
+  alternative_considered: Nelson-Siegel vs Gamma vs Weibull distribution - Gamma chosen for bounded PD curves
+- id: BD-061
+  type: M/DK
+  content: CHAID analysis used for PD segmentation
+  rationale: CHAID (Chi-squared Automatic Interaction Detection) is a named statistical algorithm for optimal segmentation. This decision tree approach has specific mathematical properties for finding optimal
+    borrower groupings. Different segmentation methods would produce different segment structures.
+  evidence: N/A:0(see_rationale)
+  stage: PD Segmentation
+  alternative_considered: Expert segmentation vs statistical segmentation - CHAID chosen for data-driven approach
+- id: BD-062
+  type: M/DK
+  content: 12-Month ODR calculated as Bad/N at each aging bucket for segment-specific PD estimation
+  rationale: The ODR formula (observed default rate = bad accounts / total accounts) is a fundamental statistical ratio. The specific aging bucket structure and segment breakdown represent implementation
+    choices for this calculation.
+  evidence: N/A:0(see_rationale)
+  stage: PD Estimation
+  alternative_considered: Pooled vs segmented estimation - segmented chosen for segment-specific PD
+- id: BD-063
+  type: B
+  content: Hybrid loans can convert between revolving (RP) and term loan (TL) based on truncate option
+  rationale: The ability for hybrid loans to convert between revolving and term loan types represents a business rule about loan features. This is a mutable implementation choice that affects how EAD is
+    calculated for these accounts. A different approach would be to treat them as fixed-type throughout.
+  evidence: N/A:0(see_rationale)
+  stage: EAD Calculation
+  alternative_considered: Fixed type vs convertible loan - convertible chosen for product flexibility
+- id: BD-064
+  type: B/RC
+  content: Unbias LGD removes floors and downturn adjustments from regulatory LGD
+  rationale: 'This decision involves two components: (1) the regulatory requirement (IFRS 9 unbias) and (2) the specific implementation of removing floors and downturn adjustments. If IFRS 9 didn''t exist,
+    the regulatory LGD with floors would still be used - so this is a business implementation choice layered on top of regulatory guidance.'
+  evidence: N/A:0(see_rationale)
+  stage: LGD Calculation
+  alternative_considered: Keep regulatory floor vs remove - removal per IFRS 9 unbias requirement
+- id: BD-065
+  type: BA
+  content: PD Assumed LGD assumes 50% LGD for portfolios with insufficient data
+  rationale: The 50% LGD assumption for insufficient portfolios is a hidden economic assumption about typical recovery rates. This assumption is encoded rather than derived from data and represents a business
+    assumption that could be changed to a different default value.
+  evidence: N/A:0(see_rationale)
+  stage: PD Estimation
+  alternative_considered: Assume LGD vs use actual LGD - assumed 50% chosen as conservative fallback
+- id: BD-066
+  type: M/DK
+  content: Cluster analysis with K-Means used for macro variable selection in forward-looking models
+  rationale: K-Means is a named clustering algorithm used for grouping correlated macroeconomic variables. This statistical method has specific mathematical properties and affects which variables are selected
+    for macro-PD models. Different clustering methods would produce different variable groupings.
+  evidence: N/A:0(see_rationale)
+  stage: Forward-Looking PD
+  alternative_considered: Expert selection vs cluster-based selection - cluster-based chosen for data-driven approach
+- id: BD-067
+  type: M
+  content: Silhouette analysis used to determine optimal number of clusters in K-Means
+  rationale: Silhouette analysis is a named quantitative method (coefficient ranging from -1 to 1) for evaluating cluster quality. This method mathematically determines the optimal k by maximizing cohesion
+    and separation. Different methods (elbow, gap statistic) would produce different optimal k values.
+  evidence: N/A:0(see_rationale)
+  stage: Forward-Looking PD
+  alternative_considered: Fixed k vs silhouette-optimized k - silhouette method chosen for quantitative validation
+- id: BD-068
+  type: M/DK
+  content: Lasso regression used for feature selection in multivariate macro regression models
+  rationale: Lasso (Least Absolute Shrinkage and Selection Operator) is a named statistical method with L1 regularization that performs feature selection by shrinking coefficients to zero. This has specific
+    mathematical properties affecting variable selection. Different methods (stepwise, ridge) would select different variables.
+  evidence: N/A:0(see_rationale)
+  stage: Forward-Looking PD
+  alternative_considered: Stepwise vs Lasso vs expert selection - Lasso chosen for regularization approach
+- id: BD-069
+  type: M
+  content: Distribution selection tests multiple statistical distributions to find best-fit lifetime curves
+  rationale: Testing multiple distributions (Beta, Gamma, lognormal, Weibull, etc.) and selecting the best fit is a statistical model selection approach. The choice of information criterion and distribution
+    families affects which curve is selected. Different criteria would produce different selections.
+  evidence: N/A:0(see_rationale)
+  stage: Lifetime PD Estimation
+  alternative_considered: Fixed distribution vs best-fit selection - best-fit chosen for flexibility
+- id: BD-070
+  type: M/DK
+  content: Bayes calibration for lifetime uses Bayes formula compared to scaling method
+  rationale: Bayesian calibration using Maximum a Posteriori (MAP) estimation is a named statistical methodology. This approach combines prior information with observed data through Bayes' theorem. Different
+    prior specifications or estimation methods would produce different calibrated values.
+  evidence: N/A:0(see_rationale)
+  stage: Lifetime PD Estimation
+  alternative_considered: Scaling vs Bayes formula - Bayes approach chosen for principled estimation
+- id: BD-071
+  type: M/DK
+  content: Theoretical Migration Matrix (TMM) model used for low default portfolios using external rating
+  rationale: The TMM approach using external ratings (Moody's) for low default portfolios is a specific quantitative methodology. This leverages external data to calibrate stable transition matrices. Different
+    external sources or methods would produce different PD estimates for low-default portfolios.
+  evidence: N/A:0(see_rationale)
+  stage: PD Estimation
+  alternative_considered: Internal data only vs external rating migration - external rating chosen for stability
+- id: BD-072
+  type: M/BA
+  content: KMV model leverages individual risk assessment from financial statement and historical stock data
+  rationale: The KMV model is a named structural credit model based on Merton's option-theoretic framework. It uses equity prices and volatility to estimate default probability through the distance-to-default
+    metric. Different structural models would produce different individual PD estimates.
+  evidence: N/A:0(see_rationale)
+  stage: PD Estimation
+  alternative_considered: Reduced-form vs structural model - KMV structural approach chosen
+- id: BD-073
+  type: M/DK
+  content: NRT Matrix model uses reference row of transition matrix to overcome unstable count observations for non-retail portfolios
+  rationale: The NRT (Null Reference Term) matrix approach is a specific smoothing methodology for handling sparse data in non-retail transition matrices. This addresses data insufficiency through mathematical
+    adjustment. Different smoothing methods would produce different adjusted matrices.
+  evidence: N/A:0(see_rationale)
+  stage: Transition Matrix
+  alternative_considered: Raw observation vs NRT adjustment - NRT smoothing chosen for stability
+- id: BD-074
+  type: M/DK
+  content: Generator matrix used for transition matrix model adjustment
+  rationale: The generator matrix (infinitesimal generator) is a mathematical tool for deriving continuous-time Markov chain transition matrices. This has specific mathematical properties for matrix exponentiation.
+    Different continuous-time approaches would produce different matrix dynamics.
+  evidence: N/A:0(see_rationale)
+  stage: Transition Matrix
+  alternative_considered: Additive vs multiplicative adjustment - generator matrix approach chosen
+- id: BD-075
+  type: M
+  content: HAC adjustment using Newey-West estimator for heteroskedasticity and autocorrelation consistent standard errors
+  rationale: The Newey-West estimator is a named statistical method for computing heteroskedasticity and autocorrelation consistent (HAC) standard errors. This corrects inference in time series regression.
+    Different correction methods would affect standard error estimates and significance tests.
+  evidence: N/A:0(see_rationale)
+  stage: Regression Validation
+  alternative_considered: OLS vs HAC standard errors - HAC chosen for time series autocorrelation
+- id: BD-076
+  type: M/DK
+  content: Cook's Distance and Studentised Residual used for outlier analysis in regression models
+  rationale: Cook's Distance and Studentized Residuals are named statistical diagnostic measures for identifying influential observations and outliers. These have specific mathematical thresholds and properties.
+    Different outlier detection methods would identify different observations.
+  evidence: N/A:0(see_rationale)
+  stage: Regression Validation
+  alternative_considered: Visual inspection vs statistical tests - statistical tests chosen for objectivity
+- id: BD-077
+  type: RC
+  content: 'Monitoring required: PD estimates must be monitored continuously and recalibrated when necessary'
+  rationale: IFRS 9 requires ongoing model performance validation and recalibration when necessary. This is a regulatory requirement for model governance. The frequency and triggers for recalibration are
+    part of regulatory expectations.
+  evidence: N/A:0(see_rationale)
+  stage: Model Governance
+  alternative_considered: Annual vs continuous monitoring - continuous monitoring per IFRS 9
+- id: BD-078
+  type: RC
+  content: Significant Increase in Credit Risk assessed via relative PD change threshold and absolute threshold
+  rationale: IFRS 9 requires assessment of significant credit risk increase for staging transfers. The specific relative and absolute thresholds are regulatory implementation choices that determine when
+    accounts move between Stage 1 and Stage 2. These thresholds directly affect provision amounts.
+  evidence: N/A:0(see_rationale)
+  stage: Staging
+  alternative_considered: Absolute threshold only vs relative + absolute - both thresholds used per IFRS 9 guidance
+- id: BD-079
+  type: RC
+  content: Probability-weighted outcomes used in ECL measurement reflecting range of possible outcomes
+  rationale: IFRS 9.5.5.17 mandates that ECL must reflect an unbiased probability-weighted amount considering multiple scenarios. This is a regulatory requirement that ECL cannot be based solely on a single
+    scenario or most likely outcome.
+  evidence: N/A:0(see_rationale)
+  stage: ECL Calculation
+  alternative_considered: Point estimate vs probability-weighted scenarios - multiple scenarios required per IFRS 9
+  vague_rationale: true
+- id: BD-080
+  type: T
+  content: Logit transformation of ODR for PD modeling
+  rationale: Logit transformation is a standard statistical method for bounded probability data. The specific scipy.special.logit implementation is a standard library function. Using probit or raw probability
+    would be equivalent transformations with different numerical scaling.
+  evidence: N/A:0(see_rationale)
+  stage: PD Modeling
+  alternative_considered: Raw probability, probit transform, log-odds - each produce equivalent model results
+- id: BD-081
+  type: T
+  content: Variable clustering using VarClusHi algorithm
+  rationale: VarClusHi is a standard statistical algorithm for grouping correlated variables. The implementation uses eigenvalue-based splitting in the varclushi library. Alternative methods (PCA, correlation
+    grouping) would produce similar groupings without affecting final model outputs.
+  evidence: N/A:0(see_rationale)
+  stage: Variable Analysis
+  alternative_considered: PCA, correlation-based grouping, domain expertise - each equivalent approaches
+- id: BD-082
+  type: T
+  content: Z-score normalization for stationarity testing
+  rationale: Z-score standardization is a standard statistical preprocessing step. The scipy implementation is standard. Alternative scalers (min-max, robust) would produce different numerical scales but
+    equivalent statistical properties after transformation.
+  evidence: N/A:0(see_rationale)
+  stage: Data Preprocessing
+  alternative_considered: Min-max scaling, robust scaling - each produce equivalent standardized data
+- id: BD-083
+  type: T
+  content: Linear regression for PD-macroeconomics relationship using OLS
+  rationale: OLS linear regression is a standard statistical estimation method. The sklearn implementation is standard library code. Alternative regularized methods (Ridge, LASSO) are separate models, not
+    technical alternatives to OLS itself.
+  evidence: N/A:0(see_rationale)
+  stage: Regression Analysis
+  alternative_considered: Ridge regression, LASSO, elastic net - these are separate model choices
+- id: BD-084
+  type: T
+  content: Row-normalization of transition matrices from count data
+  rationale: Row-normalization ensuring row sums equal 1.0 is a standard mathematical constraint for transition matrices. The normalization implementation is standard array manipulation. Alternative normalizations
+    (column, doubly stochastic) would produce different matrices.
+  evidence: N/A:0(see_rationale)
+  stage: Matrix Calculation
+  alternative_considered: Column normalization, doubly stochastic - different probability constraints
+- id: BD-085
+  type: M/DK
+  content: Risk weight mapping for Basel asset classes
+  rationale: 'Risk weight mapping to Basel asset classes (EL: 0.05, 0.1, 0.35, 1.0, 6.25; Capital: 0.7, 0.9, 1.15, 2.5, 0) is a specific mathematical mapping with regulatory origins. The inverse relationship
+    between EL and capital weight has specific mathematical implications.'
+  evidence: N/A:0(see_rationale)
+  stage: Risk Weighting
+  alternative_considered: Continuous risk scoring, expert-based weights - discrete bucketing per Basel
+- id: BD-086
+  type: M
+  content: fsolve for implied LGD calculation from risk weights using Newton-Raphson
+  rationale: fsolve (Newton-Raphson method) is a named numerical optimization technique for finding roots of the LGD equation derived from risk weights. Different numerical solvers would converge to the
+    same solution with potentially different convergence properties.
+  evidence: N/A:0(see_rationale)
+  stage: LGD Calculation
+  alternative_considered: Analytical inversion, grid search - numerical method chosen for flexibility
+- id: BD-087
+  type: M/BA
+  content: Beta distribution for PD curve fitting
+  rationale: Beta distribution is a named statistical distribution bounded [0,1] suitable for probability data. The scipy parameterization (alpha, beta) is standard. Different distributions (Gamma, lognormal)
+    would fit the data differently.
+  evidence: N/A:0(see_rationale)
+  stage: Distribution Fitting
+  alternative_considered: Gamma, lognormal, Weibull distributions - Beta chosen for bounded [0,1] support
+- id: BD-088
+  type: M/DK
+  content: curve_fit for distribution parameter estimation using non-linear least squares
+  rationale: curve_fit using non-linear least squares is a named estimation method for fitting distribution parameters. The Levenberg-Marquardt algorithm has specific convergence properties. Alternative
+    methods (MLE, method of moments) would produce potentially different estimates.
+  evidence: N/A:0(see_rationale)
+  stage: Parameter Estimation
+  alternative_considered: Maximum likelihood estimation, method of moments - least squares chosen
+- id: BD-089
+  type: M
+  content: R-squared for distribution fit evaluation
+  rationale: R-squared is a named metric for evaluating goodness of fit. The sklearn implementation is standard. Alternative criteria (AIC, BIC, KS test) would rank distributions differently for model selection.
+  evidence: N/A:0(see_rationale)
+  stage: Model Selection
+  alternative_considered: AIC, BIC, Kolmogorov-Smirnov test - R² chosen for interpretability
+- id: BD-090
+  type: M/DK
+  content: Cubic spline interpolation for macroeconomic gaps
+  rationale: Cubic spline interpolation is a named mathematical method for smooth curve fitting between data points. The specific parameters (method='cubic', limit_direction='forward') define the interpolation
+    behavior. Different methods (linear, nearest) would produce different interpolated values.
+  evidence: N/A:0(see_rationale)
+  stage: Data Interpolation
+  alternative_considered: Linear interpolation, nearest neighbor - cubic spline chosen for smoothness
+- id: BD-091
+  type: M
+  content: ADF test for time series stationarity
+  rationale: ADF test is a named statistical hypothesis test for unit roots/stationarity. The statsmodels implementation follows standard methodology. Alternative tests (KPSS, Phillips-Perron) test different
+    null hypotheses for stationarity.
+  evidence: N/A:0(see_rationale)
+  stage: Time Series Analysis
+  alternative_considered: KPSS test, Phillips-Perron test - ADF chosen for standard unit root testing
+- id: BD-092
+  type: M
+  content: Seasonal decomposition of macroeconomic series
+  rationale: Seasonal decomposition is a named time series method separating trend, seasonal, and residual components. The statsmodels implementation follows classical methodology. Alternative methods (STL,
+    X-13ARIMA-SEATS) would decompose differently.
+  evidence: N/A:0(see_rationale)
+  stage: Time Series Analysis
+  alternative_considered: STL, X-13ARIMA-SEATS - classical decomposition chosen for simplicity
+- id: BD-093
+  type: M/DK
+  content: Chain-ladder development factors for IBNR estimation
+  rationale: Chain-ladder is a named actuarial method for estimating IBNR (incurred but not reported) claims. Development factors from run-off triangles have specific mathematical properties. Alternative
+    methods (Bornhuetter-Ferguson, Mack) would produce different IBNR estimates.
+  evidence: N/A:0(see_rationale)
+  stage: IBNR Estimation
+  alternative_considered: Bornhuetter-Ferguson, Mack method - chain-ladder chosen for simplicity
+- id: BD-094
+  type: M/BA
+  content: expit/sigmoid for probability estimation in calibration using scipy.special.expit
+  rationale: Expit (inverse logit) is a named mathematical function transforming log-odds to probabilities. The scipy implementation is standard. Alternative link functions (probit, complementary log-log)
+    would produce different probability transformations.
+  evidence: N/A:0(see_rationale)
+  stage: Probability Transformation
+  alternative_considered: Probit, complementary log-log - expit chosen for log-odds consistency
+- id: BD-095
+  type: M/BA
+  content: 'Downgrade/Default Probability (DDP) calculation: DDP_t = (# downgrade/default at t) / (total observations at t)'
+  rationale: DDP is calculated as a simple ratio of default events to total observations. This mathematical formula defines how portfolio-level default rates are computed for CCI calibration. Different
+    formulas would produce different default rate time series.
+  evidence: N/A:0(see_rationale)
+  stage: Default Rate Calculation
+  alternative_considered: Individual borrower PD, cohort PD - simple ratio chosen for aggregation
+- id: BD-096
+  type: M/BA
+  content: Transition probability matrix estimation from ratings using empirical frequencies
+  rationale: Transition probabilities estimated as empirical frequencies (transition counts / initial state counts) is a named statistical estimation method. The approach assumes time-homogeneous transitions.
+    Alternative methods (generator matrix, smoothing) would adjust these estimates.
+  evidence: N/A:0(see_rationale)
+  stage: Transition Matrix Estimation
+  alternative_considered: Generator matrix estimation, smoothing methods - empirical approach as baseline
+- id: BD-097
+  type: M
+  content: Exponential and quadratic curve fitting for migration using curve_fit
+  rationale: Fitting exponential decay and quadratic functions to migration data uses named non-linear regression methods. Different functional forms would produce different fitted curves for migration
+    patterns.
+  evidence: N/A:0(see_rationale)
+  stage: Curve Fitting
+  alternative_considered: Power-law, logarithmic curves - exponential/quadratic chosen for decay patterns
+- id: BD-098
+  type: M
+  content: Matrix smoothing for transition probability regularization
+  rationale: Matrix smoothing with row/column balancing is a named mathematical technique for regularizing transition matrices. The constraints ensure doubly stochastic properties. Alternative methods (IPF,
+    RAS) would regularize differently.
+  evidence: N/A:0(see_rationale)
+  stage: Matrix Regularization
+  alternative_considered: Iterative proportional fitting, RAS method - smoothing approach chosen
+- id: BD-INT-001
+  type: BA
+  content: 'INTERACTION: BD-042 (fillna(0) for shift results) × BD-008 (lifetime PD = 1 - cumprod) → Hidden dependency creating NaN propagation risk'
+  rationale: BD-042 states that shift results require fillna(0) for first-period values because NaN propagates through cumsum/cumprod and breaks survival functions. BD-008 uses np.cumprod on conditional
+    PDs. If fillna is not applied before BD-008, the cumulative product operation will produce NaN lifetime PD for each accounts, corrupting each downstream ECL calculations. This is a silent failure mode
+    where NaN may not trigger obvious errors until stage 3 calculations.
+  evidence: N/A:0(see_rationale)
+  stage: cross_stage
+  alternative_considered: Forward-fill or interpolation could be used as alternative fill strategies
+- id: BD-INT-002
+  type: B/RC
+  content: 'INTERACTION: BD-014 (exclude indirect costs) × BD-027 (remove regulatory floors) × BD-051 (LGD excludes indirect costs) → Risk cascade creating IFRS 9 unbias implementation complexity'
+  rationale: 'Three decisions address LGD unbiasing: BD-014 excludes indirect costs per IFRS 9, BD-027 removes regulatory floors and downturn adjustments, and BD-051 confirms LGD excludes indirect costs.
+    These decisions must be applied consistently. If BD-027 incorrectly removes floors but BD-014 is not applied, or if BD-014 is applied but BD-027 is not, the LGD will be biased. Additionally, BD-029
+    (50% default LGD) may conflict with unbias requirements for thin-data portfolios. The cascade risk is that changes to any one of these decisions without corresponding updates to others creates systematic
+    LGD misspecification.'
+  evidence: N/A:0(see_rationale)
+  stage: cross_stage
+  alternative_considered: Hybrid unbias approach with partial adjustments was not implemented
+- id: BD-INT-003
+  type: B/RC
+  content: 'INTERACTION: BD-028 (Stage determination MUST precede PD/LGD/EAD) × BD-025 (Stage 1 = 12-month PD, Stage 2/3 = lifetime) × BD-047 (Stage 1 EAD 12-month cap) → Contradiction risk when staging
+    order is violated'
+  rationale: 'BD-028 is an invariant requiring stage determination before PD/LGD/EAD computation. BD-025 selects 12-month vs lifetime PD based on stage. BD-047 applies different EAD amortization caps by
+    stage. If BD-028 ordering is violated and PD is computed before staging, the wrong PD type (12-month vs lifetime) will be used, combined with wrong EAD caps. This creates a contradiction: the ECL formula
+    (BD-026) uses stage-dependent components, but if order is reversed, stage assignment uses wrong ECL values, creating a circular dependency that can lead to non-convergence or wrong provisions.'
+  evidence: N/A:0(see_rationale)
+  stage: cross_stage
+  alternative_considered: Iterative refinement was not considered but could handle circular dependency
+- id: BD-INT-004
+  type: M/DK
+  content: 'INTERACTION: BD-035 (Gamma distribution for lifetime extrapolation) × BD-036 (Nelson-Siegel for marginal PD extrapolation) × BD-060 (Gamma distribution fitting) → Amplification of extrapolation
+    uncertainty'
+  rationale: Both Gamma distribution (BD-035, BD-060) and Nelson-Siegel curve fitting (BD-036) are used for lifetime curve extrapolation. Gamma assumes specific tail behavior (bounded PD curves with exponential
+    decay), while Nelson-Siegel assumes smooth factor loading decay. BD-036 notes it may produce implausible long-term PD if term structure has non-monotonic behavior. When both methods are used for different
+    purposes (Gamma for lifetime, Nelson-Siegel for marginal), the combined uncertainty in the tail extrapolations amplifies, potentially creating inconsistent long-term PD term structures that affect lifetime
+    ECL non-linearly.
+  evidence: N/A:0(see_rationale)
+  stage: cross_stage
+  alternative_considered: Weibull, lognormal, or spline-based extrapolation were not compared to assess consistency
+- id: BD-INT-005
+  type: B/BA
+  content: 'INTERACTION: BD-010 (CCI uses survive.shift(1) with fillna(0)) × BD-031 (CCI applied AFTER TTC calibration) × BD-011 (Vasicek single-factor model) → Risk cascade through forward-looking adjustment
+    pipeline'
+  rationale: 'BD-010 creates the CCI using lagged survival rates (shift(1) with fillna(0)). BD-031 requires CCI to be applied after TTC calibration. BD-011 uses Vasicek single-factor model with Basel rho
+    for systematic correlation. The cascade: (1) shift(1) requires proper temporal ordering per BD-012 (sort=False assumption), (2) CCI calculation amplifies or dampens PD based on cycle phase, (3) if CCI
+    is applied before TTC calibration (violating BD-031), the cycle adjustment is applied to uncalibrated values, (4) Vasicek then applies systematic correlation to the CCI-adjusted PD, potentially amplifying
+    cyclical effects. A stress scenario (downturn) combined with incorrect ordering could produce severely overstated or understated conditional transition matrices.'
+  evidence: N/A:0(see_rationale)
+  stage: cross_stage
+  alternative_considered: Regime-switching correlation model was not implemented to handle cycle phases natively
+- id: BD-INT-006
+  type: B/RC
+  content: 'INTERACTION: BD-013 (discount recovery at EIR) × BD-026 (ECL = PD × LGD × EAD discounted at EIR) × BD-053 (recovery discounting uses EIR) → Amplification of discounting consistency requirement'
+  rationale: 'EIR discounting appears in three places: BD-013 for LGD recovery cash flows, BD-026 for ECL calculation, and BD-053 for recovery discounting. These must use identical EIR values and day count
+    conventions. BD-043 specifies EIR as annual rate divided by 12 for monthly compounding, but the audit found no explicit day count convention (audit item 17: Day count convention - FAIL). If EIR calculation
+    uses different day count than discount factor calculation, the present value of cash flows will be inconsistent, causing systematic bias in both LGD and ECL. The amplification occurs because errors
+    compound: wrong LGD multiplied by wrong EAD, with wrong discount factor, each derived from inconsistent EIR treatment.'
+  evidence: N/A:0(see_rationale)
+  stage: cross_stage
+  alternative_considered: Standardized day count library was not implemented
+- id: BD-INT-007
+  type: BA
+  content: 'INTERACTION: BD-002 (groupby AccountID before shift) × BD-012 (groupby sort=False assumption) × BD-001 (shift -i for forward window) → Hidden dependency creating cross-account contamination
+    risk'
+  rationale: 'BD-002 requires groupby AccountID before shift operations to prevent cross-account data contamination. BD-012 uses sort=False assumption for computational efficiency, assuming input data is
+    chronologically ordered. BD-001 uses shift(-i) for forward window creation. The hidden dependency: if data arrives out of order, the groupby (even with sort=False) will not correctly associate rows
+    with their temporal neighbors, causing shift operations to create incorrect forward-looking flags. This silently corrupts the 12-month performance status flags (BD-001) and subsequently the cohort-based
+    PD calculation. The contamination is hidden because the code runs without errors but produces wrong temporal associations.'
+  evidence: N/A:0(see_rationale)
+  stage: cross_stage
+  alternative_considered: Explicit sort with validation overhead was rejected for performance, creating silent failure risk
+- id: BD-INT-008
+  type: M/B
+  content: 'INTERACTION: BD-030 (Cumulative PD computed BEFORE marginal PD via diff) × BD-007 (marginal PD = survival × conditional) × BD-008 (Lifetime PD = 1 - cumprod(1 - conditional)) → Risk cascade
+    through survival analysis ordering'
+  rationale: 'BD-030 establishes that cumulative PD must be computed before marginal PD via diff(). BD-007 defines marginal PD as survival function times conditional PD. BD-008 defines lifetime PD using
+    cumulative product of (1 - conditional PDs). The cascade: if cumulative PD is not computed first, conditional PDs cannot be derived correctly. If conditional PDs are wrong, the cumprod in BD-008 produces
+    incorrect lifetime PD. This is not just ordering - it''s mathematical dependency where BD-007''s survival function depends on BD-030''s cumulative probabilities. Errors compound through the survival
+    analysis stage into each downstream lifetime PD applications (staging, ECL, provisions).'
+  evidence: N/A:0(see_rationale)
+  stage: cross_stage
+  alternative_considered: Alternative hazard function formulations were not evaluated
+- id: BD-INT-009
+  type: BA/RC
+  content: 'INTERACTION: BD-018 (backward shift for SICR with t-1 and t-2 status) × BD-019 (bucket-based staging thresholds) × BD-020 (30-day past due rebuttable presumption) → Amplification of staging
+    sensitivity to early deterioration'
+  rationale: 'BD-018 requires status at t-1 and t-2 for SICR assessment using backward shift. BD-019 uses bucket migration (aging movement) as observable indicators. BD-020 applies 30-day past due as IFRS
+    9 rebuttable presumption. These interact: (1) BD-018 requires sufficient historical depth - if lookback window is shorter than 2 periods, SICR cannot be assessed properly; (2) BD-019 assumes bucket
+    migration is a leading indicator, but early deterioration may occur before bucket movement; (3) BD-020 provides a backstop but only for 30+ days past due. The amplification: accounts with early-stage
+    deterioration (before bucket migration and before 30dpd) are not captured by any trigger, potentially delaying Stage 2 classification and understating lifetime ECL recognition.'
+  evidence: N/A:0(see_rationale)
+  stage: cross_stage
+  alternative_considered: ML-based early warning system could capture deterioration earlier than bucket migration thresholds
+- id: BD-INT-010
+  type: M/BA
+  content: 'INTERACTION: BD-006 (pivot_table aggfunc=sum for count matrices) × BD-084 (row-normalization of transition matrices) × BD-096 (empirical transition frequency estimation) → Risk cascade through
+    transition probability calculation'
+  rationale: 'BD-006 uses pivot_table with aggfunc=sum to aggregate count matrices by Segment/Aging/Aging12Adj. BD-084 applies row-normalization ensuring row sums equal 1.0. BD-096 estimates transition
+    probabilities as empirical frequencies (counts / initial state counts). The cascade: if BD-006 aggregation is incorrect (wrong grouping variables, missing accounts, duplicate counting), the count matrices
+    fed into BD-096 are wrong. If counts are wrong, empirical frequencies are wrong. If frequencies are wrong, row-normalization (BD-084) adjusts already-wrong probabilities to sum to 1, preserving the
+    wrong relative relationships. This creates systematic bias in transition matrices affecting each subsequent lifetime PD calculations.'
+  evidence: N/A:0(see_rationale)
+  stage: cross_stage
+  alternative_considered: Weighted average by exposure was not considered for aggregation
+- id: BD-INT-011
+  type: B/BA
+  content: 'INTERACTION: BD-004 (max(axis=1) for ''ever-default'' logic) × BD-019 (bucket-based staging thresholds) × BD-025 (Stage 1/2/3 PD rules) → Amplification of Stage 2 retention effect'
+  rationale: 'BD-004 uses max(axis=1) to identify if account ''ever'' defaulted during the 12-month observation window (ever-default logic). BD-019 triggers Stage 2 based on bucket migration. BD-025 applies
+    lifetime PD to Stages 2-3. The amplification effect: once an account triggers Stage 2 via bucket migration, the ''ever-default'' logic ensures the account remains in a deteriorated state classification.
+    Even if the account recovers (bucket improves), the max() has already recorded the worst status. Combined with staging thresholds (BD-019), this means accounts entering Stage 2 require significant sustained
+    improvement to exit. This amplifies the lifetime ECL recognition because Stage 2 classification persists even after recovery indicators appear.'
+  evidence: N/A:0(see_rationale)
+  stage: cross_stage
+  alternative_considered: First default tracking could allow faster stage recovery than ever-default approach
+- id: BD-INT-012
+  type: B/BA
+  content: 'INTERACTION: BD-017 (separate LimitID/AccountID hierarchies) × BD-044 (CCF approach for EAD) × BD-048 (EAD = Outstanding + Available × CCF) → Hidden dependency where hierarchy collapse breaks
+    EAD calculation'
+  rationale: 'BD-017 maintains separate LimitID and AccountID hierarchies because one limit facility can cover multiple accounts. BD-044 uses CCF approach for EAD calculation. BD-048 defines EAD for revolving
+    facilities as Outstanding + (Available Limit × CCF). The hidden dependency: if the hierarchy collapses (data model changes to flat account structure, or if BD-017 is not properly joined), the Available
+    Limit calculation (using BD-015 cumsum.shift().fillna pattern) will attribute wrong limits to accounts. This affects the CCF calculation: if available limit is overstated or understated due to hierarchy
+    issues, EAD is systematically miscalculated. The failure is silent because the EAD formula produces numbers, but the numbers are wrong due to wrong limit attribution.'
+  evidence: N/A:0(see_rationale)
+  stage: cross_stage
+  alternative_considered: Event-driven limit tracking was not implemented to validate hierarchy consistency
+- id: BD-GAP-001
+  content: 'Missing: float vs Decimal for currency'
+  type: RC
+  rationale: 'Audit finding: missing: float vs decimal for currency. Identified by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: unknown
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-002
+  content: 'Missing: Stale data detection/expiry'
+  type: DK
+  rationale: 'Audit finding: missing: stale data detection/expiry. Identified by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: unknown
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-003
+  content: 'Missing: Random seed full coverage'
+  type: DK
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: unknown
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-004
+  content: 'Missing: 再平衡触发机制'
+  type: B
+  rationale: 'Audit finding: missing: 再平衡触发机制. Identified by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: unknown
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-005
+  content: 'Missing: NPL 组合 EBA 字段完整性'
+  type: RC
+  rationale: 'Audit finding: missing: npl 组合 eba 字段完整性. Identified by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: unknown
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+_enrich_meta:
+  evidence_coverage_ratio: 0.173
+  evidence_verified: 19
+  evidence_invalid: 0
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 1.0
+known_use_cases:
+- id: UC-101
+  name: ECL Limit Level Truncation Analysis
+  source: ECL/ECLLimitLevel_Truncate.ipynb
+  type: data_pipeline
+  business_problem: Calculates Expected Credit Loss (ECL) at the limit/tranche level by computing remaining tenor and projecting loan balances with interest, supporting IFRS 9 impairment calculations.
+  intent_keywords:
+  - ECL
+  - Expected Credit Loss
+  - limit level
+  - truncate
+  - IFRS 9
+  - impairment
+  stage: ecalculation
+  negative_keywords:
+  - amortization
+  - LGD
+  - PD calibration
+  - transition matrix
+  disambiguation: Are you working on ECL impairment calculations at the facility/limit level, or do you need a simpler loan amortization schedule?
+  data_domain: credit_data
+- id: UC-102
+  name: Loan Amortization Schedule Calculator
+  source: ECL/abAmortization.ipynb
+  type: data_pipeline
+  business_problem: Computes loan amortization schedules by iteratively calculating interest amounts and remaining balances after each payment, determining total repayment terms.
+  intent_keywords:
+  - amortization
+  - loan
+  - payment schedule
+  - interest calculation
+  - balance
+  stage: calculation
+  negative_keywords:
+  - ECL
+  - PD
+  - transition matrix
+  - LGD
+  disambiguation: Do you need a loan amortization schedule for payment planning, or are you looking for ECL/PD credit risk modeling?
+  data_domain: credit_data
+- id: UC-103
+  name: Amortization Schedule with NumPy Financial
+  source: ECL/amortization.ipynb
+  type: data_pipeline
+  business_problem: Generates amortization schedules using numpy-financial library functions (PMT, PPMT, IPMT) for calculating periodic payments, principal, and interest breakdown.
+  intent_keywords:
+  - amortization
+  - numpy-financial
+  - PMT
+  - principal
+  - interest
+  - payment
+  stage: calculation
+  negative_keywords:
+  - ECL
+  - PD model
+  - transition matrix
+  - credit risk model
+  disambiguation: Are you calculating loan payment schedules using Python financial libraries, or do you need credit risk PD/LGD modeling?
+  data_domain: credit_data
+- id: UC-104
+  name: LGD Function Model Development
+  source: LGD/LGDFunctionModel.ipynb
+  type: data_pipeline
+  business_problem: Develops Loss Given Default (LGD) models using statistical regression techniques with 12-month forward observation windows for non-default populations.
+  intent_keywords:
+  - LGD
+  - Loss Given Default
+  - regression
+  - statsmodels
+  - recovery rate
+  stage: model_development
+  negative_keywords:
+  - PD
+  - amortization
+  - trading
+  - screening
+  disambiguation: Are you modeling LGD (Loss Given Default) for recovery rate estimation, or PD (Probability of Default)?
+  data_domain: credit_data
+- id: UC-105
+  name: Bank of Thailand Macroeconomic Data API Fetch
+  source: PD/APIBOTMacro.ipynb
+  type: data_pipeline
+  business_problem: Fetches macroeconomic variables from Bank of Thailand's API including GDP, employment, and trade indicators for integration into credit risk models.
+  intent_keywords:
+  - API
+  - macroeconomic
+  - Bank of Thailand
+  - BOT
+  - economic data
+  - GDP
+  - fetch
+  stage: data_collection
+  negative_keywords:
+  - internal PD
+  - LGD
+  - transition matrix
+  - trading signals
+  disambiguation: Are you fetching external macroeconomic data from APIs, or working with internal credit risk models?
+  data_domain: financial_data
+- id: UC-106
+  name: Bank of Thailand NPL Data Processing
+  source: PD/BOTNPLData.ipynb
+  type: data_pipeline
+  business_problem: Cleans and processes raw NPL (Non-Performing Loan) data from Bank of Thailand, handling inconsistent column structures and formatting for credit risk analysis.
+  intent_keywords:
+  - NPL
+  - non-performing loan
+  - data cleaning
+  - Bank of Thailand
+  - raw data
+  stage: data_processing
+  negative_keywords:
+  - PD model
+  - LGD
+  - trading strategy
+  - amortization
+  disambiguation: Are you cleaning/processing NPL data from BOT, or building PD/LGD credit risk models?
+  data_domain: credit_data
+- id: UC-107
+  name: Bayesian Calibration of Transition Matrices
+  source: PD/BayesCalibration.ipynb
+  type: data_pipeline
+  business_problem: Calibrates credit rating transition matrices using Bayesian optimization methods to ensure row stochasticity and alignment with observed migration patterns.
+  intent_keywords:
+  - Bayesian
+  - calibration
+  - transition matrix
+  - migration
+  - probability
+  stage: model_calibration
+  negative_keywords:
+  - trading
+  - screening
+  - LGD
+  - amortization
+  disambiguation: Are you calibrating PD transition matrices using Bayesian methods, or developing trading strategies?
+  data_domain: credit_data
+- id: UC-108
+  name: CHAID Customer Segmentation for Credit Scoring
+  source: PD/CHAIDSegmentation.ipynb
+  type: data_pipeline
+  business_problem: Segments used car loan customers using CHAID (Chi-squared Automatic Interaction Detection) decision tree algorithm with optimal binning for credit scoring development.
+  intent_keywords:
+  - CHAID
+  - segmentation
+  - customer
+  - credit scoring
+  - binning
+  - decision tree
+  stage: feature_engineering
+  negative_keywords:
+  - trading
+  - LGD
+  - transition matrix
+  - amortization
+  disambiguation: Are you performing customer segmentation for credit scoring, or building trading/lending strategies?
+  data_domain: credit_data
+- id: UC-109
+  name: Cook's Distance Outlier Detection in PD Models
+  source: PD/CooksDStudent.ipynb
+  type: data_pipeline
+  business_problem: Identifies influential outliers and high-leverage points in PD regression models using Cook's distance and studentized residuals analysis.
+  intent_keywords:
+  - Cook's distance
+  - outlier
+  - studentized
+  - leverage
+  - regression diagnostics
+  stage: model_diagnostics
+  negative_keywords:
+  - trading strategy
+  - screening
+  - LGD
+  - amortization
+  disambiguation: Are you detecting outliers in PD regression models, or developing trading strategies?
+  data_domain: credit_data
+- id: UC-110
+  name: Heteroscedasticity and Autocorrelation Adjustment in PD
+  source: PD/HACAdjustment.ipynb
+  type: data_pipeline
+  business_problem: Adjusts PD regression models for heteroscedasticity and autocorrelation using HAC (Heteroscedasticity and Autocorrelation Consistent) standard errors.
+  intent_keywords:
+  - HAC
+  - heteroscedasticity
+  - autocorrelation
+  - Newey-West
+  - standard errors
+  stage: model_diagnostics
+  negative_keywords:
+  - trading
+  - LGD
+  - screening
+  - amortization
+  disambiguation: Are you correcting for heteroscedasticity/autocorrelation in PD models, or building trading systems?
+  data_domain: credit_data
+- id: UC-111
+  name: KMV Merton Model for PD Estimation
+  source: PD/KMVModel.ipynb
+  type: data_pipeline
+  business_problem: Implements the KMV-Merton structural model to estimate default probabilities from equity prices and market capitalization using option pricing theory.
+  intent_keywords:
+  - KMV
+  - Merton
+  - structural model
+  - default probability
+  - equity
+  - market cap
+  stage: model_development
+  negative_keywords:
+  - reduced form
+  - transition matrix
+  - trading
+  - amortization
+  disambiguation: Are you using the KMV-Merton structural approach for PD, or working with reduced-form/transition matrix methods?
+  data_domain: market_data
+- id: UC-112
+  name: LASSO Feature Selection for PD Models
+  source: PD/LassoSelection.ipynb
+  type: data_pipeline
+  business_problem: Selects optimal macroeconomic variables for PD models using LASSO (Least Absolute Shrinkage and Selection Operator) regression with time series cross-validation.
+  intent_keywords:
+  - LASSO
+  - feature selection
+  - macroeconomic
+  - variable selection
+  - regularization
+  stage: feature_selection
+  negative_keywords:
+  - trading strategy
+  - screening
+  - LGD
+  - amortization
+  disambiguation: Are you selecting variables for PD models using LASSO, or developing trading strategies?
+  data_domain: credit_data
+- id: UC-113
+  name: Non-Retail Credit Rating Transition Matrix
+  source: PD/NRTMatrix.ipynb
+  type: data_pipeline
+  business_problem: Constructs credit rating transition matrices for non-retail portfolios by counting rating migrations and computing conditional transition probabilities.
+  intent_keywords:
+  - transition matrix
+  - rating migration
+  - non-retail
+  - credit rating
+  - migration
+  stage: matrix_construction
+  negative_keywords:
+  - retail PD
+  - trading
+  - LGD
+  - amortization
+  disambiguation: Are you building non-retail transition matrices, or retail PD models?
+  data_domain: credit_data
+- id: UC-114
+  name: Nelson-Siegel-Svensson PD Term Structure
+  source: PD/NelsonSiegelCurve.ipynb
+  type: data_pipeline
+  business_problem: Fits Nelson-Siegel-Svensson curves to PD term structures for modeling the relationship between probability of default and time to maturity.
+  intent_keywords:
+  - Nelson-Siegel
+  - PD term structure
+  - yield curve
+  - curve fitting
+  - maturity
+  stage: curve_fitting
+  negative_keywords:
+  - transition matrix
+  - trading
+  - LGD
+  - screening
+  disambiguation: Are you fitting yield/PD term structures using Nelson-Siegel, or building transition matrices?
+  data_domain: credit_data
+- id: UC-115
+  name: PD and LGD Risk Weight Assumptions
+  source: PD/PDAssumedLGD.ipynb
+  type: data_pipeline
+  business_problem: Defines assumed PD and LGD risk weights by asset class (Strong, Good, Satisfactory, Weak, Default) for regulatory capital and expected loss calculations.
+  intent_keywords:
+  - risk weight
+  - PD assumption
+  - LGD assumption
+  - asset class
+  - regulatory
+  stage: parameter_estimation
+  negative_keywords:
+  - empirical PD
+  - model calibration
+  - trading
+  - amortization
+  disambiguation: Are you setting assumed PD/LGD risk weights, or empirically calibrating PD models?
+  data_domain: credit_data
+- id: UC-116
+  name: PD Calibration TTC to PIT
+  source: PD/PDCalibration.ipynb
+  type: data_pipeline
+  business_problem: Calibrates Probability of Default from Through-the-Cycle (TTC) to Point-in-Time (PIT) estimates using central tendency adjustments and risk grade mapping.
+  intent_keywords:
+  - PD calibration
+  - TTC
+  - PIT
+  - through-the-cycle
+  - point-in-time
+  - central tendency
+  stage: model_calibration
+  negative_keywords:
+  - LGD
+  - trading
+  - screening
+  - amortization
+  disambiguation: Are you calibrating PD from TTC to PIT, or working on LGD/recovery models?
+  data_domain: credit_data
+- id: UC-117
+  name: Variable Clustering for Multicollinearity Reduction
+  source: PD/PROCVARCLUS.ipynb
+  type: data_pipeline
+  business_problem: Performs hierarchical variable clustering using VarClusHi algorithm to reduce multicollinearity among macroeconomic variables in PD models.
+  intent_keywords:
+  - variable clustering
+  - multicollinearity
+  - VarClusHi
+  - feature reduction
+  - hierarchical
+  stage: feature_selection
+  negative_keywords:
+  - trading
+  - LGD
+  - screening
+  - direct selection
+  disambiguation: Are you using variable clustering to reduce multicollinearity, or selecting features through other methods?
+  data_domain: credit_data
+- id: UC-118
+  name: Silhouette Analysis for K-Means Clustering
+  source: PD/SilhouetteAnalysis.ipynb
+  type: data_pipeline
+  business_problem: Evaluates optimal number of clusters in K-means segmentation using silhouette score analysis to determine best customer groupings for PD modeling.
+  intent_keywords:
+  - silhouette
+  - K-means
+  - clustering
+  - segmentation
+  - optimal clusters
+  stage: segmentation
+  negative_keywords:
+  - regression
+  - trading
+  - LGD
+  - time series
+  disambiguation: Are you evaluating clustering quality with silhouette analysis, or building regression models?
+  data_domain: credit_data
+- id: UC-119
+  name: Theoretical Migration Matrix Construction
+  source: PD/TheoreticalMigrationMatrix.ipynb
+  type: data_pipeline
+  business_problem: Constructs theoretically grounded migration matrices using parametric distributions and optimization to ensure mathematical consistency and economic plausibility.
+  intent_keywords:
+  - migration matrix
+  - theoretical
+  - generator
+  - infinitesimal
+  - continuous time
+  stage: matrix_construction
+  negative_keywords:
+  - empirical matrix
+  - trading
+  - LGD
+  - screening
+  disambiguation: Are you building theoretical/generator matrices, or empirical transition matrices from data?
+  data_domain: credit_data
+- id: UC-120
+  name: Every Combinations Variable Selection
+  source: PD/allCombinations.ipynb
+  type: data_pipeline
+  business_problem: Generates each possible combinations of macroeconomic variables within clusters for exhaustive model selection in PD development.
+  intent_keywords:
+  - each combinations
+  - variable selection
+  - model selection
+  - combinatorial
+  - exhaustive
+  stage: feature_selection
+  negative_keywords:
+  - LASSO
+  - stepwise
+  - trading
+  - LGD
+  disambiguation: Are you performing exhaustive combinatorial search for variables, or using regularized selection methods?
+  data_domain: credit_data
+- id: UC-121
+  name: Autocorrelation Testing in PD Residuals
+  source: PD/autoCorrTest.ipynb
+  type: data_pipeline
+  business_problem: Tests for autocorrelation in PD model residuals using ACF plots, Ljung-Box test, and Durbin-Watson statistics to validate time series assumptions.
+  intent_keywords:
+  - autocorrelation
+  - ACF
+  - Ljung-Box
+  - Durbin-Watson
+  - residual diagnostics
+  stage: model_diagnostics
+  negative_keywords:
+  - trading strategy
+  - screening
+  - LGD
+  - cross-sectional
+  disambiguation: Are you testing for autocorrelation in time series residuals, or building cross-sectional models?
+  data_domain: credit_data
+- id: UC-122
+  name: Credit Conversion Index (CCI) Calculation
+  source: PD/cci.ipynb
+  type: data_pipeline
+  business_problem: Calculates Credit Conversion Index (CCI) by measuring downgrade rates and converting to a normalized z-score for stress testing and early warning systems.
+  intent_keywords:
+  - CCI
+  - credit conversion
+  - downgrade
+  - z-score
+  - early warning
+  stage: indicator_calculation
+  negative_keywords:
+  - PD calibration
+  - LGD
+  - trading
+  - transition matrix
+  disambiguation: Are you calculating Credit Conversion Index for early warning, or building full PD models?
+  data_domain: credit_data
+- id: UC-123
+  name: Chain Ladder PD Curve Estimation
+  source: PD/chainLadder.ipynb
+  type: data_pipeline
+  business_problem: Applies actuarial chain ladder methodology to estimate PD curves over time and aging buckets using weighted average calculations.
+  intent_keywords:
+  - chain ladder
+  - PD curve
+  - actuarial
+  - development factors
+  - buckets
+  stage: model_development
+  negative_keywords:
+  - regression
+  - trading
+  - LGD
+  - transition matrix
+  disambiguation: Are you using chain ladder actuarial methods for PD curves, or regression-based PD models?
+  data_domain: credit_data
+- id: UC-124
+  name: Cluster Selection for Variable Grouping
+  source: PD/clusterSelection.ipynb
+  type: data_pipeline
+  business_problem: Selects representative variables from clusters based on lowest R-square ratio and highest correlation for parsimonious PD model specification.
+  intent_keywords:
+  - cluster selection
+  - R-square ratio
+  - representative
+  - variable choice
+  stage: feature_selection
+  negative_keywords:
+  - each combinations
+  - LASSO
+  - trading
+  - LGD
+  disambiguation: Are you selecting representative variables from clusters, or using other selection methods?
+  data_domain: credit_data
+- id: UC-125
+  name: PD Distribution Fitting and Selection
+  source: PD/distributionSelection.ipynb
+  type: data_pipeline
+  business_problem: Fits and compares multiple statistical distributions (Gamma, Log-normal, Weibull, etc.) to empirical PD risk grade curves for model selection.
+  intent_keywords:
+  - distribution fitting
+  - Gamma
+  - Weibull
+  - lognormal
+  - curve fitting
+  - goodness of fit
+  stage: model_development
+  negative_keywords:
+  - transition matrix
+  - trading
+  - LGD
+  - regression
+  disambiguation: Are you fitting probability distributions to PD curves, or building regression/transition models?
+  data_domain: credit_data
+- id: UC-126
+  name: External Rating Matrix Integration
+  source: PD/externalMatrix.ipynb
+  type: data_pipeline
+  business_problem: Integrates external credit ratings (e.g., Moody's) and their transition matrices with internal rating systems for PD benchmarking and calibration.
+  intent_keywords:
+  - external rating
+  - Moody's
+  - benchmark
+  - rating mapping
+  - external matrix
+  stage: data_integration
+  negative_keywords:
+  - internal matrix
+  - trading
+  - LGD
+  - empirical
+  disambiguation: Are you integrating external rating data, or building internal transition matrices?
+  data_domain: credit_data
+- id: UC-127
+  name: Gamma Distribution PD Curve Fitting
+  source: PD/gammaFitting.ipynb
+  type: data_pipeline
+  business_problem: Fits Gamma cumulative distribution functions to PD risk grade curves using scipy optimization to model default probability term structure.
+  intent_keywords:
+  - Gamma distribution
+  - PD curve
+  - cumulative density
+  - fitting
+  - risk grade
+  stage: model_development
+  negative_keywords:
+  - other distributions
+  - transition matrix
+  - trading
+  - LGD
+  disambiguation: Are you specifically fitting Gamma distributions to PD curves, or testing other distribution families?
+  data_domain: credit_data
+- id: UC-128
+  name: Generator Matrix for Continuous-Time Transitions
+  source: PD/generatorMatrix.ipynb
+  type: data_pipeline
+  business_problem: Constructs generator (infinitesimal) matrices for continuous-time credit migration models enabling computation of transition probabilities over arbitrary time horizons.
+  intent_keywords:
+  - generator matrix
+  - infinitesimal
+  - continuous time
+  - Kolmogorov
+  - Q-matrix
+  stage: matrix_construction
+  negative_keywords:
+  - discrete time
+  - empirical matrix
+  - trading
+  - LGD
+  disambiguation: Are you building continuous-time generator matrices, or discrete-time transition matrices?
+  data_domain: credit_data
+- id: UC-129
+  name: Heteroscedasticity Testing in PD Regression
+  source: PD/heteroTest.ipynb
+  type: data_pipeline
+  business_problem: Tests for heteroscedasticity in PD regression models using White's test and Breusch-Pagan test to validate homoscedasticity assumptions.
+  intent_keywords:
+  - heteroscedasticity
+  - White test
+  - Breusch-Pagan
+  - residual
+  - variance
+  stage: model_diagnostics
+  negative_keywords:
+  - autocorrelation
+  - trading
+  - LGD
+  - screening
+  disambiguation: Are you testing for heteroscedasticity, or other regression assumptions like autocorrelation?
+  data_domain: credit_data
+- id: UC-130
+  name: Lifetime PD Calibration and Tracking
+  source: PD/lifetimeCalibration.ipynb
+  type: data_pipeline
+  business_problem: Calibrates lifetime PD curves using through-the-cycle (TTC) reference data and tracks calibration stability over time for IFRS 9 lifetime ECL calculations.
+  intent_keywords:
+  - lifetime PD
+  - IFRS 9
+  - ECL
+  - TTC calibration
+  - tracking
+  stage: model_calibration
+  negative_keywords:
+  - 12-month PD
+  - spot PD
+  - trading
+  - LGD
+  disambiguation: Are you calibrating lifetime PD for ECL, or short-term/stage 1 PD models?
+  data_domain: credit_data
+- id: UC-131
+  name: PD Curve Limiting and Constraints
+  source: PD/limitPDCurves.ipynb
+  type: data_pipeline
+  business_problem: Applies limiting constraints to PD curves ensuring monotonicity, non-exceedance of regulatory floors, and compliance with Basel/IFRS 9 requirements.
+  intent_keywords:
+  - PD limits
+  - constraints
+  - floor
+  - monotonicity
+  - Basel
+  - regulatory
+  stage: model_calibration
+  negative_keywords:
+  - unconstrained
+  - trading
+  - LGD
+  - empirical curves
+  disambiguation: Are you applying regulatory constraints to PD curves, or working with raw empirical estimates?
+  data_domain: credit_data
+- id: UC-132
+  name: Multicollinearity Testing with VIF
+  source: PD/multicolTest.ipynb
+  type: data_pipeline
+  business_problem: Tests for multicollinearity among macroeconomic variables using Variance Inflation Factor (VIF) and correlation matrices in PD regression models.
+  intent_keywords:
+  - multicollinearity
+  - VIF
+  - correlation
+  - variance inflation
+  - variable
+  stage: model_diagnostics
+  negative_keywords:
+  - autocorrelation
+  - heteroscedasticity
+  - trading
+  - LGD
+  disambiguation: Are you testing for multicollinearity using VIF, or other diagnostic issues?
+  data_domain: credit_data
+- id: UC-133
+  name: Normality Testing of PD Residuals
+  source: PD/normalityTest.ipynb
+  type: data_pipeline
+  business_problem: Tests normality of regression residuals using Shapiro-Wilk, Anderson-Darling tests, QQ plots, and histograms for PD model assumption validation.
+  intent_keywords:
+  - normality
+  - Shapiro-Wilk
+  - Anderson-Darling
+  - QQ plot
+  - residual diagnostics
+  stage: model_diagnostics
+  negative_keywords:
+  - heteroscedasticity
+  - trading
+  - LGD
+  - non-parametric
+  disambiguation: Are you testing normality of residuals, or other distributional assumptions?
+  data_domain: credit_data
+- id: UC-134
+  name: Simplified Credit Conversion Index
+  source: PD/simplifiedCCI.ipynb
+  type: data_pipeline
+  business_problem: Computes simplified Credit Conversion Index using z-score normalization of downgrade probabilities for portfolio-level credit stress monitoring.
+  intent_keywords:
+  - simplified CCI
+  - z-score
+  - downgrade
+  - stress
+  - portfolio monitoring
+  stage: indicator_calculation
+  negative_keywords:
+  - full CCI
+  - transition matrix
+  - trading
+  - LGD
+  disambiguation: Are you calculating a simplified CCI for quick monitoring, or detailed transition analysis?
+  data_domain: credit_data
+- id: UC-135
+  name: Survival Analysis for Lifetime PD Estimation
+  source: PD/survivalAnalysis.ipynb
+  type: data_pipeline
+  business_problem: Applies survival analysis techniques to estimate lifetime default probabilities using Kaplan-Meier curves and Cox proportional hazards for IFRS 9 staging.
+  intent_keywords:
+  - survival analysis
+  - Kaplan-Meier
+  - Cox
+  - lifetime PD
+  - hazard rate
+  - IFRS 9
+  stage: model_development
+  negative_keywords:
+  - transition matrix
+  - regression
+  - trading
+  - 12-month PD
+  disambiguation: Are you using survival analysis for lifetime PD, or regression-based PD models?
+  data_domain: credit_data
+- id: UC-136
+  name: Time Series K-Means Clustering
+  source: PD/timeSeriesKMeans.ipynb
+  type: data_pipeline
+  business_problem: Clusters macroeconomic time series using Dynamic Time Warping (DTW) distance with K-means algorithm to identify similar economic patterns for PD modeling.
+  intent_keywords:
+  - time series clustering
+  - K-means
+  - DTW
+  - dynamic time warping
+  - economic patterns
+  stage: segmentation
+  negative_keywords:
+  - cross-sectional clustering
+  - regression
+  - trading
+  - LGD
+  disambiguation: Are you clustering time series with DTW, or doing cross-sectional customer segmentation?
+  data_domain: financial_data
+- id: UC-137
+  name: Time Series Stationarity Analysis
+  source: PD/timeSeriesStationary.ipynb
+  type: data_pipeline
+  business_problem: Analyzes stationarity of macroeconomic time series using ADF tests and seasonal decomposition for proper model specification in PD regression.
+  intent_keywords:
+  - stationarity
+  - ADF test
+  - unit root
+  - seasonal decomposition
+  - time series
+  stage: data_analysis
+  negative_keywords:
+  - cross-sectional
+  - trading
+  - LGD
+  - panel data
+  disambiguation: Are you testing time series stationarity, or working with cross-sectional data?
+  data_domain: financial_data
+- id: UC-138
+  name: Credit Rating Transition Matrix from Transactions
+  source: PD/transitionMatrix.ipynb
+  type: data_pipeline
+  business_problem: Constructs empirical credit rating transition matrices from transaction-level data by tracking 12-month forward aging status and computing migration probabilities.
+  intent_keywords:
+  - transition matrix
+  - empirical
+  - transaction
+  - 12-month
+  - migration probability
+  stage: matrix_construction
+  negative_keywords:
+  - theoretical
+  - generator
+  - trading
+  - LGD
+  disambiguation: Are you building empirical transition matrices from data, or theoretical/generator matrices?
+  data_domain: credit_data
+- id: UC-139
+  name: Univariate Analysis for PD Variables
+  source: PD/univariateAnalysis1.ipynb
+  type: data_pipeline
+  business_problem: Performs univariate regression analysis on individual macroeconomic variables to assess their predictive power for ODR (Observed Default Rate) before multivariate modeling.
+  intent_keywords:
+  - univariate
+  - regression
+  - variable analysis
+  - ODR
+  - feature screening
+  stage: feature_selection
+  negative_keywords:
+  - multivariate
+  - trading
+  - LGD
+  - clustering
+  disambiguation: Are you doing univariate screening of variables, or building multivariate PD models?
+  data_domain: credit_data
+- id: UC-140
+  name: Vasicek Model Basel Rho Estimation
+  source: PD/vasicekBaselRho.ipynb
+  type: data_pipeline
+  business_problem: Estimates Basel Rho parameter (asset correlation) in the Vasicek single-factor model for regulatory capital calculation and portfolio credit risk.
+  intent_keywords:
+  - Vasicek
+  - Basel
+  - rho
+  - asset correlation
+  - regulatory capital
+  - single factor
+  stage: model_development
+  negative_keywords:
+  - Merton
+  - KMV
+  - transition matrix
+  - trading
+  - LGD
+  disambiguation: Are you estimating Vasicek/Basel Rho parameters, or using Merton/KMV structural models?
+  data_domain: credit_data
+- id: UC-141
+  name: Vasicek Transition Matrix Calibration
+  source: PD/vasicekTransitionMatrix.ipynb
+  type: data_pipeline
+  business_problem: Calibrates credit rating transition matrices using the Vasicek asymptotic single risk factor model ensuring consistency with Basel regulatory requirements.
+  intent_keywords:
+  - Vasicek
+  - transition matrix
+  - calibration
+  - single risk factor
+  - Basel
+  - ASRF
+  stage: model_calibration
+  negative_keywords:
+  - empirical matrix
+  - generator
+  - trading
+  - LGD
+  disambiguation: Are you calibrating matrices using Vasicek ASRF model, or building empirical matrices?
+  data_domain: credit_data
+- id: UC-142
+  name: Backward Transaction Data Processing
+  source: Staging/backwardTransaction.ipynb
+  type: data_pipeline
+  business_problem: Processes backward-looking transaction data to create performance windows and default flags for credit scoring model development in staging environments.
+  intent_keywords:
+  - backward
+  - transaction
+  - performance window
+  - data staging
+  - default flag
+  stage: data_processing
+  negative_keywords:
+  - forward-looking
+  - trading
+  - real-time
+  - production
+  disambiguation: Are you processing historical transaction data for model development, or building real-time production systems?
+  data_domain: credit_data
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - RSK
+  - CRD
+  finance_universal:
+    pass: 0
+    warn: 14
+    fail: 6
+  subdomain_totals:
+    pass: 4
+    warn: 8
+    fail: 2
+  coverage: 4/34 (11%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+resources:
+- id: res-slot-001
+  type: replaceable_component
+  name: macroeconomic_data_provider
+  path: null
+  description: Based on geographic focus and regulatory requirements
+  used_in_stages: []
+  options:
+  - name: Bank of Thailand API
+    traits:
+    - official
+    - country-specific
+    - requires-api-key
+    fit_for:
+    - Thailand-focused PD/ECL models requiring local macro data
+    not_fit_for:
+    - Multi-country models, organizations without BOT API access
+  - name: World Bank API
+    traits:
+    - open-data
+    - multi-country
+    - no-auth-required
+    fit_for:
+    - Global models, research purposes
+    not_fit_for:
+    - Country-specific regulatory requirements
+  - name: Bloomberg Terminal
+    traits:
+    - professional
+    - real-time
+    - comprehensive
+    - proprietary
+    fit_for:
+    - Professional trading desks, real-time risk management
+    not_fit_for:
+    - Academic research, budget-constrained projects
+  default: Bank of Thailand API
+  _source: worker_resource
+- id: res-slot-002
+  type: replaceable_component
+  name: data_storage_format
+  path: null
+  description: Based on data volume and access patterns
+  used_in_stages: []
+  options:
+  - name: CSV files
+    traits:
+    - human-readable
+    - simple
+    - version-control-friendly
+    fit_for:
+    - Small datasets, prototypes, version control
+    not_fit_for:
+    - Large datasets (>100MB), high-frequency updates
+  - name: Parquet
+    traits:
+    - columnar
+    - compressed
+    - efficient-read
+    fit_for:
+    - Large analytical datasets, cloud storage
+    not_fit_for:
+    - Small datasets, human inspection
+  - name: SQLite
+    traits:
+    - relational
+    - queryable
+    - concurrent-access
+    fit_for:
+    - Multi-table relationships, complex queries
+    not_fit_for:
+    - Simple flat data, single-file portability
+  - name: PostgreSQL
+    traits:
+    - server-based
+    - scalable
+    - concurrent
+    fit_for:
+    - Production systems, multiple users, large scale
+    not_fit_for:
+    - Local development, single-user scenarios
+  default: CSV files
+  _source: worker_resource
+- id: res-slot-003
+  type: replaceable_component
+  name: visualization_library
+  path: null
+  description: Based on visualization requirements and output format
+  used_in_stages: []
+  options:
+  - name: matplotlib + seaborn
+    traits:
+    - static-plots
+    - publication-quality
+    - mature
+    fit_for:
+    - Statistical charts, academic publications
+    not_fit_for:
+    - Interactive dashboards, web applications
+  - name: plotly
+    traits:
+    - interactive
+    - web-ready
+    - exportable
+    fit_for:
+    - Interactive reports, web dashboards
+    not_fit_for:
+    - Simple static charts, print publications
+  - name: bokeh
+    traits:
+    - interactive
+    - streaming
+    - large-datasets
+    fit_for:
+    - Real-time monitoring dashboards
+    not_fit_for:
+    - Simple static visualizations
+  default: matplotlib + seaborn
+  _source: worker_resource
+- id: res-slot-004
+  type: replaceable_component
+  name: model_persistence
+  path: null
+  description: Based on deployment requirements and portability needs
+  used_in_stages: []
+  options:
+  - name: pickle
+    traits:
+    - python-native
+    - fast
+    fit_for:
+    - Quick prototyping, single-python-environment
+    not_fit_for:
+    - Cross-language, long-term storage, security
+  - name: joblib
+    traits:
+    - efficient
+    - numpy-optimized
+    fit_for:
+    - Large numpy arrays, sklearn models
+    not_fit_for:
+    - Non-numpy data, cross-language
+  - name: ONNX
+    traits:
+    - cross-platform
+    - standardized
+    - inference-optimized
+    fit_for:
+    - Production deployment, cross-framework integration
+    not_fit_for:
+    - Quick prototyping, experimental models
+  - name: PMML
+    traits:
+    - industry-standard
+    - cross-platform
+    fit_for:
+    - Regulatory compliance, enterprise integration
+    not_fit_for:
+    - Complex models, deep learning
+  default: pickle
+  _source: worker_resource
+- id: res-slot-005
+  type: replaceable_component
+  name: statistical_analysis
+  path: null
+  description: Based on statistical complexity requirements
+  used_in_stages: []
+  options:
+  - name: statsmodels
+    traits:
+    - regression-focused
+    - statistical-tests
+    fit_for:
+    - Regression analysis, statistical tests, time series
+    not_fit_for:
+    - Machine learning, deep learning
+  - name: scipy.stats (standalone)
+    traits:
+    - lightweight
+    - core-statistics
+    fit_for:
+    - Simple statistical tests, probability distributions
+    not_fit_for:
+    - Complex regression, econometric modeling
+  - name: PyMC
+    traits:
+    - bayesian
+    - probabilistic-programming
+    fit_for:
+    - Bayesian inference, probabilistic models
+    not_fit_for:
+    - Simple frequentist analysis
+  default: statsmodels
+  _source: worker_resource
+- id: res-slot-006
+  type: replaceable_component
+  name: time_series_clustering
+  path: null
+  description: Based on time series characteristics and alignment needs
+  used_in_stages: []
+  options:
+  - name: tslearn
+    traits:
+    - dtw-support
+    - dedicated-ts-clustering
+    fit_for:
+    - Time series specific clustering with DTW
+    not_fit_for:
+    - General clustering, cross-domain
+  - name: scikit-learn clustering
+    traits:
+    - general-purpose
+    - familiar
+    fit_for:
+    - Standard clustering, when tslearn unavailable
+    not_fit_for:
+    - Time series with temporal alignment issues
+  default: tslearn
+  _source: worker_resource
+- id: res-007
+  type: python_package
+  name: pandas
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-008
+  type: python_package
+  name: numpy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: python_package
+  name: scipy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: python_package
+  name: scikit-learn
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: python_package
+  name: statsmodels
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: python_package
+  name: matplotlib
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: python_package
+  name: seaborn
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-014
+  type: python_package
+  name: pickle
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-015
+  type: python_package
+  name: varclushi
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: python_package
+  name: CHAID
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+applicability:
+  domain: finance
+  task_type: Expected Credit Loss (ECL) calculation for loan portfolios
+  description: IFRS 9 impairment model that calculates 12-month and lifetime expected credit losses using probability of default (PD), loss given default (LGD), and exposure at default (EAD) components
+    with forward-looking macroeconomic adjustments
+  prerequisites: Understanding of IFRS 9 accounting standard, credit risk concepts (PD/LGD/EAD), pandas/Python for data processing, time-series analysis
+  not_suitable_for: Non-credit financial instruments, regulatory capital calculations (uses unbiased IFRS 9 estimates vs Basel regulatory values), non-financial asset impairment
+global_contracts:
+- contract: All DataFrames use ACCOUNT_ID or AccountID as primary key for longitudinal tracking
+  evidence: PD/transitionMatrix.ipynb:127(groupby AccID)
+- contract: Monthkey or AS_OF_DATE used as temporal index for time-series operations
+  evidence: PD/transitionMatrix.ipynb:127(sort_values Monthkey)
+- contract: 'Aging codes: 0=current, 1/2/3=delinquency buckets, 4=default, -1=closed'
+  evidence: PD/transitionMatrix.ipynb:111(Aging eq -1)
+- contract: GroupBy operations precede shift operations to prevent cross-account leakage
+  evidence: PD/transitionMatrix.ipynb:133(groupby shift)
+- contract: All monetary values use float64 for precision in EIR calculations
+  evidence: ECL/amortization.ipynb:97(float64)
+- contract: Stage determination MUST precede PD/LGD/EAD computation
+  evidence: README.md:19-20 (DEEP-001)
+- contract: Cumulative PD must be computed BEFORE marginal PD via diff() operation
+  evidence: PD/lifetimeCalibration.ipynb:269-274 (DEEP-003)
+- contract: Forward-looking adjustment (CCI) must be applied AFTER TTC PD calibration
+  evidence: PD/cci.ipynb, PD/simplifiedCCI.ipynb (DEEP-009)
+- contract: Amortization schedules use EIR as discount rate, not market rate
+  evidence: ECL/amortization.ipynb:93-103 (DEEP-005)
+- contract: Univariate analysis filtering must precede multivariate analysis
+  evidence: PD/univariateAnalysis1.ipynb (DEEP-015)
