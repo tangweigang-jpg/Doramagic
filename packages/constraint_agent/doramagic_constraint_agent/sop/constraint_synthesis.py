@@ -458,25 +458,27 @@ def _normalize_synthesis_item(item: object) -> object:
     if "original_index" not in out and "id" in out:
         out["original_index"] = out.pop("id")
 
-    # Flatten modified.{kind,severity} if present
-    modified = out.get("modified")
-    if isinstance(modified, dict):
-        if "constraint_kind" not in out:
-            kind_val = modified.get("kind") or modified.get("constraint_kind")
-            if kind_val:
-                out["constraint_kind"] = kind_val
-        if "severity" not in out and "severity" in modified:
-            out["severity"] = modified["severity"]
+    # Flatten {modified|proposed|updated|new}.{kind,severity} if present
+    for new_key in ("modified", "proposed", "updated", "new"):
+        nested = out.get(new_key)
+        if isinstance(nested, dict):
+            if "constraint_kind" not in out:
+                kind_val = nested.get("kind") or nested.get("constraint_kind")
+                if kind_val:
+                    out["constraint_kind"] = kind_val
+            if "severity" not in out and "severity" in nested:
+                out["severity"] = nested["severity"]
 
-    # Fallback: pull from original if modified absent
-    original = out.get("original")
-    if isinstance(original, dict):
-        if "constraint_kind" not in out:
-            kind_val = original.get("kind") or original.get("constraint_kind")
-            if kind_val:
-                out["constraint_kind"] = kind_val
-        if "severity" not in out and "severity" in original:
-            out["severity"] = original["severity"]
+    # Fallback: pull from {original|current|old} if new side absent
+    for old_key in ("original", "current", "old"):
+        nested = out.get(old_key)
+        if isinstance(nested, dict):
+            if "constraint_kind" not in out:
+                kind_val = nested.get("kind") or nested.get("constraint_kind")
+                if kind_val:
+                    out["constraint_kind"] = kind_val
+            if "severity" not in out and "severity" in nested:
+                out["severity"] = nested["severity"]
 
     # Flat variant: {id, kind, upgrade_kind, severity, upgrade_reason}
     if "constraint_kind" not in out:
