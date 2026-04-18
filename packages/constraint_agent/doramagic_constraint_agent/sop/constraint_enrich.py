@@ -893,7 +893,7 @@ def _patch_modality_severity(constraints: list[dict[str, Any]]) -> int:
             old = modality
             raw["modality"] = "must" if modality == "should" else "must_not"
             count += 1
-            logger.info(
+            logger.debug(
                 "P17: %s modality %s→%s (severity=%s)",
                 raw.get("constraint_kind", "?"),
                 old,
@@ -901,7 +901,7 @@ def _patch_modality_severity(constraints: list[dict[str, Any]]) -> int:
                 severity,
             )
     if count:
-        logger.info("Patch 17 (modality_severity): %d constraints upgraded", count)
+        logger.info("Patch 17: upgraded %d modalities", count)
     return count
 
 
