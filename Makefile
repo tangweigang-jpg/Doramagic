@@ -148,3 +148,63 @@ sop-status:
 sop-resume:
 	@test -n "$(BP)" || (echo "Usage: make sop-resume BP=finance-bp-009" && exit 1)
 	.venv/bin/python scripts/run_sop.py blueprint --blueprint-id $(BP) --resume
+
+
+# --- Crystal Compilation Tooling (v3.1+) ---
+# Full workflow: `make crystal-full BP=finance-bp-009--zvt VERSION=v3.3`
+# Individual steps:
+#   make crystal-prepare BP=<blueprint-source-dir>
+#   make crystal-compile BP=<blueprint-source-dir> VERSION=<version>
+#   make crystal-gate    BP=<blueprint-source-dir> VERSION=<version>
+# BP format: the folder name under knowledge/sources/finance/, e.g. finance-bp-009--zvt
+
+.PHONY: crystal-prepare crystal-compile crystal-gate crystal-full crystal-clean
+
+CRYSTAL_BP_DIR = knowledge/sources/finance/$(BP)
+CRYSTAL_SEED = $(CRYSTAL_BP_DIR)/$(BP_ID)-$(VERSION).seed.md
+CRYSTAL_IR = $(CRYSTAL_BP_DIR)/$(BP_ID)-$(VERSION).ir.yaml
+CRYSTAL_VALIDATE = $(CRYSTAL_BP_DIR)/validate.py
+
+# Derive blueprint ID from BP (strip the --suffix portion)
+BP_ID = $(firstword $(subst --, ,$(BP)))
+
+crystal-prepare:
+	@test -n "$(BP)" || (echo "Usage: make crystal-prepare BP=finance-bp-009--zvt" && exit 1)
+	@test -d "$(CRYSTAL_BP_DIR)" || (echo "Directory not found: $(CRYSTAL_BP_DIR)" && exit 1)
+	.venv/bin/python scripts/prepare_crystal_inputs.py --blueprint-dir $(CRYSTAL_BP_DIR)
+
+crystal-compile:
+	@test -n "$(BP)" || (echo "Usage: make crystal-compile BP=finance-bp-009--zvt VERSION=v3.3" && exit 1)
+	@test -n "$(VERSION)" || (echo "Usage: make crystal-compile BP=finance-bp-009--zvt VERSION=v3.3" && exit 1)
+	.venv/bin/python scripts/compile_crystal_skeleton.py \
+		--blueprint-dir $(CRYSTAL_BP_DIR) \
+		--target-host $(or $(HOST),openclaw) \
+		--output-seed $(CRYSTAL_SEED) \
+		--output-ir $(CRYSTAL_IR) \
+		--output-validate $(CRYSTAL_VALIDATE)
+
+crystal-gate:
+	@test -n "$(BP)" || (echo "Usage: make crystal-gate BP=finance-bp-009--zvt VERSION=v3.3" && exit 1)
+	@test -n "$(VERSION)" || (echo "Usage: make crystal-gate BP=finance-bp-009--zvt VERSION=v3.3" && exit 1)
+	.venv/bin/python scripts/crystal_quality_gate.py \
+		--blueprint $(CRYSTAL_BP_DIR)/LATEST.yaml \
+		--constraints $(CRYSTAL_BP_DIR)/LATEST.jsonl \
+		--crystal $(CRYSTAL_SEED) \
+		--strict
+
+# One-shot: prepare → compile → gate
+crystal-full: crystal-prepare crystal-compile crystal-gate
+	@echo ""
+	@echo "===================================================================="
+	@echo "Crystal $(BP_ID)-$(VERSION) compiled and gate-passed."
+	@echo "Next: main thread to fill SOUL_TODO sections in $(CRYSTAL_SEED)"
+	@echo "  - Human Summary (Doraemon persona, §1.7)"
+	@echo "  - Per-stage narratives (6 main stages)"
+	@echo "Then re-run crystal-gate to verify."
+	@echo "===================================================================="
+
+crystal-clean:
+	@test -n "$(BP)" || (echo "Usage: make crystal-clean BP=finance-bp-009--zvt VERSION=v3.3" && exit 1)
+	rm -f $(CRYSTAL_SEED) $(CRYSTAL_IR) $(CRYSTAL_SEED:.seed.md=.seed.quality_report.json)
+	rm -rf $(CRYSTAL_BP_DIR)/crystal_inputs
+	@echo "Cleaned $(BP) $(VERSION) crystal artifacts"
