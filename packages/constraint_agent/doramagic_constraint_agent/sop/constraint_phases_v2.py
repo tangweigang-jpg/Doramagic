@@ -940,8 +940,7 @@ def _accumulate_derive_result(
 ) -> None:
     """Expand a derive result into the flat list and update counters.
 
-    Supports ConstraintExtractionResult (current, uses RawConstraint),
-    DeriveChunkResult (flat DerivedConstraint), and legacy DeriveExtractionResult (grouped).
+    Supports ConstraintExtractionResult (current, uses RawConstraint).
     """
     if hasattr(result, "constraints"):
         # Re-inject derived_from metadata (RawConstraint drops it)
@@ -951,7 +950,7 @@ def _accumulate_derive_result(
             if i < len(derive_meta) and derive_meta[i]:
                 d["derived_from"] = derive_meta[i]
             all_derived.append(d)
-        # Handle missing_gap_pairs if present (DeriveChunkResult)
+        # Handle missing_gap_pairs if present
         if hasattr(result, "missing_gap_pairs"):
             for pair in result.missing_gap_pairs:
                 all_derived.append(pair.boundary.model_dump())
@@ -970,38 +969,14 @@ def _accumulate_derive_result(
                 totals[2] += 1
             else:
                 totals[3] += 1
-    else:
-        # Legacy DeriveExtractionResult (grouped)
-        all_derived.extend(c.model_dump() for c in result.rc_constraints)
-        all_derived.extend(c.model_dump() for c in result.ba_constraints)
-        all_derived.extend(c.model_dump() for c in result.m_constraints)
-        all_derived.extend(c.model_dump() for c in result.b_constraints)
-        for pair in result.missing_gap_pairs:
-            all_derived.append(pair.boundary.model_dump())
-            all_derived.append(pair.remedy.model_dump())
-        totals[0] += len(result.rc_constraints)
-        totals[1] += len(result.ba_constraints)
-        totals[2] += len(result.m_constraints)
-        totals[3] += len(result.b_constraints)
-        totals[4] += len(result.missing_gap_pairs)
-        totals[5] += len(result.skipped_decisions)
 
 
 def _count_derive_result(result: Any) -> int:
     """Count total constraints in a derive result."""
-    if hasattr(result, "constraints"):
-        count = len(result.constraints)
-        if hasattr(result, "missing_gap_pairs"):
-            count += len(result.missing_gap_pairs) * 2
-        return count
-    # Legacy DeriveExtractionResult
-    return (
-        len(result.rc_constraints)
-        + len(result.ba_constraints)
-        + len(result.m_constraints)
-        + len(result.b_constraints)
-        + len(result.missing_gap_pairs) * 2
-    )
+    count = len(result.constraints)
+    if hasattr(result, "missing_gap_pairs"):
+        count += len(result.missing_gap_pairs) * 2
+    return count
 
 
 async def _con_derive_v2_handler(state: AgentState, repo_path: Path) -> PhaseResult:
@@ -2094,7 +2069,7 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
     if total < 80:
         hard_issues.append(f"QG-01 FAIL: total={total} < 80")
     else:
-        logger.info("QG-01 PASS: total=%d >= 80", total)
+        logger.debug("QG-01 PASS: total=%d >= 80", total)
 
     # QG-02: kind_coverage >= 5 (SOP requires all 5 kinds covered).
     # Fix #8: SOP specifies coverage of all 5 kinds, not just 3.
@@ -2104,7 +2079,7 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
             f"QG-02 FAIL: kind_coverage={kind_coverage} < 5 — kinds: {list(by_kind.keys())}"
         )
     else:
-        logger.info("QG-02 PASS: kind_coverage=%d >= 5", kind_coverage)
+        logger.debug("QG-02 PASS: kind_coverage=%d >= 5", kind_coverage)
 
     # QG-03: claim_boundary >= 5%
     if total > 0:
@@ -2113,7 +2088,7 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
         if cb_pct < 5.0:
             hard_issues.append(f"QG-03 FAIL: claim_boundary={cb_count} ({cb_pct:.1f}%) < 5%")
         else:
-            logger.info("QG-03 PASS: claim_boundary=%d (%.1f%%) >= 5%%", cb_count, cb_pct)
+            logger.debug("QG-03 PASS: claim_boundary=%d (%.1f%%) >= 5%%", cb_count, cb_pct)
 
     # QG-04: domain_rule + architecture_guardrail >= 50% (lowered from 60% for 6-kind era)
     if total > 0:
@@ -2123,7 +2098,7 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
         if dr_ag_pct < 50.0:
             hard_issues.append(f"QG-04 FAIL: dr+ag={dr_count + ag_count} ({dr_ag_pct:.1f}%) < 50%")
         else:
-            logger.info("QG-04 PASS: dr+ag=%d (%.1f%%) >= 50%%", dr_count + ag_count, dr_ag_pct)
+            logger.debug("QG-04 PASS: dr+ag=%d (%.1f%%) >= 50%%", dr_count + ag_count, dr_ag_pct)
 
     # QG-09: fatal + machine_checkable threshold coverage >= 30%
     if fatal_checkable_total > 0:
@@ -2135,7 +2110,7 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
                 f"({fc_vt_pct:.1f}%) < 30%"
             )
         else:
-            logger.info(
+            logger.debug(
                 "QG-09 PASS: fatal_checkable_threshold=%d/%d (%.1f%%) >= 30%%",
                 fatal_checkable_with_vt,
                 fatal_checkable_total,
@@ -2151,7 +2126,7 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
         if ev_pct < 50.0:
             warnings.append(f"QG-05 WARN: evidence_coverage={ev_pct:.1f}% < 50%")
         else:
-            logger.info("QG-05 OK: evidence_coverage=%.1f%%", ev_pct)
+            logger.debug("QG-05 OK: evidence_coverage=%.1f%%", ev_pct)
 
     # QG-06: vt_coverage (M-class derived with validation_threshold)
     if m_derived_total > 0:
@@ -2161,7 +2136,7 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
                 f"QG-06 WARN: vt_coverage={m_derived_with_vt}/{m_derived_total} ({vt_pct:.1f}%) < 80%"
             )
         else:
-            logger.info("QG-06 OK: vt_coverage=%.1f%%", vt_pct)
+            logger.debug("QG-06 OK: vt_coverage=%.1f%%", vt_pct)
 
     # QG-07: derive_count
     manifest = _get_manifest(state)
@@ -2173,7 +2148,7 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
             f"(bd_count={bd_count})"
         )
     else:
-        logger.info("QG-07 OK: derive_count=%d >= %d", derived_count, expected_derived_min)
+        logger.debug("QG-07 OK: derive_count=%d >= %d", derived_count, expected_derived_min)
 
     # QG-08: needs_threshold_ratio — % of constraints missing validation_threshold tag.
     # Fix #8: rename to needs_threshold_ratio; describes validation_threshold missing ratio.
@@ -2184,7 +2159,7 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
                 f"QG-08 WARN: needs_threshold_ratio={p4_residual_count} ({needs_threshold_pct:.1f}%) > 10%"
             )
         else:
-            logger.info("QG-08 OK: needs_threshold_ratio=%.1f%%", needs_threshold_pct)
+            logger.debug("QG-08 OK: needs_threshold_ratio=%.1f%%", needs_threshold_pct)
 
     # Log warnings
     for w in warnings:
