@@ -36,6 +36,9 @@ logger = logging.getLogger(__name__)
 _EV_PATTERN = re.compile(r"^(.+?):(\d+(?:[,\-]\d+)*)\((.+?)\)$")
 # v10: fallback for evidence without (function) suffix, e.g. "file.py:42" or "file.py:10-50"
 _EV_PATTERN_NO_FN = re.compile(r"^(.+?):(\d+(?:[,\-]\d+)*)$")
+# Characters that cannot appear in a valid Python identifier — used by defect-1 fix to detect
+# natural-language or code-snippet fn_name values that should skip the function-presence check.
+_NON_IDENT_CHARS_RE = re.compile(r"[ ,\[\]=:\(\)\\]")
 
 # ---------------------------------------------------------------------------
 # System prompt for Track B (semantic evaluator)
@@ -246,19 +249,33 @@ async def deterministic_eval(
 
         full_path = repo_path / file_rel
 
-        # Check 1: file exists
+        # Check 1: file exists.
+        # Fix (defect-2): if the direct path is missing, try a basename glob
+        # under repo_path. Accept only when exactly one match is found — this
+        # recovers LLM-truncated paths like "black_scholes_model.py" that are
+        # really "financetoolkit/options/black_scholes_model.py".
+        # Example BD: bp-118 FinanceToolkit evidence with bare filename.
         if not full_path.exists():
-            verdicts.append(
-                {
-                    "bd_id": bd_id,
-                    "file_exists": False,
-                    "line_valid": False,
-                    "function_found": False,
-                    "verdict": "FILE_MISSING",
-                    "note": f"file not found: {file_rel}",
-                }
-            )
-            continue
+            basename = Path(file_rel).name
+            matches = list(repo_path.rglob(basename))
+            if len(matches) == 1:
+                full_path = matches[0]
+                file_rel = str(full_path.relative_to(repo_path))
+            else:
+                verdicts.append(
+                    {
+                        "bd_id": bd_id,
+                        "file_exists": False,
+                        "line_valid": False,
+                        "function_found": False,
+                        "verdict": "FILE_MISSING",
+                        "note": (
+                            f"file not found: {file_rel}"
+                            + (f" (basename glob found {len(matches)} matches)" if matches else "")
+                        ),
+                    }
+                )
+                continue
 
         # Check 2: line number valid
         try:
@@ -290,8 +307,22 @@ async def deterministic_eval(
             )
             continue
 
-        # Check 3: function name appears in file (simple string search)
-        fn_found = fn_name in file_text if fn_name and fn_name not in ("see_rationale",) else True
+        # Check 3: function name appears in file (simple string search).
+        # Fix (defect-1): LLMs sometimes fill (fn_name) with natural-language
+        # descriptions ("warning docstring", "sort_values in docstring pattern")
+        # or code snippets ("etm[:, :, 0] = np.eye(state_dim)") instead of a
+        # real Python identifier. These contain spaces, brackets, commas, or
+        # operators that can never appear in a plain identifier, so exact-match
+        # is guaranteed to fail even when the file+line are correct.
+        # When fn_name looks non-identifier (contains any of " ,[]()=:"), skip
+        # the function check and treat file+line validity as sufficient.
+        # Example BD: bp-119 transitionMatrix (83.6 % invalid rate).
+        fn_is_natural_language = bool(fn_name and _NON_IDENT_CHARS_RE.search(fn_name))
+        fn_found = (
+            True
+            if (not fn_name or fn_name in ("see_rationale",) or fn_is_natural_language)
+            else fn_name in file_text
+        )
 
         if not fn_found:
             verdicts.append(
