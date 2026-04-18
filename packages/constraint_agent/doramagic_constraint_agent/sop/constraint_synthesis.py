@@ -20,6 +20,12 @@ from typing import TYPE_CHECKING
 
 from doramagic_agent_core.core.fallback import RawFallback
 
+from doramagic_constraint_agent.sop._json_recovery import (
+    extract_fenced_json_blocks,
+    extract_json_array,
+    extract_json_object,
+    strip_markdown_fences,
+)
 from doramagic_constraint_agent.sop.constraint_schemas_v2 import (
     ConstraintSynthesisResult,
 )
@@ -354,15 +360,13 @@ def _try_extract_synthesis_result(raw_text: str) -> ConstraintSynthesisResult | 
 
     Returns ``None`` if extraction or validation fails.
     """
-    import re
-
     from pydantic import ValidationError
 
     # 0. Multi-fenced-block variant: several ```json {...}``` blocks scattered
     #    in a markdown report, each describing ONE reviewed constraint. Try this
     #    before fence-stripping because stripping merges all objects into an
     #    invalid concatenation.
-    fenced_blocks = re.findall(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw_text)
+    fenced_blocks = extract_fenced_json_blocks(raw_text)
     if len(fenced_blocks) >= 2:
         aggregated: list[dict] = []
         for block in fenced_blocks:
@@ -391,20 +395,19 @@ def _try_extract_synthesis_result(raw_text: str) -> ConstraintSynthesisResult | 
                 pass  # fall through to other recovery strategies
 
     # 1. Strip all markdown fences first
-    cleaned = re.sub(r"```(?:json)?\s*\n?", "", raw_text)
-    cleaned = re.sub(r"\n?```", "", cleaned)
+    cleaned = strip_markdown_fences(raw_text)
 
     candidates: list[tuple[str, bool]] = []  # (text, is_bare_list)
 
     # 2. Greedy top-level object
-    obj_match = re.search(r"\{[\s\S]*\}", cleaned)
-    if obj_match:
-        candidates.append((obj_match.group(0), False))
+    obj_str = extract_json_object(cleaned)
+    if obj_str is not None:
+        candidates.append((obj_str, False))
 
     # 3. Greedy top-level array (bare reviewed_constraints list)
-    arr_match = re.search(r"\[[\s\S]*\]", cleaned)
-    if arr_match:
-        candidates.append((arr_match.group(0), True))
+    arr_str = extract_json_array(cleaned)
+    if arr_str is not None:
+        candidates.append((arr_str, True))
 
     for candidate, is_bare_list in candidates:
         try:

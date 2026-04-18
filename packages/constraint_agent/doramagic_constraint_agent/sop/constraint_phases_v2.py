@@ -816,28 +816,26 @@ def _recover_derive_from_raw(
     1. Old grouped format (rc_constraints/ba_constraints/etc.)
     2. Valid constraint JSON objects embedded in markdown/text
     """
+    import contextlib
     import json
-    import re
 
+    from ._json_recovery import extract_json_array, extract_json_object, strip_markdown_fences
     from .constraint_schemas_v2 import ConstraintExtractionResult, RawConstraint
 
     # Strip markdown code fences before JSON extraction
-    cleaned = re.sub(r"```(?:json)?\s*\n?", "", raw_text)
-    cleaned = re.sub(r"\n?```", "", cleaned)
+    cleaned = strip_markdown_fences(raw_text)
 
     # Try to find JSON (object or array) in the text
-    import contextlib
-
     data = None
-    json_match = re.search(r"\{[\s\S]*\}", cleaned)
-    if json_match:
+    obj_str = extract_json_object(cleaned)
+    if obj_str is not None:
         with contextlib.suppress(json.JSONDecodeError):
-            data = json.loads(json_match.group())
+            data = json.loads(obj_str)
     if data is None:
-        arr_match = re.search(r"\[[\s\S]*\]", cleaned)
-        if arr_match:
+        arr_str = extract_json_array(cleaned)
+        if arr_str is not None:
             with contextlib.suppress(json.JSONDecodeError):
-                data = json.loads(arr_match.group())
+                data = json.loads(arr_str)
     if data is None:
         return None
 
