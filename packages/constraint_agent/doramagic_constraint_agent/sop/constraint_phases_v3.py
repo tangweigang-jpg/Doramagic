@@ -296,10 +296,10 @@ def build_constraint_phases_v3(
         + v2_phases[synthesis_idx:]  # con_constraint_synthesis onward
     )
 
-    # Update con_constraint_synthesis to depend on con_evaluate
-    for phase in result:
-        if phase.name == "con_constraint_synthesis" and "con_evaluate" not in phase.depends_on:
-            phase.depends_on.append("con_evaluate")
+    # NOTE: con_constraint_synthesis does NOT depend on con_evaluate.
+    # con_evaluate is advisory (human-review aid) and runs non-blocking; making
+    # synthesis depend on it would cause synthesis to be blocked when evaluate
+    # fails, even though evaluate's output is never consumed downstream.
 
     logger.info(
         "build_constraint_phases_v3: %d phases for %s (v2 base: %d, +3 new: "
