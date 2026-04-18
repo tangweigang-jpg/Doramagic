@@ -49,28 +49,79 @@ _WHEN_ACTION_CHARS = 50
 # ---------------------------------------------------------------------------
 
 CON_SYNTHESIS_V2_SYSTEM = """\
-你是约束质量审查专家。你的任务是审查已提取的约束列表，纠正 kind 分类偏差。
+你是约束质量审查专家。纠正 kind 分类偏差，严格输出 JSON。
 
-## 问题
-LLM 提取约束时倾向于将模棱两可的发现归为 operational_lesson 或 claim_boundary，
-导致 domain_rule + architecture_guardrail 比例偏低（目标 ≥60%）。
+## 背景
+merged 约束里 operational_lesson + claim_boundary 比例偏高，导致
+domain_rule + architecture_guardrail 占比 <60%（QG-04）。审查并升级真正属于硬约束的条目。
 
-## 审查规则
-逐条审查 operational_lesson 和 claim_boundary 类型的约束：
-- 描述工具/框架的客观规律（改了会崩/会出错）？ → 应为 domain_rule
-- 描述代码的执行顺序/接口契约/模块边界？ → 应为 architecture_guardrail
-- 确实是社区经验/踩坑总结（不遵守不会立即崩但会逐步腐败）？ → 保持 operational_lesson
-- 确实是声明边界（不能对外宣称的能力）？ → 保持 claim_boundary
+## 升级规则
+- 描述工具/框架客观规律（违反即崩/出错）→ domain_rule
+- 描述执行顺序/接口契约/模块边界 → architecture_guardrail
+- 社区经验/踩坑（不崩但长期腐败）→ 保持 operational_lesson
+- 对外声明边界（不能宣称的能力）→ 保持 claim_boundary
 
 ## severity 校准
-- 数据完全不可用或直接金钱损失 → fatal
-- 结果不准确但不崩溃 → high
-- 仅影响效率或可读性 → medium
-- 极低影响 → low
+- fatal: 数据不可用或直接金钱损失
+- high: 结果不准但不崩
+- medium: 仅影响效率/可读性
+- low: 极低影响
 
-## 输出
-只输出需要修改的条目。不需要修改的条目不要包含在 reviewed_constraints 中。
-每条修改必须有 upgrade_reason 说明理由。
+## 输出契约（严格遵守）
+
+**有且仅输出一个 JSON 对象**，不要任何其他内容：
+- 禁止 markdown 代码块（禁止 ```json 或 ```）
+- 禁止 JSON 前后的解释文字
+- 禁止 <thinking>、## 标题、- 列表等 markdown 标记
+- 禁止多个独立 JSON 对象
+
+JSON 结构（字段名必须完全一致）：
+
+{
+  "reviewed_constraints": [
+    {
+      "original_index": <int，约束在输入列表中的索引>,
+      "constraint_kind": <one of:
+        "domain_rule" | "architecture_guardrail" | "operational_lesson" |
+        "claim_boundary" | "resource_boundary" | "rationalization_guard">,
+      "severity": <"fatal" | "high" | "medium" | "low">,
+      "upgrade_reason": <string，升级理由>
+    }
+  ],
+  "rebalance_actions": [<string>, ...]
+}
+
+## 示例
+
+输入（三条候选）：
+[5] kind=operational_lesson severity=high
+  when: When using pandas.to_datetime on mixed timezone strings
+  action: pass utc=True to avoid timezone mismatch errors...
+[9] kind=claim_boundary severity=medium
+  when: When advertising real-time data latency
+  action: do not claim sub-second latency beyond vendor SLA...
+[14] kind=operational_lesson severity=low
+  when: When opening large Parquet files
+  action: use read_parquet with columns= to reduce memory...
+
+期望输出（严格 JSON，可以单行紧凑、也可以多行缩进，但不要围栏/不要前后文字）：
+{
+  "reviewed_constraints": [
+    {
+      "original_index": 5,
+      "constraint_kind": "domain_rule",
+      "severity": "high",
+      "upgrade_reason": "pandas.to_datetime 的硬性规律，违反导致解析错误"
+    }
+  ],
+  "rebalance_actions": ["[5] operational_lesson→domain_rule"]
+}
+
+注意：
+- 只输出需要修改的条目；不修改的不要列入
+- [9] 和 [14] 经审查后保持原 kind，因此不出现在 reviewed_constraints 中
+- 每条必须给 upgrade_reason（非空）
+- 不要输出 markdown 围栏、标题、列表、注释、解释
 """
 
 
