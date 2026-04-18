@@ -246,8 +246,18 @@ class ConstraintBatchOrchestrator:
                 )
                 if state.commit_hash:
                     logger.info("Blueprint commit_hash=%s", state.commit_hash[:7])
-            except Exception:
-                pass
+            except OSError as exc:
+                logger.warning(
+                    "Failed to read blueprint YAML for commit_hash (path=%s): %s",
+                    blueprint_path,
+                    exc,
+                )
+            except yaml.YAMLError as exc:
+                logger.warning(
+                    "Failed to parse blueprint YAML for commit_hash (path=%s): %s",
+                    blueprint_path,
+                    exc,
+                )
 
         # 5. Build tool registry
         registry = ToolRegistry()
