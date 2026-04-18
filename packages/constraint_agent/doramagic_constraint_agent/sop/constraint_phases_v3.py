@@ -262,6 +262,9 @@ def build_constraint_phases_v3(
     )
 
     # --- con_evaluate (independent evaluator, after merge) ---
+    # blocking=False: the evaluation report is advisory (human-review aid) and
+    # does not gate the downstream synthesis/validate steps. Making it blocking
+    # was serializing the pipeline unnecessarily.
     evaluate_phase = Phase(
         name="con_evaluate",
         description="Independent Sprint-Contract constraint evaluation",
@@ -276,7 +279,7 @@ def build_constraint_phases_v3(
         max_iterations=40,
         required_artifacts=["ct_evaluation_report.json"],
         depends_on=["con_merge"],
-        blocking=True,
+        blocking=False,
     )
 
     # Assemble final phase list:
