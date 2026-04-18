@@ -215,7 +215,6 @@ def build_constraint_phases_v3(
     # Find insertion points
     # Insert new extract phases before con_merge (last extract group member)
     merge_idx = next(i for i, p in enumerate(v2_phases) if p.name == "con_merge")
-    synthesis_idx = next(i for i, p in enumerate(v2_phases) if p.name == "con_constraint_synthesis")
 
     # Build new phases
     new_extract_phases: list[Phase] = []
@@ -261,49 +260,23 @@ def build_constraint_phases_v3(
         )
     )
 
-    # --- con_evaluate (independent evaluator, after merge) ---
-    # blocking=False: the evaluation report is advisory (human-review aid) and
-    # does not gate the downstream synthesis/validate steps. Making it blocking
-    # was serializing the pipeline unnecessarily.
-    evaluate_phase = Phase(
-        name="con_evaluate",
-        description="Independent Sprint-Contract constraint evaluation",
-        system_prompt=prompts_v2.CON_EVALUATOR_SYSTEM,
-        initial_message_builder=_build_ct_evaluate_message,
-        allowed_tools=[
-            "read_file",
-            "grep_codebase",
-            "get_artifact",
-            "write_artifact",
-        ],
-        max_iterations=40,
-        required_artifacts=["ct_evaluation_report.json"],
-        depends_on=["con_merge"],
-        blocking=False,
-    )
+    # NOTE: con_evaluate phase is DISABLED in production.
+    # The evaluator produces `ct_evaluation_report.json` which is purely
+    # advisory (human-review aid) — no downstream handler reads it.
+    # Running it costs ~5 min / 40 iterations / ~80K tokens per blueprint
+    # with zero impact on the emitted constraint set. Skipping it saves
+    # ~3.5h across a 41-bp batch without changing extraction quality.
+    # _build_ct_evaluate_message() is kept for reference / re-enable.
 
     # Assemble final phase list:
     # v2_phases[:merge_idx] = pre-processing + all v2 extract phases
     # + new extract phases (doc + rationalization)
-    # + v2_phases[merge_idx:synthesis_idx] = con_merge + any phases between merge and synthesis
-    # + evaluate_phase
-    # + v2_phases[synthesis_idx:] = con_constraint_synthesis onward
-    result = (
-        v2_phases[:merge_idx]
-        + new_extract_phases
-        + v2_phases[merge_idx:synthesis_idx]  # con_merge + any intermediate phases
-        + [evaluate_phase]  # independent evaluator
-        + v2_phases[synthesis_idx:]  # con_constraint_synthesis onward
-    )
-
-    # NOTE: con_constraint_synthesis does NOT depend on con_evaluate.
-    # con_evaluate is advisory (human-review aid) and runs non-blocking; making
-    # synthesis depend on it would cause synthesis to be blocked when evaluate
-    # fails, even though evaluate's output is never consumed downstream.
+    # + v2_phases[merge_idx:] = con_merge + synthesis + downstream
+    result = v2_phases[:merge_idx] + new_extract_phases + v2_phases[merge_idx:]
 
     logger.info(
-        "build_constraint_phases_v3: %d phases for %s (v2 base: %d, +3 new: "
-        "doc_extract, rationalization, evaluate)",
+        "build_constraint_phases_v3: %d phases for %s (v2 base: %d, +2 new: "
+        "doc_extract, rationalization; con_evaluate disabled)",
         len(result),
         blueprint_id,
         len(v2_phases),
