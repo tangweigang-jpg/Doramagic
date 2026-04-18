@@ -322,7 +322,7 @@ class ConstraintBatchOrchestrator:
             repo_path,
             model_router=model_router,
             agent_factory=agent_factory,
-            max_parallel=5,  # was 3 — bumped for throughput; MiniMax Max plan can handle 5
+            max_parallel=3,  # tried 5 — triggered heavy MiniMax 2062 rate limits, reverted
         )
         con_result = await con_executor.run()
 
