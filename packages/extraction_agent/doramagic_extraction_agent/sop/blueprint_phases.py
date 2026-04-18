@@ -44,6 +44,71 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _extract_stages_from_truncated_json(text: str) -> list | None:
+    """Rescue stages array from a truncated JSON string.
+
+    When LLM output is cut off mid-JSON, yaml.safe_load fails
+    (unclosed strings/brackets).  This walks character-by-character
+    to find complete stage objects and returns them.
+
+    Returns a list of parsed stage dicts if ≥1 complete stage found,
+    else None.
+    """
+    m = re.search(r'"stages"\s*:\s*\[', text)
+    if not m:
+        return None
+    start = m.end()  # index just after the opening '['
+
+    in_str = False
+    escape_next = False
+    depth = 0  # counts '{' and '[' inside the array
+    last_complete_pos: int | None = None  # end of last complete stage object
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if escape_next:
+            escape_next = False
+            i += 1
+            continue
+        if ch == "\\" and in_str:
+            escape_next = True
+            i += 1
+            continue
+        if ch == '"':
+            in_str = not in_str
+            i += 1
+            continue
+        if in_str:
+            i += 1
+            continue
+        if ch in ("{", "["):
+            depth += 1
+        elif ch in ("}", "]"):
+            depth -= 1
+            if depth == 0 and ch == "}":
+                # Just closed a top-level stage object
+                last_complete_pos = i + 1
+            elif depth < 0:
+                # Hit the closing ']' of the stages array
+                break
+        i += 1
+
+    if last_complete_pos is None:
+        return None
+
+    # Reconstruct a minimal valid JSON fragment
+    fragment = "[" + text[start:last_complete_pos] + "]"
+    try:
+        stages = json.loads(fragment)
+        if isinstance(stages, list) and len(stages) >= 1:
+            return stages
+    except json.JSONDecodeError:
+        pass
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Pure-Python phase handlers
 # ---------------------------------------------------------------------------
@@ -2417,72 +2482,6 @@ def build_blueprint_phases_v5(
             raw = _re.sub(r"\n?```\s*$", "", raw)
             # Keep a reference to result.stage before we potentially reassign result
             _raw_fallback_stage = result.stage
-
-            def _extract_stages_from_truncated_json(text: str) -> list | None:
-                """Rescue stages array from a truncated JSON string.
-
-                When LLM output is cut off mid-JSON, yaml.safe_load fails
-                (unclosed strings/brackets).  This walks character-by-character
-                to find complete stage objects and returns them.
-
-                Returns a list of parsed stage dicts if ≥1 complete stage found,
-                else None.
-                """
-                import json as _json2
-                import re as _re2
-
-                m = _re2.search(r'"stages"\s*:\s*\[', text)
-                if not m:
-                    return None
-                start = m.end()  # index just after the opening '['
-
-                in_str = False
-                escape_next = False
-                depth = 0  # counts '{' and '[' inside the array
-                last_complete_pos: int | None = None  # end of last complete stage object
-                i = start
-                n = len(text)
-                while i < n:
-                    ch = text[i]
-                    if escape_next:
-                        escape_next = False
-                        i += 1
-                        continue
-                    if ch == "\\" and in_str:
-                        escape_next = True
-                        i += 1
-                        continue
-                    if ch == '"':
-                        in_str = not in_str
-                        i += 1
-                        continue
-                    if in_str:
-                        i += 1
-                        continue
-                    if ch in ("{", "["):
-                        depth += 1
-                    elif ch in ("}", "]"):
-                        depth -= 1
-                        if depth == 0 and ch == "}":
-                            # Just closed a top-level stage object
-                            last_complete_pos = i + 1
-                        elif depth < 0:
-                            # Hit the closing ']' of the stages array
-                            break
-                    i += 1
-
-                if last_complete_pos is None:
-                    return None
-
-                # Reconstruct a minimal valid JSON fragment
-                fragment = "[" + text[start:last_complete_pos] + "]"
-                try:
-                    stages = _json2.loads(fragment)
-                    if isinstance(stages, list) and len(stages) >= 1:
-                        return stages
-                except _json2.JSONDecodeError:
-                    pass
-                return None
 
             try:
                 import json as _json
