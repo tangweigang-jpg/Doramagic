@@ -118,6 +118,7 @@ _无_ 🎉
 
 ## 事件日志
 
+- **2026-04-18 08:50** — evidence verifier 两处修复后重跑 bp-118/bp-119（commit 900af46）；bp-119 invalid 83.6%→0.8%（verifier fix），bp-118 57.7%→18.9%（basename fallback + LLM 重跑）
 - **2026-04-18 08:20** — Wave 5+6 验收 + 2 项重跑完成：**56 PASS / 17 WARN / 0 FAIL**
 - 2026-04-18 08:19 — bp-116 FinRL-Meta 重跑完成（BDs 43→171，PASS）
 - 2026-04-18 08:14 — bp-126 lifelines 重跑完成（stages 0→6，PASS）
