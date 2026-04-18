@@ -1,0 +1,3199 @@
+id: finance-bp-125
+name: bt - Flexible Backtesting for Python
+sop_version: '3.6'
+source:
+  projects:
+  - bt
+  commit_hash: 48353dfa929e44921ec7fe9cb117cc98e71cb2af
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: quantitative trading strategy backtesting
+  description: A flexible Python framework for testing quantitative trading strategies
+    using a tree-based hierarchical structure and modular AlgoStack components. Supports
+    equity and fixed income securities with commission modeling and detailed performance
+    analytics.
+  prerequisites: Users need Python proficiency, pandas DataFrame knowledge, and understanding
+    of financial backtesting concepts. Familiarity with ffn library is helpful.
+  not_suitable_for: Real-time trading execution, production deployment, high-frequency
+    trading requiring sub-second latency, non-financial simulation, or users requiring
+    built-in risk management or compliance features.
+stages:
+- id: data_input
+  name: Data Input & Preprocessing
+  order: 1
+  responsibility: Ingests price data and additional data (bidoffer, coupons) into
+    the backtest. Adds virtual row at t0-1day to ensure clean starting point for day-0
+    trading evaluation and consistent indexing across each data structures.
+  interface:
+    inputs:
+    - price DataFrame with datetime index
+    - additional_data dict containing bidoffer, coupons, unit_risk
+    outputs:
+    - processed data with virtual t0-1day row prepended
+    - dates DateTimeIndex aligned to data
+  required_methods:
+  - name: Backtest.run
+    description: Main backtest execution method that orchestrates data processing
+      and simulation loop
+    evidence: bt/backtest.py:237(run)
+  - name: Backtest._process_data
+    description: Preprocesses input data, adds virtual row at t0-1day, and aligns
+      additional_data DataFrames
+    evidence: bt/backtest.py:183(_process_data)
+  key_behaviors:
+  - behavior: Virtual t0-1day row insertion
+    description: Inserts a virtual row one day before the first data date to establish
+      clean starting reference for price-based calculations, preventing day-0 commissions
+      from affecting starting price reference which should remain at 100.
+    evidence: bt/backtest.py:191(_process_data)
+  - behavior: Additional DataFrame alignment
+    description: Every additional data DataFrames (bidoffer, coupons) receive the
+      same virtual row treatment to maintain consistent indexing with price data for
+      lookback calculations.
+    evidence: bt/backtest.py:205(_process_data)
+  - behavior: Deep copy isolation
+    description: Strategy is deep copied to enable reuse across multiple backtests
+      without state leakage
+    evidence: bt/backtest.py:165(__init__)
+  replaceable_points:
+  - name: data_source
+    description: Source of price and additional data is pluggable - any datetime-indexed
+      pandas structure
+    options:
+    - name: ffn.get()
+      traits:
+      - Remote data fetching
+      - Caching enabled
+      - Multiple source support
+      fit_for:
+      - Quick prototyping
+      - Public market data
+      - Yahoo/AlphaVantage integration
+      not_fit_for:
+      - Proprietary data
+      - Custom data formats
+      - Real-time streams
+    - name: manual DataFrame
+      traits:
+      - Full control
+      - In-memory only
+      - Direct manipulation
+      fit_for:
+      - Synthetic data
+      - Custom preprocessing
+      - Debugging scenarios
+      not_fit_for:
+      - Large datasets
+      - Remote data sources
+      - Automated pipelines
+    - name: CSV loader
+      traits:
+      - File-based
+      - Batch processing
+      - Persistent storage
+      fit_for:
+      - Historical data files
+      - Audit trails
+      - Offline processing
+      not_fit_for:
+      - Real-time data
+      - Streaming scenarios
+      - In-memory only workflows
+    default: ffn.get()
+  design_decisions:
+  - 'Virtual t0-1day row added to prevent day-0 commissions from affecting starting
+    price reference. Without this, big trades on day 0 would adjust Strategy.prices
+    and hide total return issues. The series should start at 100 but might start at
+    90. Evidence: bt/backtest.py:191(_process_data)'
+  - 'Additional DataFrames get same virtual row treatment to ensure bidoffer, coupons,
+    etc. have consistent indexing with price data for lookback calculations. Evidence:
+    bt/backtest.py:209(_process_data)'
+  - 'Backtest deepcopies strategy to enable reuse across multiple runs while isolating
+    state. Evidence: bt/backtest.py:165(__init__)'
+  acceptance_hints:
+  - strategy.prices index starts at t0-1day with NaN values for each securities
+  - Every additional_data DataFrames have same index as price data including virtual
+    row
+  - Dates alignment is consistent across each DataFrames
+  - Virtual row has NaN price values but valid datetime index
+- id: tree_building
+  name: Tree Structure Construction
+  order: 2
+  responsibility: Builds hierarchical Node tree (Strategy→Security) with lazy child
+    creation, integer position tracking, and parent-child relationships. Establishes
+    the foundation for modular strategy composition and capital allocation hierarchy.
+  interface:
+    inputs:
+    - Strategy/Node definitions with children dict or list
+    outputs:
+    - Node tree with parent/root references
+    - lazy_children mapping for string-named children
+    - _childrenv list for ordered access
+  required_methods:
+  - name: Node.__init__
+    description: Base tree node initialization with name, parent, children, stale
+      flag, and integer_positions setting
+    evidence: bt/core.py:94(__init__)
+  - name: StrategyBase.__init__
+    description: Capital allocation node with universe, cash, flows, and fixed_income
+      mode
+    evidence: bt/core.py:333(__init__)
+  - name: SecurityBase.__init__
+    description: Leaf node for tradable securities with position, multiplier, and
+      notional_value
+    evidence: bt/core.py:1150(__init__)
+  - name: Node._add_children
+    description: Handles dict/list children input, lazy creation of string-named children
+      on first access
+    evidence: bt/core.py:142(_add_children)
+  key_behaviors:
+  - behavior: Self-referential root detection
+    description: Root node sets parent=self enabling cheap root detection via if node.parent
+      == node. Avoids separate root flag while enabling full_name computation and
+      stale propagation.
+    evidence: bt/core.py:90(__init__)
+  - behavior: Lazy child creation
+    description: String children become lazy children, only created when accessed
+      via __getattr__. Improves performance for sparse universes where securities
+      are only materialized when actually traded.
+    evidence: bt/core.py:81(_lazy_children)
+  - behavior: Duplicate child name enforcement
+    description: Duplicate child names within same parent raise ValueError to prevent
+      silent bugs where one child overwrites another in the children dict.
+    evidence: bt/core.py:168(_add_children)
+  - behavior: Integer positions propagation
+    description: integer_positions propagates from root to each children via use_integer_positions().
+      Lazy children inherit setting when created. Default True causes fractional share
+      rounding to zero for high-priced assets.
+    evidence: bt/core.py:205(use_integer_positions)
+  replaceable_points:
+  - name: security_type
+    description: Child creation is extensible - different security classes can be
+      used for lazy creation based on tree structure
+    options:
+    - name: Security
+      traits:
+      - Standard equity
+      - Position-based
+      - Market value weighting
+      fit_for:
+      - Equity portfolios
+      - ETF trading
+      - Standard asset classes
+      not_fit_for:
+      - Fixed income
+      - Derivatives
+      - Multi-leg instruments
+    - name: FixedIncomeSecurity
+      traits:
+      - Par-based pricing
+      - Notional value
+      - Additive returns
+      fit_for:
+      - Bonds
+      - Fixed income ETFs
+      - Coupon-paying instruments
+      not_fit_for:
+      - Equities
+      - Options
+      - Futures
+    - name: CouponPayingSecurity
+      traits:
+      - Periodic coupons
+      - Accrued interest
+      - Yield tracking
+      fit_for:
+      - Coupon bonds
+      - Preferred stock
+      - Dividend strategies
+      not_fit_for:
+      - Zero-coupon bonds
+      - Equity
+      - Non-cash instruments
+    default: Security
+  - name: lazy_creation
+    description: Children can be eagerly created at initialization or lazily on first
+      access
+    options:
+    - name: eager (Node instances)
+      traits:
+      - Immediate instantiation
+      - Memory allocated upfront
+      - No lazy lookup overhead
+      fit_for:
+      - Small universes
+      - Every securities known upfront
+      - Performance-critical tight loops
+      not_fit_for:
+      - Large universes
+      - Sparse trading
+      - Dynamic universe selection
+    - name: lazy (strings)
+      traits:
+      - On-demand creation
+      - Memory efficient
+      - Dynamic universe support
+      fit_for:
+      - Large universes
+      - Sparse trading
+      - Dynamic strategy construction
+      not_fit_for:
+      - Small universes
+      - Performance-critical scenarios
+      - Debugging (less predictable)
+    default: lazy (strings)
+  design_decisions:
+  - 'Integer positions default to True for backward compatibility. Causes rounding
+    issues with high prices relative to capital. Users must explicitly set integer_positions=False
+    for robustness. Evidence: bt/core.py:94(__init__)'
+  - 'Node uses parent=self when root enabling self-referential root detection. Allows
+    cheap root detection: if node.parent == node, it''s the root. Avoids separate
+    root flag. Evidence: bt/core.py:90(__init__)'
+  - 'String children become lazy children created on first access. Improves performance
+    for sparse universes - securities only materialized when actually traded. Evidence:
+    bt/core.py:81(_lazy_children)'
+  - 'Duplicate child names raise ValueError to prevent silent bugs. Silent duplicates
+    would cause one child to overwrite another in dict. Evidence: bt/core.py:168(_add_children)'
+  acceptance_hints:
+  - 'Root node detection works: node.parent == node for root only'
+  - Every descendants accessible via parent-child traversal
+  - Lazy children created correctly on first attribute access
+  - No duplicate child names within same parent (ValueError on duplicates)
+  - integer_positions setting cascades to each children
+- id: strategy_logic
+  name: Strategy Logic Execution (AlgoStack)
+  order: 3
+  responsibility: Executes modular Algo components in sequence via AlgoStack. Each
+    Algo operates on temp dict, stopping on False return unless run_always decorator
+    used. Provides flexible, testable, reusable strategy logic blocks.
+  interface:
+    inputs:
+    - temp dict (selected, weights, stat)
+    - Strategy target
+    - AlgoStack configuration
+    outputs:
+    - Modified temp dict with selections/weights/stats
+    - bool success/failure per Algo
+  required_methods:
+  - name: Algo.__call__
+    description: Base class call method receiving target Strategy, returns bool to
+      control stack execution
+    evidence: bt/core.py:2016(__call__)
+  - name: AlgoStack.__call__
+    description: Runs algos until one returns False (stop) or each complete. Checks
+      run_always flag to bypass stop-on-False behavior.
+    evidence: bt/core.py:2020(__call__)
+  - name: Strategy.run
+    description: Clears temp dict, runs AlgoStack, then runs child strategies. temp
+      is scratch space; perm persists across calls.
+    evidence: bt/core.py:2097(run)
+  key_behaviors:
+  - behavior: Short-circuit on False return
+    description: AlgoStack stops execution on first False return from any Algo. Simple
+      but powerful control flow mimicking grep pipeline philosophy where each Algo
+      does one thing well.
+    evidence: bt/core.py:2042(AlgoStack.__call__)
+  - behavior: run_always decorator bypass
+    description: run_always decorator marks algos to bypass normal stop-on-False behavior.
+      Needed for algos like RebalanceOverTime that must run every period even if other
+      algos fail.
+    evidence: bt/algos.py:18(run_always)
+  - behavior: temp/perm dictionary separation
+    description: temp dict cleared each run() call for scratch space algo-to-algo
+      communication within a timestep. perm dict persists across calls for state that
+      needs to survive timesteps.
+    evidence: bt/core.py:2098(Strategy.run)
+  - behavior: Duck typing for Algos
+    description: Uses duck typing with NotImplementedError rather than ABC. Allows
+      simple functions as algos too (no state needed). Algo.__call__ signature must
+      be respected.
+    evidence: bt/core.py:2016(Algo.__call__)
+  - behavior: Algo temp pipeline ordering
+    description: 'Expected pipeline order: selected → stat → weights → Rebalance.
+      Algos expecting ''selected'' will fail if previous algo didn''t set it. Rebalance
+      silently succeeds if ''weights'' missing.'
+    evidence: bt/algos.py:482(SelectAll), bt/algos.py:906(SetStat), bt/algos.py:1007(WeighSpecified),
+      bt/algos.py:1777(Rebalance)
+  replaceable_points:
+  - name: run_timing
+    description: Controls when strategy logic executes - which dates trigger the AlgoStack
+    options:
+    - name: RunOnce
+      traits:
+      - Single execution
+      - No rebalancing
+      - Static allocation
+      fit_for:
+      - Buy and hold
+      - Initial setup
+      - One-time allocation
+      not_fit_for:
+      - Rebalancing
+      - Dynamic strategies
+      - Periodic adjustments
+    - name: RunDaily
+      traits:
+      - Every business day
+      - High frequency decisions
+      - Daily rebalance capable
+      fit_for:
+      - Daily rebalancing
+      - High-turnover strategies
+      - Short-term signals
+      not_fit_for:
+      - Monthly strategies
+      - Low-frequency signals
+      - Long-only portfolios
+    - name: RunMonthly
+      traits:
+      - First day of month
+      - Low turnover
+      - Strategic allocation
+      fit_for:
+      - Strategic asset allocation
+      - Monthly rebalancing
+      - Core-satellite approaches
+      not_fit_for:
+      - Daily rebalancing
+      - High-frequency trading
+      - Tactical allocation
+    - name: RunAfterDate
+      traits:
+      - Conditional start
+      - Warm-up period
+      - Delayed start
+      fit_for:
+      - Lookback-dependent strategies
+      - Initial warmup
+      - Delayed strategy start
+      not_fit_for:
+      - Immediate execution
+      - No warmup needed
+      - Continuous strategies
+    - name: RunEveryNPeriods
+      traits:
+      - Fixed interval
+      - Flexible frequency
+      - Configurable period
+      fit_for:
+      - Custom frequency
+      - N-day rebalancing
+      - Flexible scheduling
+      not_fit_for:
+      - Calendar-based
+      - Fixed monthly
+      - Daily-only
+    default: RunMonthly
+  - name: selection_logic
+    description: Determines which securities from the universe to include in the current
+      rebalance
+    options:
+    - name: SelectAll
+      traits:
+      - No filtering
+      - Every securities
+      - Equal universe
+      fit_for:
+      - Equal-weighted
+      - Full universe
+      - Index replication
+      not_fit_for:
+      - Screening
+      - Momentum
+      - Factor-based
+    - name: SelectN
+      traits:
+      - Top N selection
+      - Ranked filtering
+      - Configurable sort
+      fit_for:
+      - Top-N momentum
+      - Concentrated portfolios
+      - Rank-based signals
+      not_fit_for:
+      - Screening
+      - Threshold-based
+      - No ranking
+    - name: SelectMomentum
+      traits:
+      - Return-based ranking
+      - Lookback period
+      - Top performers
+      fit_for:
+      - Momentum strategies
+      - Trend following
+      - Relative strength
+      not_fit_for:
+      - Value strategies
+      - Mean reversion
+      - Fundamental screening
+    - name: SelectWhere
+      traits:
+      - Conditional selection
+      - Signal-based
+      - Flexible conditions
+      fit_for:
+      - Signal-driven
+      - Conditional filtering
+      - Custom logic
+      not_fit_for:
+      - Simple ranking
+      - Top-N selection
+      - Momentum
+    - name: SelectHasData
+      traits:
+      - Data availability check
+      - Missing data handling
+      - Survivorship bias prevention
+      fit_for:
+      - Realistic backtesting
+      - Survivorship-free
+      - Data quality
+      not_fit_for:
+      - Known universe
+      - No missing data
+      - Perfect data
+    - name: SelectRegex
+      traits:
+      - Pattern matching
+      - Ticker-based
+      - Regular expression
+      fit_for:
+      - Sector-based
+      - Ticker patterns
+      - Naming conventions
+      not_fit_for:
+      - Non-name criteria
+      - Factor-based
+      - Quantitative screens
+    default: SelectAll
+  - name: weighting_logic
+    description: Determines how to allocate capital across selected securities
+    options:
+    - name: WeighEqually
+      traits:
+      - Equal weights
+      - No optimization
+      - Simple
+      fit_for:
+      - Equal-weighted
+      - Diversified
+      - Low-complexity
+      not_fit_for:
+      - Optimization
+      - Risk parity
+      - Factor exposure
+    - name: WeighSpecified
+      traits:
+      - User-defined weights
+      - Fixed allocation
+      - Explicit input
+      fit_for:
+      - Strategic allocation
+      - Known weights
+      - Target allocation
+      not_fit_for:
+      - Dynamic weights
+      - Optimization
+      - Signal-based
+    - name: WeighInvVol
+      traits:
+      - Inverse volatility
+      - Risk parity base
+      - Volatility scaling
+      fit_for:
+      - Risk parity
+      - Low-volatility
+      - Equal risk contribution
+      not_fit_for:
+      - Equal weight
+      - Mean-variance
+      - Momentum
+    - name: WeighERC
+      traits:
+      - Equal risk contribution
+      - Iterative optimization
+      - Correlation-aware
+      fit_for:
+      - Risk parity
+      - Diversified
+      - Correlation-aware
+      not_fit_for:
+      - Simple equal weight
+      - No optimization
+      - Fast execution
+    - name: WeighMeanVar
+      traits:
+      - Mean-variance optimization
+      - Covariance-based
+      - Efficient frontier
+      fit_for:
+      - Optimal allocation
+      - Risk-return tradeoff
+      - Markowitz
+      not_fit_for:
+      - Robust optimization
+      - Fast execution
+      - No covariance data
+    - name: WeighTarget
+      traits:
+      - Target weight
+      - Drift monitoring
+      - Tolerance band
+      fit_for:
+      - Target allocation
+      - Band rebalancing
+      - Strategic weighting
+      not_fit_for:
+      - Equal weight
+      - Momentum
+      - Dynamic signals
+    default: WeighEqually
+  design_decisions:
+  - 'Algo.__call__ must return bool - False stops stack execution. Simple but powerful
+    control flow mimicking grep pipeline philosophy. Each Algo does one thing well.
+    Evidence: bt/core.py:2042(AlgoStack.__call__)'
+  - 'run_always decorator bypasses normal stop-on-False behavior. Needed for algos
+    like RebalanceOverTime that must run every period even if other algos fail. Evidence:
+    bt/algos.py:18(run_always)'
+  - 'temp dict cleared each run() call, perm dict persists across calls. temp is scratch
+    space for algo-to-algo communication within a timestep; perm stores state across
+    time. Evidence: bt/core.py:2098(Strategy.run)'
+  - 'Algo subclasses use duck typing with NotImplementedError rather than ABC. Allows
+    simple functions as algos too (no state needed). Evidence: bt/core.py:2016(Algo.__call__)'
+  - 'RunPeriod defaults run_on_first_date=True - algos fire on first date by default.
+    Unexpected first-date execution if developer assumes monthly/weekly basis only.
+    Evidence: bt/algos.py:136(run_on_first_date=True)'
+  acceptance_hints:
+  - AlgoStack stops on first False unless run_always=True decorator present
+  - temp dict cleared between run() calls but perm persists
+  - Every Algos in stack called in order until False or completion
+  - 'Algo temp pipeline: selected set first, then stat, then weights, then Rebalance'
+- id: capital_allocation
+  name: Capital Allocation & Rebalancing
+  order: 4
+  responsibility: Translates target weights into actual capital movements. Handles
+    both market-value (equity) and notional-value (fixed income) weighting modes.
+    Executes transactions with commission deduction and bid/offer spread modeling.
+  interface:
+    inputs:
+    - target weights from temp['weights']
+    - current portfolio value from _value
+    - cash reserve from _cash
+    outputs:
+    - Security transactions via SecurityBase.transact
+    - capital adjustments via parent.adjust()
+    - position changes in _position
+  required_methods:
+  - name: StrategyBase.allocate
+    description: Capital allocation to strategy/child, recursively proportionally
+      to weights via _weight. Enables hierarchical allocation where parent percentage
+      splits to children.
+    evidence: bt/core.py:890(allocate)
+  - name: StrategyBase.rebalance
+    description: Rebalance child to target weight - calculates delta, calls allocate
+      with update=False to lock original base value across children
+    evidence: bt/core.py:971(rebalance)
+  - name: SecurityBase.transact
+    description: Execute buy/sell for given quantity, deduct commissions, mark root.stale=True
+      for lazy recalculation
+    evidence: bt/core.py:1636(transact)
+  - name: SecurityBase.outlay
+    description: Calculate total cash outlay including bid/offer spread. Uses abs(q)
+      for symmetric spread, signed q for custom price direction.
+    evidence: bt/core.py:1700(outlay)
+  key_behaviors:
+  - behavior: Proportional hierarchical allocation
+    description: allocate() pushes down proportionally via _weight, enabling hierarchical
+      allocation. A 10% allocation to parent becomes 5%/5% for two 50%-weighted children.
+      Enables tree-based capital allocation.
+    evidence: bt/core.py:931(allocate)
+  - behavior: Base value locking for sequential rebalancing
+    description: rebalance() uses base parameter to lock original value for delta
+      calc across children. Without base, sequential rebalancing changes the base
+      for each child causing incorrect allocations. Set base once before iteration.
+    evidence: bt/core.py:989(rebalance)
+  - behavior: Symmetric bid/offer handling
+    description: outlay() uses abs(q) for symmetric bid/offer (spread paid on both
+      buy and sell), but custom price uses signed q to track direction correctly.
+    evidence: bt/core.py:1712(outlay)
+  - behavior: Fixed income bankruptcy bypass
+    description: fixed_income=True disables automatic bankruptcy detection and uses
+      notional_value weighting instead of market value. Fixed income strategies have
+      deterministic notional; bankruptcy is modeled via Algo (Margin).
+    evidence: bt/core.py:749(update)
+  - behavior: Paper trading shadow strategy
+    description: Child strategies auto-paper-trade unless explicitly marked. Creates
+      $1M fake _paper strategy to simulate fills without real capital impact. Price
+      sourced from paper strategy.
+    evidence: bt/core.py:580-590(setup creates _paper)
+  replaceable_points:
+  - name: weight_mode
+    description: Determines whether allocation uses market value (equity) or notional
+      value (fixed income) as the denominator for weight calculations
+    options:
+    - name: Strategy (market value)
+      traits:
+      - Market value weighting
+      - Price-based
+      - Value-at-risk
+      fit_for:
+      - Equity portfolios
+      - ETF strategies
+      - Market-cap weighting
+      not_fit_for:
+      - Fixed income
+      - Bonds
+      - Notional exposure
+    - name: FixedIncomeStrategy (notional value)
+      traits:
+      - Notional value weighting
+      - Position-based
+      - PAR reference
+      fit_for:
+      - Fixed income portfolios
+      - Bond strategies
+      - Coupon-paying instruments
+      not_fit_for:
+      - Equity
+      - Market-cap weighting
+      - Value-based
+    default: Strategy (market value)
+  - name: commission_model
+    description: Transaction cost model applied during SecurityBase.transact
+    options:
+    - name: zero (default)
+      traits:
+      - No transaction costs
+      - Gross returns
+      - Best-case scenario
+      fit_for:
+      - Gross performance
+      - Benchmark comparison
+      - Theoretical analysis
+      not_fit_for:
+      - Net returns
+      - Realistic backtesting
+      - Turnover-sensitive strategies
+    - name: percentage
+      traits:
+      - Proportional to value
+      - BPS-based
+      - Percentage of trade
+      fit_for:
+      - Equity commissions
+      - Ad valorem fees
+      - Percent of notional
+      not_fit_for:
+      - Fixed costs
+      - Per-share pricing
+      - Tiered pricing
+    - name: fixed + percentage
+      traits:
+      - Fixed fee plus percentage
+      - Realistic modeling
+      - Tiered structure
+      fit_for:
+      - Realistic commissions
+      - Broker modeling
+      - Slippage
+      not_fit_for:
+      - Simple analysis
+      - Gross returns
+      - Pure percentage
+    default: zero (default)
+  design_decisions:
+  - 'allocate() pushes down proportionally via _weight enabling hierarchical allocation.
+    A 10% allocation to parent becomes 5%/5% for two 50%-weighted children. Evidence:
+    bt/core.py:931(allocate)'
+  - 'rebalance() uses base parameter to lock original value for delta calc across
+    children. Without base, sequential rebalancing changes the base for each child
+    causing incorrect allocations. Evidence: bt/core.py:989(rebalance)'
+  - 'outlay() uses abs(q) for symmetric bid/offer but custom price uses signed q.
+    Regular trades: abs(q) since spread paid on both buy/sell. Custom price: signed
+    q to track direction correctly. Evidence: bt/core.py:1712(outlay)'
+  - 'fixed_income=True disables bankruptcy and uses notional weighting. Fixed income
+    strategies have deterministic notional; bankruptcy is modeled via Algo (Margin),
+    not automatic detection. Evidence: bt/core.py:749(update)'
+  - 'Rebalance REQUIRES weights in temp dict or silently passes (returns True). Missing
+    weights not an error - Rebalance does nothing. Hard to debug empty portfolios.
+    Evidence: bt/algos.py:1777-1779(Rebalance checks ''weights'' not in target.temp)'
+  acceptance_hints:
+  - Capital allocations propagate correctly from parent to children proportionally
+  - Sequential rebalancing produces same result as simultaneous rebalancing (base
+    parameter working)
+  - Commission deducted correctly on each transaction
+  - Bid/offer spread applied symmetrically for buys and sells
+  - Fixed income strategies use notional_value rather than market value for weights
+- id: value_propagation
+  name: Value Propagation & Stale Resolution
+  order: 5
+  responsibility: Propagates price/value changes up the tree on demand. Uses stale
+    flag to defer expensive updates until data is actually accessed. Manages the cascading
+    value calculations from leaf securities to root strategy.
+  interface:
+    inputs:
+    - price changes at leaf SecurityBase nodes
+    - stale flag indicating cache invalidation
+    - Date/datetime for period tracking
+    outputs:
+    - updated _value and _price at each nodes
+    - strategy prices Series indexed by DateTimeIndex
+    - position values and weights
+  required_methods:
+  - name: StrategyBase.update
+    description: Main update method - cascades to children, recalculates value/price/weight,
+      detects bankruptcy via _value < 0
+    evidence: bt/core.py:692(update)
+  - name: SecurityBase.update
+    description: Updates price from universe DataFrame, calculates value=position*price*multiplier,
+      skips update if position unchanged since last date
+    evidence: bt/core.py:1421(update)
+  - name: StrategyBase._sync_data
+    description: Syncs internal arrays (values, prices, weights) to data DataFrame
+      for result storage and analysis
+    evidence: bt/core.py:674(_sync_data)
+  key_behaviors:
+  - behavior: Lazy evaluation via stale flag
+    description: Update deferred until data access. Backtest iterates dates without
+      accessing values; update only triggered when user queries results. Avoids O(n*depth)
+      on every step when only final results needed.
+    evidence: bt/core.py:416(price property)
+  - behavior: newpt flag for period tracking
+    description: newpt flag tracks date changes - resets _net_flows, saves _last_value.
+      Net flows only track between-period capital movements, not intra-day. Last-value
+      needed for return calculation.
+    evidence: bt/core.py:700(update)
+  - behavior: Position-unchanged skip optimization
+    description: SecurityBase skips update if position unchanged since last date.
+      Position=0 securities with no trades don't need recalculation. Optimization
+      for sparse trading.
+    evidence: bt/core.py:1430(update)
+  - behavior: PAR=100.0 as fixed income reference
+    description: PAR=100.0 hardcodes fixed income reference price. Fixed income prices
+      start at par. Returns are additive per period, scaled by PAR for indexing. Price
+      = last_price + return*(value/notional)*PAR uses multiplicative PAR scaling.
+    evidence: bt/core.py:12(PAR=100.0)
+  - behavior: is_zero() floating point tolerance
+    description: TOL=1e-16 used for floating point comparisons via is_zero(). Prevents
+      division-by-zero or infinite loops from floating point accumulation errors.
+      Critical for value comparisons throughout update chain.
+    evidence: bt/core.py:17(is_zero)
+  - behavior: Stale flag propagation to root
+    description: Transactions mark root.stale=True. Stale state delays recalculation
+      until next update. Stale flag propagates to root, deferred recalculation occurs
+      when data is actually accessed.
+    evidence: bt/core.py:968(root.stale=True in transact)
+  replaceable_points:
+  - name: price_source
+    description: Determines how to obtain security price for value calculations
+    options:
+    - name: universe DataFrame column
+      traits:
+      - DataFrame-based
+      - Pre-processed
+      - Index-aligned
+      fit_for:
+      - Standard backtesting
+      - Historical data
+      - Pre-calculated prices
+      not_fit_for:
+      - Real-time pricing
+      - Custom models
+      - Delayed data
+    - name: manual data param
+      traits:
+      - Custom pricing
+      - Model-based
+      - Flexible
+      fit_for:
+      - Proprietary pricing models
+      - Alternative data
+      - Real-time feeds
+      not_fit_for:
+      - Simple backtesting
+      - Standard data
+      - FFN integration
+    default: universe DataFrame column
+  design_decisions:
+  - 'Lazy evaluation via stale flag - update deferred until data access. Backtest
+    iterates dates without accessing values; update only triggered when user queries
+    results. Avoids O(n*depth) on every step. Evidence: bt/core.py:416(price)'
+  - 'newpt flag tracks date changes - resets _net_flows, saves _last_value. Net flows
+    only track between-period capital movements, not intra-day. Last-value needed
+    for return calculation. Evidence: bt/core.py:700(update)'
+  - 'SecurityBase skips update if position unchanged since last date. Position=0 securities
+    with no trades don''t need recalculation. Optimization for sparse trading. Evidence:
+    bt/core.py:1430(update)'
+  - 'PAR=100.0 as reference price for fixed income strategies. Fixed income prices
+    start at par (100). Returns are additive per period, scaled by PAR for indexing.
+    Evidence: bt/core.py:12'
+  - 'is_zero() uses TOL=1e-16 for floating point robustness. Prevents division-by-zero
+    or infinite loops from floating point accumulation errors. Evidence: bt/core.py:17(is_zero)'
+  - 'Fixed income price = last_price + return*(value/notional)*PAR uses multiplicative
+    PAR scaling. Price index is in PAR units, not dollars. Evidence: bt/core.py:787(update)'
+  acceptance_hints:
+  - Stale flag triggers update when price/value is accessed
+  - Value propagates correctly from Securities to Strategy root
+  - Price index aligned with input data DateTimeIndex
+  - Fixed income prices start at PAR (100.0) and evolve via additive returns
+  - New period tracking (newpt flag) correctly separates inter-period flows
+- id: result_analysis
+  name: Result Analysis & Benchmarking
+  order: 6
+  responsibility: Computes performance statistics, generates plots, and benchmarks
+    against random strategies. Wraps ffn.GroupStats for compatibility with ffn ecosystem
+    while adding bt-specific helpers and fixed income analysis.
+  interface:
+    inputs:
+    - completed Backtest objects
+    - strategy.prices Series
+    - transaction records
+    outputs:
+    - ffn.GroupStats wrapper (Result)
+    - transaction records MultiIndex DataFrame
+    - weight histories
+    - performance plots
+  required_methods:
+  - name: Result.__init__
+    description: Wrapper around ffn.GroupStats with bt-specific helpers for display
+      and comparison
+    evidence: bt/backtest.py:370(Result)
+  - name: RandomBenchmarkResult.__init__
+    description: Compares strategy vs N random strategies, plots distribution of returns
+      to assess statistical significance
+    evidence: bt/backtest.py:518(RandomBenchmarkResult)
+  - name: RenormalizedFixedIncomeResult._price
+    description: Recomputes fixed income prices with different normalization for fair
+      comparison across periods using returns/(normalizing_value).cumsum()
+    evidence: bt/backtest.py:613(_price)
+  - name: Result.get_transactions
+    description: Returns MultiIndex DataFrame of trades by extracting position changes
+      via positions.diff()
+    evidence: bt/backtest.py:498(get_transactions)
+  key_behaviors:
+  - behavior: ffn.GroupStats extension
+    description: Result extends ffn.GroupStats for compatibility with ffn ecosystem.
+      Leverages ffn's proven statistics computation; bt adds plotting helpers and
+      transaction extraction.
+    evidence: bt/backtest.py:370(Result)
+  - behavior: Transaction extraction via diff
+    description: get_transactions uses positions.diff() to detect trades. Position
+      diff = trades. First row uses initial position as trades since diff(NaN)=NaN.
+    evidence: bt/core.py:1111(get_transactions)
+  - behavior: Fixed income price renormalization
+    description: Original fixed income prices use varying notional as denominator.
+      Renormalized uses fixed denominator for fair comparison across periods via returns/(normalizing_value).cumsum().
+    evidence: bt/backtest.py:613(_price)
+  - behavior: Plotting and display helpers
+    description: Result provides quick way to compare statistics across many different
+      backtests via display methods and integrated charting.
+    evidence: bt/backtest.py:370(Result)
+  replaceable_points:
+  - name: normalization
+    description: Fixed income result normalization method for fair price comparison
+      across periods with varying notional
+    options:
+    - name: max notional
+      traits:
+      - Peak notional basis
+      - Conservative scaling
+      - Best-case index
+      fit_for:
+      - Peak exposure comparison
+      - Conservative benchmarking
+      - Worst-case scaling
+      not_fit_for:
+      - Average exposure
+      - Risk-adjusted
+      - Custom basis
+    - name: avg notional
+      traits:
+      - Average notional basis
+      - Smooth scaling
+      - Mean exposure
+      fit_for:
+      - Average exposure comparison
+      - Smooth benchmarking
+      - Risk-adjusted
+      not_fit_for:
+      - Peak exposure
+      - Conservative
+      - Custom basis
+    - name: risk-based
+      traits:
+      - Risk-adjusted basis
+      - Volatility scaling
+      - Risk parity
+      fit_for:
+      - Risk-adjusted returns
+      - Volatility-targeting
+      - Risk parity
+      not_fit_for:
+      - Nominal returns
+      - Simple comparison
+      - Fixed notional
+    - name: custom series
+      traits:
+      - User-defined basis
+      - Flexible
+      - Custom logic
+      fit_for:
+      - Proprietary benchmarks
+      - Custom methodology
+      - Alternative normalization
+      not_fit_for:
+      - Standard approaches
+      - Quick analysis
+      - Simple comparison
+    default: varies based on fixed_income strategy type
+  design_decisions:
+  - 'Result extends ffn.GroupStats for compatibility with ffn ecosystem. Leverages
+    ffn''s proven statistics computation; bt adds plotting helpers and transaction
+    extraction. Evidence: bt/backtest.py:370(Result)'
+  - 'get_transactions uses positions.diff() to detect trades. Position diff = trades.
+    First row uses initial position as trades since diff(NaN)=NaN. Evidence: bt/core.py:1111(get_transactions)'
+  - 'Fixed income prices renormalized via returns/(normalizing_value).cumsum(). Original
+    prices use varying notional as denominator. Renormalized uses fixed denominator
+    for fair comparison across periods. Evidence: bt/backtest.py:613(_price)'
+  acceptance_hints:
+  - Result contains each expected performance metrics (Sharpe, Sortino, max drawdown,
+    etc.)
+  - Transaction records correctly identify each trades with dates and quantities
+  - Fixed income results properly renormalized for comparison
+  - Random benchmark produces statistically meaningful comparison distribution
+data_flow:
+- from_stage: data_input
+  to_stage: tree_building
+  data: price DataFrame with datetime index and columns per security; dates DateTimeIndex;
+    additional_data dict with bidoffer, coupons
+- from_stage: tree_building
+  to_stage: strategy_logic
+  data: Strategy tree with universe attached via setup() method; parent-child relationships
+    established
+- from_stage: strategy_logic
+  to_stage: capital_allocation
+  data: temp['selected'] (list of security nodes to trade); temp['weights'] (dict
+    mapping securities to target weights)
+- from_stage: capital_allocation
+  to_stage: value_propagation
+  data: SecurityBase.transact() calls with quantity and price; parent.adjust() for
+    capital flow adjustments; root.stale=True flag set
+- from_stage: value_propagation
+  to_stage: result_analysis
+  data: strategy.prices (Series), strategy.positions (DataFrame), strategy.values
+    (Series), get_transactions() output
+- from_stage: external
+  to_stage: data_input
+  data: Raw price data from ffn.get(), CSV files, or manual DataFrame; additional
+    data (bidoffer, coupons)
+- from_stage: Backtest.run
+  to_stage: strategy_logic
+  data: self (target Strategy), iterates over dates DateTimeIndex, calls target.run()
+    each date
+- from_stage: Strategy.run
+  to_stage: strategy_logic
+  data: target (self reference), AlgoStack modifies target.temp dict in place with
+    selected/weights/stat
+- from_stage: AlgoStack.__call__
+  to_stage: strategy_logic
+  data: Individual Algo receives target (Strategy) reference, returns bool to control
+    execution flow
+global_contracts:
+- contract: Every Node subclasses must implement update(date, data, inow) or raise
+    NotImplementedError
+  evidence: bt/core.py:285(update)
+- contract: root.stale=True signals value cache invalidation; must call root.update()
+    before value access
+  evidence: bt/core.py:416(price property)
+- contract: strategy.prices index starts at t0-1day (virtual row) with NaN values
+    for each securities
+  evidence: bt/backtest.py:191(_process_data)
+- contract: Node name uniqueness enforced within parent - duplicate names raise ValueError
+  evidence: bt/core.py:168(_add_children)
+- contract: integer_positions propagates from root to each children via use_integer_positions()
+    method
+  evidence: bt/core.py:205(use_integer_positions)
+- contract: Fixed income strategies cannot have non-fixed income children (guarded
+    in setup)
+  evidence: bt/core.py:575(setup raises ValueError)
+- contract: AlgoStack stops execution on first False unless algo has run_always=True
+    decorator
+  evidence: bt/core.py:2042(AlgoStack.__call__)
+- contract: Every price/value arrays indexed by DateTimeIndex matching input data
+    dates
+  evidence: bt/core.py:624(setup)
+- contract: Root node parent points to itself (self.parent=self) enabling cheap root
+    detection
+  evidence: bt/core.py:90-92(self.parent=self, self.root=self)
+- contract: Security cannot be allocated if price is zero or NaN at allocation time
+  evidence: bt/core.py:1521-1522(raises Exception if price is zero or nan)
+- contract: 'Backtest run order: setup → adjust(capital) → update(t0) → loop with
+    update→run→update pattern'
+  evidence: bt/backtest.py:237-263
+business_decisions:
+- id: BD-001
+  type: B/BA
+  content: Add virtual row at t0-1day with NaN values to preserve accurate total return
+    calculation
+  rationale: Without a virtual pre-period row, total return calculations would fail
+    for the first actual data point since there would be no baseline price to compare
+    against. The boundary is at the start of the backtest period (t0), ensuring each
+    subsequent returns are computable by providing a NaN baseline that pandas can
+    handle correctly in ratio calculations.
+  evidence: bt/backtest.py:183(_process_data)
+  stage: data_input
+  alternative_considered: Could interpolate first price backward, but NaN preserves
+    true 'no data' semantics and avoids fabricating prices outside the dataset
+- id: BD-002
+  type: B
+  content: Deepcopy strategy when creating Backtest to enable strategy reuse
+  rationale: Without deep copying, multiple backtests using the same strategy object
+    would share state, causing results to leak between runs. The boundary is at Backtest
+    instantiation, ensuring each backtest receives an independent copy that can be
+    modified without affecting the original strategy or other concurrent backtests.
+  evidence: bt/backtest.py:165(module)
+  stage: backtest_setup
+  alternative_considered: Could require users to manually copy strategies, but this
+    creates user friction and error-prone workflows
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/backtest.py'
+- id: BD-003
+  type: B/BA
+  content: Default initial_capital is 1,000,000 units
+  rationale: A default capital base of 1M provides a realistic institutional-scale
+    baseline while avoiding fractional share issues in most scenarios. The boundary
+    is at Backtest creation with no explicit capital specified, ensuring consistent
+    default behavior across each backtests without requiring configuration for standard
+    use cases.
+  evidence: bt/backtest.py:153(module)
+  stage: backtest_setup
+  alternative_considered: Could use 100K (retail scale) or leave unset, but 1M balances
+    institutional relevance with default usability
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/backtest.py'
+- id: BD-004
+  type: B/BA
+  content: Default integer_positions=True for securities
+  rationale: Defaulting to integer positions reflects real-world constraints where
+    most securities trade in whole shares. The boundary is at security creation when
+    integer_positions is not specified, ensuring physical share constraints are respected
+    by default while still allowing fractional shares for synthetic strategies or
+    derivatives.
+  evidence: bt/core.py:93(module)
+  stage: backtest_setup
+  alternative_considered: Could default to False for maximum flexibility, but this
+    would produce unrealistic backtests for most equity strategies
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/core.py'
+- id: BD-005
+  type: B/BA
+  content: 'RunPeriod default: run_on_first_date=True, run_on_end_of_period=False'
+  rationale: Starting execution on the first available date ensures strategies begin
+    trading immediately rather than waiting for a full period to elapse. The boundary
+    is at the first date in the data range, preventing artificial delays in strategy
+    activation while ensuring end-of-period logic only triggers after complete periods.
+  evidence: bt/algos.py:135(module)
+  stage: trading_frequency
+  alternative_considered: Could default to run_on_end_of_period only, but this would
+    delay strategy activation and reduce sample data utilization
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-006
+  type: B/BA
+  content: SelectAll excludes securities with no data (NaN) and negative/zero prices
+    by default
+  rationale: Excluding securities without valid price data prevents division-by-zero
+    errors and ensures calculations only operate on tradeable assets. The boundary
+    is at selection time, filtering out invalid securities before weight calculation
+    or execution can reference them, thus avoiding runtime errors in downstream algos.
+  evidence: bt/algos.py:477(module)
+  stage: security_selection
+  alternative_considered: Could pass NaN securities through and let downstream algos
+    handle, but this scatters error handling across the codebase
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-007
+  type: B/BA
+  content: SelectHasData default lookback period is 3 months
+  rationale: Three months provides sufficient history to establish price continuity
+    while excluding securities with too-short trading histories. The boundary is at
+    3 months prior to current date, ensuring only securities with adequate recent
+    trading history are included, which prevents stale data from newly-listed securities
+    from distorting signals.
+  evidence: bt/algos.py:565(module)
+  stage: security_selection
+  alternative_considered: Could use 1 month (aggressive) or 12 months (conservative),
+    but 3 months balances data sufficiency with universe size
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-008
+  type: B/BA
+  content: StatTotalReturn default lookback is 3 months for momentum calculation
+  rationale: Three-month momentum captures medium-term trend while filtering short-term
+    noise and avoiding look-ahead bias from very recent data. The boundary is at 3
+    months ago from current date, ensuring momentum calculations use a consistent
+    historical window that balances signal stability with responsiveness to regime
+    changes.
+  evidence: bt/algos.py:941(module)
+  stage: signal_generation
+  alternative_considered: Could use 1-month (more responsive) or 12-month (more stable),
+    but 3 months is standard in momentum literature (Jegadeesh-Titman)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-009
+  type: B/BA
+  content: WeighInvVol/WeighERC/WeighMeanVar each default to 3-month lookback
+  rationale: Consistent 3-month covariance lookback across risk-based weighting methods
+    ensures uniform volatility estimation and avoids cherry-picking lookback periods.
+    The boundary is at weight calculation time with a 3-month rolling window, ensuring
+    risk estimates reflect recent market conditions while remaining stable enough
+    for portfolio construction.
+  evidence: bt/algos.py:1110,1178,1252(module)
+  stage: weight_calculation
+  alternative_considered: Could allow each algo to use its own default, but this creates
+    inconsistent risk estimates when algos are used together
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-010
+  type: B/BA
+  content: LimitDeltas default weight delta limit is 0.1 (10%)
+  rationale: Ten percent weight changes per rebalance balance turnover costs against
+    tracking error, preventing drastic portfolio shifts from signal noise. The boundary
+    is at each rebalance execution, capping the maximum permissible weight change
+    from current to target allocation, thus controlling transaction costs and market
+    impact.
+  evidence: bt/algos.py:1364(module)
+  stage: risk_management
+  alternative_considered: Could use 5% (more conservative) or 20% (less constrained),
+    but 10% balances signal responsiveness with cost control
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-011
+  type: B
+  content: LimitWeights redistributes excess weight proportionally to other assets
+  rationale: Proportional redistribution preserves relative weights among remaining
+    assets while ensuring total weights sum to 100%. The boundary is at weight capping
+    time, preventing individual positions from exceeding limits while maintaining
+    the portfolio's risk characteristics by respecting the original weight hierarchy.
+  evidence: bt/algos.py:1435(module)
+  stage: risk_management
+  alternative_considered: Could redistribute to equally-weighted assets, but this
+    changes the portfolio's risk characteristics and defeats the original weighting
+    scheme
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-012
+  type: B/BA
+  content: TargetVol uses 252 as annualization factor (trading days/year)
+  rationale: Using 252 trading days converts daily volatility to annualized terms
+    using market-standard convention for US equities. The boundary is at volatility
+    annualization, ensuring TargetVol produces consistent volatility targets regardless
+    of the data frequency used in calculations.
+  evidence: bt/algos.py:1468(module)
+  stage: risk_management
+  alternative_considered: Could use 365 (calendar days) or 250 (EU markets), but 252
+    is the industry standard for US equity backtesting
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-013
+  type: B/BA
+  content: RebalanceOverTime spreads rebalancing over 10 periods by default
+  rationale: Ten-period gradual rebalancing minimizes market impact for large institutional
+    portfolios while achieving target weights within a reasonable timeframe. The boundary
+    is at rebalance initiation, specifying how many consecutive periods to divide
+    the total weight adjustment across, reducing per-period trading activity.
+  evidence: bt/algos.py:1859(module)
+  stage: strategy_logic
+  alternative_considered: Could use 5 periods (faster but higher impact) or 20 periods
+    (slower but lower impact), but 10 balances execution speed with market impact
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-014
+  type: B/DK
+  content: CorporateActions models dividends on ex-date with cash adjustments
+  rationale: Recording dividends on ex-date (not pay date) reflects actual market
+    mechanics where stock price drops by the dividend amount on the ex-date. The boundary
+    is at the ex-date, ensuring price adjustments and cash receipts align with when
+    shareholders actually become entitled to dividends, producing accurate total return
+    calculations.
+  evidence: bt/algos.py:1640(module)
+  stage: corporate_actions
+  alternative_considered: Could use pay date, but this creates look-ahead bias as
+    price hasn't adjusted yet on pay date
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-015
+  type: B/BA
+  content: Paper trading amount defaults to 1,000,000 for sub-strategies
+  rationale: Matching paper trading capital to live trading capital ensures sub-strategies
+    receive consistent allocation sizing between live and paper modes. The boundary
+    is at paper trading initialization, ensuring sub-strategies scale positions proportionally
+    regardless of whether running live or simulation, enabling fair comparison of
+    live vs. paper performance.
+  evidence: bt/core.py:582(module)
+  stage: paper_trading
+  alternative_considered: Could use a different paper amount, but this would create
+    sizing discrepancies between paper and live execution
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/core.py'
+- id: BD-016
+  type: B/BA
+  content: PAR value of 100.0 used as reference price for fixed income
+  rationale: PAR value of 100 represents standard fixed income convention where bonds
+    are issued and trade relative to face value. The boundary is at fixed income price
+    calculations, ensuring bond prices are quoted as percentage of par rather than
+    absolute dollar amounts, aligning with market convention and enabling fair comparison
+    across different bond sizes.
+  evidence: bt/core.py:12(module)
+  stage: fixed_income
+  alternative_considered: Could use different par values per bond, but 100 is the
+    universal standard making cross-bond comparisons straightforward
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/core.py'
+- id: BD-017
+  type: B/BA
+  content: Floating point tolerance TOL=1e-16 for is_zero comparison
+  rationale: Machine epsilon-scale tolerance prevents floating point accumulation
+    errors from causing incorrect zero-detection in financial calculations. The boundary
+    is at zero-comparison operations, ensuring near-zero values resulting from floating
+    point arithmetic are treated as zero, avoiding division-by-zero errors or incorrect
+    position sizing in edge cases.
+  evidence: bt/core.py:13(module)
+  stage: precision
+  alternative_considered: Could use larger tolerance (1e-10), but this might incorrectly
+    zero out small but valid positions; could use smaller (1e-30), but this risks
+    numerical instability
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/core.py'
+- id: BD-018
+  type: B/BA
+  content: Turnover = min(pos_outlay, neg_outlay) / NAV
+  rationale: Using the minimum of buy and sell outlays as turnover captures the actual
+    capital reallocated rather than double-counting. The boundary is at turnover calculation,
+    ensuring turnover measures the true portfolio change rate, which is critical for
+    cost estimation and strategy comparison.
+  evidence: bt/backtest.py:347(module)
+  stage: metrics
+  alternative_considered: Could use max() or sum(), but this would overstate turnover
+    when both buys and sells occur simultaneously
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/backtest.py'
+- id: BD-019
+  type: B/BA
+  content: WeighERC tolerance=1e-8, maximum_iterations=100, ledoit-wolf covariance
+  rationale: Ledoit-Wolf shrinkage provides stable covariance estimates even with
+    limited history or high correlation, preventing singular matrices. The boundary
+    is at covariance estimation, ensuring risk parity weights remain computable under
+    realistic data conditions with convergence tolerance of 1e-8 within 100 iterations
+    max.
+  evidence: bt/algos.py:1181(module)
+  stage: optimization
+  alternative_considered: Could use sample covariance directly, but this produces
+    unstable estimates with short histories; could use stronger shrinkage, but 1e-8
+    tolerance balances stability with accuracy
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-020
+  type: B/BA
+  content: Rebalance closes positions not in target weights before rebalancing
+  rationale: Closing zero-weight positions before opening new positions ensures capital
+    is freed for reallocation and prevents unintended double exposure. The boundary
+    is at rebalance execution start, ensuring each position changes proceed from a
+    clean slate reflecting only the current target universe, preventing legacy positions
+    from distorting risk calculations.
+  evidence: bt/algos.py:1794(module)
+  stage: strategy_logic
+  alternative_considered: Could allow zero-weight positions to persist, but this creates
+    a mismatch between target weights and actual holdings
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-021
+  type: B
+  content: Stale flag avoids unnecessary update propagation
+  rationale: The stale flag short-circuits unnecessary computation when data hasn't
+    changed, improving performance for repeated queries on the same date. The boundary
+    is at data access time, skipping update propagation when the data hasn't changed
+    since the last access, avoiding redundant recalculation of derived values.
+  evidence: bt/core.py:697(module)
+  stage: optimization
+  alternative_considered: Could always propagate updates, but this would cause O(n)
+    behavior for repeated accesses on the same date
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/core.py'
+- id: BD-022
+  type: B/DK
+  content: RunAfterDays decrements counter until zero before returning True
+  rationale: Counting down from the specified days ensures the algo only triggers
+    after the exact waiting period has elapsed. The boundary is at each execution
+    check, decrementing the internal counter and returning False until it reaches
+    zero, then triggering on the subsequent check, ensuring precise temporal control
+    of algo execution.
+  evidence: bt/algos.py:370(module)
+  stage: flow_control
+  alternative_considered: Could use fixed date comparison, but countdown approach
+    is more robust to varying data frequencies
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-023
+  type: B/BA
+  content: SelectN handles n<1 as percentage of available securities
+  rationale: Interpreting fractional n as percentage enables flexible selection that
+    scales with universe size rather than requiring absolute numbers. The boundary
+    is at selection time when n < 1, ensuring 'SelectN(0.1)' selects 10% of available
+    securities regardless of whether the universe has 100 or 1000 members, providing
+    dynamic sizing.
+  evidence: bt/algos.py:637(module)
+  stage: security_selection
+  alternative_considered: Could require absolute numbers only, but this reduces flexibility
+    and requires recalculation when universe changes
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-024
+  type: B
+  content: LimitDeltas supports global float or per-ticker dict limits
+  rationale: Supporting both scalar and dict limits enables uniform constraints across
+    each assets or asset-specific limits for differentiated risk management. The boundary
+    is at limit application, checking whether limit is a dict to apply per-ticker
+    constraints or a scalar for uniform limits, providing flexibility for strategies
+    requiring asymmetric constraints.
+  evidence: bt/algos.py:1364(module)
+  stage: risk_management
+  alternative_considered: Could require dict only, but this adds friction for simple
+    uniform-limit use cases
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-025
+  type: B/BA
+  content: UpdateRisk default history=0 (no depth tracking)
+  rationale: Defaulting to zero history minimizes memory usage for simple risk tracking
+    while still capturing current risk state. The boundary is at risk state update,
+    storing zero historical snapshots by default to avoid memory bloat, with optional
+    history depth available for strategies requiring time-series risk analysis.
+  evidence: bt/algos.py:2276(module)
+  stage: risk_tracking
+  alternative_considered: Could default to non-zero history for richer analysis, but
+    this increases memory usage for each users regardless of need
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-026
+  type: B/RC
+  content: CloseDead checks price <= 0 for dead securities
+  rationale: Including zero and negative prices ensures securities that have delisted,
+    suspended, or are in distress are properly closed out. The boundary is at price
+    check, closing positions where price <= 0 to avoid holding positions in securities
+    that can no longer be traded, preventing stuck positions that distort NAV calculations.
+  evidence: bt/algos.py:1718(module)
+  stage: position_management
+  alternative_considered: Could check price < 0 only, but this would leave zero-priced
+    securities open
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-027
+  type: B/BA
+  content: 'Pairs trading exit: price < 96 OR price > 104 OR hold >= 5 days'
+  rationale: Eight percent price bands (96-104) combined with 5-day maximum hold define
+    clear exit boundaries that balance mean reversion expectations with bounded risk.
+    The boundary is at each check, exiting pairs trades when price deviates beyond
+    4% from parity or time limit expires, preventing extended exposure to broken pairs.
+  evidence: examples/pairs_trading.py:216(module)
+  stage: pairs_trading
+  alternative_considered: Could use tighter bands (2%) for faster exits, but this
+    increases trading frequency; could use wider bands (10%) for longer holds, but
+    this increases tail risk
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in examples/pairs_trading.py'
+- id: BD-028
+  type: B/BA
+  content: 'Pairs trading: allocate 20% of capital to new trades per timestep'
+  rationale: Twenty percent allocation per timestep limits single-period exposure
+    while allowing multiple simultaneous pairs trades. The boundary is at trade sizing,
+    capping each new pairs trade at 20% of available capital, ensuring no single entry
+    point can cause excessive portfolio concentration.
+  evidence: examples/pairs_trading.py:229(module)
+  stage: pairs_trading
+  alternative_considered: Could use 10% for more diversification but fewer pairs,
+    or 50% for larger positions but fewer simultaneous pairs
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in examples/pairs_trading.py'
+- id: BD-029
+  type: B
+  content: 'Margin algo charges daily rate: (1+annual_rate)^(1/365.25)-1'
+  rationale: Compounding daily rates using exact day count (365.25 including leap
+    years) provides accurate margin cost calculation. The boundary is at daily rate
+    computation, converting annual margin rates to daily charges using true daily
+    compounding, ensuring margin costs are proportionally accurate regardless of the
+    number of days positions are held.
+  evidence: bt/algos.py:2448(module)
+  stage: leverage
+  alternative_considered: Could divide annual rate by 365 (simpler), but this slightly
+    understates daily costs; could use 360 (banking), but this is less accurate for
+    investment portfolios
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-030
+  type: B/DK
+  content: 'Fixed income strategy: notional weighting instead of market value'
+  rationale: Notional weighting reflects bond portfolio construction where par value
+    determines allocation rather than current market value. The boundary is at weight
+    calculation for fixed income securities, ensuring bonds with identical par values
+    receive identical weights regardless of price fluctuations, which is standard
+    practice for immunization strategies.
+  evidence: bt/core.py:768(module)
+  stage: fixed_income
+  alternative_considered: Could use market value weighting, but this is inappropriate
+    for liability-driven or immunization approaches common in fixed income
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/core.py'
+- id: BD-031
+  type: B
+  content: WeighSpecified stores copy of weights dict to prevent mutation
+  rationale: Defensive copying prevents external modifications to the input weights
+    dict from affecting the strategy's internal state. The boundary is at weight storage,
+    copying the input weights to isolate internal state from external mutations, ensuring
+    reproducibility and preventing side effects from user code modifying shared data
+    structures.
+  evidence: bt/algos.py:1007(module)
+  stage: weight_calculation
+  alternative_considered: Could require immutable input, but this imposes burden on
+    users and doesn't prevent accidental modification
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-032
+  type: B/RC
+  content: AlgoStack short-circuits on first False return (except @run_always)
+  rationale: Short-circuit evaluation stops processing when an algo signals failure,
+    enabling early termination for conditions not met. The boundary is at each algo
+    execution, stopping the stack on first False unless the algo is decorated with
+    @run_always, ensuring conditional execution flows work correctly while allowing
+    mandatory setup algos to always run.
+  evidence: bt/core.py:2020(algostack)
+  stage: flow_control
+  alternative_considered: Could always run each algos, but this defeats the purpose
+    of conditional execution; could require explicit early-exit calls, but this is
+    more error-prone
+  _evidence_issues:
+  - 'FN_NOT_FOUND: algostack in bt/core.py'
+- id: BD-033
+  type: B
+  content: Strategy bankrupt if value < 0 for non-fixed-income
+  rationale: Bankruptcy detection at zero ensures leveraged strategies are properly
+    liquidated before going negative, reflecting broker margin call mechanics. The
+    boundary is at daily valuation, marking strategy as bankrupt when NAV drops below
+    zero, triggering liquidation and preventing negative balance scenarios that couldn't
+    occur with proper margin management.
+  evidence: bt/core.py:749(module)
+  stage: risk_management
+  alternative_considered: Could use higher threshold (10% drawdown), but zero is the
+    actual bankruptcy boundary in margin accounts
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/core.py'
+- id: BD-034
+  type: B/BA
+  content: Progress bar disabled by default (progress_bar=False)
+  rationale: Disabling progress bar by default avoids overhead in non-interactive
+    environments like batch processing or CI/CD pipelines. The boundary is at backtest
+    initialization, defaulting to no progress display to ensure clean log output and
+    optimal performance in headless environments while allowing opt-in visualization.
+  evidence: bt/backtest.py:156(module)
+  stage: UX
+  alternative_considered: Could default to True for richer UX, but this pollutes logs
+    and slows execution slightly in batch contexts
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/backtest.py'
+- id: BD-035
+  type: B/BA
+  content: Benchmark random uses same structure but random selection
+  rationale: Random benchmarking using the same structure as real strategies provides
+    a fair baseline that accounts for strategy mechanics. The boundary is at benchmark
+    generation, ensuring random selection follows identical constraints as the strategy
+    being benchmarked, enabling proper statistical comparison by isolating skill from
+    structural effects.
+  evidence: bt/backtest.py:42(module)
+  stage: result_analysis
+  alternative_considered: Could use simple random selection without structure matching,
+    but this would create unfair comparisons for complex strategies
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/backtest.py'
+- id: BD-036
+  type: B/BA
+  content: ClosePositions returns False (stops algo stack) after closing
+  rationale: Returning False after closing each positions stops further algo processing,
+    ensuring the strategy transitions cleanly to flat before any subsequent logic
+    can trigger new positions. The boundary is at position closure completion, signaling
+    stack termination to prevent conflicting signals from downstream algos that expect
+    flat positions.
+  evidence: examples/pairs_trading.py:142(module)
+  stage: strategy_logic
+  alternative_considered: Could return True to continue algo stack, but this risks
+    conflicting signals after closing positions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in examples/pairs_trading.py'
+- id: BD-037
+  type: B/BA
+  content: Require algo defaults if_none=False (pass through)
+  rationale: Passing through when weight is None allows Require to act as a filter
+    without blocking execution when weights are already set. The boundary is at weight
+    availability check, returning False only when a required weight is missing, otherwise
+    passing through to allow downstream algos to continue processing.
+  evidence: bt/algos.py:1920(module)
+  stage: flow_control
+  alternative_considered: Could default to blocking (True), but this prevents flexible
+    composition where Require is part of a larger conditional flow
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-038
+  type: B/RC
+  content: SelectRegex filters existing selected list by regex pattern
+  rationale: Filtering an existing selection rather than starting from universe enables
+    composition of selection criteria using regex patterns. The boundary is at filter
+    application, taking the current selected list and further filtering by pattern,
+    enabling modular security universe construction where broad selection is refined
+    by specific criteria.
+  evidence: bt/algos.py:830(module)
+  stage: security_selection
+  alternative_considered: Could start from full universe with regex, but composition
+    with other Select algos requires starting from existing selection
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-039
+  type: B
+  content: Bid/offer spread deducted from execution price (slippage)
+  rationale: Deducting half-spread from execution prices reflects realistic trading
+    costs where buy orders execute at ask and sell orders at bid. The boundary is
+    at price calculation for new positions, adjusting execution prices by the spread
+    amount to ensure backtests include realistic transaction costs that exist in live
+    trading.
+  evidence: bt/core.py:1120(module)
+  stage: transaction_costs
+  alternative_considered: Could use full spread for one-sided execution, but half-spread
+    is more accurate for market orders that typically execute between bid and ask
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/core.py'
+- id: BD-040
+  type: B
+  content: 'Universe caching: return same data if same date (avoid recompute)'
+  rationale: Caching universe data for repeated queries on the same date avoids redundant
+    computation for algos that access data multiple times per period. The boundary
+    is at data access time, checking if the date matches the last query and returning
+    cached results if so, reducing O(n) repeated computations to O(1) for multi-access
+    scenarios.
+  evidence: bt/core.py:515(module)
+  stage: optimization
+  alternative_considered: Could always recompute, but this would cause unnecessary
+    computation in common patterns where multiple algos access the same data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/core.py'
+- id: BD-041
+  type: B/RC
+  content: SelectActive excludes closed/rolled securities from reselection
+  rationale: Excluding closed or rolled securities prevents reselection of securities
+    no longer trading in the current period. The boundary is at selection refresh,
+    filtering out securities marked as closed or rolled to ensure the universe only
+    contains active tradeable securities, avoiding attempts to trade delisted or expired
+    instruments.
+  evidence: bt/algos.py:2142(module)
+  stage: position_management
+  alternative_considered: Could allow closed securities to be reselected, but this
+    would cause trading errors for securities that can't be bought/sold
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-042
+  type: B/BA
+  content: RunIfOutOfBounds measures deviation as abs(new-old)/old
+  rationale: Relative deviation measurement enables scale-independent threshold specification
+    regardless of position size or asset price. The boundary is at deviation calculation,
+    computing percentage change from current to target weight, ensuring 5% weight
+    change is treated identically whether from $1M or $100M position.
+  evidence: bt/algos.py:409(module)
+  stage: capital_allocation
+  alternative_considered: Could use absolute difference, but this would require different
+    thresholds for different position sizes
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-043
+  type: B
+  content: WeighTarget returns False if date not in weights DataFrame
+  rationale: Returning False when target weights are unavailable stops the algo stack,
+    preventing position assignment without defined targets. The boundary is at date
+    lookup, failing gracefully when the current date has no defined target weights
+    rather than proceeding with undefined or stale weights, ensuring strategies only
+    execute when explicitly defined.
+  evidence: bt/algos.py:1079(module)
+  stage: weight_calculation
+  alternative_considered: Could use previous weights, but this creates look-ahead
+    risk; could use equal weights, but this masks the missing data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-044
+  type: B/BA
+  content: ScaleWeights allows negative scale for short positions
+  rationale: Supporting negative scale factors enables scaling short positions inversely,
+    maintaining proper sign for short exposure. The boundary is at weight scaling,
+    applying the scale factor to each weight and preserving negative signs for short
+    positions, ensuring ScaleWeights works correctly in long/short or market-neutral
+    strategies.
+  evidence: bt/algos.py:1032(module)
+  stage: weight_calculation
+  alternative_considered: Could require separate handling for shorts, but this creates
+    asymmetry and requires users to implement custom logic
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-045
+  type: B/BA
+  content: PairsSignal threshold of 4.0 for correlation indicator
+  rationale: Threshold of 4.0 standard deviations ensures only extreme deviations
+    from historical correlation trigger signals. The boundary is at correlation deviation
+    check, filtering out normal correlation fluctuations to only signal when pairs
+    relationship has unusually broken down, reducing false signals from typical correlation
+    variations.
+  evidence: examples/pairs_trading.py:227(module)
+  stage: pairs_trading
+  alternative_considered: Could use lower threshold (2.0) for more signals, but this
+    increases false positives; could use higher threshold (5.0) for fewer signals,
+    but this might miss valid opportunities
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in examples/pairs_trading.py'
+- id: BD-046
+  type: B/BA
+  content: Weight = 1.0 (100%) on buy side in pairs trade
+  rationale: Full position sizing on the buy side (while shorting the other leg) provides
+    maximum exposure within the capital allocated to each pair. The boundary is at
+    position sizing for each pair leg, ensuring the long leg receives full allocation
+    while the short leg receives offsetting exposure, maximizing pairs trade return
+    potential per capital deployed.
+  evidence: examples/pairs_trading.py:99(module)
+  stage: pairs_trading
+  alternative_considered: Could use partial sizing (0.5), but this reduces return
+    potential; could use leverage, but this adds risk
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in examples/pairs_trading.py'
+- id: BD-047
+  type: B/BA
+  content: SetupPairsTrades creates child strategy dynamically per pair
+  rationale: Creating child strategies per pair enables independent position tracking
+    and separate performance measurement for each pair. The boundary is at pair initialization,
+    spawning a dedicated child strategy that maintains its own state, allowing pairs
+    to be managed, analyzed, and exited independently without interference from other
+    pair positions.
+  evidence: examples/pairs_trading.py:51(module)
+  stage: pairs_trading
+  alternative_considered: Could manage each pairs in single strategy, but this prevents
+    independent pair analysis and requires custom logic for per-pair exits
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in examples/pairs_trading.py'
+- id: BD-048
+  type: B/BA
+  content: SelectThese drops NaN prices unless include_no_data=True
+  rationale: Dropping securities with missing prices by default ensures only tradeable
+    securities enter the portfolio pipeline. The boundary is at security inclusion,
+    filtering out NaN-priced securities unless explicitly requested, preventing downstream
+    errors from attempting to trade securities with no valid price data.
+  evidence: bt/algos.py:515(module)
+  stage: security_selection
+  alternative_considered: Could pass NaN securities through by default, but this creates
+    errors downstream; include_no_data=True allows explicit handling when needed
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-049
+  type: B/RC
+  content: StatTotalReturn returns False if lookback period not available
+  rationale: Failing gracefully when insufficient history exists prevents calculation
+    of incomplete or misleading momentum signals. The boundary is at return calculation,
+    returning False when the full lookback period isn't available in the data, ensuring
+    only securities with complete history receive momentum scores, avoiding biased
+    signals from newly-listed securities.
+  evidence: bt/algos.py:948(module)
+  stage: signal_generation
+  alternative_considered: Could calculate partial-period return, but this creates
+    inconsistency between securities with different history lengths
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-050
+  type: B
+  content: RunEveryNPeriods supports offset parameter for staggered execution
+  rationale: Offset parameter enables staggering multiple N-period strategies to avoid
+    synchronized trading that could impact liquidity. The boundary is at period alignment,
+    using offset to phase-shift execution timing, allowing multiple strategies with
+    the same N to trade at different times rather than each executing simultaneously.
+  evidence: bt/algos.py:438(module)
+  stage: trading_frequency
+  alternative_considered: Could require different N values for staggering, but this
+    reduces flexibility and requires custom frequency tuning
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bt/algos.py'
+- id: BD-051
+  type: B
+  content: Inverse volatility weighting for risk parity portfolio
+  rationale: 'Inverse volatility weighting assigns weights inversely proportional
+    to each asset''s volatility, enabling equal risk contribution across positions.
+    This avoids concentration in high-volatility assets and supports risk parity objectives.
+    Boundary: method handles edge cases where volatility approaches zero by applying
+    minimum weight constraints.'
+  evidence: bt/algos.py:1110-1135(WeighInvVol.__init__,__call__)
+  stage: bt
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: WeighInvVol.__init__,__call__ in bt/algos.py'
+- id: BD-052
+  type: B/BA
+  content: Equal Risk Contribution portfolio optimization
+  rationale: 'Equal Risk Contribution (ERC) optimization ensures each asset contributes
+    equally to total portfolio volatility, providing a natural diversification balance.
+    Unlike simple inverse volatility, ERC accounts for correlation structure. Boundary:
+    solver convergence tolerance and maximum iterations constrain the optimization
+    search space.'
+  evidence: bt/algos.py:1176-1221(WeighERC.__init__,__call__)
+  stage: bt
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: WeighERC.__init__,__call__ in bt/algos.py'
+- id: BD-053
+  type: B/BA
+  content: Markowitz mean-variance portfolio optimization
+  rationale: 'Markowitz mean-variance optimization maximizes expected return for a
+    given level of risk (or minimizes risk for a given return) based on historical
+    mean returns and covariance matrix. This is the foundational Modern Portfolio
+    Theory approach. Boundary: requires positive semi-definite covariance matrix;
+    applies constraints to ensure valid input.'
+  evidence: bt/algos.py:1250-1285(WeighMeanVar.__init__,__call__)
+  stage: bt
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: WeighMeanVar.__init__,__call__ in bt/algos.py'
+- id: BD-054
+  type: B/DK
+  content: Target volatility scaling of portfolio weights
+  rationale: 'Target volatility scaling adjusts portfolio weights to achieve a specified
+    annualized volatility target, regardless of base strategy allocation. This enables
+    consistent risk targeting across varying market conditions. Boundary: scaling
+    is bounded to prevent excessive leverage or shorting when realized volatility
+    deviates significantly.'
+  evidence: bt/algos.py:1441(targetvol)
+  stage: bt
+  _evidence_issues:
+  - 'FN_NOT_FOUND: targetvol in bt/algos.py'
+- id: BD-055
+  type: B/BA
+  content: Portfolio Tracking Error based rebalancing trigger
+  rationale: 'Rebalancing is triggered when realized tracking error exceeds a threshold,
+    balancing transaction costs against benchmark deviation. This provides a rules-based
+    approach to maintain index alignment. Boundary: threshold parameter controls sensitivity;
+    considers both positive and negative tracking error.'
+  evidence: bt/algos.py:1526-1543(PTE_Rebalance.__init__,__call__)
+  stage: bt
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: PTE_Rebalance.__init__,__call__ in bt/algos.py'
+  vague_rationale: true
+- id: BD-056
+  type: B/RC
+  content: Total return momentum calculation for security ranking
+  rationale: 'Total return momentum ranks securities based on cumulative return over
+    a specified lookback period, implementing the well-documented momentum anomaly.
+    This drives security selection in tactical strategies. Boundary: calculation uses
+    adjusted prices to account for corporate actions.'
+  evidence: bt/algos.py:920(stattotalreturn)
+  stage: bt
+  _evidence_issues:
+  - 'FN_NOT_FOUND: stattotalreturn in bt/algos.py'
+- id: BD-057
+  type: B
+  content: Ledoit-Wolf shrinkage covariance estimator
+  rationale: 'Ledoit-Wolf shrinkage estimator improves covariance matrix conditioning
+    by shrinking sample covariance toward a structured target, reducing estimation
+    error in mean-variance optimization. This addresses the well-known instability
+    of sample covariance. Boundary: shrinkage intensity is automatically optimized
+    via analytical formula.'
+  evidence: bt/algos.py:1491(sklearn.covariance.ledoit_wolf)
+  stage: bt
+  _evidence_issues:
+  - 'FN_NOT_FOUND: sklearn.covariance.ledoit_wolf in bt/algos.py'
+- id: BD-058
+  type: B/BA
+  content: Random weight generation for benchmarking
+  rationale: 'Random weight generation provides a null-hypothesis benchmark to evaluate
+    whether active strategies outperform random allocation. This establishes baseline
+    performance comparison. Boundary: supports both uniform and bounded random distributions
+    with seed control for reproducibility.'
+  evidence: bt/algos.py:1289(weighrandomly)
+  stage: bt
+  _evidence_issues:
+  - 'FN_NOT_FOUND: weighrandomly in bt/algos.py'
+- id: BD-059
+  type: B
+  content: Herfindahl-Hirschman Index for portfolio concentration
+  rationale: 'HHI measures portfolio concentration as sum of squared weights, providing
+    a quantitative metric for diversification quality. Higher values indicate greater
+    concentration risk. Boundary: normalized to [0, 1] range; HHI=1 indicates single-asset
+    portfolio.'
+  evidence: bt/backtest.py:331(herfindahl_index)
+  stage: bt
+- id: BD-060
+  type: B/BA
+  content: Turnover calculation as min(buy, sell) outlay over NAV
+  rationale: 'Turnover is measured as the ratio of trading outlay (using min approach
+    to avoid double-counting) to portfolio NAV, providing a standard transaction cost
+    proxy. This enables realistic cost estimation. Boundary: uses absolute value to
+    handle both positive and negative cash flows.'
+  evidence: bt/backtest.py:347-367(turnover property)
+  stage: bt
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: turnover property in bt/backtest.py'
+- id: BD-061
+  type: B/BA
+  content: Pairs trading signal from price difference threshold
+  rationale: 'Pairs trading generates long/short signals when the spread between two
+    correlated securities exceeds a threshold, assuming mean reversion. This implements
+    a classic statistical arbitrage strategy. Boundary: z-score threshold parameter
+    controls signal frequency vs. specificity.'
+  evidence: examples/pairs_trading.py:20-36(PairsSignal.__init__,__call__)
+  stage: examples
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: PairsSignal.__init__,__call__ in examples/pairs_trading.py'
+- id: BD-062
+  type: T
+  content: AR(1) process generation for synthetic price data
+  rationale: AR(1) autoregressive process generates synthetic price series with realistic
+    autocorrelation structure for backtesting pairs trading strategies. This is data
+    generation infrastructure, not a portfolio construction decision. Rejected as
+    T-type infrastructure with no standalone business impact.
+  evidence: examples/pairs_trading.py:186-204(make_data)
+  stage: examples
+- id: BD-063
+  type: T
+  content: Multivariate normal noise with compound correlation matrix
+  rationale: Multivariate normal distribution with structured correlation matrix generates
+    correlated synthetic returns for pairs testing. This is statistical data generation
+    infrastructure. Rejected as T-type implementation detail without business decision
+    content.
+  evidence: examples/pairs_trading.py:194-195(cov construction)
+  stage: examples
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: cov construction in examples/pairs_trading.py'
+- id: BD-064
+  type: T
+  content: Daily returns from normal distribution scaled for annualization
+  rationale: Normal distribution with specified mean and standard deviation parameters
+    generates daily return scenarios for buy-and-hold simulation. This is parameter
+    configuration for data generation, not a business decision. Rejected as T-type
+    infrastructure.
+  evidence: examples/buy_and_hold.py:20-23(normal distribution params)
+  stage: examples
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: normal distribution params in examples/buy_and_hold.py'
+- id: BD-065
+  type: T
+  content: Log-normal price simulation from normal returns
+  rationale: Log-normal price simulation using exponentiated cumulative normal returns
+    implements the standard geometric Brownian motion model. This is data generation
+    infrastructure. Rejected as T-type implementation detail.
+  evidence: examples/buy_and_hold.py:25(pdf cumprod calculation)
+  stage: examples
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: pdf cumprod calculation in examples/buy_and_hold.py'
+- id: BD-066
+  type: BA
+  content: 'Algo temp dictionary pipeline: selected → stat → weights → Rebalance'
+  rationale: Each algorithm in the standard pipeline writes to a dedicated temp dict
+    key that the next algorithm reads. SELECT populates 'selected', SET_STAT writes
+    'stat', WEIGHSpecified writes 'weights', and REBALANCE reads 'weights'. This ordering
+    is a hard contract - skipping or reordering steps breaks the pipeline because
+    algorithms expect their input key to exist. Developers must not insert custom
+    algos that read/write conflicting keys between these stages.
+  evidence: bt/algos.py:40(printtempdata)
+  stage: ordering_contract
+  _evidence_issues:
+  - 'FN_NOT_FOUND: printtempdata in bt/algos.py'
+- id: BD-067
+  type: B/BA
+  content: integer_positions=True by default - causes fractional share rounding to
+    zero
+  rationale: The framework defaults to integer-only positions for each strategies
+    and backtests. When integer_positions=True, positions are rounded to whole shares.
+    This means a $500 allocation with $100 share price results in 5 shares, not 5.23.
+    The boundary effect is that fractional share quantities are silently truncated,
+    causing residual cash that accumulates over many rebalances. Set to False only
+    if fractional shares are supported by the broker.
+  evidence: bt/core.py:205(use_integer_positions)
+  stage: value_propagation
+- id: BD-068
+  type: RC
+  content: Fixed income strategy children MUST have fixed income parent (no mixing)
+  rationale: Fixed income securities require special handling in rebalancing because
+    they have duration, convexity, and cash flow characteristics different from equities.
+    The framework enforces that a fixed_income flag set on a security propagates up,
+    and if any child has fixed_income=True while parent has fixed_income=False, setup
+    raises ValueError. This is a hard regulatory and operational boundary preventing
+    mixed portfolio constructions that would produce incorrect analytics.
+  evidence: bt/core.py:222(fixed_income)
+  stage: invariant
+- id: BD-069
+  type: BA
+  content: AlgoStack short-circuits on first False return - execution stops immediately
+  rationale: AlgoStack implements fail-fast behavior where each algorithm is called
+    in sequence, but if any algorithm returns False, execution stops immediately and
+    subsequent algos in the stack are never invoked. The boundary is that returning
+    False means 'do not proceed with this date' - each downstream algos are skipped.
+    This is commonly used as a guard condition (e.g., CheckDate) that prevents processing
+    when conditions aren't met.
+  evidence: bt/core.py:2020(algostack)
+  stage: ordering_contract
+  _evidence_issues:
+  - 'FN_NOT_FOUND: algostack in bt/core.py'
+- id: BD-070
+  type: M/DK
+  content: Paper trading shadow strategy pattern - creates $1M fake strategy
+  rationale: The framework implements paper trading by creating a hidden shadow strategy
+    with $1M in fake capital ($_paper_amount=1000000). This shadow strategy receives
+    each allocations but tracks them separately from real positions. The purpose is
+    to simulate fills without executing in the real market. The boundary is that paper
+    trades use this exact $1M figure as a placeholder notional value, which must not
+    be confused with real strategy capital.
+  evidence: bt/core.py:333(strategybase)
+  stage: pattern_choice
+  _evidence_issues:
+  - 'FN_NOT_FOUND: strategybase in bt/core.py'
+- id: BD-071
+  type: M
+  content: PAR=100.0 and TOL=1e-16 floating point constants - used for price/float
+    comparisons
+  rationale: PAR (parity) is set to 100.0 for price normalization scenarios, while
+    TOL (tolerance) is 1e-16 representing machine epsilon for double-precision float
+    comparisons. The is_zero() function uses TOL to determine if a value should be
+    treated as zero. The boundary is that TOL=1e-16 is extremely tight - values smaller
+    than this are considered numerically zero, but this may miss very small positions
+    that matter in high-frequency scenarios.
+  evidence: bt/core.py:12(PAR=100.0), bt/core.py:13(TOL=1e-16), bt/core.py:17-21(is_zero
+    function)
+  stage: value_propagation
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: PAR=100.0), bt/core.py:13(TOL=1e-16), bt/core.py:17-21(is_zero
+    function in bt/core.py'
+  vague_rationale: true
+- id: BD-072
+  type: B/BA
+  content: Rebalance REQUIRES weights in temp dict or silently passes (returns True)
+  rationale: The Rebalance algo checks if 'weights' key exists in target.temp before
+    executing. If weights are missing (not set by a prior weighing algo), Rebalance
+    returns True without making any adjustments. This is a silent failure boundary
+    - no exception is raised, no warning is logged. The caller may incorrectly assume
+    trades were executed when none occurred.
+  evidence: bt/algos.py:1754(rebalance)
+  stage: ordering_contract
+  _evidence_issues:
+  - 'FN_NOT_FOUND: rebalance in bt/algos.py'
+- id: BD-073
+  type: M
+  content: SecurityBase integer_positions propagates to parent and children via use_integer_positions()
+  rationale: The use_integer_positions() method propagates integer position handling
+    through the node hierarchy. When set on a SecurityBase, it cascades to parent
+    and each child nodes. The boundary is that changing integer_positions at any node
+    level affects the entire subtree, which may have unintended side effects if different
+    securities in a portfolio require different rounding behaviors.
+  evidence: bt/core.py:205(use_integer_positions)
+  stage: inheritance
+- id: BD-074
+  type: BA/DK
+  content: 'Pairs trading example: sell must be identified BEFORE buy (directional
+    dependency)'
+  rationale: The pairs trading example indexes pairs by ['sell', 'buy'] in that specific
+    order, establishing a hard ordering contract where the sell side of the pair must
+    be processed first. This determines directionality - the algorithm identifies
+    which leg to short (sell) and which to long (buy) before executing. The boundary
+    is that reversing this order or incorrectly identifying which security is the
+    sell leg produces wrong position direction.
+  evidence: examples/pairs_trading.py:9(pairssignal)
+  stage: ordering_contract
+  _evidence_issues:
+  - 'FN_NOT_FOUND: pairssignal in examples/pairs_trading.py'
+- id: BD-075
+  type: BA/DK
+  content: Security cannot be allocated if price is zero or NaN at allocation time
+  rationale: Before allocating to a security, the framework validates that the security
+    has a valid (non-zero, non-NaN) price. If price is invalid, an exception is raised.
+    This prevents division by zero and ensures positions are sized correctly. The
+    boundary is that this is a hard stop - no allocation occurs, and the exception
+    propagates up, potentially halting a backtest if market data has gaps.
+  evidence: bt/core.py:17(is_zero)
+  stage: invariant
+- id: BD-076
+  type: B/BA
+  content: RunPeriod defaults run_on_first_date=True - algos fire on first date by
+    default
+  rationale: RunPeriod algo defaults run_on_first_date=True, meaning algos execute
+    on the first simulation date (typically t0) in addition to subsequent dates. This
+    affects behavior because many statistical calculations on day 1 may be based on
+    incomplete or NaN data. The boundary is that algo behavior differs between first
+    and subsequent dates, which may cause look-ahead bias if initial state assumptions
+    differ from ongoing state.
+  evidence: bt/algos.py:135(__init__ signature), bt/algos.py:136(run_on_first_date=True
+    default)
+  stage: value_propagation
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: __init__ signature), bt/algos.py:136(run_on_first_date=True
+    default in bt/algos.py'
+- id: BD-077
+  type: T
+  content: Root node parent points to itself (self.parent=self) - used for full_name
+    and stale propagation
+  rationale: The root node (top-level strategy) sets self.parent and self.root to
+    itself as a sentinel value. This enables full_name property to work by traversing
+    up the tree, where the root correctly terminates. It also provides the termination
+    condition for stale propagation where root.stale is set after any child transaction.
+    The boundary is that any code traversing parent pointers must handle self-referential
+    termination or risk infinite loops.
+  evidence: bt/core.py:24(node)
+  stage: invariant
+  _evidence_issues:
+  - 'FN_NOT_FOUND: node in bt/core.py'
+- id: BD-078
+  type: BA
+  content: Rebalance calculates delta using stale value as base before allocations
+    (update=False pattern)
+  rationale: When rebalancing with update=False (default), the Rebalance algo captures
+    the current position value as 'base' before any de-allocation occurs. This base
+    value is then used to calculate deltas for new allocations. The boundary is that
+    if positions are modified externally between rebalances, the stale base causes
+    incorrect delta calculations, leading to over or under allocation.
+  evidence: bt/algos.py:1784-1792(saves base before de-allocation), bt/core.py:1002-1007(uses
+    base from value/notional_value)
+  stage: pattern_choice
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: saves base before de-allocation), bt/core.py:1002-1007(uses
+    base from value/notional_value in bt/algos.py'
+- id: BD-079
+  type: T
+  content: 'Backtest run order: setup → adjust(capital) → update(t0) → loop update→run→update'
+  rationale: 'The backtest execution lifecycle follows a strict order: strategy.setup()
+    initializes state, adjust() sets initial capital, first update(t0) seeds initial
+    positions/prices, then the main loop calls update→run→update for each date. The
+    boundary is that setup occurs before any data, so algos relying on historical
+    data in setup will fail. Also, the double update (before and after run) ensures
+    both pre and post-trade states are recorded.'
+  evidence: bt/backtest.py:91(backtest)
+  stage: ordering_contract
+  _evidence_issues:
+  - 'FN_NOT_FOUND: backtest in bt/backtest.py'
+- id: BD-080
+  type: M
+  content: Node stale flag propagates to root; transactions mark root.stale=True
+  rationale: When any node calls transact(), root.stale is set to True, marking the
+    entire strategy tree as stale. The stale flag is checked in weight and value computation
+    (lines 253-271) to ensure consistency. This propagates from leaf transactions
+    up to root, invalidating cached values throughout. The boundary is that stale
+    state triggers recalculation on next access, but if code bypasses the stale check,
+    it may use outdated values.
+  evidence: bt/core.py:200(_set_root)
+  stage: inheritance
+- id: BD-081
+  type: BA
+  content: 'INTERACTION: [BD-004] × [BD-017] × [BD-067] → Amplified cash drag from
+    integer rounding combined with strict zero-tolerance'
+  rationale: 'BD-004 defaults integer_positions=True which rounds each positions to
+    whole shares. BD-017 sets TOL=1e-16 as the zero-tolerance threshold. BD-067 documents
+    the truncation behavior. When combined: fractional shares resulting from rounding
+    are compared against TOL=1e-16; if below this threshold they are treated as zero.
+    This means very small residual cash positions from rounding are silently discarded,
+    accumulating cash drag over multiple rebalances. The effect amplifies with more
+    frequent rebalancing and larger universes.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Could use larger tolerance (1e-8) to absorb more rounding
+    errors, or implement cash recycling to reinvest residual amounts
+- id: BD-082
+  type: BA
+  content: 'INTERACTION: [BD-005] × [BD-022] → Contradiction: RunPeriod fires immediately
+    on first date while RunAfterDays delays until countdown completes'
+  rationale: 'BD-005 defaults run_on_first_date=True meaning RunPeriod algos execute
+    on the first simulation date (t0). BD-022 implements RunAfterDays which decrements
+    a counter and returns False until zero. When both are used in the same strategy:
+    RunPeriod would trigger execution on t0, but RunAfterDays would block any processing
+    for the specified number of periods. This creates a contradiction where the timing
+    expectations conflict - one algos wants immediate execution while the other enforces
+    delay. The result is user confusion about when strategies actually begin trading.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Could document the incompatibility explicitly, or have RunAfterDays
+    override RunPeriod's first-date behavior
+- id: BD-083
+  type: BA
+  content: 'INTERACTION: [BD-066] × [BD-069] × [BD-072] → Hidden dependency: silent
+    Rebalance failure when pipeline algos return False'
+  rationale: 'BD-066 establishes the temp dict pipeline (selected → stat → weights
+    → Rebalance). BD-069 implements AlgoStack short-circuit on first False. BD-072
+    documents that Rebalance silently passes when weights are missing. The hidden
+    dependency: if any algo in the pipeline (Select, SetStat, Weigh) returns False
+    for ANY reason (including data issues, convergence failures, or conditional logic),
+    AlgoStack stops execution immediately. Rebalance never receives the weights it
+    needs, and crucially returns True (not False), so the stack continues as if rebalancing
+    succeeded. This is a silent failure mode where the backtest runs without any actual
+    rebalancing occurring.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Could add explicit logging when Rebalance finds no weights,
+    or have Rebalance return False when weights missing to propagate failure
+- id: BD-084
+  type: RC
+  content: 'INTERACTION: [BD-001] × [BD-006] × [BD-048] × [BD-049] × [BD-075] → Risk
+    cascade: NaN handling chain from virtual row insertion to security allocation
+    failure'
+  rationale: 'BD-001 inserts a virtual row at t0-1day with NaN values to enable return
+    calculation. BD-006 SelectAll excludes securities with NaN prices. BD-048 SelectThese
+    drops NaN prices. BD-049 StatTotalReturn returns False if lookback period not
+    available. BD-075 raises exception if price is NaN at allocation time. The cascade:
+    virtual row with NaN propagates through selection (filtered by SelectAll/SelectThese),
+    prevents momentum calculation (returns False from StatTotalReturn), and if not
+    caught would cause allocation failure. This creates a risk where newly-added securities
+    or securities with data gaps trigger a chain of failures, potentially causing
+    backtest to fail or produce incomplete results.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Could implement graceful degradation where partial data
+    still allows momentum calculation, or provide explicit warning when securities
+    are excluded due to insufficient history
+- id: BD-085
+  type: RC
+  content: 'INTERACTION: [BD-068] × [BD-030] × [BD-016] → Risk cascade: mixing fixed
+    income and equity causes incorrect notional pricing across portfolio'
+  rationale: 'BD-068 enforces that fixed income children must have fixed income parent
+    (ValueError on violation). BD-030 implements notional weighting for fixed income
+    (par value determines allocation). BD-016 sets PAR=100.0 as reference price for
+    fixed income. The cascade risk: if the invariant in BD-068 is somehow bypassed
+    or violated, equity securities would receive notional (par-based) weighting instead
+    of market-value weighting, and their prices would be calculated relative to PAR=100.0
+    instead of actual market prices. This would cause catastrophic mispricing - an
+    equity trading at $150 would be treated as if it had $100 par value, distorting
+    each downstream NAV calculations and position sizing.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Could add additional runtime checks in weight calculation
+    to verify each children match parent fixed_income flag before applying weighting
+    method
+- id: BD-086
+  type: BA
+  content: 'INTERACTION: [BD-079] × [BD-066] → Hidden dependency: backtest setup phase
+    cannot access data, breaking algos that expect historical context'
+  rationale: 'BD-079 documents the backtest execution order: setup → adjust → update(t0)
+    → loop. BD-066 establishes the temp dict pipeline where algos expect data to be
+    available. The hidden dependency: setup() runs before ANY data is loaded (line
+    237), meaning algos in the strategy cannot access historical prices, returns,
+    or other data during initialization. However, the algo pipeline (selected → stat
+    → weights → Rebalance) is designed to operate on data. If a weighing algo requires
+    historical context for initialization (e.g., to set up rolling windows), it will
+    fail because data only becomes available after the first update(t0) call in the
+    loop. This creates a subtle initialization order problem.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Could add a pre-setup data loading phase, or document that
+    algos must defer data-dependent initialization to first update() call
+- id: BD-087
+  type: BA/DK
+  content: 'INTERACTION: [BD-012] × [BD-029] → Amplification: 252-day annualization
+    applied to daily margin rate calculation creates compounding inconsistency'
+  rationale: 'BD-012 uses 252 trading days as annualization factor for volatility
+    calculations. BD-029 calculates daily margin rate as (1+annual_rate)^(1/365.25)-1
+    using calendar days including leap years. The amplification: TargetVol scaling
+    uses 252-day annualization for volatility, but margin costs are calculated using
+    365.25-day compounding. This creates an inconsistency where volatility-targeted
+    portfolios that also carry margin debt have misaligned risk metrics - volatility
+    is expressed in 252-day terms while carry costs are in 365.25-day terms. For leveraged
+    strategies using both TargetVol and margin, this mismatch can cause slight misestimation
+    of true risk-adjusted returns.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Could use consistent day count across each annualization
+    (either each 252 or each 365.25), or document the inconsistency explicitly for
+    users
+- id: BD-088
+  type: BA/M
+  content: 'INTERACTION: [BD-018] × [BD-039] → Amplification: turnover metric underestimates
+    true transaction costs when spread is modeled'
+  rationale: 'BD-018 calculates turnover as min(pos_outlay, neg_outlay) / NAV. BD-039
+    models bid/offer spread by deducting half-spread from execution prices. The amplification:
+    turnover measures the capital movement but spread modeling affects execution prices.
+    When spread is deducted, the actual cash outlay for buys increases (paying ask)
+    and sell proceeds decrease (receiving bid). This means the true cost of a trade
+    is higher than turnover alone suggests - turnover measures quantity but not price
+    impact. For high-turnover strategies, the combination of turnover-based cost estimates
+    and spread modeling can still understate true transaction costs because spread
+    is a fixed percentage while turnover is volume-based.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Could integrate spread cost into turnover calculation directly,
+    or add explicit total cost metric combining turnover and spread effects
+- id: BD-089
+  type: BA/M
+  content: 'INTERACTION: [BD-051] × [BD-052] × [BD-053] × [BD-057] → Hidden dependency:
+    each risk-based weighting algos require sklearn covariance estimation'
+  rationale: 'BD-051 WeighInvVol, BD-052 WeighERC, and BD-053 WeighMeanVar each perform
+    risk-based portfolio optimization. BD-057 documents Ledoit-Wolf shrinkage as the
+    covariance estimator. The hidden dependency: each three weighting methods rely
+    on the sklearn covariance module for matrix estimation. If sklearn is unavailable,
+    upgraded to a breaking version, or the sklearn API changes, each risk-based weighting
+    algos would fail simultaneously. This creates a single point of failure for risk
+    parity, equal risk contribution, and mean-variance optimization strategies.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Could implement covariance estimation inline, or add sklearn
+    version pins and fallback implementations for basic covariance calculation
+- id: BD-GAP-001
+  content: 'Missing: Timezone explicit annotation'
+  type: DK
+  rationale: 'Audit finding: missing: timezone explicit annotation. Identified by
+    audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_input
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-002
+  content: 'Missing: float vs Decimal for currency'
+  type: RC
+  rationale: 'Audit finding: missing: float vs decimal for currency. Identified by
+    audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_input
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-003
+  content: 'Missing: Point-in-Time data'
+  type: DK
+  rationale: 'Audit finding: missing: point-in-time data. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_input
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-004
+  content: 'Missing: Random seed full coverage'
+  type: DK
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit
+    checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_input
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-005
+  content: 'Missing: Model/data version snapshot'
+  type: DK
+  rationale: 'Audit finding: missing: model/data version snapshot. Identified by audit
+    checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_input
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-006
+  content: 'Missing: Settlement/delivery time convention'
+  type: RC
+  rationale: 'Audit finding: missing: settlement/delivery time convention. Identified
+    by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_input
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-007
+  content: 'Missing: Backtest Overfitting Protection'
+  type: B
+  rationale: 'Audit finding: missing: backtest overfitting protection. Identified
+    by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_input
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-008
+  content: 'Missing: Factor IC Demean & Group Alignment'
+  type: B
+  rationale: 'Audit finding: missing: factor ic demean & group alignment. RSK Pass
+    Rate:** 2/8 (25%). This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_input
+  status: missing
+  severity: high
+  impact: RSK Pass Rate:** 2/8 (25%)
+  known_gap: true
+- id: BD-GAP-009
+  content: 'Missing: Versioned Write & Snapshot Semantics'
+  type: DK
+  rationale: 'Audit finding: missing: versioned write & snapshot semantics. Identified
+    by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_input
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-010
+  content: 'Missing: ** "Add Decimal type for each monetary calculations to eliminate
+    floating-point rounding errors in PnL and fees'
+  type: RC
+  rationale: 'Audit finding: missing: ** "add decimal type for each monetary calculations
+    to eliminate floating-point rounding errors in pnl and fees. ** "Currency calculations
+    use float64 which can accumulate rounding errors over many transactions.. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_input
+  status: missing
+  severity: high
+  impact: '** "Currency calculations use float64 which can accumulate rounding errors
+    over many transactions.'
+  known_gap: true
+- id: BD-GAP-011
+  content: 'Missing: ** "Add Point-in-Time data availability tracking with release_date/publish_date
+    semantics'
+  type: DK
+  rationale: 'Audit finding: missing: ** "add point-in-time data availability tracking
+    with release_date/publish_date semantics. ** "Framework assumes each data is available
+    from start. No handling of data revision or delayed publication.. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_input
+  status: missing
+  severity: high
+  impact: '** "Framework assumes each data is available from start. No handling of
+    data revision or delayed publication.'
+  known_gap: true
+- id: BD-GAP-012
+  content: 'Missing: ** "Implement train/test temporal split and walk-forward analysis
+    framework'
+  type: B
+  rationale: 'Audit finding: missing: ** "implement train/test temporal split and
+    walk-forward analysis framework. ** "No protection against overfitting. Every
+    data used for both signal generation and evaluation.. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_input
+  status: missing
+  severity: high
+  impact: '** "No protection against overfitting. Every data used for both signal
+    generation and evaluation.'
+  known_gap: true
+- id: BD-GAP-013
+  content: 'Missing: ** "Implement versioned data storage with immutable snapshots
+    and prune protection'
+  type: DK
+  rationale: 'Audit finding: missing: ** "implement versioned data storage with immutable
+    snapshots and prune protection. ** "Data modifications are destructive. No rollback
+    capability.. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_input
+  status: missing
+  severity: high
+  impact: '** "Data modifications are destructive. No rollback capability.'
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: Buy and Hold Monthly Rebalancing Strategy
+  source: docs/source/Buy_and_hold.ipynb
+  type: trading_strategy
+  business_problem: Implements a passive buy-and-hold strategy with monthly rebalancing
+    to fixed target weights, demonstrating core backtesting framework capabilities.
+  intent_keywords:
+  - buy and hold
+  - monthly rebalance
+  - fixed weights
+  - passive strategy
+  - portfolio allocation
+  stage: backtesting
+  negative_keywords:
+  - active trading
+  - signal-based
+  - dynamic weights
+  - momentum
+  - pairs trading
+  disambiguation: Are you looking for a simple passive strategy with fixed allocation,
+    or do you need dynamic signal-based trading?
+  data_domain: financial_data
+- id: UC-102
+  name: Equal Risk Contribution Portfolio Construction
+  source: docs/source/ERC.ipynb
+  type: trading_strategy
+  business_problem: Demonstrates Equal Risk Contribution (ERC) portfolio weighting
+    using multivariate normal returns and covariance matrix inputs for risk parity
+    allocation.
+  intent_keywords:
+  - equal risk contribution
+  - risk parity
+  - covariance
+  - volatility weighting
+  - ERC
+  stage: backtesting
+  negative_keywords:
+  - momentum
+  - trend following
+  - fixed income
+  - pairs trading
+  - buy and hold
+  disambiguation: Do you want risk parity across assets based on their volatility
+    contribution, or a simpler equal-weight or momentum-based approach?
+  data_domain: financial_data
+- id: UC-103
+  name: Fixed Income Government Bond Rolling Strategy
+  source: docs/source/Fixed_Income.ipynb
+  type: trading_strategy
+  business_problem: Simulates rolling government bond trading with synthetic price-to-yield
+    calculations and bond lifecycle management for fixed income backtesting.
+  intent_keywords:
+  - fixed income
+  - government bonds
+  - rolling bonds
+  - price to yield
+  - bond maturity
+  stage: backtesting
+  negative_keywords:
+  - equity momentum
+  - pairs trading
+  - ML prediction
+  - buy and hold
+  - equity screening
+  disambiguation: Are you testing fixed income instruments specifically, or do you
+    need equity-based strategies?
+  data_domain: financial_data
+- id: UC-104
+  name: Inverse Volatility Weighted Portfolio
+  source: docs/source/PTE.ipynb
+  type: trading_strategy
+  business_problem: Implements inverse volatility weighting to allocate more capital
+    to lower-volatility assets, with 3-month lookback and 1-day lag for rebalancing.
+  intent_keywords:
+  - inverse volatility
+  - volatility weighting
+  - risk parity
+  - low volatility
+  - vol lookback
+  stage: backtesting
+  negative_keywords:
+  - momentum
+  - trend following
+  - fixed income
+  - pairs trading
+  - buy and hold equal weights
+  disambiguation: Do you want to weight by inverse volatility for risk control, or
+    are you interested in momentum/return-based strategies?
+  data_domain: financial_data
+- id: UC-105
+  name: Multi-Strategy Portfolio Combination
+  source: docs/source/Strategy_Combination.ipynb
+  type: trading_strategy
+  business_problem: Combines multiple trading strategies into a single portfolio to
+    test strategy allocation and diversification across different algorithmic approaches.
+  intent_keywords:
+  - strategy combination
+  - multi-strategy
+  - strategy allocation
+  - portfolio of strategies
+  - strategy blending
+  stage: backtesting
+  negative_keywords:
+  - single strategy
+  - signal-based screening
+  - ML prediction
+  - data pipeline
+  - monitoring
+  disambiguation: Are you looking to combine multiple strategies together, or do you
+    need a single standalone strategy?
+  data_domain: financial_data
+- id: UC-106
+  name: Target Volatility Portfolio Strategy
+  source: docs/source/Target_Volatility.ipynb
+  type: trading_strategy
+  business_problem: Controls portfolio-level volatility to a target annualized level
+    (10%) using weekly rebalancing with inverse volatility asset weights.
+  intent_keywords:
+  - target volatility
+  - volatility targeting
+  - volatility control
+  - annualized vol
+  - risk management
+  stage: backtesting
+  negative_keywords:
+  - momentum
+  - trend following
+  - fixed income
+  - pairs trading
+  - buy and hold
+  disambiguation: Do you need to control overall portfolio volatility to a specific
+    target, or are you looking for return/momentum-based strategies?
+  data_domain: financial_data
+- id: UC-107
+  name: Trend Following with Rolling Median Signal
+  source: docs/source/Trend_1.ipynb
+  type: trading_strategy
+  business_problem: Implements trend following using a rolling 12-month median as
+    a moving average signal for asset selection and timing decisions.
+  intent_keywords:
+  - trend following
+  - moving average
+  - median crossover
+  - technical indicator
+  - momentum
+  stage: backtesting
+  negative_keywords:
+  - mean reversion
+  - pairs trading
+  - fixed income
+  - volatility targeting
+  - buy and hold
+  disambiguation: Are you looking for trend-following/momentum strategies, or do you
+    need mean-reversion or other approaches?
+  data_domain: financial_data
+- id: UC-108
+  name: Custom Signal-Based Monthly Rebalancing
+  source: docs/source/Trend_2.ipynb
+  type: trading_strategy
+  business_problem: Demonstrates custom algorithm creation by implementing a Signal
+    algo that calculates total returns over a lookback period for monthly rebalancing
+    decisions.
+  intent_keywords:
+  - custom algo
+  - signal creation
+  - total return
+  - lookback period
+  - monthly rebalance
+  stage: backtesting
+  negative_keywords:
+  - builtin factors
+  - pre-built algorithms
+  - fixed income
+  - pairs trading
+  - buy and hold
+  disambiguation: Do you need to create a custom trading signal/algorithm, or would
+    you prefer to use pre-built bt library algorithms?
+  data_domain: financial_data
+- id: UC-109
+  name: SelectWhere Signal-Based Trading with Moving Averages
+  source: docs/source/examples-nb.ipynb
+  type: trading_strategy
+  business_problem: Demonstrates the SelectWhere algorithm for selecting securities
+    based on custom signal DataFrames, using 50-day rolling mean as a sample indicator.
+  intent_keywords:
+  - select where
+  - signal selection
+  - moving average
+  - custom signal
+  - indicator based
+  stage: backtesting
+  negative_keywords:
+  - equal weight
+  - fixed allocation
+  - fixed income
+  - pairs trading
+  - volatility targeting
+  disambiguation: Do you want to select securities based on a custom indicator/signal,
+    or do you need equal-weight or fixed allocation strategies?
+  data_domain: financial_data
+- id: UC-110
+  name: Introduction to bt Library - Monthly vs Weekly Strategies
+  source: docs/source/intro.ipynb
+  type: trading_strategy
+  business_problem: Educational example comparing monthly equal-weight vs weekly inverse-volatility
+    strategies using real market data (AAPL, MSFT, SPY, AGG).
+  intent_keywords:
+  - getting started
+  - tutorial
+  - equal weight
+  - inverse volatility
+  - strategy comparison
+  stage: backtesting
+  negative_keywords:
+  - advanced
+  - custom algos
+  - fixed income
+  - pairs trading
+  - ML prediction
+  disambiguation: Are you looking for a beginner tutorial example, or do you need
+    advanced/specific strategy implementations?
+  data_domain: financial_data
+- id: UC-111
+  name: Pairs Trading Strategy with Correlation Signals
+  source: examples/pairs_trading.py
+  type: trading_strategy
+  business_problem: Implements statistical arbitrage pairs trading by identifying
+    cointegrated pairs whose indicator exceeds threshold for long/short positioning.
+  intent_keywords:
+  - pairs trading
+  - statistical arbitrage
+  - cointegration
+  - long short
+  - correlation trading
+  stage: backtesting
+  negative_keywords:
+  - single asset
+  - momentum
+  - trend following
+  - fixed income
+  - buy and hold
+  disambiguation: Are you looking to trade correlated pairs of securities for spread
+    convergence, or single-asset directional strategies?
+  data_domain: financial_data
+- id: UC-112
+  name: Buy and Hold Strategy with Python Script
+  source: examples/buy_and_hold.py
+  type: trading_strategy
+  business_problem: Executable Python version of buy-and-hold strategy with monthly
+    rebalancing, demonstrating standalone script execution for portfolio backtesting.
+  intent_keywords:
+  - buy and hold
+  - python script
+  - standalone
+  - monthly rebalance
+  - fixed weights
+  stage: backtesting
+  negative_keywords:
+  - Jupyter notebook
+  - interactive
+  - signal-based
+  - dynamic
+  - momentum
+  disambiguation: Do you need a standalone Python script that can run from command
+    line, or are you working with Jupyter notebooks?
+  data_domain: financial_data
+- id: UC-113
+  name: Fixed Income Bond Portfolio with Synthetic Data
+  source: examples/fixed_income.ipynb
+  type: trading_strategy
+  business_problem: Creates synthetic government bond data with rolling maturity schedules,
+    price-to-yield calculations, and bond lifecycle management for fixed income backtesting.
+  intent_keywords:
+  - fixed income
+  - synthetic bonds
+  - price yield
+  - bond rolling
+  - government securities
+  stage: backtesting
+  negative_keywords:
+  - equity
+  - stock trading
+  - momentum
+  - pairs trading
+  - ML prediction
+  disambiguation: Are you specifically testing fixed income instruments with bond
+    characteristics, or do you need equity-based strategies?
+  data_domain: financial_data
+- id: UC-114
+  name: Equal Risk Contribution with Covariance Matrix
+  source: examples/ERC.ipynb
+  type: trading_strategy
+  business_problem: Equal Risk Contribution portfolio using multivariate normal returns
+    and explicit covariance matrix for risk parity weighting across assets.
+  intent_keywords:
+  - equal risk contribution
+  - ERC
+  - covariance matrix
+  - risk parity
+  - multivariate normal
+  stage: backtesting
+  negative_keywords:
+  - momentum
+  - trend
+  - fixed income
+  - pairs
+  - single asset
+  disambiguation: Do you need risk parity based on asset volatilities, or are you
+    interested in momentum/return-based weighting?
+  data_domain: financial_data
+- id: UC-115
+  name: Inverse Volatility Portfolio with 3-Month Lookback
+  source: examples/PTE.ipynb
+  type: trading_strategy
+  business_problem: Inverse volatility weighting strategy using 3-month historical
+    data and 1-day lag to reduce risk concentration in high-volatility assets.
+  intent_keywords:
+  - inverse volatility
+  - vol weighting
+  - risk parity
+  - lookback period
+  - lagged data
+  stage: backtesting
+  negative_keywords:
+  - momentum
+  - trend following
+  - fixed income
+  - pairs
+  - equal weight
+  disambiguation: Do you want volatility-based weighting for risk control, or momentum/return-based
+    strategies?
+  data_domain: financial_data
+- id: UC-116
+  name: Multi-Strategy Portfolio Integration
+  source: examples/Strategy_Combination.ipynb
+  type: trading_strategy
+  business_problem: Combines multiple strategies into a unified portfolio allocation
+    framework for testing strategy diversification and correlation effects.
+  intent_keywords:
+  - multi strategy
+  - strategy combination
+  - portfolio integration
+  - strategy allocation
+  - diversification
+  stage: backtesting
+  negative_keywords:
+  - single strategy
+  - single asset
+  - fixed income
+  - pairs
+  - screening
+  disambiguation: Are you combining multiple strategies together, or do you need a
+    single standalone strategy?
+  data_domain: financial_data
+- id: UC-117
+  name: Target Volatility Strategy with Weekly Rebalancing
+  source: examples/Target_Volatility.ipynb
+  type: trading_strategy
+  business_problem: Controls portfolio volatility to 10% annualized target using weekly
+    rebalancing and inverse volatility asset weighting with 12-month lookback.
+  intent_keywords:
+  - target volatility
+  - vol targeting
+  - volatility control
+  - weekly rebalance
+  - risk management
+  stage: backtesting
+  negative_keywords:
+  - momentum
+  - trend following
+  - fixed income
+  - pairs
+  - buy and hold
+  disambiguation: Do you need to constrain portfolio volatility to a specific target
+    level, or are you looking for return/momentum strategies?
+  data_domain: financial_data
+- id: UC-118
+  name: Buy and Hold with Monthly Rebalancing
+  source: examples/buy_and_hold.ipynb
+  type: trading_strategy
+  business_problem: Basic buy-and-hold strategy with monthly rebalancing to fixed
+    weights (60/40), demonstrating core framework rebalancing mechanics.
+  intent_keywords:
+  - buy and hold
+  - monthly rebalance
+  - fixed weights
+  - passive
+  - 60/40 portfolio
+  stage: backtesting
+  negative_keywords:
+  - active
+  - signal based
+  - dynamic weights
+  - momentum
+  - pairs
+  disambiguation: Do you need a simple passive strategy with fixed allocation, or
+    dynamic signal-based trading?
+  data_domain: financial_data
+- id: UC-119
+  name: Trend Following with Rolling Median Signal
+  source: examples/trend_1.ipynb
+  type: trading_strategy
+  business_problem: Trend following strategy using 12-month rolling median as a baseline
+    indicator, visualizing price vs moving average crossover signals.
+  intent_keywords:
+  - trend following
+  - rolling median
+  - moving average
+  - momentum
+  - median crossover
+  stage: backtesting
+  negative_keywords:
+  - mean reversion
+  - pairs
+  - fixed income
+  - volatility targeting
+  - inverse vol
+  disambiguation: Are you implementing trend-following strategies, or do you need
+    mean-reversion or volatility-based approaches?
+  data_domain: financial_data
+- id: UC-120
+  name: Custom Return Signal Monthly Rebalancing
+  source: examples/trend_2.ipynb
+  type: trading_strategy
+  business_problem: Custom Signal algorithm that calculates total returns over configurable
+    lookback periods for monthly rebalancing decisions.
+  intent_keywords:
+  - custom signal
+  - total return
+  - lookback
+  - monthly rebalance
+  - custom algo
+  stage: backtesting
+  negative_keywords:
+  - builtin algos
+  - pre-built
+  - fixed income
+  - pairs
+  - ML prediction
+  disambiguation: Do you need to create a custom signal/algorithm, or would pre-built
+    library algorithms meet your needs?
+  data_domain: financial_data
+_enrich_meta:
+  evidence_coverage_ratio: 0.899
+  evidence_verified: 8
+  evidence_invalid: 72
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.1
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  - RSK
+  - DAT
+  finance_universal:
+    pass: 1
+    warn: 11
+    fail: 8
+  subdomain_totals:
+    pass: 4
+    warn: 15
+    fail: 6
+  coverage: 5/45 (11%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+resources:
+- id: res-slot-001
+  type: replaceable_component
+  name: progress_bar
+  path: null
+  description: tqdm preferred for Jupyter, pyprind for minimal installs
+  used_in_stages: []
+  options:
+  - name: pyprind
+    traits:
+    - simple
+    - cross_platform
+    fit_for:
+    - Simple progress indication during backtest
+    not_fit_for:
+    - Jupyter notebook environments (progress bar can be verbose)
+  - name: tqdm
+    traits:
+    - feature_rich
+    - jupyter_ready
+    - thread_safe
+    fit_for:
+    - Multi-backtest runs, Jupyter environments, detailed progress
+    not_fit_for:
+    - Minimal dependencies
+  default: pyprind (for single backtest), tqdm (for multiple backtests via bt.run())
+  _source: worker_resource
+- id: res-slot-002
+  type: replaceable_component
+  name: covariance_estimation
+  path: null
+  description: Use sklearn for most cases; pandas cov() for minimal dependencies or
+    very large universes
+  used_in_stages: []
+  options:
+  - name: sklearn Ledoit-Wolf
+    traits:
+    - shrinkage
+    - regularized
+    - robust
+    fit_for:
+    - Portfolio optimization with limited history, noisy covariance estimates
+    not_fit_for:
+    - Very large universes (O(n^2) complexity)
+  - name: pandas built-in
+    traits:
+    - simple
+    - no_shrinkage
+    fit_for:
+    - Large universes with sufficient history, no additional dependencies
+    not_fit_for:
+    - Noisy/limited data
+  - name: statsmodels
+    traits:
+    - shrinkage
+    - oracle_approximating
+    fit_for:
+    - When sklearn is not available, oracle approximating shrinkage (OAS)
+    not_fit_for:
+    - Ledoit-Wolf specific requirements
+  default: sklearn Ledoit-Wolf (via sklearn.covariance)
+  _source: worker_resource
+- id: res-slot-003
+  type: replaceable_component
+  name: visualization
+  path: null
+  description: matplotlib for standard use; plotly for interactive needs; none for
+    headless environments
+  used_in_stages: []
+  options:
+  - name: matplotlib
+    traits:
+    - standard
+    - publication_quality
+    - static_plots
+    fit_for:
+    - Standard plotting, publication-quality charts
+    not_fit_for:
+    - Interactive dashboards, web integration
+  - name: plotly
+    traits:
+    - interactive
+    - web_ready
+    fit_for:
+    - Interactive charts, web dashboards
+    not_fit_for:
+    - Static reports, minimal dependencies
+  - name: No visualization
+    traits:
+    - minimal
+    - scriptable
+    fit_for:
+    - Headless environments, purely quantitative analysis
+    not_fit_for:
+    - Exploratory analysis, presentations
+  default: matplotlib
+  _source: worker_resource
+- id: res-004
+  type: python_package
+  name: ffn>=1.1.2
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-005
+  type: python_package
+  name: pyprind>=2.11
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-006
+  type: python_package
+  name: tqdm>=4
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-007
+  type: python_package
+  name: cython>=0.29.25
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-008
+  type: python_package
+  name: matplotlib>=2
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: python_package
+  name: numpy>=1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: python_package
+  name: pandas>=0.19
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: python_package
+  name: pytest
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: python_package
+  name: pytest-cov
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: python_package
+  name: ruff>=0.5.0,<0.16
+  description: ''
+  used_in_stages: []
+  _source: worker_resource

@@ -1,0 +1,1999 @@
+id: finance-bp-116
+name: FinRL-Meta
+sop_version: '3.6'
+source:
+  projects:
+  - FinRL-Meta
+  commit_hash: 15405db81ef46790d430341166700a61ba51b70d
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: financial reinforcement learning market environments and benchmarks
+  description: Market environment and benchmark layer of the FinRL ecosystem that
+    builds a universe of market environments for data-driven financial reinforcement
+    learning, enabling users to easily develop, evaluate, and compare trading agents
+    across diverse financial tasks.
+  prerequisites: Python 3.6+, reinforcement learning concepts, financial trading basics,
+    familiarity with OpenAI Gym interface
+  not_suitable_for: High-frequency trading requiring ultra-low latency (<1ms), production-grade
+    deployment (see FinRL-X/FinRL-Trading), non-RL based quantitative strategies
+stages:
+- id: data_collection
+  name: Market Data Collection
+  order: 1
+  responsibility: Fetches raw OHLCV data from 15+ financial data sources including
+    Alpaca, Binance, WRDS, CCXT and normalizes disparate column schemas into unified
+    'time'/'tic'/'close'/'open'/'high'/'low'/'volume' format. This stage exists to
+    abstract away the complexity of connecting to heterogeneous data providers.
+  interface:
+    inputs: ticker_list (List[str]), start_date, end_date, time_interval
+    outputs: self.dataframe (pd.DataFrame) with standardized columns, self.dictnumpy
+      (dict of np arrays)
+  required_methods:
+  - name: DataProcessor.select_dataset
+    description: Factory method that selects and instantiates appropriate data source
+      processor based on source identifier
+    evidence: meta/data_processor.py:28-110
+  - name: _Base.download_data
+    description: Downloads raw data from specific provider (implemented by each subclass)
+    evidence: meta/data_processors/_base.py:63
+  - name: _Base.clean_data
+    description: Normalizes provider-specific column names to standard 'time'/'tic'/'open'/'high'/'low'/'close'/'volume'
+      schema
+    evidence: meta/data_processors/_base.py:88-91
+  - name: _Base.fillna
+    description: Handles missing values after data normalization
+    evidence: meta/data_processors/_base.py:63
+  key_behaviors:
+  - behavior: Lazy import of provider modules
+    description: Only loads the requested data provider module at runtime, avoiding
+      import-time dependency loading for each 15+ providers
+    evidence: meta/data_processor.py:28-110
+  - behavior: Column name standardization
+    description: Maps provider-specific names (date, datetime, index) to unified 'time'
+      column; handles RiceQuant multi-index (tic,time) by resetting to flat DataFrame
+    evidence: meta/data_processors/_base.py:88-100
+  replaceable_points:
+  - name: data_source_processor
+    description: Add new financial data provider by subclassing _Base
+    options:
+    - name: _Base subclass
+      traits:
+      - Implements download_data, clean_data, fillna
+      - Inherits common DataFrame operations
+      fit_for:
+      - Adding support for new exchange or data vendor
+      not_fit_for:
+      - Providers requiring fundamentally different DataFrame schema
+    - name: DataSource enum extension
+      traits:
+      - Enum with 15+ source identifiers
+      fit_for:
+      - Registering new data source with factory
+      not_fit_for:
+      - Multiple variants of same provider needing separate classes
+    default: _Base subclass with DataSource enum extension
+  design_decisions:
+  - Lazy import pattern avoids loading each provider dependencies at import time;
+    only loads requested provider module (meta/data_processor.py:28-110)
+  - Standardized column names enforced in clean_data ensures date->time, datetime->time,
+    index->time mapping so downstream code never encounters raw provider column names
+    (meta/data_processors/_base.py:88-91)
+  - Multi-index reset for RiceQuant data normalizes (tic,time) multi-index to flat
+    DataFrame for consistent processing (meta/data_processors/_base.py:95-100)
+  acceptance_hints:
+  - 'DataFrame columns match: time, tic, open, high, low, close, volume'
+  - No 'date', 'datetime', or 'index' column names remain
+  - Every tickers present in output dataframe
+  - Date range matches requested start_date to end_date
+- id: technical_indicator_computation
+  name: Technical Indicator Computation
+  order: 2
+  responsibility: Calculates 8+ technical indicators (MACD, Bollinger Bands, RSI,
+    CCI, DX) using either stockstats (default) or TA-Lib library. Drops timesteps
+    with NaN by default to ensure complete state vectors for RL training.
+  interface:
+    inputs: self.dataframe with OHLCV columns, tech_indicator_list, select_stockstats_talib
+      (IndicatorLib enum)
+    outputs: self.dataframe with additional indicator columns appended
+  required_methods:
+  - name: _Base.add_technical_indicator
+    description: Main entry point that selects stockstats or talib implementation
+      based on IndicatorLib parameter
+    evidence: meta/data_processors/_base.py:187
+  - name: _Base._add_technical_indicator_stockstats
+    description: Iterates over tickers and applies stockstats indicators per-ticker
+    evidence: meta/data_processors/_base.py:224
+  - name: _Base._add_technical_indicator_talib
+    description: GroupBy ticker, applies talib indicators with forward-fill before
+      calculation
+    evidence: meta/data_processors/_base.py:253
+  key_behaviors:
+  - behavior: NaN row dropping for RL compatibility
+    description: Drops entire timesteps where any ticker has NaN, ensuring complete
+      state vectors for neural network training
+    evidence: meta/data_processors/_base.py:217-221
+  - behavior: Talib forward-fill requirement
+    description: TA-Lib crashes on NaN values, so forward-fill preserves last known
+      price context before indicator calculation
+    evidence: meta/data_processors/_base.py:264
+  replaceable_points:
+  - name: indicator_calculation_library
+    description: Switch between stockstats (pure Python) and TA-Lib (C extension)
+      for indicator calculation
+    options:
+    - name: stockstats
+      traits:
+      - Pure Python
+      - No external C dependency
+      - Default option
+      fit_for:
+      - Development
+      - Environments without paid TA-Lib license
+      - Cross-platform compatibility
+      not_fit_for:
+      - Production requiring maximum performance
+      - Indicators only available in TA-Lib
+    - name: TA-Lib
+      traits:
+      - C extension
+      - Paid license required
+      - More indicator coverage
+      fit_for:
+      - Production with TA-Lib license
+      - Maximum performance
+      - Extended indicator library
+      not_fit_for:
+      - Open-source projects
+      - Environments without C compiler
+      - Budget-constrained deployments
+    default: stockstats (IndicatorLib.STOCKSTATS)
+  design_decisions:
+  - Talib requires ffill before indicator calculation because TA-Lib crashes on NaN
+    values; forward-fill preserves last known price context (meta/data_processors/_base.py:264)
+  - Drop timesteps with any NaN across each tickers because RL training requires complete
+    state vectors; dropping entire timesteps avoids padding complexity (meta/data_processors/_base.py:217-221)
+  - stockstats default due to no external C dependency - TA-Lib requires paid license
+    while stockstats is pure Python fallback (meta/data_processors/_base.py:187)
+  acceptance_hints:
+  - Technical indicator columns present in DataFrame
+  - No NaN values in any row (each timesteps with missing data removed)
+  - DataFrame sorted by ['time', 'tic']
+  - Indicators calculated correctly match expected values for known tickers
+- id: factor_computation
+  name: Alpha Factor Computation
+  order: 3
+  responsibility: Computes Chinese-market alpha factors including momentum, emotion/sentiment,
+    RSRS (阻力相对强度), and generic technical factors using scipy and statsmodels. Separate
+    factor families enable targeted factor research.
+  interface:
+    inputs: price series (pd.Series), volume series (pd.Series), OHLCV DataFrames
+    outputs: factor values (pd.Series/pd.DataFrame) for each factor type
+  required_methods:
+  - name: MomentumFactors.compute
+    description: 'Calculates momentum factors: BIAS, ROC, CCI, bull_power for price
+      momentum signals'
+    evidence: meta/factors/factors.py:133
+  - name: EmotionFactors.compute
+    description: 'Calculates volume-based sentiment factors: VSTD, VEMA, VROC, AR
+      sentiment indicators'
+    evidence: meta/factors/factors.py:243
+  - name: generalFactors.compute
+    description: 'Calculates generic technical indicators: MACD, KDJ, RSI, WR, BOLL,
+      ATR, DMI'
+    evidence: meta/factors/factors.py:397
+  key_behaviors:
+  - behavior: Factor class specialization
+    description: Separate factor classes by signal category (Momentum vs Emotion vs
+      RSRS vs Generic) enable targeted factor research and modular composition
+    evidence: meta/factors/factors.py:133,243,362,397
+  - behavior: Statistical factor computation
+    description: RSRS (阻力相对强度) requires linear regression from statsmodels for resistance/support
+      relative strength calculation
+    evidence: meta/factors/factors.py:1-3
+  replaceable_points:
+  - name: factor_calculation_engine
+    description: Statistical library for advanced factor computation
+    options:
+    - name: scipy/statsmodels
+      traits:
+      - Linear regression for RSRS
+      - Statistical tests
+      fit_for:
+      - Chinese market factors requiring statistical modeling
+      not_fit_for:
+      - Simple moving average factors
+    default: scipy/statsmodels
+  design_decisions:
+  - Separate factor classes by signal category (Momentum vs Emotion vs RSRS vs Generic)
+    enables targeted factor research (meta/factors/factors.py:133,243,362,397)
+  - scipy/statsmodels for statistical factors because RSRS (阻力相对强度) requires linear
+    regression from statsmodels (meta/factors/factors.py:1-3)
+  acceptance_hints:
+  - Factor values computed without errors
+  - Factor DataFrame index matches price DataFrame index
+  - No infinite or NaN values in factor output (except where mathematically defined)
+- id: env_preparation
+  name: Gym Environment Preparation
+  order: 4
+  responsibility: Converts processed DataFrames into OpenAI Gym-compatible environments
+    with standardized config dicts. Supports stock trading, portfolio optimization,
+    crypto, futures, and market impact modeling with standardized observation and
+    action spaces.
+  interface:
+    inputs: price_array (np.ndarray), tech_array, turbulence_array, initial_amount,
+      turbulence_threshold
+    outputs: gym.Env with Box observation_space and action_space, config dict for
+      agent
+  required_methods:
+  - name: StockTradingEnv.reset
+    description: Resets environment to initial state, optionally with random stock/capital
+      variation for training mode
+    evidence: meta/env_stock_trading/env_stock_trading.py:78
+  - name: StockTradingEnv.step
+    description: Executes trading action (sell first, then buy), computes reward with
+      gamma accumulation and turbulence sell-each safety
+    evidence: meta/env_stock_trading/env_stock_trading.py:109-139
+  - name: PortfolioOptimizationEnv._allocate
+    description: Softmax-weighted portfolio allocation with multi-feature time windows
+    evidence: meta/env_portfolio_optimization/env_portfolio_optimization.py:29
+  - name: MarketEnvironment.compute_reward
+    description: Almgren-Chriss liquidation reward with permanent/temporary impact
+      modeling
+    evidence: meta/env_execution_optimizing/liquidation/env_execution_optimizing.py:366-374
+  key_behaviors:
+  - behavior: SELL before BUY execution order
+    description: 'Critical ordering invariant: SELL operations execute before BUY
+      within each timestep to prevent cash limit violations and incorrect position
+      calculations'
+    evidence: meta/env_stock_trading/env_stock_trading.py:109-124
+  - behavior: Turbulence-based risk management
+    description: When turbulence exceeds threshold (default 99), ALL positions must
+      liquidate for risk management safety
+    evidence: meta/env_stock_trading/env_stock_trading.py:126-129
+  - behavior: Feature normalization with power-of-2 scaling
+    description: reward_scaling=2^-11 and tech_array*=2^-7 for bit-shift efficiency
+      and neural network gradient stability
+    evidence: meta/env_stock_trading/env_stock_trading.py:18,29
+  - behavior: Plug-in market impact model
+    description: ImpactModel ABC with SqrtImpactModel/ACImpactModel/OWImpactModel/BaselineImpactModel
+      implementations
+    evidence: meta/env_market_impact/envs/impact_models.py:28-91
+  replaceable_points:
+  - name: market_impact_model
+    description: Market impact model for portfolio optimization with transaction costs
+    options:
+    - name: SqrtImpactModel
+      traits:
+      - Square root market impact
+      - Standard finance assumption
+      fit_for:
+      - Equity portfolios
+      - Medium-frequency trading
+      not_fit_for:
+      - Illiquid assets
+      - High-frequency scenarios
+    - name: ACImpactModel
+      traits:
+      - Almgren-Chriss model
+      - Permanent + temporary impact
+      fit_for:
+      - Execution optimization
+      - Liquidation scenarios
+      not_fit_for:
+      - Portfolio rebalancing without liquidation
+    - name: OWImpactModel
+      traits:
+      - Obizhaeva-Wang model
+      fit_for:
+      - Order flow modeling
+      not_fit_for:
+      - Simple backtesting
+    - name: BaselineImpactModel
+      traits:
+      - No market impact
+      - Baseline comparison
+      fit_for:
+      - Testing without impact
+      - Benchmark comparison
+      not_fit_for:
+      - Realistic trading simulation
+    default: SqrtImpactModel
+  - name: environment_type
+    description: Gym environment for different financial instruments
+    options:
+    - name: StockTradingEnv
+      traits:
+      - Discrete stock trading
+      - Turbulence-aware
+      fit_for:
+      - Stock portfolio trading
+      not_fit_for:
+      - Crypto
+      - Futures
+    - name: CryptoEnv
+      traits:
+      - Multi-crypto support
+      - Normalized actions
+      fit_for:
+      - Cryptocurrency trading
+      not_fit_for:
+      - Stock trading
+    - name: PortfolioOptimizationEnv
+      traits:
+      - Continuous allocation
+      - Softmax weights
+      fit_for:
+      - Portfolio rebalancing
+      not_fit_for:
+      - Single-asset trading
+    - name: MarketEnvironment
+      traits:
+      - Almgren-Chriss
+      - Liquidation focus
+      fit_for:
+      - Execution optimization
+      - VWAP/TWAP comparison
+      not_fit_for:
+      - Long-term portfolio management
+    default: StockTradingEnv
+  design_decisions:
+  - sigmoid_sign normalization for turbulence thresholding smoothly maps turbulence
+    values to bounded range avoiding hard threshold artifacts in state (meta/env_stock_trading/env_stock_trading.py:159-164)
+  - 'turbulence sell-each behavior: market dislocation detected by turbulence > threshold
+    triggers full liquidation to avoid losses (meta/env_stock_trading/env_stock_trading.py:126-129)'
+  - 'gamma_reward accumulation for terminal reward: discounted cumulative reward reduces
+    variance vs single terminal value (meta/env_stock_trading/env_stock_trading.py:136-139)'
+  - reward_scaling = 2**-11 default prevents large absolute rewards from destabilizing
+    neural network training gradients (meta/env_stock_trading/env_stock_trading.py:18)
+  - tech_array * 2**-7 normalization brings technical indicators to ~[-2,2] range
+    comparable to price/stock features (meta/env_stock_trading/env_stock_trading.py:29)
+  - Plug-in ImpactModel abstraction enables SqrtImpactModel, ACImpactModel, OWImpactModel,
+    BaselineImpactModel substitution (meta/env_market_impact/envs/env_portfolio_optimization_impact.py:89-91)
+  acceptance_hints:
+  - Environment inherits from gym.Env
+  - reset() returns (observation, info) tuple
+  - step() returns (observation, reward, terminated, truncated, info)
+  - observation_space is Box with correct dimensions
+  - Turbulence threshold sell-each triggers when turbulence > threshold
+  - SELL executes before BUY in step()
+- id: dr_model_training
+  name: Deep Reinforcement Learning Model Training
+  order: 5
+  responsibility: Wraps Stable-Baselines3, ElegantRL, and RLlib for DRL agent training.
+    Provides unified get_model/train_model/DRL_prediction interface across libraries,
+    with ensemble support and train/validation/test rolling windows to prevent look-ahead
+    bias.
+  interface:
+    inputs: gym.Env, model_name (A2C/PPO/DDPG/SAC/TD3), model_kwargs, train_kwargs
+    outputs: trained model saved to TRAINED_MODEL_DIR, DRL_prediction returns portfolio
+      values
+  required_methods:
+  - name: DRLAgent.get_model
+    description: Instantiates DRL model with specified algorithm, environment dimensions,
+      and hyperparameters
+    evidence: agents/stablebaselines3_models.py:48
+  - name: DRLAgent.train_model
+    description: Trains model with TensorboardCallback for per-episode reward tracking
+    evidence: agents/stablebaselines3_models.py:48
+  - name: DRLAgent.DRL_prediction
+    description: Runs trained model on environment to generate portfolio values
+    evidence: agents/stablebaselines3_models.py:48
+  - name: DRLEnsembleAgent.train_ensemble
+    description: Trains ensemble of A2C/PPO/DDPG with train/validation/test rolling
+      windows, preventing look-ahead bias
+    evidence: agents/stablebaselines3_models.py:320-360
+  key_behaviors:
+  - behavior: TensorboardCallback reward tracking
+    description: Hardcoded to self.logger.record(reward) after each episode for TensorBoard
+      monitoring without custom callback boilerplate
+    evidence: agents/stablebaselines3_models.py:40-45
+  - behavior: Train/validation/test rolling windows
+    description: Ensemble agent trains on historical data, validates on recent data,
+      tests on held-out period to prevent look-ahead bias
+    evidence: agents/stablebaselines3_models.py:320-360
+  - behavior: State continuity via last_state passing
+    description: DRLEnsembleAgent requires train→validation→trade state continuity
+      via last_state passing between windows
+    evidence: agents/stablebaselines3_models.py:329-331
+  - behavior: Action noise for exploration
+    description: action_noise sigma=0.1 for continuous control provides sufficient
+      exploration without destabilizing
+    evidence: agents/stablebaselines3_models.py:88
+  replaceable_points:
+  - name: drl_library
+    description: Deep reinforcement learning library for agent training
+    options:
+    - name: stablebaselines3
+      traits:
+      - PyTorch-based
+      - A2C/PPO/DDPG/SAC/TD3
+      - TensorBoard support
+      - Default option
+      fit_for:
+      - General stock trading
+      - Most use cases
+      - Easy debugging
+      not_fit_for:
+      - Very large-scale training
+      - Multi-GPU training
+    - name: elegantrl
+      traits:
+      - Lightweight
+      - ElegantRL agents
+      - Multi-GPU support
+      fit_for:
+      - Custom agents
+      - GPU-intensive training
+      - Futures trading
+      not_fit_for:
+      - Quick prototyping
+      - Production deployment
+    - name: rllib
+      traits:
+      - Ray-based
+      - Distributed training
+      - Scalable
+      fit_for:
+      - Large-scale training
+      - Production systems
+      - Multi-agent
+      not_fit_for:
+      - Simple experiments
+      - Local development
+    default: stablebaselines3
+  design_decisions:
+  - TensorboardCallback hardcoded to self.logger.record(reward) allows per-episode
+    reward tracking in TensorBoard without custom callback boilerplate (agents/stablebaselines3_models.py:40-45)
+  - DRLEnsembleAgent with train/val/test rolling windows prevents look-ahead bias
+    by training on historical, validating on recent, testing on held-out period (agents/stablebaselines3_models.py:320-360)
+  - 'action_noise sigma=0.1 for continuous control: 10% of action range as std dev
+    provides sufficient exploration without destabilizing (agents/stablebaselines3_models.py:88)'
+  - Validation Sharpe ratio with 4**0.5 annualization simplifies daily return annualization
+    (agents/stablebaselines3_models.py:218-222)
+  acceptance_hints:
+  - Model checkpoint saved to TRAINED_MODEL_DIR
+  - DRL_prediction returns portfolio values array
+  - Training logs show episode rewards
+  - Ensemble produces multiple model checkpoints
+  - Validation Sharpe ratio computed during training
+- id: order_execution_optimization
+  name: High-Frequency Order Execution
+  order: 6
+  responsibility: Qlib-based high-frequency execution system with RL agents (PPO,
+    OPD) and rule-based baselines (TWAP, VWAP, AC). Teacher-student distillation for
+    PPO supervision enables knowledge transfer from expert policies.
+  interface:
+    inputs: order files, high-frequency market data from Qlib, policy_conf, network_conf
+    outputs: trained policy checkpoint, backtest performance metrics
+  required_methods:
+  - name: Executor.train
+    description: Orchestrates train loop with Collector, Buffer, policy, optimizer
+      for high-frequency execution training
+    evidence: meta/env_execution_optimizing/order_execution_qlib/trade/executor.py:197
+  - name: Collector.collect
+    description: Collects episodes from vectorized environments with optional noise
+      for exploration
+    evidence: meta/env_execution_optimizing/order_execution_qlib/trade/collector.py:26
+  - name: PPO.update
+    description: PPO policy with GAE computation and teacher supervision for knowledge
+      distillation
+    evidence: meta/env_execution_optimizing/order_execution_qlib/trade/policy/ppo.py:42
+  - name: PPO_sup.update
+    description: PPO with log-likelihood supervision loss from teacher policy for
+      distillation
+    evidence: meta/env_execution_optimizing/order_execution_qlib/trade/policy/ppo_supervision.py:24
+  key_behaviors:
+  - behavior: Teacher-student distillation
+    description: Teacher policy provides expert demonstrations to accelerate student
+      policy convergence via supervision loss
+    evidence: meta/env_execution_optimizing/order_execution_qlib/trade/policy/ppo.py:45
+  - behavior: Multi-layer architecture
+    description: Executor orchestrates policy/network/sampler/logger/reward/action
+      hierarchy with BasePolicy and Batch interfaces
+    evidence: meta/env_execution_optimizing/order_execution_qlib/trade/executor.py:197
+  - behavior: Vectorized environment training
+    description: SubprocVectorEnv and ShmemVectorEnv for parallel episode collection
+      with shared memory reducing IPC overhead
+    evidence: meta/env_execution_optimizing/order_execution_qlib/trade/vecenv.py:677,716
+  replaceable_points:
+  - name: execution_policy
+    description: Policy for high-frequency order execution
+    options:
+    - name: PPO
+      traits:
+      - On-policy
+      - GAE
+      - Teacher supervision available
+      fit_for:
+      - General execution optimization
+      not_fit_for:
+      - Very high-frequency requiring off-policy
+    - name: OPD
+      traits:
+      - On-Policy Distributional
+      - Specialized for execution
+      fit_for:
+      - Distribution-sensitive execution
+      not_fit_for:
+      - Simple baseline comparison
+    default: PPO
+  design_decisions:
+  - Tianshou-based policy implementation provides high-performance Python RL with
+    replay buffer, GAE, on-policy updates (meta/env_execution_optimizing/order_execution_qlib/trade/policy/ppo.py:1)
+  - 'Teacher-student distillation for PPO supervision: Teacher policy provides expert
+    demonstrations to accelerate student policy convergence (meta/env_execution_optimizing/order_execution_qlib/trade/policy/ppo.py:45)'
+  - HighfreqWorkflow for qlib data pipeline handles calendar caching, feature normalization,
+    dataset serialization (meta/env_execution_optimizing/order_execution_qlib/highfreq/workflow.py:34)
+  acceptance_hints:
+  - Policy checkpoint saved after training
+  - Backtest metrics (VWAP slippage, implementation shortfall) improve vs baseline
+  - Teacher supervision loss decreases over training
+  - Vectorized environments achieve high throughput
+- id: trading_execution
+  name: Live/Paper Trading Execution
+  order: 7
+  responsibility: Connects trained models to live broker APIs (Alpaca) for paper trading
+    and live execution. Multi-threaded trading loop with latency testing and state
+    tracking enables real-world deployment of trained RL agents.
+  interface:
+    inputs: trained model, API credentials, ticker_list, net_dim, state_dim, action_dim
+    outputs: live order execution via Alpaca API, state tracking, profit/loss reporting
+  required_methods:
+  - name: AlpacaPaperTrading.run
+    description: Multi-threaded trading loop with awaitMarketOpen for non-blocking
+      market wait and latency testing
+    evidence: meta/env_stock_trading/env_stock_papertrading.py:146-197
+  - name: AlpacaPaperTrading.test_latency
+    description: Measures API round-trip latency to detect network issues before live
+      trading
+    evidence: meta/env_stock_trading/env_stock_papertrading.py:134-144
+  - name: AlpacaPaperTrading.get_action
+    description: Converts model output to trading action using sigmoid_sign preprocessing
+      matching training distribution
+    evidence: meta/env_stock_trading/env_stock_papertrading.py:369-379
+  key_behaviors:
+  - behavior: Threading-based trading loop
+    description: Non-blocking market wait with awaitMarketOpen allows CPU utilization
+      during overnight gaps and market closures
+    evidence: meta/env_stock_trading/env_stock_papertrading.py:146-197
+  - behavior: Pre-trading latency testing
+    description: Measures API round-trip latency before live trading to detect network
+      issues and prevent bad order submissions
+    evidence: meta/env_stock_trading/env_stock_papertrading.py:134-144
+  - behavior: sigmoid_sign action processing
+    description: Maps continuous [-1,1] actions from model to bounded trading decisions
+      matching training distribution
+    evidence: meta/env_stock_trading/env_stock_papertrading.py:369-379
+  replaceable_points:
+  - name: broker_api
+    description: Broker API for paper/live trading execution
+    options:
+    - name: Alpaca
+      traits:
+      - US equities
+      - Crypto support
+      - Free paper trading
+      fit_for:
+      - US stock trading
+      - Multi-crypto
+      not_fit_for:
+      - Non-US markets
+      - Futures
+    default: Alpaca
+  design_decisions:
+  - Threading-based trading loop with awaitMarketOpen provides non-blocking market
+    wait allowing CPU utilization during overnight gaps (meta/env_stock_trading/env_stock_papertrading.py:146-197)
+  - latency testing before live trading measures API round-trip latency to detect
+    network issues before trading (meta/env_stock_trading/env_stock_papertrading.py:134-144)
+  - sigmoid_sign action processing in paper trading maps continuous [-1,1] actions
+    to bounded trading decisions matching training distribution (meta/env_stock_trading/env_stock_papertrading.py:369-379)
+  acceptance_hints:
+  - Orders submitted successfully to Alpaca API
+  - P/L tracking updates after each trade
+  - Latency test passes before trading starts
+  - State maintained correctly across trading days
+- id: futures_trading
+  name: Futures Trading with Wt4ElegantRL
+  order: 8
+  responsibility: Integrates WtQuant framework (C++ backtest engine) with ElegantRL
+    for futures trading. Multi-process training with PipeLearner/PipeEvaluator architecture
+    enables GPU parallelization for high-performance futures agent training.
+  interface:
+    inputs: WtEnv with WtBtEngine, AgentPPO/AgentSAC, config dict with time_range,
+      features
+    outputs: trained agent checkpoint, backtest analyst results with Sharpe/max drawdown
+  required_methods:
+  - name: WtEnv.step
+    description: Gym-compatible wrapper around WtBtEngine C++ backtester for futures
+      trading
+    evidence: meta/env_future_trading/wt4elegantrl/envs.py:19
+  - name: AgentPPO.update
+    description: PPO agent with GAE, clip objective, entropy bonus for futures trading
+    evidence: meta/env_future_trading/wt4elegantrl/elegantrl/agent.py:1016
+  - name: PipeLearner.run
+    description: Multi-GPU training with gradient averaging across learners in separate
+      processes
+    evidence: meta/env_future_trading/wt4elegantrl/elegantrl/run.py:447
+  - name: ContractMgr.get_contract
+    description: Loads contract info from JSON for futures instrument metadata
+    evidence: meta/env_future_trading/wt4elegantrl/wtpy/ContractMgr.py:13
+  key_behaviors:
+  - behavior: Multiprocessing architecture
+    description: Actors in workers, learner in separate process, evaluator in separate
+      process for GPU parallelization
+    evidence: meta/env_future_trading/wt4elegantrl/elegantrl/run.py:358-760
+  - behavior: C++ backtest integration via pybind11
+    description: WtBtEngine C++ engine provides fast backtesting while Python provides
+      RL training flexibility
+    evidence: meta/env_future_trading/wt4elegantrl/wtpy/WtBtEngine.py:25
+  - behavior: Prioritized Experience Replay with BinarySearchTree
+    description: O(log n) priority updates for PER with segment tree implementation
+    evidence: meta/env_future_trading/wt4elegantrl/elegantrl/replay.py:342
+  replaceable_points:
+  - name: futures_agent
+    description: RL agent type for futures trading
+    options:
+    - name: AgentPPO
+      traits:
+      - On-policy
+      - GAE
+      - Clip objective
+      - Entropy bonus
+      fit_for:
+      - General futures trading
+      not_fit_for:
+      - Continuous action spaces requiring DDPG/SAC
+    - name: AgentSAC
+      traits:
+      - Off-policy
+      - Soft actor-critic
+      - Maximum entropy
+      fit_for:
+      - Continuous action spaces
+      - Exploration-heavy tasks
+      not_fit_for:
+      - On-policy requirements
+    default: AgentPPO
+  design_decisions:
+  - 'Multiprocessing PipeWorker/PipeLearner/PipeEvaluator enables GPU parallelization:
+    actors in workers, learner in separate process, evaluator in separate process
+    (meta/env_future_trading/wt4elegantrl/elegantrl/run.py:358-760)'
+  - WtBtEngine C++ integration via pybind11 provides fast backtesting while Python
+    provides RL training flexibility (meta/env_future_trading/wt4elegantrl/wtpy/WtBtEngine.py:25)
+  - BinarySearchTree for Prioritized Experience Replay provides O(log n) priority
+    updates with segment tree implementation (meta/env_future_trading/wt4elegantrl/elegantrl/replay.py:342)
+  acceptance_hints:
+  - Agent checkpoint saved after training
+  - Backtest analyst shows Sharpe ratio and max drawdown
+  - Multi-process training completes without errors
+  - Contract metadata loaded correctly
+data_flow:
+- from_stage: data_collection
+  to_stage: technical_indicator_computation
+  data: DataFrame with time/tic/open/high/low/close/volume columns after normalization
+- from_stage: technical_indicator_computation
+  to_stage: env_preparation
+  data: DataFrame with added indicator columns, NaN rows dropped, sorted by ['time',
+    'tic']
+- from_stage: env_preparation
+  to_stage: dr_model_training
+  data: price_array (np.float32), tech_array (np.float32), turbulence_array config
+    dict
+- from_stage: dr_model_training
+  to_stage: trading_execution
+  data: trained model checkpoint (SB3/ElegantRL), net_dimension, state_dim, action_dim
+- from_stage: dr_model_training
+  to_stage: order_execution_optimization
+  data: trained PPO policy, network weights for high-frequency execution
+- from_stage: dr_model_training
+  to_stage: futures_trading
+  data: trained ElegantRL Agent, config with state_dim/action_dim for futures
+- from_stage: data_collection
+  to_stage: futures_trading
+  data: historical futures price data via WtBtEngine C++ backtester
+global_contracts:
+- contract: Every DataFrames use 'time' column (not 'date'/'datetime'/'index') after
+    clean_data
+  evidence: meta/data_processors/_base.py:88-93
+- contract: Every DataFrames sorted by ['time', 'tic'] after indicator computation
+  evidence: meta/data_processors/_base.py:216
+- contract: price_array and tech_array use np.float32 dtype for GPU compatibility
+  evidence: meta/env_stock_trading/env_stock_trading.py:25-26
+- contract: reward_scaling is a power of 2 inverse (2**-11, 2**-7) for bit-shift efficiency
+  evidence: meta/env_stock_trading/env_stock_trading.py:18,29
+- contract: Every gym.Env subclasses implement reset() returning (observation, info)
+    tuple
+  evidence: meta/env_stock_trading/env_stock_trading.py:78
+- contract: SELL must execute before BUY within each timestep across each trading
+    environments
+  evidence: meta/env_stock_trading/env_stock_trading.py:109-124
+- contract: Every paper trading classes expect sigmoid_sign preprocessing on actions
+  evidence: meta/env_stock_trading/env_stock_papertrading.py:369
+- contract: Market impact models must implement apply_trade and end_day methods
+  evidence: meta/env_market_impact/envs/impact_models.py:28-88
+- contract: 'Turbulence threshold SELL_ALL: when turbulence exceeds threshold, ALL
+    positions must liquidate'
+  evidence: meta/env_stock_trading/env_stock_trading.py:126-129
+- contract: DRLEnsembleAgent requires train→validation→trade state continuity via
+    last_state passing
+  evidence: agents/stablebaselines3_models.py:329-331
+business_decisions:
+- id: BD-001
+  type: B
+  content: Weighted metrics by trade value (money_sell/money_buy) for aggregated stats
+  rationale: 'Value-weighted aggregation prevents large trades from being dwarfed
+    by many small ones. Better reflects actual execution impact. Boundary: Weight
+    computed from trade value; not from P&L.'
+  evidence: meta/env_execution_optimizing/order_execution_qlib/trade/logger/single_logger.py:56(module)
+  stage: evaluation
+  alternative_considered: Equal weighting was rejected for misleading aggregation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in meta/env_execution_optimizing/order_execution_qlib/trade/logger/single_logger.py'
+- id: BD-002
+  type: B/DK
+  content: Linear market impact model with permanent/temporary components
+  rationale: 'Separate permanent impact (information leakage, price reversion) from
+    temporary impact (liquidity constraints) prevents overestimating execution costs
+    for large orders. The permanent/temporary split is critical for orders exceeding
+    5-10% of ADV where naive linear models would underestimate market footprint. Boundary:
+    model holds for liquid instruments with bid-ask spread < 50bp; degrades for illiquid
+    securities with wide spreads.'
+  evidence: meta/env_execution_optimizing/liquidation/env_execution_optimizing.py:366(permanentimpact),
+    :370(temporaryimpact)
+  stage: order_execution_optimization
+  alternative_considered: Single linear model without decomposition was rejected due
+    to poor fit for large trade sizes.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: permanentimpact), :370(temporaryimpact in meta/env_execution_optimizing/liquidation/env_execution_optimizing.py'
+- id: BD-003
+  type: B/BA
+  content: Conditional Value at Risk (Expected Shortfall) for risk measurement
+  rationale: 'CVaR (tail risk beyond 95th percentile) captures downside exposure that
+    VaR misses, enabling proper risk assessment for large liquidation scenarios. Standard
+    VaR ignores tail magnitude, which can underestimate risk by 40-60% for fat-tailed
+    distributions. Boundary: computed at 95% confidence; accuracy degrades for higher
+    confidence levels requiring more simulation data.'
+  evidence: meta/env_execution_optimizing/liquidation/env_execution_optimizing.py:376(get_expected_shortfall),
+    :383(get_ac_expected_shortfall)
+  stage: order_execution_optimization
+  alternative_considered: VaR alone was rejected for ignoring tail severity; CVaR
+    provides more conservative risk estimates.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: get_expected_shortfall), :383(get_ac_expected_shortfall in
+    meta/env_execution_optimizing/liquidation/env_execution_optimizing.py'
+- id: BD-004
+  type: B/BA
+  content: Mean-variance utility combining expected cost and variance
+  rationale: 'Mean-variance utility penalizes high-variance execution strategies that
+    may appear optimal on average but introduce execution uncertainty. This is essential
+    for minimizing execution costs in large liquidations where variance risk premium
+    matters. Boundary: assumes Gaussian reward distribution; may underweight extreme
+    events captured by CVaR.'
+  evidence: meta/env_execution_optimizing/liquidation/env_execution_optimizing.py:406-412(compute_AC_utility)
+  stage: order_execution_optimization
+  alternative_considered: Pure expected cost maximization was rejected for ignoring
+    execution variance risk.
+- id: BD-005
+  type: B/BA
+  content: Percentage-based transaction cost model
+  rationale: 'Percentage-of-notional cost model aligns with real market conditions
+    where fees scale proportionally with trade size, rather than flat fees that distort
+    optimal execution strategy. This directly influences agent behavior in optimizing
+    execution trajectories. Boundary: constant percentage assumed; real costs vary
+    with order size and market conditions.'
+  evidence: meta/env_crypto_trading/env_multiple_crypto.py:7(__init__), :59(step)
+  stage: trading_execution
+  alternative_considered: Flat fee model rejected as unrealistic; tiered fee structures
+    deferred for future enhancement.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: __init__), :59(step in meta/env_crypto_trading/env_multiple_crypto.py'
+- id: BD-006
+  type: B/BA
+  content: Ensemble strategy with turbulence-based market regime detection
+  rationale: 'Turbulence-based regime detection enables the ensemble to dynamically
+    weight component strategies based on current market conditions, preventing style
+    clashes during high-volatility periods. Without regime detection, the ensemble
+    applies uniform weights across incompatible market states. Boundary: turbulence
+    threshold calibrated on historical data; may lag during regime transitions.'
+  evidence: agents/stablebaselines3_models.py:320(run_ensemble_strategy)
+  stage: agents
+  alternative_considered: Static ensemble weights rejected for poor performance during
+    market regime changes.
+- id: BD-007
+  type: B/RC
+  content: Dual-clip PPO for handling terminal states
+  rationale: 'Dual clipping bounds advantage estimates at both ends, preventing large
+    policy updates when episodic returns are extreme (e.g., final liquidation state).
+    This stabilizes training for finite-horizon tasks with terminal states. Boundary:
+    second clip at -2 standard deviations; tuning required for different episode lengths.'
+  evidence: meta/env_execution_optimizing/order_execution_qlib/trade/policy/ppo.py:45(__init__)
+  stage: order_execution_optimization
+  alternative_considered: Single-clip PPO rejected for causing large policy swings
+    at episode boundaries in finite-horizon tasks.
+- id: BD-008
+  type: B
+  content: Teacher-student distillation with KL divergence loss
+  rationale: 'Knowledge distillation from a larger teacher network to a compact student
+    model enables production deployment where inference latency constraints preclude
+    using the full teacher architecture. The KL divergence loss preserves teacher
+    guidance on critical decision boundaries. Boundary: 4x compression ratio achieved;
+    beyond 10x the student performance degrades significantly.'
+  evidence: meta/env_execution_optimizing/order_execution_qlib/trade/policy/ppo_supervision.py:27(__init__)
+  stage: order_execution_optimization
+  alternative_considered: Direct training of small student model rejected due to 30%
+    accuracy loss without teacher guidance.
+- id: BD-009
+  type: T
+  content: Turbulence threshold SELL_ALL invariant - when turbulence exceeds threshold,
+    ALL positions must liquidate
+  rationale: 'Market turbulence signals regime change where mean-reversion assumptions
+    break; forcing full liquidation prevents accumulating losses in trending crash.
+    Boundary: Triggers across each equity positions when VIX-equivalent turbulence
+    exceeds 1e8 threshold; no partial liquidation allowed.'
+  evidence: 'env_stock_trading.py:126-129(else: sell each when turbulence), env_stock_papertrading.py:271-286(sell
+    each when turbulence)'
+  stage: invariant
+  alternative_considered: Gradual liquidation was rejected due to execution uncertainty
+    during high-volatility periods
+  _evidence_issues:
+  - 'NOT_FOUND: env_stock_trading.py'
+- id: BD-010
+  type: T
+  content: DRLEnsembleAgent requires train→validation→trade state continuity via last_state
+    passing
+  rationale: 'State continuity ensures ensemble models receive consistent observation
+    context when transitioning between data splits. Boundary: last_state from training
+    must be passed to validation and trading phases; breaking continuity causes policy
+    to operate without proper state initialization.'
+  evidence: agents/stablebaselines3_models.py:164(drlensembleagent), :201(train_model),
+    :264(drl_validation)
+  stage: invariant
+  alternative_considered: Resetting state each phase was rejected due to losing temporal
+    context that affects ensemble coordination
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: drlensembleagent), :201(train_model), :264(drl_validation
+    in agents/stablebaselines3_models.py'
+- id: BD-011
+  type: B/BA
+  content: 'INTERACTION: BD-002 × BD-003 × BD-004 → Amplified execution cost underestimation
+    for tail events'
+  rationale: The permanent/temporary market impact model (BD-002) is calibrated for
+    normal liquidity conditions. CVaR (BD-003) measures tail risk beyond VaR, while
+    mean-variance utility (BD-004) assumes Gaussian returns and ignores tail severity.
+    When impact is highest (large orders during stress), the utility function underestimates
+    cost, potentially causing agents to execute positions that CVaR identifies as
+    high-risk. This creates a false sense of optimality where the agent believes it's
+    balancing cost vs
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Coherent risk measures (CVaR-based utility) could replace
+    mean-variance but require algorithmic redesign
+- id: BD-012
+  type: B/BA
+  content: 'INTERACTION: BD-012 × BD-016 → Hidden mismatch between reward normalization
+    range and extreme liquidation scenarios'
+  rationale: The reward_scaling=2^-11 normalizes P&L to [-1, 1] range for RL training
+    (BD-012). However, when turbulence exceeds threshold (BD-016), the SELL_ALL invariant
+    forces complete liquidation regardless of policy preference. This means the RL
+    agent was never trained on scenarios where P&L exceeds the normalized range due
+    to extreme adverse moves during forced liquidation. The policy learned optimal
+    behavior for [-1, 1] P&L but must execute decisions in a domain it never observed
+    during training. This
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Adaptive reward scaling during turbulence or curriculum
+    learning with extreme scenarios
+- id: BD-013
+  type: T
+  content: 'INTERACTION: BD-006 × BD-016 → Contradiction between ensemble regime detection
+    and hardcoded SELL_ALL threshold'
+  rationale: 'The ensemble strategy (BD-006) uses turbulence-based market regime detection
+    to dynamically weight component strategies, shifting to defensive positions during
+    high volatility. However, BD-016 imposes a separate hardcoded SELL_ALL invariant
+    when turbulence exceeds 1e8. These two mechanisms are not coordinated: the ensemble
+    may still be executing defensive trades while the hardcoded condition forces complete
+    position liquidation. This creates contradictory agent behavior where different
+    parts of '
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Integrate SELL_ALL into ensemble strategy weights rather
+    than hardcoding separate invariant
+- id: BD-014
+  type: B/DK
+  content: 'INTERACTION: BD-008 × BD-012 × BD-013 → Risk cascade where distillation
+    quality depends on reward scaling consistency'
+  rationale: Teacher-student distillation (BD-008) transfers knowledge from a teacher
+    policy to a student using KL divergence loss. The teacher was trained with specific
+    reward scaling (BD-012, BD-013) that normalizes P&L to [-1, 1]. If the student
+    inherits this scaling, knowledge transfer works correctly. However, if market
+    conditions change (e.g., different asset classes or higher volatility), the student
+    may encounter reward magnitudes outside the teacher's training distribution. The
+    KL divergence loss ca
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Domain adaptation layers in student network or scale-invariant
+    distillation loss
+- id: BD-015
+  type: BA/DK
+  content: 'INTERACTION: BD-019 × BD-020 → Risk cascade where hardcoded half-life
+    and Almgren-Chriss constants create unvalidated execution assumptions'
+  rationale: The permanent impact half-life (BD-019) defaults to 5.0 days, reflecting
+    empirical evidence for US equities. The Almgren-Chriss model (BD-020) embeds hardcoded
+    constants (ANNUAL_VOLAT=0.12, BID_ASK_SP=1/8) also calibrated for US equities.
+    When applying these to different asset classes (crypto, A-shares, illiquid securities),
+    both assumptions become invalid simultaneously. The 5-day half-life may be too
+    long or short, and the 12% volatility assumption may not match actual asset behavior.
+    This cre
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Asset-class-specific parameter calibration or data-driven
+    model fitting
+- id: BD-016
+  type: B/DK
+  content: 'INTERACTION: BD-001 × BD-005 → Amplification where percentage-based costs
+    and value-weighted metrics combine to incentivize order fragmentation'
+  rationale: Value-weighted aggregation (BD-001) ensures large trades dominate performance
+    metrics, correctly reflecting portfolio impact. However, percentage-based transaction
+    costs (BD-005) make it equally expensive (as a percentage) to execute large or
+    small orders. This creates an incentive to fragment large orders into many small
+    ones to reduce per-order market impact, but fragmentation increases total percentage
+    costs and trading frequency. The value-weighted metrics then reward this fragmented
+    behavio
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Fixed cost components or marginal impact models that properly
+    price order fragmentation
+- id: BD-017
+  type: BA
+  content: 'INTERACTION: BD-010 × BD-011 → Hidden dependency where STOCKSTATS default
+    silently affects each downstream financial calculations'
+  rationale: 'BD-010 and BD-011 both address the STOCKSTATS default, but together
+    they create a hidden dependency chain. The default indicator library choice (BD-010)
+    silently changes calculation methods, which propagates to financial signal quality
+    (BD-011). However, downstream components like ensemble strategy (BD-006), turbulence
+    detection, and reward computation never explicitly track which indicator library
+    was used. When backtesting results differ from production, or when comparing across
+    environments, '
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Explicit indicator library parameter propagation or standardized
+    feature extraction layer
+- id: BD-GAP-001
+  type: BA/DK
+  content: stockstats is the default technical indicator library with backward-compatible
+    integer enum (0=stockstats, 1=talib) to preserve legacy user configurations
+  rationale: Backwards compatibility ensures existing configs don't break when the
+    library is updated; the integer convention predates the enum and cannot be removed
+    without migration tooling.
+  evidence: meta/data_processors/_base.py:51(IndicatorLib)
+  stage: design
+  alternative_considered: Breaking change to require enum values only, rejected due
+    to user impact
+- id: BD-GAP-002
+  type: B/BA
+  content: Turbulence index calculation uses 252-day lookback window, annualized to
+    match trading year convention
+  rationale: 252 days is standard for annualizing trading metrics; using a fixed window
+    avoids recalculating full history but breaks if data spans fewer than 252 trading
+    days
+  evidence: meta/data_processors/_base.py:344(calculate_turbulence)
+  stage: implementation
+  alternative_considered: Dynamic lookback based on available data, rejected for inconsistency
+    across experiments
+- id: BD-GAP-003
+  type: T
+  content: Observation state scaled by 2^-12 to improve neural network convergence
+    by keeping inputs in similar magnitude as reward scaling
+  rationale: Reinforcement learning networks train better with similarly-scaled inputs;
+    2^-12 keeps observation magnitudes comparable to the reward scaling factor (2^-11)
+  evidence: meta/env_market_impact/envs/env_margin_trader_impact.py:754(get_state)
+  stage: tuning
+  alternative_considered: Layer normalization, rejected in favor of manual scaling
+    for reproducibility
+- id: BD-GAP-004
+  type: B/BA
+  content: Margin maintenance warning threshold set at 40% with 30% forced liquidation
+    margin, matching broker regulatory requirements
+  rationale: 40% warning gives traders time to add collateral before 30% margin call;
+    these values mirror typical broker margin rules and prevent immediate forced liquidation
+  evidence: meta/env_market_impact/envs/env_margin_trader_impact.py:70(__init__)
+  stage: implementation
+  alternative_considered: Dynamic margin thresholds based on historical volatility,
+    considered but not implemented
+- id: BD-GAP-005
+  type: B/BA
+  content: Baseline impact model charges fixed 10 basis points per trade, providing
+    non-zero cost floor for comparing sophisticated models
+  rationale: 10 bps represents realistic execution cost floor; ensures even untuned
+    strategies face friction, preventing unrealistic backtest results
+  evidence: meta/env_market_impact/envs/impact_models.py:482(__init__)
+  stage: implementation
+  alternative_considered: Variable spread-based costs, rejected due to data requirements
+- id: BD-GAP-006
+  type: B/BA
+  content: Permanent market impact decays with 5-day half-life, assuming price effects
+    persist for approximately one trading week
+  rationale: 5 days balances realism (permanent impact doesn't vanish instantly) with
+    data requirements (shorter half-life needs more frequent recalculation); breaks
+    for high-frequency strategies with sub-day rebalancing
+  evidence: meta/env_market_impact/envs/impact_models.py:482(__init__)
+  stage: tuning
+  alternative_considered: Asset-specific half-life calibration, considered but requires
+    extensive backtesting
+- id: BD-GAP-007
+  type: T
+  content: Prioritized Experience Replay uses Binary Search Tree for O(log n) sampling,
+    enabling efficient importance-weighted updates
+  rationale: Binary Search Tree provides faster sampling than naive priority queue
+    while maintaining O(log n) update; essential for high-throughput training with
+    large buffers
+  evidence: meta/env_future_trading/wt4elegantrl/elegantrl/replay.py:342(BinarySearchTree)
+  stage: order_execution_optimization
+  alternative_considered: Segment Tree, rejected as BST provides sufficient performance
+    for typical buffer sizes
+- id: BD-GAP-008
+  type: T
+  content: Soft update target network tau parameter defaults to standard DDPG value,
+    slowly copying online network weights
+  rationale: Small tau (typically 0.005) ensures target networks change gradually,
+    stabilizing training; breaks if tau too large causing oscillation
+  evidence: meta/env_future_trading/wt4elegantrl/elegantrl/agent.py:294(soft_update)
+  stage: tuning
+  alternative_considered: Adaptive tau based on gradient magnitude, considered but
+    adds complexity
+- id: BD-GAP-009
+  type: BA
+  content: Train/test data split uses temporal ordering without shuffling, ensuring
+    no future data leakage
+  rationale: Financial time series must not leak future information; temporal split
+    respects causality and produces realistic backtest results
+  evidence: meta/env_market_impact/envs/market_data.py:201(_split)
+  stage: validation
+  alternative_considered: Expanding window backtesting, not implemented due to complexity
+- id: BD-GAP-010
+  type: T
+  content: Differential Sharpe Ratio update formula replaces batch Sharpe for online
+    reward assessment, avoiding waiting for full epoch
+  rationale: Differential Sharpe provides continuous reward signal during training;
+    batch Sharpe requires full episode, delaying learning signal
+  evidence: meta/env_market_impact/envs/env_mace_stock_trading.py:414(_differential_sharpe)
+  stage: implementation
+  alternative_considered: Rolling Sharpe with fixed window, rejected for delaying
+    reward signal
+- id: BD-GAP-011
+  type: B/BA
+  content: Maximum stock position capped at 100 shares with turbulence threshold of
+    99, preventing extreme positions during market stress
+  rationale: 100-share cap limits downside in catastrophic trades; turbulence threshold
+    cuts position size during high volatility periods, protecting capital
+  evidence: meta/env_stock_trading/env_stock_trading.py:7(__init__)
+  stage: risk_management
+  alternative_considered: Dynamic position limits based on realized volatility, not
+    implemented
+- id: BD-GAP-012
+  type: B/BA
+  content: Buy and sell transaction costs set at 0.1% (10 bps), representing realistic
+    brokerage fees plus small market impact
+  rationale: 10 bps approximates typical retail brokerage commissions plus bid-ask
+    spread; ensures backtest realism without overestimating costs
+  evidence: meta/env_stock_trading/env_stock_trading.py:7(__init__)
+  stage: implementation
+  alternative_considered: Volume-weighted transaction costs, considered but rejected
+    for data simplicity
+- id: BD-GAP-013
+  type: T
+  content: Observation normalizer state can be frozen after training and transferred
+    to test environment, ensuring consistent scaling
+  rationale: Freezing normalizer prevents test environment from learning from test
+    data statistics, maintaining experimental validity; enables proper out-of-sample
+    evaluation
+  evidence: meta/env_market_impact/envs/env_mace_stock_trading.py:209(set_normalizer_state)
+  stage: validation
+  alternative_considered: Separate normalizer instances for train/test, rejected for
+    memory overhead
+- id: BD-GAP-014
+  type: T
+  content: Multi-processing training uses PipeWorker, PipeLearner, PipeEvaluator architecture
+    for parallel environment rollout and centralized learning
+  rationale: Separation allows independent scaling of exploration vs. learning vs.
+    evaluation; pipes enable efficient inter-process communication without shared
+    memory locks
+  evidence: meta/env_future_trading/wt4elegantrl/elegantrl/run.py:358(PipeWorker)
+  stage: architecture
+  alternative_considered: Shared memory queues, rejected due to synchronization complexity
+- id: BD-GAP-015
+  type: B
+  content: ppo_reward includes previous action in reward calculation, providing temporal
+    context for sequential decision-making
+  rationale: Previous action influences current reward by affecting execution quality;
+    IJCAI 2020 paper showed this improves temporal credit assignment
+  evidence: meta/env_execution_optimizing/order_execution_qlib/trade/reward/ppo_reward.py:15(get_reward)
+  stage: implementation
+  alternative_considered: Recurrent network for action history, rejected in favor
+    of explicit state inclusion
+- id: BD-GAP-016
+  content: 'Missing: float vs Decimal for currency'
+  type: RC
+  rationale: 'Audit finding: missing: float vs decimal for currency. Identified by
+    audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: factor_computation
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-017
+  content: 'Missing: Point-in-Time data availability'
+  type: DK
+  rationale: 'Audit finding: missing: point-in-time data availability. Identified
+    by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-018
+  content: 'Missing: Stale data detection and expiry policy'
+  type: DK
+  rationale: 'Audit finding: missing: stale data detection and expiry policy. Identified
+    by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-019
+  content: 'Missing: Parameter change version tracking'
+  type: B
+  rationale: 'Audit finding: missing: parameter change version tracking. Identified
+    by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-020
+  content: 'Missing: Settlement and delivery time convention'
+  type: RC
+  rationale: 'Audit finding: missing: settlement and delivery time convention. Identified
+    by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: trading_execution
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-021
+  content: 'Missing: Price and quantity precision'
+  type: RC
+  rationale: 'Audit finding: missing: price and quantity precision. Identified by
+    audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: trading_execution
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-022
+  content: 'Missing: Funding Cost Modeling'
+  type: B
+  rationale: 'Audit finding: missing: funding cost modeling. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: trading_execution
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-023
+  content: 'Missing: Suspension Handling'
+  type: B
+  rationale: 'Audit finding: missing: suspension handling. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-024
+  content: 'Missing: Sell-Before-Buy vs Buy-Before-Sell'
+  type: B
+  rationale: 'Audit finding: missing: sell-before-buy vs buy-before-sell. Identified
+    by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: trading_execution
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-025
+  content: 'Missing: Volatility Model and Distribution'
+  type: B
+  rationale: 'Audit finding: missing: volatility model and distribution. Identified
+    by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-026
+  content: 'Missing: Factor IC Demean and Group Alignment'
+  type: B
+  rationale: 'Audit finding: missing: factor ic demean and group alignment. RSK Coverage**:
+    2/8 (25%). This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: factor_computation
+  status: missing
+  severity: high
+  impact: 'RSK Coverage**: 2/8 (25%)'
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: PPO Agent Paper Trading with Alpaca
+  source: Paper Trading/Automated_Paper_Trading.ipynb
+  type: live_trading
+  business_problem: Enables automated paper trading of DOW 30 stocks using a trained
+    PPO reinforcement learning agent connected to Alpaca's paper trading API.
+  intent_keywords:
+  - paper trading
+  - PPO agent
+  - Alpaca API
+  - automated trading
+  - DOW 30 stocks
+  stage: live_trading
+  negative_keywords:
+  - backtesting
+  - historical simulation
+  - markowitz
+  - portfolio optimization
+  - order execution
+  disambiguation: Are you looking to execute trades in a simulated paper trading environment
+    with a pre-trained AI model, or do you need to backtest a strategy on historical
+    data first?
+  data_domain: trading_data
+- id: UC-102
+  name: Markowitz Mean-Variance Portfolio Optimization
+  source: examples/Aarons_portfolio_optimization_example.ipynb
+  type: trading_strategy
+  business_problem: Optimizes portfolio allocation across multiple stocks using classical
+    Markowitz mean-variance optimization to maximize risk-adjusted returns.
+  intent_keywords:
+  - markowitz
+  - portfolio optimization
+  - mean-variance
+  - cvxpy
+  - portfolio allocation
+  stage: factor_computation
+  negative_keywords:
+  - reinforcement learning
+  - PPO agent
+  - neural network
+  - deep learning
+  - paper trading
+  disambiguation: Do you want to use classical financial optimization (Markowitz)
+    or a machine learning approach (like reinforcement learning) for portfolio allocation?
+  data_domain: holding_data
+- id: UC-103
+  name: Ensemble DRL Stock Trading Strategy
+  source: examples/FinRL_Ensemble_StockTrading_ICAIF_2020.ipynb
+  type: trading_strategy
+  business_problem: Implements an ensemble approach combining multiple DRL agents
+    for stock trading, providing more robust trading strategies through model diversity.
+  intent_keywords:
+  - ensemble DRL
+  - multiple agents
+  - stock trading ensemble
+  - DRL ensemble
+  - model diversity
+  stage: factor_computation
+  negative_keywords:
+  - single agent
+  - markowitz
+  - portfolio optimization
+  - order execution
+  - screening
+  disambiguation: Do you want to combine multiple AI trading agents for more robust
+    performance, or are you looking for a single agent approach?
+  data_domain: market_data
+- id: UC-104
+  name: Alpaca Paper Trading Demo with PPO
+  source: examples/FinRL_PaperTrading_Demo.ipynb
+  type: live_trading
+  business_problem: Demonstrates live paper trading functionality with a PPO agent
+    using Alpaca's paper trading API, suitable for testing strategies without financial
+    risk.
+  intent_keywords:
+  - paper trading demo
+  - Alpaca
+  - PPO
+  - live trading
+  - automated execution
+  stage: live_trading
+  negative_keywords:
+  - backtesting
+  - historical data
+  - markowitz
+  - portfolio optimization
+  - research analysis
+  disambiguation: Are you looking to test a trading strategy in a simulated environment,
+    or do you need to develop and validate a strategy using historical data first?
+  data_domain: trading_data
+- id: UC-105
+  name: Deep RL Portfolio Optimization Environment
+  source: examples/FinRL_PortfolioOptimizationEnv_Demo.ipynb
+  type: trading_strategy
+  business_problem: Uses deep reinforcement learning in a custom portfolio optimization
+    environment to learn optimal asset allocation across Brazilian stocks.
+  intent_keywords:
+  - portfolio optimization
+  - deep RL
+  - Brazilian stocks
+  - BRL
+  - asset allocation
+  stage: factor_computation
+  negative_keywords:
+  - markowitz
+  - classical optimization
+  - order execution
+  - screening
+  - monitoring
+  disambiguation: Do you want to use AI to learn portfolio allocation, or do you prefer
+    classical finance approaches like Markowitz mean-variance optimization?
+  data_domain: holding_data
+- id: UC-106
+  name: StableBaselines3 Stock Trading Pipeline
+  source: examples/Stock_NeurIPS2018_SB3.ipynb
+  type: trading_strategy
+  business_problem: Provides a complete end-to-end stock trading pipeline using StableBaselines3
+    library with multiple DRL algorithms (A2C, DDPG, PPO) and comprehensive backtesting.
+  intent_keywords:
+  - stablebaselines3
+  - A2C
+  - DDPG
+  - PPO
+  - stock trading pipeline
+  - backtesting
+  stage: factor_computation
+  negative_keywords:
+  - markowitz
+  - portfolio optimization
+  - order execution
+  - screening
+  - live trading
+  disambiguation: Do you need a complete trading system with model training and historical
+    evaluation, or are you looking for a specific component like just execution or
+    optimization?
+  data_domain: market_data
+- id: UC-107
+  name: Markowitz Portfolio Optimization Script
+  source: examples/run_markowitz_portfolio_optimization.py
+  type: trading_strategy
+  business_problem: Executable Python script implementing Markowitz mean-variance
+    portfolio optimization for automated portfolio weight calculation.
+  intent_keywords:
+  - markowitz script
+  - portfolio optimization
+  - executable
+  - mean-variance optimization
+  - cvxpy
+  stage: factor_computation
+  negative_keywords:
+  - reinforcement learning
+  - PPO
+  - deep learning
+  - neural network trading
+  - paper trading
+  disambiguation: Do you want a classical mathematical optimization approach or an
+    AI/machine learning approach for portfolio allocation?
+  data_domain: holding_data
+- id: UC-108
+  name: RL Portfolio Optimization Script
+  source: examples/run_rl_portfolio_optimization.py
+  type: trading_strategy
+  business_problem: Executable Python script using reinforcement learning (A2C agent)
+    for portfolio optimization, learning optimal allocations through agent-environment
+    interaction.
+  intent_keywords:
+  - RL portfolio optimization
+  - A2C agent
+  - executable script
+  - reinforcement learning allocation
+  - DRL portfolio
+  stage: factor_computation
+  negative_keywords:
+  - markowitz
+  - classical optimization
+  - cvxpy
+  - order execution
+  - screening
+  disambiguation: Do you want to use reinforcement learning to learn portfolio allocation,
+    or do you prefer traditional quantitative finance methods?
+  data_domain: holding_data
+- id: UC-109
+  name: Qlib Order Execution Optimization
+  source: meta/env_execution_optimizing/order_execution_qlib/workflow_by_code.ipynb
+  type: trading_strategy
+  business_problem: Optimizes order execution strategies using Qlib's LightGBM model
+    and TopkDropoutStrategy to minimize market impact and achieve better execution
+    prices.
+  intent_keywords:
+  - order execution
+  - qlib
+  - lightgbm
+  - execution optimization
+  - strategy
+  - topk dropout
+  stage: factor_computation
+  negative_keywords:
+  - portfolio optimization
+  - markowitz
+  - PPO agent
+  - paper trading
+  - backtesting long-term
+  disambiguation: Are you focused on optimizing how orders are executed (timing, sizing)
+    or on selecting which assets to trade?
+  data_domain: trading_data
+_enrich_meta:
+  evidence_coverage_ratio: 0.781
+  evidence_verified: 16
+  evidence_invalid: 6
+  evidence_auto_fixed: 3
+  evidence_verify_ratio: 0.64
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  - A_STOCK
+  - RSK
+  - CRD
+  - DAT
+  - AIL
+  finance_universal:
+    pass: 3
+    warn: 9
+    fail: 8
+  subdomain_totals:
+    pass: 5
+    warn: 20
+    fail: 12
+  coverage: 8/57 (14%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+resources:
+- id: res-slot-001
+  type: replaceable_component
+  name: market_data_source
+  path: null
+  description: 'Choose based on: (1) Target market (US, China, Crypto), (2) Data frequency
+    needs, (3) Authentication requirements, (4) Cost constraints'
+  used_in_stages: []
+  options:
+  - name: Yahoo Finance
+    traits:
+    - free
+    - no_auth
+    - global_coverage
+    - 1min_granularity
+    fit_for:
+    - Quick prototyping, backtesting with US/global stocks, no API costs
+    not_fit_for:
+    - High-frequency trading, live trading execution
+  - name: Alpaca
+    traits:
+    - free
+    - api_key
+    - live_trading
+    - 1min_granularity
+    fit_for:
+    - Live trading, paper trading, real-time data
+    not_fit_for:
+    - China A-shares, high-frequency trading
+  - name: Binance
+    traits:
+    - free
+    - api_key_optional
+    - crypto
+    - 1s_granularity
+    fit_for:
+    - Cryptocurrency trading, high-frequency crypto strategies
+    not_fit_for:
+    - Traditional stocks, fiat currencies
+  - name: CCXT
+    traits:
+    - free
+    - multi_exchange
+    - crypto
+    - standardized
+    fit_for:
+    - Multi-exchange crypto strategies, unified exchange API
+    not_fit_for:
+    - Single exchange optimization, traditional stocks
+  - name: Tushare
+    traits:
+    - requires_token
+    - china_a_shares
+    - 1min_granularity
+    fit_for:
+    - China A-share trading research
+    not_fit_for:
+    - US markets, free tier users
+  - name: WRDS
+    traits:
+    - academic_subscription
+    - millisecond_data
+    - us_stocks
+    fit_for:
+    - Academic research, high-frequency US stock data
+    not_fit_for:
+    - Retail traders, crypto, China markets
+  default: Yahoo Finance
+  _source: worker_resource
+- id: res-slot-002
+  type: replaceable_component
+  name: technical_indicator_library
+  path: null
+  description: 'Choose based on: (1) Indicator requirements, (2) Installation constraints,
+    (3) Performance needs'
+  used_in_stages: []
+  options:
+  - name: stockstats
+    traits:
+    - pandas_compatible
+    - no_c_compilation
+    - default
+    fit_for:
+    - General use, pandas workflow, no installation headaches
+    not_fit_for:
+    - High-performance needs, TA-Lib available systems
+  - name: TA-Lib
+    traits:
+    - industry_standard
+    - fast
+    - comprehensive
+    fit_for:
+    - Production systems, maximum indicator coverage, speed critical
+    not_fit_for:
+    - Systems without C compiler, simple use cases
+  - name: finta
+    traits:
+    - pandas_based
+    - simple
+    - fx_focused
+    fit_for:
+    - FX trading, simple indicator needs
+    not_fit_for:
+    - Comprehensive technical analysis
+  default: stockstats
+  _source: worker_resource
+- id: res-slot-003
+  type: replaceable_component
+  name: trading_calendar
+  path: null
+  description: pandas_market_calendars is actively maintained; trading_calendars available
+    as legacy fallback
+  used_in_stages: []
+  options:
+  - name: pandas_market_calendars
+    traits:
+    - default
+    - multi_exchange
+    - active_maintenance
+    fit_for:
+    - General use, multiple exchanges
+    not_fit_for:
+    - Custom exchange calendars
+  - name: trading_calendars
+    traits:
+    - legacy
+    - zipline_dependency
+    fit_for:
+    - Legacy code compatibility
+    not_fit_for:
+    - New projects
+  default: pandas_market_calendars
+  _source: worker_resource
+- id: res-slot-004
+  type: replaceable_component
+  name: backtesting_engine
+  path: null
+  description: Use vectorbt for vectorized performance; built-in for DRL integration
+  used_in_stages: []
+  options:
+  - name: Built-in backtesting
+    traits:
+    - simple
+    - integrated
+    - drl_specific
+    fit_for:
+    - DRL-based backtesting, quick iteration
+    not_fit_for:
+    - Complex multi-asset strategies, production backtesting
+  - name: vectorbt
+    traits:
+    - vectorized
+    - fast
+    - visualization
+    fit_for:
+    - Performance-critical backtesting, technical analysis
+    not_fit_for:
+    - DRL training integration
+  default: Built-in backtesting
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: Yahoo
+  description: 'OHLCV stock prices, ETFs. Coverage: US Securities, global markets.
+    Auth: None for basic (rate limit 2,000/hour)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: Alpaca Markets
+  description: 'OHLCV US stocks, ETFs. Coverage: US Stocks and ETFs, 2015-present.
+    Auth: API Key + API Secret required'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: Binance
+  description: 'OHLCV cryptocurrency, aggregate trades. Coverage: Cryptocurrency pairs
+    (BTC, ETH, etc.). Auth: None for public API; API key optional for higher limits'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-008
+  type: external_service
+  name: CCXT (CryptoCurrency eXchange Trading)
+  description: 'OHLCV across 100+ crypto exchanges. Coverage: Multi-exchange cryptocurrency
+    data. Auth: Exchange-specific API keys'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-009
+  type: external_service
+  name: Tushare
+  description: 'OHLCV China A-share stocks. Coverage: China A-shares (SSE, SZSE).
+    Auth: Token required (registration at tushare.pro)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-010
+  type: external_service
+  name: AkShare
+  description: 'OHLCV China A-share stocks. Coverage: China A-shares, 2017-present.
+    Auth: None (open source)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-011
+  type: external_service
+  name: Baostock
+  description: 'OHLCV China stocks. Coverage: China stocks, 1990-present. Auth: None
+    (free)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-012
+  type: external_service
+  name: WRDS/NYSE
+  description: 'Intraday Trades (TAQ). Coverage: US Securities, 2003-present. Auth:
+    WRDS account (academic/commercial subscription)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-013
+  type: external_service
+  name: JoinQuant
+  description: 'OHLCV China stocks. Coverage: China Securities, 2005-present. Auth:
+    username + password required'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-014
+  type: external_service
+  name: RiceQuant
+  description: 'OHLCV China stocks. Coverage: China Securities, 2005-present. Auth:
+    username + password (or license initialization)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-015
+  type: external_service
+  name: IEX Cloud
+  description: 'OHLCV US securities. Coverage: NMS US securities, 1970-present. Auth:
+    API token required'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-016
+  type: external_service
+  name: Alpha Vantage
+  description: 'OHLCV stocks. Coverage: Global stocks. Auth: API key (free tier available)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-017
+  type: external_service
+  name: Nasdaq Data Link (formerly Quandl)
+  description: 'Fundamental data (ZACKS/FC). Coverage: Fundamental financial data.
+    Auth: API key'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-018
+  type: external_service
+  name: QuantConnect
+  description: 'OHLCV US securities. Coverage: US Securities, 1998-present. Auth:
+    API key'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-019
+  type: external_service
+  name: Alpaca Trading API
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-020
+  type: external_service
+  name: VIX Data (Yahoo Finance proxy)
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-021
+  type: external_service
+  name: NYSE Trading Calendar
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-022
+  type: python_package
+  name: numpy>=1.23.1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-023
+  type: python_package
+  name: pandas>=1.4.3
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-024
+  type: python_package
+  name: gym>=0.17
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-025
+  type: python_package
+  name: pytz
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-026
+  type: python_package
+  name: matplotlib>=3.5.2
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-027
+  type: python_package
+  name: stable-baselines3[extra]>=1.5.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-028
+  type: python_package
+  name: ray[default]>=1.13.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-029
+  type: python_package
+  name: elegantrl
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-030
+  type: python_package
+  name: torch
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-031
+  type: python_package
+  name: scikit-learn>=1.1.1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
