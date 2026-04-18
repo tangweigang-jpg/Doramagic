@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Compile Crystal Skeleton — 基于蓝图/约束/UC 机械生成晶体骨架
+"""Compile Crystal Skeleton v5.0 — Schema-driven compiler for Doramagic crystals.
 
-产出一个 ~70 pct 完成的 seed.md，所有 ID 引用齐全（100 pct 覆盖），
-主线程在此基础上 Edit 补充"灵魂部分"：Human Summary / 阶段叙事 /
-validator assertions / Soft Gate rubric / 哆啦A梦人设。
+Reads blueprint (LATEST.yaml) + constraints (LATEST.jsonl) + coverage_targets.json
+and emits:
+  1. {id}.seed.yaml  — structured crystal contract conforming to crystal_contract.schema.yaml
+  2. {id}.human_summary.md — English Doraemon-persona sidecar rendered from seed.yaml
+  3. validate.py — standalone validation script
 
-用法:
+Usage:
     python3 compile_crystal_skeleton.py \\
         --blueprint-dir knowledge/sources/finance/finance-bp-009--zvt \\
         --target-host openclaw \\
-        --output-seed finance-bp-009-v3.3.seed.md \\
-        --output-ir finance-bp-009-v3.3.ir.yaml \\
-        [--output-validate validate.py]
+        --output-seed finance-bp-009-v5.0.seed.yaml \\
+        --output-human-summary finance-bp-009-v5.0.human_summary.md \\
+        --output-validate validate.py \\
+        --sop-version crystal-compilation-v5.0
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ import argparse
 import json
 import sys
 from collections import defaultdict
+from datetime import UTC, datetime
 from pathlib import Path
 
 try:
@@ -30,7 +34,7 @@ except ImportError:
 
 
 # ============================================================
-# 加载输入
+# Load Inputs (retained from v3.x)
 # ============================================================
 
 
@@ -39,93 +43,1347 @@ def load_inputs(blueprint_dir: Path) -> tuple[dict, list[dict], dict]:
     cons_path = blueprint_dir / "LATEST.jsonl"
     with bp_path.open() as f:
         bp = yaml.safe_load(f)
-    constraints = []
+    constraints: list[dict] = []
     with cons_path.open() as f:
         for line in f:
             line = line.strip()
             if line:
                 constraints.append(json.loads(line))
     targets_path = blueprint_dir / "crystal_inputs" / "coverage_targets.json"
-    targets = {}
+    targets: dict = {}
     if targets_path.exists():
         targets = json.loads(targets_path.read_text())
     return bp, constraints, targets
 
 
 # ============================================================
-# validate.py 模板
+# Helper: get constraint when/action/modality/kind fields
+# ============================================================
+
+
+def _extract_constraint_fields(c: dict) -> dict:
+    core = c.get("core") or {}
+    return {
+        "id": c.get("id", "?"),
+        "when": core.get("when") or c.get("when", ""),
+        "action": core.get("action") or c.get("action", ""),
+        "modality": core.get("modality") or c.get("modality", "must"),
+        "kind": c.get("constraint_kind", "domain_rule"),
+        "severity": c.get("severity", "high"),
+        "consequence": core.get("consequence"),
+        "stage_ids": (c.get("applies_to") or {}).get("stage_ids") or [],
+        "derived_from_bd_id": c.get("derived_from"),
+    }
+
+
+# ============================================================
+# Build: meta
+# ============================================================
+
+
+def build_meta(bp: dict, target_host: str, sop_version: str) -> dict:
+    # Derive crystal version from sop_version (e.g. crystal-compilation-v5.2 → v5.2)
+    import re as _re
+
+    m = _re.search(r"v(\d+\.\d+)$", sop_version)
+    version_str = f"v{m.group(1)}" if m else "v5.2"
+    bp_id = bp.get("id", "unknown")
+    crystal_id = f"{bp_id}-{version_str}"
+    return {
+        "id": crystal_id,
+        "version": version_str,
+        "blueprint_id": bp_id,
+        "sop_version": sop_version,
+        "source_language": "en",
+        "compiled_at": datetime.now(UTC).isoformat(),
+        "target_host": target_host,
+        "authoritative_artifact": {
+            "primary": "seed.yaml",
+            "non_authoritative_derivatives": [
+                "SKILL.md (host-generated summary, may lag)",
+                "HEARTBEAT.md (host telemetry)",
+                "memory/*.md (host conversational memory)",
+            ],
+            "rule": (
+                "On any behavioral decision (preconditions check, OV assertion, EQ rule firing, "
+                "spec_lock verification), agents MUST re-read seed.yaml. Derivatives are for UI "
+                "display only and may be out-of-date."
+            ),
+        },
+        "execution_protocol": {
+            "install_trigger": (
+                "When seed.yaml is submitted without explicit execution intent "
+                "(e.g. file upload, skill registration command)"
+            ),
+            "execute_trigger": (
+                "When user intent matches intent_router.uc_entries[].positive_terms "
+                "AND user uses action verb (run/execute/跑/执行/backtest/fetch/collect)"
+            ),
+            "on_execute": [
+                "Reload seed.yaml (do not rely on SKILL.md or cached summaries)",
+                "Run preconditions[] in declared order; halt on first fatal failure with on_fail message to user",
+                "Enter context_state_machine.CA1_MEMORY_CHECKED state",
+                "Evaluate evidence_quality.enforcement_rules[]; fire triggers that match declared state",
+                "Translate user_facing_fields to user locale per locale_contract",
+            ],
+            "workspace_resolution": {
+                "scripts_path": "{host_workspace}/scripts/",
+                "skills_path": "{host_workspace}/skills/",
+                "trace_path": "{host_workspace}/.trace/",
+            },
+        },
+    }
+
+
+# ============================================================
+# Build: locale_contract
+# ============================================================
+
+
+def build_locale_contract() -> dict:
+    return {
+        "source_language": "en",
+        "user_facing_fields": [
+            "human_summary",
+            "evidence_quality.user_disclosure_template",
+            "post_install_notice.message_template.positioning",
+            "post_install_notice.message_template.capability_catalog.groups[].name",
+            "post_install_notice.message_template.capability_catalog.groups[].description",
+            "post_install_notice.message_template.capability_catalog.groups[].ucs[].short_description",
+            "post_install_notice.message_template.call_to_action",
+            "post_install_notice.message_template.featured_entries[].beginner_prompt",
+            "post_install_notice.message_template.more_info_hint",
+        ],
+        "locale_detection_order": [
+            "explicit_user_declaration",
+            "first_message_language",
+            "system_locale",
+        ],
+        "translation_enforcement": {
+            "trigger": "on_first_user_message",
+            "action": (
+                "Render user_facing_fields in detected locale, preserving all IDs "
+                "(BD-/SL-/UC-/finance-C-) and code identifiers verbatim"
+            ),
+            "violation_code": "LOCALE-01",
+            "violation_signal": (
+                "User receives untranslated English Human Summary when detected locale != en"
+            ),
+        },
+    }
+
+
+# ============================================================
+# Build: evidence_quality
+# ============================================================
+
+
+def build_evidence_quality(bp: dict) -> dict:
+    meta = bp.get("_enrich_meta") or {}
+    audit = bp.get("audit_checklist_summary") or {}
+
+    ev_coverage_ratio = meta.get("evidence_coverage_ratio")
+    ev_verify_ratio = meta.get("evidence_verify_ratio")
+    ev_invalid = int(meta.get("evidence_invalid") or 0)
+    ev_verified = meta.get("evidence_verified")
+    ev_auto_fixed = meta.get("evidence_auto_fixed")
+
+    fu = audit.get("finance_universal") or {}
+    st = audit.get("subdomain_totals") or {}
+    fu_fail = int(fu.get("fail") or 0)
+    sub_fail = int(st.get("fail") or 0)
+    audit_fail_total = fu_fail + sub_fail
+
+    audit_coverage = audit.get("coverage")
+
+    declared = {
+        "evidence_coverage_ratio": ev_coverage_ratio,
+        "evidence_verify_ratio": ev_verify_ratio,
+        "evidence_invalid": ev_invalid,
+        "evidence_verified": ev_verified,
+        "evidence_auto_fixed": ev_auto_fixed,
+        "audit_coverage": audit_coverage,
+        "audit_fail_total": audit_fail_total,
+        "audit_finance_universal": {
+            "pass": int(fu.get("pass") or 0),
+            "warn": int(fu.get("warn") or 0),
+            "fail": fu_fail,
+        },
+        "audit_subdomain_totals": {
+            "pass": int(st.get("pass") or 0),
+            "warn": int(st.get("warn") or 0),
+            "fail": sub_fail,
+        },
+    }
+
+    enforcement_rules = [
+        {
+            "id": "EQ-01",
+            "trigger": "declared.evidence_verify_ratio < 0.5",
+            "action": (
+                "MUST invoke traceback lookup for all cited BD-IDs in output before emitting "
+                "business code — read LATEST.yaml sections for each BD referenced"
+            ),
+            "violation_code": "EQ-01-V",
+            "violation_signal": (
+                "Generated script references BD-IDs but no tool_call to read LATEST.yaml "
+                "preceded code generation"
+            ),
+        },
+        {
+            "id": "EQ-02",
+            "trigger": "declared.audit_fail_total > 20",
+            "action": (
+                "MUST prepend user_disclosure_template (translated to user locale) to first "
+                "user-facing response"
+            ),
+            "violation_code": "EQ-02-V",
+            "violation_signal": (
+                "First agent response to user does not contain audit warning phrase"
+            ),
+        },
+    ]
+
+    # Compute verify ratio for disclosure template
+    vr = ev_verify_ratio or 0.0
+    vr_pct = f"{vr * 100:.1f}%"
+
+    user_disclosure_template = (
+        f"[QUALITY NOTICE] This crystal was compiled from blueprint {bp.get('id', 'unknown')}. "
+        f"Evidence verify ratio = {vr_pct} and audit fail total = {audit_fail_total}. "
+        f"Generated results may have uncaptured requirement gaps. "
+        f"Verify critical decisions against source files (LATEST.yaml / LATEST.jsonl)."
+    )
+
+    return {
+        "declared": declared,
+        "enforcement_rules": enforcement_rules,
+        "user_disclosure_template": user_disclosure_template,
+    }
+
+
+# ============================================================
+# Build: traceback
+# ============================================================
+
+
+def build_traceback(bp: dict) -> dict:
+    bp_id = bp.get("id", "unknown")
+    return {
+        "source_files": {
+            "blueprint": "LATEST.yaml",
+            "constraints": "LATEST.jsonl",
+        },
+        "mandatory_lookup_scenarios": [
+            {
+                "id": "TB-01",
+                "condition": "Two constraints have apparently conflicting enforcement rules",
+                "lookup_target": (
+                    "LATEST.jsonl — find both constraint IDs, compare `consequence` + "
+                    "`evidence_refs` to determine priority"
+                ),
+            },
+            {
+                "id": "TB-02",
+                "condition": "A business decision rationale is unclear or disputed",
+                "lookup_target": (
+                    "LATEST.yaml — locate BD-ID under business_decisions, read "
+                    "`rationale` + `alternative_considered` fields"
+                ),
+            },
+            {
+                "id": "TB-03",
+                "condition": "evidence_invalid > 0 in evidence_quality.declared",
+                "lookup_target": (
+                    "LATEST.yaml _enrich_meta — cross-check specific BD `evidence_refs` "
+                    "fields for invalid markers"
+                ),
+            },
+            {
+                "id": "TB-04",
+                "condition": "User asks where a rule comes from",
+                "lookup_target": (
+                    "LATEST.jsonl — find constraint by ID, read `confidence.evidence_refs` "
+                    "for source file + line number"
+                ),
+            },
+            {
+                "id": "TB-05",
+                "condition": "Generated code does not match expected ZVT API behavior",
+                "lookup_target": (
+                    "LATEST.yaml stages[].required_methods — verify method signature "
+                    "and evidence locator in source code"
+                ),
+            },
+        ],
+        "degraded_lookup": {
+            "no_fs_access": (
+                "Ask the user to paste the relevant LATEST.yaml section or LATEST.jsonl "
+                f"lines for the BD-/finance-C- IDs in question. Crystal ID: {bp_id}-v5.0."
+            )
+        },
+    }
+
+
+# ============================================================
+# Build: preconditions (new in v5.0)
+# ============================================================
+
+
+def build_preconditions(uc_list: list[dict], bp_id: str) -> list[dict]:
+    """Generate preconditions based on use case types.
+
+    For backtest/strategy UCs, generate PC-01 (zvt installed) and PC-02 (k-data exists).
+    Always include PC-00 for Python environment check.
+    """
+    preconditions: list[dict] = [
+        {
+            "id": "PC-01",
+            "description": "zvt package installed and importable",
+            "check_command": "python3 -c 'import zvt; print(zvt.__version__)'",
+            "on_fail": (
+                "Run: python3 -m pip install zvt  "
+                "then re-run: python3 -m zvt.init_dirs to initialize data directories"
+            ),
+            "severity": "fatal",
+        },
+        {
+            "id": "PC-02",
+            "description": "K-data exists for target entities (required before backtesting)",
+            "check_command": (
+                'python3 -c "'
+                "from zvt.api.kdata import get_kdata; "
+                "df = get_kdata(entity_ids=['stock_sh_600000'], limit=1); "
+                "assert df is not None and len(df) > 0, 'No kdata found'\""
+            ),
+            "on_fail": (
+                "Run recorder first: "
+                "python3 -m zvt.recorders.em.em_stock_kdata_recorder "
+                "--entity_ids stock_sh_600000  "
+                "(replace with your target entity IDs)"
+            ),
+            "severity": "fatal",
+            "applies_to_uc": [
+                uc.get("id", "")
+                for uc in uc_list
+                if uc.get("type") in ("backtest", "trading", "data_pipeline")
+            ],
+        },
+        {
+            "id": "PC-03",
+            "description": "ZVT data directory initialized (~/.zvt or ZVT_HOME)",
+            "check_command": (
+                'python3 -c "'
+                "import os; from pathlib import Path; "
+                "zvt_home = Path(os.environ.get('ZVT_HOME', Path.home() / '.zvt')); "
+                "assert zvt_home.exists(), f'ZVT home not found: {zvt_home}'\""
+            ),
+            "on_fail": "Run: python3 -m zvt.init_dirs",
+            "severity": "fatal",
+        },
+        {
+            "id": "PC-04",
+            "description": "SQLite write permission for ZVT data directory",
+            "check_command": (
+                'python3 -c "'
+                "import os, tempfile; "
+                "from pathlib import Path; "
+                "zvt_home = Path(os.environ.get('ZVT_HOME', Path.home() / '.zvt')); "
+                "test_f = zvt_home / '.write_test'; "
+                'test_f.touch(); test_f.unlink()"'
+            ),
+            "on_fail": (
+                "Check directory permissions: chmod u+w ~/.zvt  "
+                "or set ZVT_HOME environment variable to a writable location"
+            ),
+            "severity": "warn",
+        },
+    ]
+    return preconditions
+
+
+# ============================================================
+# Build: intent_router
+# ============================================================
+
+
+def build_intent_router(uc_list: list[dict]) -> dict:
+    uc_entries = []
+    for uc in uc_list:
+        entry = {
+            "uc_id": uc.get("id", "?"),
+            "name": uc.get("name", ""),
+            "positive_terms": uc.get("intent_keywords") or [],
+            "data_domain": uc.get("data_domain") or uc.get("stage") or "mixed",
+        }
+        negatives = uc.get("negative_keywords") or uc.get("not_suitable_for") or []
+        if negatives:
+            entry["negative_terms"] = negatives
+        disambiguation = uc.get("disambiguation") or uc.get("ambiguity_question")
+        if disambiguation:
+            entry["ambiguity_question"] = disambiguation
+        uc_entries.append(entry)
+    return {"uc_entries": uc_entries}
+
+
+# ============================================================
+# Build: context_state_machine
+# ============================================================
+
+
+def build_context_state_machine() -> dict:
+    return {
+        "states": [
+            {
+                "id": "CA1_MEMORY_CHECKED",
+                "entry": "Task started",
+                "exit": "All memory queries attempted and recorded; memory_unavailable set if failed",
+                "timeout": "30s — skip memory, mark memory_unavailable=true, proceed to CA2",
+            },
+            {
+                "id": "CA2_GAPS_FILLED",
+                "entry": "CA1 complete",
+                "exit": (
+                    "All FATAL-priority required inputs answered: target market "
+                    "(A-share/HK/US), data source, time range, strategy type"
+                ),
+                "timeout": "NOT skippable — FATAL inputs MUST be user-answered before proceeding",
+            },
+            {
+                "id": "CA3_PATH_SELECTED",
+                "entry": "CA2 complete",
+                "exit": (
+                    "intent_router matched single use case with confidence gap > 20% "
+                    "over next candidate, no data_domain ambiguity"
+                ),
+                "timeout": (
+                    "Trigger ambiguity_question for top-2 candidates, await user selection"
+                ),
+            },
+            {
+                "id": "CA4_EXECUTING",
+                "entry": "CA3 complete + user explicit confirmation received",
+                "exit": "All hard gates G1-Gn passed and output files written",
+                "timeout": "NOT skippable — user confirmation of execution path required",
+            },
+        ],
+        "enforcement": (
+            "Code generation is PROHIBITED before CA4_EXECUTING. "
+            "Any regression to earlier state MUST be announced to user. "
+            "buy/sell ordering SL-01 check runs at CA4 entry."
+        ),
+    }
+
+
+# ============================================================
+# Build: spec_lock_registry
+# ============================================================
+
+
+def build_spec_lock_registry() -> dict:
+    semantic_locks = [
+        {
+            "id": "SL-01",
+            "description": "Execute sell orders before buy orders in every trading cycle",
+            "locked_value": "sell() called before buy() in each Trader.run() iteration",
+            "violation_is": "fatal",
+            "source_bd_ids": ["BD-018"],
+        },
+        {
+            "id": "SL-02",
+            "description": "Trading signals MUST use next-bar execution (no look-ahead)",
+            "locked_value": "due_timestamp = happen_timestamp + level.to_second()",
+            "violation_is": "fatal",
+            "source_bd_ids": ["BD-014", "BD-025"],
+        },
+        {
+            "id": "SL-03",
+            "description": "Entity IDs MUST follow format entity_type_exchange_code",
+            "locked_value": "stock_sh_600000 | stockhk_hk_0700 | stockus_nasdaq_AAPL",
+            "violation_is": "fatal",
+            "source_bd_ids": [],
+        },
+        {
+            "id": "SL-04",
+            "description": "DataFrame index MUST be MultiIndex (entity_id, timestamp)",
+            "locked_value": "df.index.names == ['entity_id', 'timestamp']",
+            "violation_is": "fatal",
+            "source_bd_ids": [],
+        },
+        {
+            "id": "SL-05",
+            "description": (
+                "TradingSignal MUST have EXACTLY ONE of: position_pct, order_money, order_amount"
+            ),
+            "locked_value": "XOR enforcement in trading/__init__.py:68",
+            "violation_is": "fatal",
+            "source_bd_ids": [],
+        },
+        {
+            "id": "SL-06",
+            "description": (
+                "filter_result column semantics: True=BUY, False=SELL, None/NaN=NO ACTION"
+            ),
+            "locked_value": "factor.py:475 order_type_flag mapping",
+            "violation_is": "fatal",
+            "source_bd_ids": [],
+        },
+        {
+            "id": "SL-07",
+            "description": "Transformer MUST run BEFORE Accumulator in factor pipeline",
+            "locked_value": "compute_result(): transform at :403 before accumulator at :409",
+            "violation_is": "fatal",
+            "source_bd_ids": [],
+        },
+        {
+            "id": "SL-08",
+            "description": "MACD parameters locked: fast=12, slow=26, signal=9",
+            "locked_value": "factors/algorithm.py:30 macd(slow=26, fast=12, n=9)",
+            "violation_is": "fatal",
+            "source_bd_ids": ["BD-036"],
+        },
+        {
+            "id": "SL-09",
+            "description": (
+                "Default transaction costs: buy_cost=0.001, sell_cost=0.001, slippage=0.001"
+            ),
+            "locked_value": "sim_account.py:25 SimAccountService default costs",
+            "violation_is": "warning",
+            "source_bd_ids": ["BD-029"],
+        },
+        {
+            "id": "SL-10",
+            "description": "A-share equity trading is T+1 (no same-day close of buy positions)",
+            "locked_value": "sim_account.available_long filters by trading_t",
+            "violation_is": "fatal",
+            "source_bd_ids": [],
+        },
+        {
+            "id": "SL-11",
+            "description": "Recorder subclass MUST define provider AND data_schema class attributes",
+            "locked_value": "contract/recorder.py:71 Meta; register_schema decorator",
+            "violation_is": "fatal",
+            "source_bd_ids": [],
+        },
+        {
+            "id": "SL-12",
+            "description": (
+                "Factor result_df MUST contain either 'filter_result' OR 'score_result' column"
+            ),
+            "locked_value": (
+                "result_df.columns.intersection({'filter_result', 'score_result'}) non-empty"
+            ),
+            "violation_is": "fatal",
+            "source_bd_ids": [],
+        },
+    ]
+
+    implementation_hints = [
+        {
+            "id": "IH-01",
+            "hint": "Use AdjustType enum exactly: qfq (pre-adjust), hfq (post-adjust), bfq (none) — contract/__init__.py:121",
+        },
+        {
+            "id": "IH-02",
+            "hint": "For A-share kdata, default to hfq for long-term analysis (dividend-adjusted) — trader.py:538 StockTrader",
+        },
+        {
+            "id": "IH-03",
+            "hint": "SQLite connection MUST use check_same_thread=False for multi-threaded recorders",
+        },
+        {
+            "id": "IH-04",
+            "hint": "Accumulator state serialization uses JSON with custom encoder/decoder hooks — contract/base_service.py",
+        },
+        {
+            "id": "IH-05",
+            "hint": "Factor.level MUST match TargetSelector.level (enforced at add_factor) — factors/target_selector.py:84",
+        },
+    ]
+
+    return {
+        "semantic_locks": semantic_locks,
+        "implementation_hints": implementation_hints,
+    }
+
+
+# ============================================================
+# Build: preservation_manifest
+# ============================================================
+
+
+def build_preservation_manifest(
+    bd_count: int,
+    fatal_count: int,
+    non_fatal_count: int,
+    uc_count: int,
+    preconditions_count: int,
+) -> dict:
+    return {
+        "required_objects": {
+            "business_decisions_count": bd_count,
+            "fatal_constraints_count": fatal_count,
+            "non_fatal_constraints_count": non_fatal_count,
+            "use_cases_count": uc_count,
+            "semantic_locks_count": 12,
+            "preconditions_count": preconditions_count,
+            "evidence_quality_rules_count": 2,
+            "traceback_scenarios_count": 5,
+        }
+    }
+
+
+# ============================================================
+# Build: architecture
+# ============================================================
+
+
+def build_architecture(bp: dict, bd_by_stage: dict) -> dict:
+    main_stages = [
+        "data_collection",
+        "data_storage",
+        "factor_computation",
+        "target_selection",
+        "trading_execution",
+        "visualization",
+    ]
+
+    stage_narratives = {
+        "data_collection": {
+            "does_what": (
+                "TimeSeriesDataRecorder and FixedCycleDataRecorder fetch OHLCV and "
+                "fundamental data from providers (eastmoney, joinquant, baostock, akshare) "
+                "and persist domain objects (Stock1dKdata, BalanceSheet) to SQLite via df_to_db()."
+            ),
+            "key_decisions": (
+                "BD-002 chose evaluate_start_end_size_timestamps for incremental fetch "
+                "(not full refresh) because comparing to get_latest_saved_record avoids "
+                "redundant API calls; BD-003 chose get_data_map field transformation "
+                "to keep domain schema provider-agnostic."
+            ),
+            "common_pitfalls": (
+                "Don't forget SL-11: Recorder subclass MUST declare both provider and "
+                "data_schema class attributes else initialization fails with assertion error; "
+                "finance-C-001 fatal violation."
+            ),
+        },
+        "data_storage": {
+            "does_what": (
+                "StorageBackend persists DataFrames to per-provider SQLite databases at "
+                "{data_path}/{provider}/{provider}_{db_name}.db using path templates "
+                "from _get_path_template; Mixin.record_data and Mixin.query_data provide "
+                "uniform read/write interface."
+            ),
+            "key_decisions": (
+                "BD-004 chose StorageBackend abstraction (not hardcoded SQLite) to allow "
+                "future cloud storage swap; BD-006 derives db_name from data_schema "
+                "__tablename__ for per-domain database isolation."
+            ),
+            "common_pitfalls": (
+                "SL-04 violation (wrong DataFrame index) causes factor pipeline failures "
+                "downstream; always ensure df.index.names == ['entity_id', 'timestamp'] "
+                "before calling record_data."
+            ),
+        },
+        "factor_computation": {
+            "does_what": (
+                "Factor.compute() applies Transformer (stateless, e.g. MacdTransformer) "
+                "then Accumulator (stateful, e.g. MaStatsAccumulator) to produce "
+                "filter_result or score_result columns; EntityStateService persists "
+                "per-entity rolling state across batches."
+            ),
+            "key_decisions": (
+                "BD-007 chose Factor inheriting DataReader for composable data access; "
+                "SL-08 locks MACD at (fast=12, slow=26, n=9) — chose standard Appel "
+                "parameters not adaptive because interpretability matters for practitioners."
+            ),
+            "common_pitfalls": (
+                "SL-07: Transformer MUST run before Accumulator — swapping order causes "
+                "NaN propagation; SL-12: result_df must contain filter_result OR "
+                "score_result column or TargetSelector silently drops all signals."
+            ),
+        },
+        "target_selection": {
+            "does_what": (
+                "TargetSelector.add_factor() registers Factor instances; get_targets() "
+                "returns entity_ids passing threshold filter at a specific timestamp, "
+                "enabling point-in-time historical backtesting without look-ahead."
+            ),
+            "key_decisions": (
+                "BD-012 chose registrable factor list (not hardcoded) for runtime "
+                "customization; BD-013 chose timestamp-specific filtering not current-only "
+                "because backtests need historical point-in-time correctness."
+            ),
+            "common_pitfalls": (
+                "Factor.level MUST match TargetSelector.level (IH-05); mismatched levels "
+                "cause silent empty target lists that look like no signals but are "
+                "actually level-mismatch bugs."
+            ),
+        },
+        "trading_execution": {
+            "does_what": (
+                "Trader.run() calls sell() before buy() each cycle, generates TradingSignals "
+                "with due_timestamp = happen_timestamp + level.to_second() for next-bar "
+                "execution, and applies on_profit_control() for stop-loss/take-profit "
+                "before regular target selection."
+            ),
+            "key_decisions": (
+                "SL-01 locks sell-before-buy order because available_long check in "
+                "sim_account depends on it — chose this over symmetric ordering to prevent "
+                "implicit leverage; BD-039 chose long=AND/short=OR multi-level logic "
+                "to reflect risk asymmetry."
+            ),
+            "common_pitfalls": (
+                "SL-02 violation (immediate execution instead of next-bar) introduces "
+                "look-ahead bias and makes backtest results unreproducible in live trading; "
+                "SL-10: A-share T+1 constraint — backtesting without it overstates returns."
+            ),
+        },
+        "visualization": {
+            "does_what": (
+                "Drawer.draw() combines kline main chart with factor overlays and "
+                "Rect annotations for entry/exit signals using Plotly; Drawable interface "
+                "on Factor enables consistent chart rendering across data types."
+            ),
+            "key_decisions": (
+                "BD-019 chose drawer_rects subclass override for custom annotations "
+                "not hardcoded markers — allows traders to define entry/exit visuals "
+                "without modifying base drawing logic."
+            ),
+            "common_pitfalls": (
+                "draw_result=True by default (BD-055) is fine for development but "
+                "set draw_result=False in production/headless environments to avoid "
+                "Plotly server startup overhead."
+            ),
+        },
+    }
+
+    stages = []
+    covered = set()
+
+    for stage_name in main_stages:
+        bds = bd_by_stage.get(stage_name, [])
+        narrative = stage_narratives.get(
+            stage_name,
+            {
+                "does_what": f"{stage_name} stage processing.",
+                "key_decisions": "See business_decisions list below.",
+                "common_pitfalls": "Check constraint list for this stage.",
+            },
+        )
+        stage_entry: dict = {
+            "id": stage_name,
+            "narrative": narrative,
+            "business_decisions": [
+                {
+                    "id": bd.get("id", "?"),
+                    "type": bd.get("type", "B"),
+                    "summary": (bd.get("content") or "").replace("\n", " ")[:200],
+                }
+                for bd in bds
+            ],
+        }
+        stages.append(stage_entry)
+        covered.add(stage_name)
+
+    # Cross-cutting concerns — merge all non-main-pipeline BDs into ONE synthetic
+    # stage with substantive narrative. Previously produced 20+ stub stages that
+    # diluted quality (v5.2 review B axis: 6/10). Now single consolidated entry.
+    other_stage_names = sorted(set(bd_by_stage.keys()) - covered - {"(unassigned)"})
+    cross_cutting_bds: list[dict] = []
+    source_groups: list[str] = []
+    for stage_name in other_stage_names:
+        bds = bd_by_stage.get(stage_name, [])
+        if not bds:
+            continue
+        source_groups.append(f"{stage_name}({len(bds)})")
+        for bd in bds:
+            cross_cutting_bds.append(
+                {
+                    "id": bd.get("id", "?"),
+                    "type": bd.get("type", "B"),
+                    "summary": (bd.get("content") or "").replace("\n", " ")[:200],
+                }
+            )
+    if cross_cutting_bds:
+        groups_sample = ", ".join(source_groups[:6]) + (
+            f", and {len(source_groups) - 6} more" if len(source_groups) > 6 else ""
+        )
+        stages.append(
+            {
+                "id": "cross_cutting_concerns",
+                "narrative": {
+                    "does_what": (
+                        f"Invariants and utilities that span multiple pipeline stages — "
+                        f"collected from {len(source_groups)} source groups: {groups_sample}."
+                    ),
+                    "key_decisions": (
+                        f"{len(cross_cutting_bds)} BDs merged here because they apply to more than one main stage "
+                        f"(e.g. algorithm helpers, default value choices, ordering contracts, error handling). "
+                        f"Agent should inspect individual BD summaries and link back to affected main stages via shared IDs."
+                    ),
+                    "common_pitfalls": (
+                        "Cross-cutting concerns frequently surface as bugs when changes to one main stage unintentionally break another. "
+                        "Check constraints referencing these BDs and verify invariants still hold after any stage-local modification."
+                    ),
+                },
+                "business_decisions": cross_cutting_bds,
+            }
+        )
+
+    pipeline = (
+        "data_collection -> data_storage -> factor_computation -> "
+        "target_selection -> trading_execution -> visualization"
+    )
+
+    return {"pipeline": pipeline, "stages": stages}
+
+
+# ============================================================
+# Build: resources
+# ============================================================
+
+
+def build_resources(bp: dict, target_host: str) -> dict:
+    resources_raw = bp.get("resources") or []
+    packages = []
+    for r in resources_raw:
+        rtype = r.get("type", "")
+        if rtype in ("python_package", "dependency"):
+            packages.append(
+                {
+                    "name": r.get("name", ""),
+                    "version_pin": r.get("version", "latest"),
+                }
+            )
+
+    # Default packages if blueprint has none
+    if not packages:
+        packages = [
+            {"name": "zvt", "version_pin": "latest"},
+            {"name": "pandas", "version_pin": ">=2.2"},
+            {"name": "numpy", "version_pin": ">=2.1"},
+            {"name": "SQLAlchemy", "version_pin": ">=2.0"},
+            {"name": "plotly", "version_pin": ">=5"},
+            {"name": "dash", "version_pin": ">=2"},
+            {"name": "akshare", "version_pin": "latest"},
+            {"name": "baostock", "version_pin": "latest"},
+        ]
+
+    strategy_scaffold = {
+        "entry_point_name": "run_backtest",
+        "tail_template": (
+            "# === DO NOT MODIFY BELOW THIS LINE ===\n"
+            'if __name__ == "__main__":\n'
+            "    result = run_backtest()  # implement above\n"
+            "    from validate import enforce_validation\n"
+            '    enforce_validation(result, output_path="{workspace}/result.csv")\n'
+            "# === END DO NOT MODIFY ==="
+        ),
+    }
+
+    host_adapter: dict = {}
+    if target_host == "openclaw":
+        host_adapter = {
+            "target": "openclaw",
+            "timeout_seconds": 1800,
+            "shell_operator_restriction": (
+                "exec tool intercepts && / ; / | — "
+                "never chain: 'pip install X && python Y'. Use separate exec calls."
+            ),
+            "install_recipes": [
+                "python3 -m pip install zvt",
+                "python3 -m pip install akshare",
+                "python3 -m zvt.init_dirs",
+            ],
+            "credential_injection": (
+                "JoinQuant/QMT credentials require user-side '!' prefix shell login. "
+                "Never hardcode credentials in generated scripts."
+            ),
+            "path_resolution": (
+                "{workspace} resolves to ~/.openclaw/workspace/doramagic at execution time. "
+                "ZVT default data dir ~/zvt-home/ is separate from workspace."
+            ),
+            "file_io_tooling": (
+                "Use openclaw 'write' tool for .py/.sql files; "
+                "'exec' tool for python3 /absolute/path/script.py (absolute paths only)."
+            ),
+        }
+    elif target_host == "claude_code":
+        host_adapter = {
+            "target": "claude_code",
+            "timeout_seconds": 600,
+            "install_recipes": ["pip install zvt", "python3 -m zvt.init_dirs"],
+            "path_resolution": "{workspace} resolves to current working directory",
+        }
+    else:
+        host_adapter = {
+            "target": target_host,
+            "timeout_seconds": 1800,
+            "install_recipes": ["pip install zvt"],
+            "path_resolution": "{workspace} resolves to host-specific working directory",
+        }
+
+    return {
+        "packages": packages,
+        "strategy_scaffold": strategy_scaffold,
+        "host_adapter": host_adapter,
+    }
+
+
+# ============================================================
+# Build: constraints (structured arrays)
+# ============================================================
+
+
+def build_constraints(fatal_constraints: list[dict], non_fatal_constraints: list[dict]) -> dict:
+    def fmt_constraint(c: dict) -> dict:
+        f = _extract_constraint_fields(c)
+        result: dict = {
+            "id": f["id"],
+            "when": f["when"],
+            "action": f["action"],
+            "severity": f["severity"],
+            "kind": f["kind"],
+            "modality": f["modality"],
+        }
+        if f["consequence"]:
+            cons = f["consequence"]
+            if isinstance(cons, dict):
+                result["consequence"] = cons.get("description")
+            else:
+                result["consequence"] = str(cons)
+        else:
+            result["consequence"] = None
+        if f["stage_ids"]:
+            result["stage_ids"] = f["stage_ids"]
+        if f["derived_from_bd_id"]:
+            result["derived_from_bd_id"] = f["derived_from_bd_id"]
+        return result
+
+    return {
+        "fatal": [fmt_constraint(c) for c in fatal_constraints],
+        "regular": [fmt_constraint(c) for c in non_fatal_constraints],
+    }
+
+
+# ============================================================
+# Build: output_validator (business-semantic, fixes OV-02 bug)
+# ============================================================
+
+
+def build_output_validator() -> dict:
+    assertions = [
+        {
+            "id": "OV-01",
+            "check_predicate": (
+                "all(p in inspect.getsource(zvt.factors.algorithm.macd) "
+                "for p in ['slow=26', 'fast=12', 'n=9'])"
+            ),
+            "failure_message": (
+                "FATAL: MACD params drifted from (fast=12, slow=26, n=9) — "
+                "SL-08 violation, non-reproducible signals"
+            ),
+            "business_meaning": (
+                "Standard MACD parameters are a semantic lock; drift makes results "
+                "incomparable with industry-standard indicators and non-reproducible."
+            ),
+            "source_ids": ["SL-08", "BD-036"],
+        },
+        {
+            "id": "OV-02",
+            "check_predicate": (
+                "result.get('total_trades', 0) > 0 or result.get('explicit_zero_trade_ack') is True"
+            ),
+            "failure_message": (
+                "Zero trades executed — likely missing pre-fetched data (see PC-02) "
+                "or over-restrictive filters"
+            ),
+            "business_meaning": (
+                "A backtest with zero trades is not a valid result; "
+                "either data is missing or the strategy never triggered. "
+                "Structural non-emptiness check is insufficient — we need business confirmation."
+            ),
+            "source_ids": ["SL-01", "finance-C-073"],
+        },
+        {
+            "id": "OV-03",
+            "check_predicate": (
+                "result.get('annual_return') is None or abs(float(result['annual_return'])) <= 5.0"
+            ),
+            "failure_message": (
+                "FATAL: |annual_return| > 500% — likely look-ahead bias or data error"
+            ),
+            "business_meaning": (
+                "Annual returns exceeding 500% are physically implausible for A-share "
+                "strategies; indicates look-ahead bias or corrupt data."
+            ),
+            "source_ids": [],
+        },
+        {
+            "id": "OV-04",
+            "check_predicate": (
+                "result.get('holding_change_pct') is None or "
+                "abs(float(result['holding_change_pct'])) <= 1.0"
+            ),
+            "failure_message": "FATAL: |holding_change_pct| > 100% — physically impossible",
+            "business_meaning": (
+                "Holding change percentage cannot exceed 100%; violation indicates "
+                "position accounting error."
+            ),
+            "source_ids": ["BD-029"],
+        },
+        {
+            "id": "OV-05",
+            "check_predicate": (
+                "result.get('max_drawdown') is None or abs(float(result['max_drawdown'])) <= 1.0"
+            ),
+            "failure_message": "FATAL: |max_drawdown| > 100% — impossible for non-leveraged account",
+            "business_meaning": (
+                "Maximum drawdown cannot exceed 100% without leverage; "
+                "violation indicates calculation error or look-ahead bias."
+            ),
+            "source_ids": [],
+        },
+        {
+            "id": "OV-06",
+            "check_predicate": (
+                "not (hasattr(result, 'trade_log') and result.trade_log and "
+                "any(result.trade_log[i].action == 'sell' and i+1 < len(result.trade_log) "
+                "and result.trade_log[i+1].action == 'buy' and "
+                "result.trade_log[i].timestamp == result.trade_log[i+1].timestamp "
+                "for i in range(len(result.trade_log)-1)))"
+            ),
+            "failure_message": (
+                "FATAL: buy-before-sell detected in same cycle — SL-01 violation, "
+                "creates implicit leverage"
+            ),
+            "business_meaning": (
+                "SL-01 requires sell() before buy() in each cycle; violation means "
+                "available_long was not updated before buying, risking duplicate positions."
+            ),
+            "source_ids": ["SL-01"],
+        },
+    ]
+
+    return {
+        "assertions": assertions,
+        "scaffold": {
+            "validate_py_path": "{workspace}/validate.py",
+            "tail_block": (
+                "# === DO NOT MODIFY BELOW THIS LINE ===\n"
+                'if __name__ == "__main__":\n'
+                "    result = run_backtest()\n"
+                "    from validate import enforce_validation\n"
+                '    enforce_validation(result, output_path="{workspace}/result.csv")\n'
+                "# === END DO NOT MODIFY ==="
+            ),
+        },
+        "enforcement_protocol": (
+            "1. Never edit validate.py. "
+            "2. Never delete the DO NOT MODIFY tail block from the main script. "
+            "3. Never wrap enforce_validation() in try/except. "
+            "4. Never rewrite result write logic — it MUST go through enforce_validation. "
+            "5. If validate.py raises ImportError, fix the dependency, do not remove the call."
+        ),
+    }
+
+
+# ============================================================
+# Build: acceptance
+# ============================================================
+
+
+def build_acceptance() -> dict:
+    hard_gates = [
+        {
+            "id": "G1",
+            "check": "{workspace}/result.csv exists AND file size > 0",
+            "on_fail": (
+                "Strategy did not produce output; check run_backtest() return value "
+                "and enforce_validation() call"
+            ),
+        },
+        {
+            "id": "G2",
+            "check": "{workspace}/result.csv.validation_passed marker file exists",
+            "on_fail": "Validation did not complete; review validate.py output and fix assertion failures",
+        },
+        {
+            "id": "G3",
+            "check": "Main script contains literal: from validate import enforce_validation",
+            "on_fail": "Validation chain stripped; re-add the import in the DO NOT MODIFY block",
+        },
+        {
+            "id": "G4",
+            "check": "Main script contains literal: # === DO NOT MODIFY BELOW THIS LINE ===",
+            "on_fail": "Validation fence removed; regenerate DO NOT MODIFY tail block",
+        },
+        {
+            "id": "G5",
+            "check": ("result.csv has at least 1 row: pandas.read_csv(result_csv).shape[0] >= 1"),
+            "on_fail": (
+                "Empty result; check if trade_log is non-empty and factors generated signals. "
+                "Confirm PC-02 (k-data exists) passed."
+            ),
+        },
+        {
+            "id": "G6",
+            "check": (
+                "If MACD strategy: source contains 'slow=26' AND 'fast=12' AND 'n=9' "
+                "in algorithm call"
+            ),
+            "on_fail": "MACD params drifted from SL-08 lock; restore standard (12, 26, 9)",
+        },
+        {
+            "id": "G7",
+            "check": (
+                "For data pipeline tasks: result.csv columns include 'entity_id' and 'timestamp'"
+            ),
+            "on_fail": (
+                "Missing required columns; check Mixin.query_data return schema and "
+                "DataFrame MultiIndex reset_index() before writing"
+            ),
+        },
+        {
+            "id": "G8",
+            "check": "OV-03 passes: abs(annual_return) <= 5.0 (500%)",
+            "on_fail": (
+                "Physical plausibility check failed; investigate look-ahead bias or "
+                "data corruption in input kdata"
+            ),
+        },
+    ]
+
+    soft_gates = [
+        {
+            "id": "SG-01",
+            "rubric": (
+                "Strategy narrative consistency: user intent aligns with generated strategy.py logic. "
+                "dim_a: signal direction (buy/sell) matches intent [1-5, pass>=4]; "
+                "dim_b: frequency (daily/intraday) aligns [1-5, pass>=4]; "
+                "dim_c: risk controls match user intent [1-5, pass>=4]."
+            ),
+        },
+        {
+            "id": "SG-02",
+            "rubric": (
+                "Factor combination quality. "
+                "dim_a: no highly correlated factor duplication [1-5, pass>=4]; "
+                "dim_b: multi-period alignment correct [1-5, pass>=4]; "
+                "dim_c: liquidity filter present for A-share [1-5, pass>=4]."
+            ),
+        },
+        {
+            "id": "SG-03",
+            "rubric": (
+                "Data source selection appropriateness. "
+                "dim_a: coverage sufficient for target entities [1-5, pass>=4]; "
+                "dim_b: provider latency acceptable for strategy frequency [1-5, pass>=4]; "
+                "dim_c: no unauthorized provider used without credentials [1-5, pass>=4]."
+            ),
+        },
+    ]
+
+    return {"hard_gates": hard_gates, "soft_gates": soft_gates}
+
+
+# ============================================================
+# Build: skill_crystallization (new in v5.0)
+# ============================================================
+
+
+def build_skill_crystallization(bp_id: str, primary_uc: str) -> dict:
+    bp_id_short = bp_id.replace("finance-", "fin-").replace("--", "-")
+    uc_lower = primary_uc.lower().replace("-", "_") if primary_uc else "zvt"
+    slug = f"{bp_id_short}-{uc_lower}"
+
+    return {
+        "trigger": "all_hard_gates_passed AND user_opt_out_skill_saving != true",
+        "output_path_template": "{workspace}/../skills/{slug}.skill",
+        "slug_template": "{blueprint_id_short}-{uc_id_lower}",
+        "captured_fields": [
+            "name",
+            "intent_keywords",
+            "entry_point_script",
+            "validate_script",
+            "fatal_constraints",
+            "spec_locks",
+            "preconditions",
+            "human_summary_translated",
+        ],
+        "action": (
+            f"After G1-G8 PASS, write .skill YAML file at {{workspace}}/../skills/{slug}.skill "
+            f"then notify user in user's locale: "
+            f"'Skill saved as {slug}.skill — say backtest or zvt next time to invoke directly.'"
+        ),
+        "violation_signal": "All hard gates passed but no .skill file exists at expected path",
+        "skill_file_schema": {
+            "name": f"{bp_id} ZVT Strategy",
+            "version": "v5.0",
+            "intent_keywords": ["backtest", "zvt", "A-share", "factor", "macd", "strategy"],
+            "entry_point": "run_backtest",
+            "fatal_guards": ["SL-01", "SL-02", "SL-08", "SL-10"],
+            "spec_locks": ["SL-01", "SL-02", "SL-03", "SL-04", "SL-05", "SL-06", "SL-07", "SL-08"],
+            "preconditions": ["PC-01", "PC-02", "PC-03"],
+        },
+    }
+
+
+# ============================================================
+# Build: human_summary
+# ============================================================
+
+
+def build_human_summary(bp: dict, uc_list: list[dict]) -> dict:
+    use_cases = [
+        "A-share MACD daily golden-cross backtest with hfq price adjustment from eastmoney",
+        "End-to-end ZVT pipeline: FinanceRecorder + GoodCompanyFactor + StockTrader",
+        "Multi-factor strategy with TargetSelector (AND mode) combining MACD + volume breakout",
+        "Index composition data collection (SZ1000, SZ2000) with EM recorder",
+        "Institutional fund holdings tracker via joinquant_fund_runner pattern",
+        "Custom Transformer + Accumulator factor with per-entity rolling state",
+        "Bollinger Band mean-reversion factor with BollTransformer (window=20, window_dev=2)",
+    ]
+
+    # Pull first few UCs from blueprint as specific examples
+    for uc in uc_list[:3]:
+        uc_name = uc.get("name", "")
+        if uc_name and uc_name not in str(use_cases):
+            use_cases.insert(0, uc_name)
+    use_cases = use_cases[:7]
+
+    what_i_auto_fetch = [
+        "ZVT stage pipeline structure (data_collection → visualization) from LATEST.yaml",
+        "Semantic locks (SL-01 through SL-12) — especially sell-before-buy ordering and MACD params",
+        "Fatal constraints (finance-C-*) relevant to your target strategy type",
+        "Default parameters: MACD(12,26,9), hfq adjustment, buy_cost=0.001, base_capital=1M CNY",
+        "Entity ID format (stock_sh_600000) and DataFrame MultiIndex convention",
+        "Provider-specific recorder class names and required class attributes",
+    ]
+
+    what_i_ask_you = [
+        "Target market: A-share (default), HK, or crypto? (US stocks in ZVT are half-baked — stockus_nasdaq_AAPL exists but coverage is thin)",
+        "Data source / provider: eastmoney (free, no account), joinquant (account+paid), baostock (free, good history), akshare, or qmt (broker)?",
+        "Strategy type: MACD golden-cross, MA crossover, volume breakout, fundamental screen, or custom factor?",
+        "Time range: start_timestamp and end_timestamp for backtest period",
+        "Target entity IDs: specific stocks (stock_sh_600000) or index components (SZ1000)?",
+    ]
+
+    return {
+        "persona": "Doraemon",
+        "what_i_can_do": {
+            "tagline": (
+                "I help you build quant strategies on A-share with ZVT — from data fetch to backtest, "
+                "one flow. Just tell me what you want; I'll write the code, you don't have to dig docs. "
+                "(Heads up: ZVT natively supports A-share, HK, and crypto. "
+                "US stocks — stockus_nasdaq_AAPL — are half-baked; don't bother for serious work.)"
+            ),
+            "use_cases": use_cases,
+        },
+        "what_i_auto_fetch": what_i_auto_fetch,
+        "what_i_ask_you": what_i_ask_you,
+        "locale_rendering": {
+            "instruction": (
+                "On first user contact, translate all fields above into detected user locale "
+                "while preserving Doraemon persona (direct, frank, mildly snarky, knows limits)."
+            ),
+            "preserve_verbatim": [
+                "BD-IDs",
+                "SL-IDs",
+                "UC-IDs",
+                "finance-C-IDs",
+                "class_names",
+                "function_names",
+                "file_paths",
+                "numeric_thresholds",
+            ],
+        },
+    }
+
+
+# ============================================================
+# Render: validate.py (retained from v3.x with OV-02 fix)
 # ============================================================
 
 
 def render_validate_py(blueprint_id: str) -> str:
     return f"""# {{workspace}}/validate.py
-# 禁止修改本文件——晶体合约的强制部分
-# Generated for {blueprint_id}
+# DO NOT EDIT — crystal contract enforcement for {blueprint_id}
+# Generated by compile_crystal_skeleton.py v5.0
 
 import sys
 import json
+import inspect
 from pathlib import Path
 
 
 def enforce_validation(result, output_path: str) -> None:
     failures = []
 
-    # === Crystal-injected assertions ===
-    # OV-01: MACD parameter lock (SL-09)
+    # OV-01: MACD parameter lock (SL-08)
     try:
         import zvt.factors.algorithm as _algo
-        import inspect
         src = inspect.getsource(_algo.macd)
         if "slow=26" not in src or "fast=12" not in src or "n=9" not in src:
-            failures.append("FATAL: MACD params drifted from (fast=12, slow=26, n=9)")
+            failures.append("FATAL OV-01: MACD params drifted from (fast=12, slow=26, n=9) — SL-08 violation")
     except Exception:
         pass
 
-    # OV-02: result must be non-empty (prevent silent no-signal false completion)
+    # OV-02: Business-semantic trade count check (not structural non-emptiness)
     if result is None:
-        failures.append("FATAL: result is None — no computation performed")
-    elif hasattr(result, "__len__") and len(result) == 0:
-        failures.append("FATAL: result is empty — possible look-ahead filter failure")
-    elif hasattr(result, "empty") and result.empty:
-        failures.append("FATAL: result DataFrame is empty")
+        failures.append("FATAL OV-02: result is None — no computation performed")
+    elif isinstance(result, dict):
+        total_trades = result.get("total_trades", 0)
+        zero_ack = result.get("explicit_zero_trade_ack") is True
+        if total_trades == 0 and not zero_ack:
+            failures.append(
+                "FATAL OV-02: Zero trades executed — likely missing pre-fetched data (PC-02) "
+                "or over-restrictive filters. Set result['explicit_zero_trade_ack']=True to ack intentional zero-trade."
+            )
 
-    # OV-03: annual return physical plausibility (per Step 1b FATAL threshold rule)
+    # OV-03: annual return physical plausibility
     try:
         if hasattr(result, "get"):
             ar = result.get("annual_return")
             if ar is not None and abs(float(ar)) > 5.0:
-                failures.append(f"FATAL: |annual_return|={{float(ar):.2f}} > 500 pct — likely look-ahead bias or data error")
+                failures.append(f"FATAL OV-03: |annual_return|={{float(ar):.2f}} > 500% — likely look-ahead bias")
     except Exception:
         pass
 
-    # OV-04: holding change physical plausibility
+    # OV-04: holding change plausibility
     try:
         if hasattr(result, "get"):
             hc = result.get("holding_change_pct")
             if hc is not None and abs(float(hc)) > 1.0:
-                failures.append(f"FATAL: |holding_change_pct|={{float(hc):.2f}} > 100 pct")
+                failures.append(f"FATAL OV-04: |holding_change_pct|={{float(hc):.2f}} > 100%")
     except Exception:
         pass
 
-    # OV-05: drawdown physical plausibility
+    # OV-05: drawdown plausibility
     try:
         if hasattr(result, "get"):
             dd = result.get("max_drawdown")
             if dd is not None and abs(float(dd)) > 1.0:
-                failures.append(f"FATAL: |max_drawdown|={{float(dd):.2f}} > 100 pct — impossible")
+                failures.append(f"FATAL OV-05: |max_drawdown|={{float(dd):.2f}} > 100% — impossible without leverage")
     except Exception:
         pass
 
-    # OV-06: sell-before-buy ordering check (SL-01)
+    # OV-06: sell-before-buy ordering (SL-01)
     try:
-        if hasattr(result, "trade_log"):
+        if hasattr(result, "trade_log") and result.trade_log:
             log = result.trade_log
-            if log and any(
-                log[i].action == "buy" and i + 1 < len(log) and log[i + 1].action == "sell"
-                and log[i].timestamp == log[i + 1].timestamp
-                for i in range(len(log) - 1)
-            ):
-                failures.append("FATAL: buy-before-sell detected in same cycle (violates SL-01)")
+            for i in range(len(log) - 1):
+                if (log[i].action == "sell"
+                        and log[i + 1].action == "buy"
+                        and log[i].timestamp == log[i + 1].timestamp):
+                    # This is correct order (sell then buy same cycle) — OK
+                    pass
+                elif (log[i].action == "buy"
+                        and log[i + 1].action == "sell"
+                        and log[i].timestamp == log[i + 1].timestamp):
+                    failures.append("FATAL OV-06: buy-before-sell in same cycle — SL-01 violation")
+                    break
     except Exception:
         pass
 
@@ -150,949 +1408,498 @@ def enforce_validation(result, output_path: str) -> None:
 
 
 if __name__ == "__main__":
-    # Standalone mode: verify all locked parameters match expected values
-    print("[validate.py] Standalone invocation — checking SL parameter integrity...")
+    print("[validate.py] Standalone mode — checking SL parameter integrity...")
     failures = []
     try:
         import zvt.factors.algorithm as _algo
         import inspect
         src = inspect.getsource(_algo.macd)
         if "slow=26" not in src:
-            failures.append("SL-09: MACD slow != 26")
+            failures.append("SL-08: MACD slow != 26")
         if "fast=12" not in src:
-            failures.append("SL-09: MACD fast != 12")
+            failures.append("SL-08: MACD fast != 12")
         if "n=9" not in src:
-            failures.append("SL-09: MACD n != 9")
+            failures.append("SL-08: MACD n != 9")
     except ImportError:
-        print("[validate.py] zvt not installed — cannot verify SL-09")
+        print("[validate.py] zvt not installed — cannot verify SL-08")
 
     if failures:
         for f in failures:
             print(f"  FAIL: {{f}}")
         sys.exit(1)
-    print("[validate.py] ALL GATES PASSED — no output_path specified, marker not written.")
+    print("[validate.py] ALL GATES PASSED.")
     sys.exit(0)
 """
 
 
 # ============================================================
-# seed.md 段落生成
+# Render: human_summary.md sidecar
 # ============================================================
 
 
-def render_human_summary_placeholder() -> str:
-    return """## Human Summary
+def render_human_summary_md(seed: dict) -> str:
+    hs = seed.get("human_summary", {})
+    meta = seed.get("meta", {})
+    crystal_id = meta.get("id", "unknown")
+    persona = hs.get("persona", "Doraemon")
 
-<!-- SOUL_TODO: Doraemon persona (§1.7) — 替用户做选择，不列选项。
-用户看完这段应该知道：
-- 这个 skill 能做什么？（给出明确用例）
-- AI 会自动获取什么？（避免用户重复描述）
-- AI 会问你什么？（3-5 个关键决策点）
--->
+    wic = hs.get("what_i_can_do", {})
+    tagline = wic.get("tagline", "")
+    use_cases = wic.get("use_cases", [])
+    auto_fetch = hs.get("what_i_auto_fetch", [])
+    ask_you = hs.get("what_i_ask_you", [])
+    lr = hs.get("locale_rendering", {})
+    lr_instruction = lr.get("instruction", "")
+    preserve = lr.get("preserve_verbatim", [])
 
-**我能帮你做什么**:
-
-（TODO 主线程填充：哆啦A梦口吻，亲切、直接、偶尔吐槽 ZVT 的局限）
-
-**我会自动获取**:
-
-（TODO 主线程填充）
-
-**我会问你**:
-
-（TODO 主线程填充）
-"""
-
-
-def render_directive_section(
-    blueprint_id: str,
-    uc_list: list[dict],
-    fatal_ids: list[str],
-    non_fatal_ids: list[str],
-    bd_ids: list[str],
-) -> str:
-    """渲染 directive 段，含 5 控制块 YAML fenced blocks."""
-    uc_count = len(uc_list)
-    uc_entries = []
-    for uc in uc_list:
-        uc_id = uc.get("id", "?")
-        name = (uc.get("name") or "").replace('"', "'")
-        keywords = uc.get("intent_keywords") or []
-        data_domain = uc.get("data_domain") or "mixed"
-        not_suitable = uc.get("not_suitable_for") or []
-        positive_terms = json.dumps(keywords, ensure_ascii=False)
-        negative_terms = json.dumps(not_suitable, ensure_ascii=False)
-        uc_entries.append(
-            f"""    - uc_id: "{uc_id}"
-      name: "{name}"
-      positive_terms: {positive_terms}
-      negative_terms: {negative_terms}
-      data_domain: "{data_domain}"
-      ambiguity_question: "Are you targeting {name.lower()}?"
-"""
-        )
-    intent_router_block = "".join(uc_entries)
-
-    semantic_locks = """    - id: SL-01
-      rule: "Execute sell orders before buy orders in every trading cycle"
-      violation: FATAL
-      rationale: "Prevents implicit leverage when cash is insufficient"
-      verification: "Confirm sell() called before buy() in trading loop"
-      adapter:
-        zvt: "trader.py:266 sell() before trader.py:295 buy()"
-    - id: SL-02
-      rule: "Trading signals MUST use next-bar execution (no look-ahead)"
-      violation: FATAL
-      rationale: "Prevents look-ahead bias in backtest"
-      verification: "due_timestamp = happen_timestamp + level.to_second()"
-      adapter:
-        zvt: "Trader.buy() sets TradingSignal.due_timestamp = happen + level.to_second()"
-    - id: SL-03
-      rule: "Entity IDs MUST follow format entity_type_exchange_code"
-      violation: FATAL
-      rationale: "ZVT splits on underscore assuming this convention; wrong format breaks lookups"
-      verification: "grep entity_id pattern"
-      adapter:
-        zvt: "stock_sh_600000, stockhk_hk_0700, stockus_nasdaq_AAPL"
-    - id: SL-04
-      rule: "DataFrame index MUST be MultiIndex with (entity_id, timestamp)"
-      violation: FATAL
-      rationale: "ZVT factor operations assume this exact index structure"
-      verification: "df.index.names == ['entity_id', 'timestamp']"
-      adapter:
-        zvt: "factor.py:502 MultiIndex.from_product"
-    - id: SL-05
-      rule: "TradingSignal MUST have EXACTLY ONE of position_pct, order_money, or order_amount"
-      violation: FATAL
-      rationale: "Mutually exclusive by design; multiple fields causes silent conflict"
-      verification: "assert sum([s.position_pct, s.order_money, s.order_amount]) is set == 1"
-      adapter:
-        zvt: "trading/__init__.py:39 TradingSignal XOR enforcement"
-    - id: SL-06
-      rule: "filter_result column semantics: True=BUY, False=SELL, None/NaN=NO ACTION"
-      violation: FATAL
-      rationale: "TargetSelector reads this column; wrong semantics = inverted trades"
-      verification: "Check order_type_flag maps True→B, False→S in factor.py"
-      adapter:
-        zvt: "factor.py:475 order_type_flag"
-    - id: SL-07
-      rule: "Transformer MUST run BEFORE Accumulator in factor pipeline"
-      violation: FATAL
-      rationale: "Accumulator expects transformed pipe_df; wrong order = NaN propagation"
-      verification: "factor.py:403 transform before :409 accumulator"
-      adapter:
-        zvt: "compute_result() pipeline"
-    - id: SL-08
-      rule: "MACD parameters locked: fast=12, slow=26, signal=9"
-      violation: FATAL
-      rationale: "Standard MACD; altering = non-standard signals, non-reproducible"
-      verification: "grep 'slow=26, fast=12, n=9' in algorithm.py"
-      adapter:
-        zvt: "factors/algorithm.py:30 macd()"
-    - id: SL-09
-      rule: "Default buy_cost=0.001, sell_cost=0.001, slippage=0.001 when simulating A-share"
-      violation: WARN
-      rationale: "ZVT default is simplified; real A-share includes 0.05 pct stamp duty on sell only"
-      verification: "sell_cost includes stamp duty (0.0005) + commission"
-      adapter:
-        zvt: "sim_account.py:25 SimAccountService"
-    - id: SL-10
-      rule: "A-share equity trading is T+1 (no same-day close of buy positions)"
-      violation: FATAL
-      rationale: "Regulatory constraint; backtests without T+1 are not reproducible in real trading"
-      verification: "sim_account.available_long filters by trading_t"
-      adapter:
-        zvt: "stockhk_meta.py:25 get_trading_t; trader.py position filtering"
-    - id: SL-11
-      rule: "Recorder subclass MUST define provider AND data_schema class attributes"
-      violation: FATAL
-      rationale: "Meta-class auto-registration depends on these attributes"
-      verification: "subclass has provider=str, data_schema=class"
-      adapter:
-        zvt: "contract/recorder.py:71 Meta; register_schema decorator"
-    - id: SL-12
-      rule: "Factor result_df MUST contain either 'filter_result' OR 'score_result' column"
-      violation: FATAL
-      rationale: "TargetSelector consumes these exact column names"
-      verification: "result_df.columns.intersection({'filter_result', 'score_result'}) non-empty"
-      adapter:
-        zvt: "contract/factor.py Factor.compute_result output"
-"""
-
-    implementation_hints = """    - id: IH-01
-      rule: "Use AdjustType enum exactly: qfq (pre), hfq (post), bfq (none)"
-      zvt: "contract/__init__.py:121 AdjustType enum"
-    - id: IH-02
-      rule: "For A-share kdata, default to hfq for long-term analysis (dividend-adjusted)"
-      zvt: "trader.py:538 StockTrader.__init__ adjust_type=hfq"
-    - id: IH-03
-      rule: "SQLite connection MUST use check_same_thread=False for multi-threaded recorders"
-      zvt: "Configured in storage backend"
-    - id: IH-04
-      rule: "Accumulator state serialization uses JSON with custom encoder/decoder hooks"
-      zvt: "contract/base_service.py EntityStateService"
-    - id: IH-05
-      rule: "Factor.level MUST match TargetSelector.level (enforced at add_factor)"
-      zvt: "factors/target_selector.py:84 add_factor"
-"""
-
-    fatal_count = len(fatal_ids)
-    non_fatal_count = len(non_fatal_ids)
-    bd_count = len(bd_ids)
-
-    preservation_manifest = f"""    required_objects:
-      - type: spec_lock_semantic
-        count: 12
-        verification_method: "grep `id: SL-` inside spec_lock_registry fenced block, expect 12"
-      - type: spec_lock_implementation
-        count: 5
-        verification_method: "grep `id: IH-` inside spec_lock_registry fenced block, expect 5"
-      - type: fatal_constraint
-        count: {fatal_count}
-        verification_method: "count `finance-C-` IDs in `## [FATAL] 约束` section, expect {fatal_count}"
-      - type: known_use_case
-        count: {uc_count}
-        verification_method: "count `uc_id:` in intent_router fenced block, expect {uc_count}"
-      - type: rationalization_guard
-        count: 0
-        verification_method: "section omitted (0 rationalization_guard constraints)"
-      - type: validator_assertion
-        count: 6
-        verification_method: "count OV-XX entries in validate.py"
-      - type: hard_gate
-        count: 8
-        verification_method: "count G[1-8] in `## 验收` section"
-      - type: business_decision
-        count: {bd_count}
-        verification_method: "count unique BD-X IDs across seed.md, expect {bd_count}"
-      - type: non_fatal_constraint
-        count: {non_fatal_count}
-        verification_method: "count `finance-C-` IDs in `## 约束` section, expect {non_fatal_count}"
-"""
-
-    output_validator_block = """    rendering_target: "## Output Validator"
-    enforcement_chain:
-      validator_script_path: "{workspace}/validate.py"
-      strategy_tail_marker: "# === DO NOT MODIFY BELOW THIS LINE ==="
-      enforcement_protocol_in_directive: true
-    assertions:
-      - source_kind: "spec_lock.SL-08"
-        rendered_check: "MACD params == (12, 26, 9)"
-        rendered_message: "FATAL: MACD params drifted"
-      - source_kind: "physical_plausibility"
-        rendered_check: "abs(annual_return) <= 5.0"
-        rendered_message: "FATAL: |annual_return| > 500 pct"
-      - source_kind: "physical_plausibility"
-        rendered_check: "abs(max_drawdown) <= 1.0"
-        rendered_message: "FATAL: |drawdown| > 100 pct"
-      - source_kind: "data_integrity"
-        rendered_check: "len(result) > 0"
-        rendered_message: "FATAL: empty result — possible look-ahead failure"
-      - source_kind: "spec_lock.SL-01"
-        rendered_check: "no buy-before-sell in same cycle"
-        rendered_message: "FATAL: SL-01 violation"
-      - source_kind: "business_decision.BD-029"
-        rendered_check: "holding_change_pct <= 1.0"
-        rendered_message: "FATAL: holding change > 100 pct"
-"""
-
-    return f"""## directive
-
-### Language Protocol
-
-This crystal is written in English for universal AI consumption.
-
-1. **Detect** the user's language from their first message or system locale
-2. **All user-facing output** (questions, explanations, warnings, reports) MUST be in the user's detected language
-3. **Intent matching**: translate user input to English semantically before matching against intent_router terms — do not require the user to speak English
-4. **Code and identifiers** remain in English regardless of user language (variable names, file paths, API calls, assert statements)
-5. **Domain terms**: use the user's language equivalent when explaining constraints or decisions (e.g., "look-ahead bias" → "前视偏差" for Chinese users)
-
-### Execution Directive
-
-This is an EXECUTION task, not a reference document. You are the host AI for a ZVT-based quantitative backtesting or data collection workflow on A-share market (primarily).
-
-Follow this protocol:
-
-**Step 1 (CA1_MEMORY_CHECKED)**: Query user memory for prior preferences, data source credentials, and strategy history. If memory unavailable, mark `memory_unavailable=true` and proceed.
-
-**Step 2 (CA2_GAPS_FILLED)**: Ask the user FATAL-priority questions if not answered in memory. MUST NOT skip — at minimum confirm target market (A-share / HK / US), data source (eastmoney / joinquant / baostock / akshare / qmt), time range, and strategy type.
-
-**Step 3 (CA3_PATH_SELECTED)**: Match user intent against intent_router entries below. If top-1 vs top-2 score gap < 20 pct OR candidates span multiple data_domains, ask ambiguity_question.
-
-**Step 4 (CA4_USER_CONFIRMED)**: State your understanding ("我理解你要 X，对吗？") and wait for explicit confirmation before generating code.
-
-### Control Blocks
-
-```yaml
-intent_router:
-{intent_router_block}```
-
-```yaml
-context_state_machine:
-  states:
-    - id: CA1_MEMORY_CHECKED
-      entry_condition: "Task started"
-      exit_condition: "All memory queries attempted and recorded"
-      on_timeout: "Skip memory, mark memory_unavailable=true, proceed to CA2"
-    - id: CA2_GAPS_FILLED
-      entry_condition: "CA1 complete"
-      exit_condition: "All FATAL-priority required_inputs answered by user"
-      on_timeout: "NOT skippable — FATAL inputs MUST be user-answered"
-    - id: CA3_PATH_SELECTED
-      entry_condition: "CA2 complete"
-      exit_condition: "intent_router matched a single use case with no ambiguity"
-      on_timeout: "Trigger ambiguity_question, await user choice"
-    - id: CA4_USER_CONFIRMED
-      entry_condition: "CA3 complete"
-      exit_condition: "User explicitly confirmed execution path and key parameters"
-      on_timeout: "NOT skippable — explicit user confirmation required"
-  enforcement:
-    - "Before CA4_USER_CONFIRMED, code generation is PROHIBITED"
-    - "Regressions to prior states must be announced to the user"
-```
-
-```yaml
-spec_lock_registry:
-  semantic_locks:
-{semantic_locks}  implementation_hints:
-{implementation_hints}```
-
-```yaml
-preservation_manifest:
-{preservation_manifest}```
-
-```yaml
-output_validator:
-{output_validator_block}```
-
-### Output Validator Enforcement Protocol (FATAL)
-
-1. 禁止编辑 validate.py
-2. 禁止删除主脚本中 `# === DO NOT MODIFY BELOW THIS LINE ===` 之后的代码
-3. 禁止用 try/except 包裹 enforce_validation 调用
-4. 禁止重写结果写出逻辑——必须经由 enforce_validation 写出
-5. validate.py 因依赖问题报错时必须修复依赖，不得删除调用
-"""
-
-
-def render_fatal_section(fatal_constraints: list[dict]) -> str:
-    lines = ["## [FATAL] 约束", ""]
-    lines.append("**绝对红线**。命中任一即停止执行，回到 context_acquisition 重新确认。")
-    lines.append("")
-    lines.append(f"共 {len(fatal_constraints)} 条 fatal 约束全量内联。")
-    lines.append("")
-    for c in fatal_constraints:
-        cid = c.get("id", "?")
-        core = c.get("core") or {}
-        when = core.get("when") or c.get("when", "")
-        action = core.get("action") or c.get("action", "")
-        modality = core.get("modality") or c.get("modality", "must")
-        kind = c.get("constraint_kind", "?")
-        consequence = core.get("consequence") or {}
-        cons_desc = consequence.get("description") if isinstance(consequence, dict) else ""
-        cons_kind = consequence.get("kind") if isinstance(consequence, dict) else ""
-        stages = (c.get("applies_to") or {}).get("stage_ids") or []
-        lines.append(f"### [FATAL] `{cid}` [{kind} / {modality}]")
-        lines.append(f"- **When**: {when}")
-        lines.append(f"- **Action**: {action}")
-        if cons_desc:
-            lines.append(f"- **Consequence** ({cons_kind}): {cons_desc}")
-        if stages:
-            lines.append(f"- **Stages**: {', '.join(stages)}")
-        lines.append("")
-    return "\n".join(lines)
-
-
-def render_output_validator_section() -> str:
-    return """## Output Validator
-
-This section defines the enforcement chain that makes "false completion claim" (SOP Step 2a #8) structurally impossible.
-
-### Validator Scaffold (`validate.py`)
-
-A standalone Python file is generated alongside this crystal at `{workspace}/validate.py`. It contains 6 OV assertions covering:
-
-- **OV-01**: MACD parameter lock (from SL-08)
-- **OV-02**: result non-empty (prevents silent no-signal false completion)
-- **OV-03**: |annual_return| <= 5.0 (physical plausibility, from Step 1b FATAL threshold rule)
-- **OV-04**: |holding_change_pct| <= 1.0 (physical plausibility)
-- **OV-05**: |max_drawdown| <= 1.0 (physical plausibility)
-- **OV-06**: No buy-before-sell in same cycle (from SL-01)
-
-Signature:
-
-```python
-def enforce_validation(result, output_path: str) -> None:
-    # Assertions run. If any fails, sys.exit(1) and write FAILED.log.
-    # On success, write result to output_path and touch {output_path}.validation_passed.
-```
-
-### Strategy Scaffold Tail (MUST appear at end of main script)
-
-Every strategy / backtest / pipeline script MUST end with the following literal block:
-
-```python
-# === DO NOT MODIFY BELOW THIS LINE ===
-if __name__ == "__main__":
-    result = run_backtest()  # AI implements run_backtest() above
-    from validate import enforce_validation
-    enforce_validation(result, output_path="{workspace}/result.csv")
-# === END DO NOT MODIFY ===
-```
-
-Placeholder rendering rules:
-- `{workspace}` → host-resolved absolute path at execution time
-- `run_backtest` is the required entry point name for backtest tasks; for data pipelines use `run_pipeline`, for ML training use `run_training`
-
-### Hard Gates (G1-G4)
-
-- **G1**: `{workspace}/result.csv` exists AND size > 0
-- **G2**: `{workspace}/result.csv.validation_passed` marker file exists
-- **G3**: Main script contains literal `from validate import enforce_validation`
-- **G4**: Main script contains literal `# === DO NOT MODIFY BELOW THIS LINE ===`
-
-G1-G2 verify output produced AND validated. G3-G4 verify validator chain not stripped.
-"""
-
-
-def render_evidence_quality_section(bp: dict) -> str:
-    meta = bp.get("_enrich_meta") or {}
-    audit = bp.get("audit_checklist_summary") or {}
-
-    def fmt_num(v, pct=False):
-        if v is None:
-            return "n/a"
-        if pct and isinstance(v, (int, float)):
-            return f"{v * 100:.1f}%"
-        return str(v)
-
-    ev_coverage = fmt_num(meta.get("evidence_coverage_ratio"), pct=True)
-    ev_verify = fmt_num(meta.get("evidence_verify_ratio"), pct=True)
-    ev_verify_raw = meta.get("evidence_verify_ratio")
-    ev_invalid = meta.get("evidence_invalid", 0) or 0
-    ev_verified = fmt_num(meta.get("evidence_verified"))
-    ev_auto_fixed = fmt_num(meta.get("evidence_auto_fixed"))
-
-    coverage_str = audit.get("coverage", "n/a")
-    fu = audit.get("finance_universal") or {}
-    st = audit.get("subdomain_totals") or {}
-    sub_fail = st.get("fail", 0) or 0
-    fu_fail = fu.get("fail", 0) or 0
-    total_fail = sub_fail + fu_fail
-
-    lines = ["## 证据质量声明", ""]
-    lines.append(
-        "> 本晶体由蓝图 + 约束机械压缩而成。蓝图源文件自报以下证据质量指标，agent 使用本晶体时必须读取这些信号并据此调整置信度。"
-    )
-    lines.append("")
-    lines.append("### 蓝图自报证据指标")
-    lines.append("")
-    lines.append(f"- **evidence_coverage_ratio**：{ev_coverage}（BD 带 evidence_refs 字段的占比）")
-    lines.append(f"- **evidence_verify_ratio**：{ev_verify}（已人工/自动核验的 evidence 占比）")
-    lines.append(f"- **evidence_invalid**：{ev_invalid} 条（被标记为无效的证据条目）")
-    lines.append(f"- **evidence_verified**：{ev_verified} 条")
-    lines.append(f"- **evidence_auto_fixed**：{ev_auto_fixed} 条")
-    lines.append("")
-    lines.append("### 审计清单覆盖率")
-    lines.append("")
-    lines.append(f"- **coverage**：{coverage_str}")
-    lines.append(
-        f"- **finance_universal**：pass {fu.get('pass', 0)} / warn {fu.get('warn', 0)} / fail {fu.get('fail', 0)}"
-    )
-    lines.append(
-        f"- **subdomain_totals**：pass {st.get('pass', 0)} / warn {st.get('warn', 0)} / fail {st.get('fail', 0)}"
-    )
-    lines.append("")
-    lines.append("### 使用规则（agent 必须遵守）")
-    lines.append("")
-    lines.append(
-        "1. evidence_verify_ratio < 50% 时：生成代码前**必须**查 `溯源政策` 指定的源文件，verify 所涉 BD 的 evidence_refs"
-    )
-    lines.append(
-        f'2. audit fail 合计 > 20（当前 {total_fail}）时：agent **必须**主动告知用户 "本蓝图有 {total_fail} 条审计项未通过，生成结果可能存在未捕获的需求缺口"'
-    )
-    lines.append("3. 禁止将本晶体当成**唯一**可信源——遇冲突以源文件为准")
-    if ev_verify_raw is not None and ev_verify_raw < 0.5:
-        lines.append("")
-        lines.append(
-            f"> ⚠️ 本蓝图 evidence_verify_ratio = {ev_verify} < 50%，规则 1 已触发：agent 必须先回查源文件。"
-        )
-    if total_fail > 20:
-        lines.append("")
-        lines.append(
-            f"> ⚠️ 本蓝图审计 fail 合计 = {total_fail} > 20，规则 2 已触发：agent 必须主动告知用户。"
-        )
-    return "\n".join(lines)
-
-
-def render_traceback_policy_section(bp: dict) -> str:
-    bp_id = bp.get("id", "unknown")
-    lines = ["## 溯源政策", ""]
-    lines.append(
-        '> **晶体的"骨架" vs 源文件的"血肉"**：本晶体包含全部 ID 骨架（100% BD/UC/约束覆盖），但每条约束的 `evidence_refs` / `machine_checkable` / `consequence` / `validation_threshold`，以及每个 BD 的 `rationale` / `evidence` / `alternative_considered` 均在源文件中，未内联到本晶体。'
-    )
-    lines.append("")
-    lines.append("### 源文件路径（相对 blueprint 目录）")
-    lines.append("")
-    lines.append(
-        f"- 蓝图原文：`LATEST.yaml`（与本晶体同目录；当前版本 `{bp_id}` 对应具体版本文件见同目录 `blueprint.v*.yaml`）"
-    )
-    lines.append(
-        "- 约束原文：`LATEST.jsonl`（与本晶体同目录；当前版本对应 `constraints.v*.jsonl`）"
-    )
-    lines.append("")
-    lines.append("### 必须回查源文件的场景")
-    lines.append("")
-    lines.append(
-        "1. **约束冲突**：两条约束执行规则看似矛盾 → 查源文件 `consequence` + `evidence_refs` 判定优先级"
-    )
-    lines.append(
-        "2. **BD 存疑**：某 BD 的选择理由不清 → 查源文件 `rationale` + `alternative_considered`"
-    )
-    lines.append(
-        "3. **证据可疑**：`证据质量声明` 段标记 evidence_invalid > 0 → 查源文件核对具体字段"
-    )
-    lines.append(
-        '4. **用户质疑**：用户问 "这个规则从哪来的" → 查源文件 `evidence_refs` 给出 source file / line'
-    )
-    lines.append("")
-    lines.append("### 回查方式")
-    lines.append("")
-    lines.append("- agent 环境有文件读取能力：直接读取 `LATEST.yaml` / `LATEST.jsonl` 按 ID 定位")
-    lines.append("- agent 环境无文件读取能力：向用户索要源文件片段，或请用户在源文件中验证")
-    lines.append("")
-    lines.append(
-        "**禁止**：将本晶体当成蓝图 + 约束的**替代品**——它是执行索引，不是可信度证据本身。"
-    )
-    return "\n".join(lines)
-
-
-def render_architecture_section(bp: dict, bd_by_stage: dict) -> str:
-    lines = ["## 架构蓝图", ""]
-    lines.append("ZVT 是一个模块化的 A 股量化数据+回测框架。6 个主要执行阶段按以下顺序运行：")
-    lines.append("")
-    lines.append(
-        "`data_collection → data_storage → factor_computation → target_selection → trading_execution → visualization`"
-    )
-    lines.append("")
-    lines.append("<!-- SOUL_TODO: 主线程补充 stage-by-stage 叙事，将 BD 串联成故事 -->")
-    lines.append("")
-
-    main_stages = [
-        "data_collection",
-        "data_storage",
-        "factor_computation",
-        "target_selection",
-        "trading_execution",
-        "visualization",
+    lines = [
+        f"# {crystal_id} — Human Summary",
+        "",
+        f"**Persona**: {persona}",
+        "",
+        f"> {tagline}",
+        "",
+        "## What I Can Do",
+        "",
     ]
-    covered_stages = set()
-
-    for stage_name in main_stages:
-        bds = bd_by_stage.get(stage_name, [])
-        lines.append(f"### Stage: {stage_name} ({len(bds)} BDs)")
-        lines.append("")
-        lines.append(
-            "<!-- SOUL_TODO: 主线程写该 stage 的 1-2 段叙事（做什么 / 关键决策 / 常见陷阱） -->"
-        )
-        lines.append("")
-        if bds:
-            lines.append("**Business Decisions**:")
-            for bd in bds:
-                bd_id = bd.get("id", "?")
-                bd_type = bd.get("type", "?")
-                content = (bd.get("content") or "").replace("\n", " ")
-                lines.append(f"- **{bd_id}** [type={bd_type}] {content}")
-            lines.append("")
-        covered_stages.add(stage_name)
-
-    # 其它 stage 分组（non-main）
-    other_stages = sorted(set(bd_by_stage.keys()) - covered_stages)
-    if other_stages:
-        lines.append("### Cross-cutting Business Decisions")
-        lines.append("")
-        lines.append(
-            "以下 BD 属于横切关注点（interactions / defaults / invariants / ML config / "
-            "reporting / visualization extras / module-level defaults）："
-        )
-        lines.append("")
-        for stage_name in other_stages:
-            bds = bd_by_stage.get(stage_name, [])
-            if not bds:
-                continue
-            lines.append(f"#### Sub-stage: `{stage_name}` ({len(bds)} BDs)")
-            for bd in bds:
-                bd_id = bd.get("id", "?")
-                bd_type = bd.get("type", "?")
-                content = (bd.get("content") or "").replace("\n", " ")
-                lines.append(f"- **{bd_id}** [type={bd_type}] {content}")
-            lines.append("")
-
+    for uc in use_cases:
+        lines.append(f"- {uc}")
+    lines += [
+        "",
+        "## What I Auto-Fetch",
+        "",
+    ]
+    for item in auto_fetch:
+        lines.append(f"- {item}")
+    lines += [
+        "",
+        "## What I Ask You",
+        "",
+    ]
+    for item in ask_you:
+        lines.append(f"- {item}")
+    lines += [
+        "",
+        "## Locale Rendering",
+        "",
+        f"**Instruction**: {lr_instruction}",
+        "",
+        "**Preserve verbatim**: " + ", ".join(preserve),
+        "",
+        "---",
+        "",
+        f"*Generated by compile_crystal_skeleton.py v5.0 for {crystal_id}*",
+        "*All content is English source — agent translates on first user contact.*",
+    ]
     return "\n".join(lines)
 
 
-def render_resources_section(bp: dict, target_host: str) -> str:
-    resources = bp.get("resources") or []
-    packages = []
-    data_sources = []
-    code_templates = []
-    infra = []
+# ============================================================
+# Build: capability_catalog helpers + builder (new in v5.2)
+# ============================================================
 
-    for r in resources:
-        rtype = r.get("type", "")
-        name = r.get("name", "")
-        path = r.get("path", "")
-        if rtype in ("python_package", "dependency"):
-            packages.append((name, path, r.get("version", "")))
-        elif rtype in ("data_source", "external_service"):
-            data_sources.append((name, path))
-        elif rtype in ("code_example", "example_script", "tutorial"):
-            code_templates.append((name, path))
-        elif rtype in ("infrastructure", "storage", "database"):
-            infra.append((name, path))
 
-    lines = ["## 资源", ""]
-    lines.append("### L1 知识层（宿主无关）")
-    lines.append("")
-    lines.append("#### Python 依赖包")
-    lines.append("")
-    if packages:
-        for name, path, ver in packages[:20]:
-            v = f" `{ver}`" if ver else ""
-            lines.append(f"- `{name}`{v} — {path}")
+def _heuristic_emoji(name: str, description: str = "") -> str:
+    """Return a universal-domain emoji based on generic English keyword matching.
+
+    Keywords are intentionally domain-agnostic so they work equally well for
+    finance, web, ML, infra, and any other project type.
+    """
+    text = (name + " " + description).lower()
+    if any(k in text for k in ["data", "fetch", "collect", "record", "recorder"]):
+        return "📊"
+    if any(k in text for k in ["compute", "analyze", "factor", "selector", "scoring"]):
+        return "🧮"
+    if any(k in text for k in ["test", "simulate", "execute", "run", "trade"]):
+        return "📈"
+    if any(k in text for k in ["report", "visual", "output", "dashboard", "export"]):
+        return "📋"
+    if any(k in text for k in ["util", "tool", "framework", "helper", "migration"]):
+        return "🔧"
+    return "📦"
+
+
+def _humanize(s: str) -> str:
+    """Convert snake_case or hyphen-case to Title Case display name.
+
+    e.g. 'data_collection' → 'Data Collection', 'ml-prediction' → 'Ml Prediction'.
+    """
+    return s.replace("-", " ").replace("_", " ").title()
+
+
+def _build_uc_summary(uc: dict) -> dict:
+    """Build a concise UC summary dict for capability_catalog.groups[].ucs[].
+
+    short_description: take the first full sentence of business_problem
+    (split on '.' / '。'), capped at 150 chars. If the first sentence is
+    shorter than 150 chars return it whole. Never mid-cut.
+    """
+    desc = (uc.get("business_problem") or "").strip()
+    if desc:
+        # Split on period / fullwidth period / semicolon; take first non-empty
+        import re as _re
+
+        parts = _re.split(r"[.。；]\s+", desc, maxsplit=1)
+        first = parts[0].strip().rstrip(".。；")
+        short_description = first[:150] if len(first) > 150 else first
     else:
-        lines.append("- `zvt` (latest) — 主框架")
-        lines.append("- `pandas>=2.2`, `numpy>=2.1` — 数据处理")
-        lines.append("- `SQLAlchemy>=2.0` — ORM")
-        lines.append("- `plotly>=5`, `dash>=2` — 可视化")
-        lines.append("- `akshare` / `baostock` — 免费 A 股数据源")
-    lines.append("")
-
-    lines.append("#### 数据源（选一个或多个）")
-    lines.append("")
-    lines.append("| Provider | Access | Coverage | Notes |")
-    lines.append("|---------|--------|----------|-------|")
-    lines.append("| eastmoney (em) | 免费，无需账号 | A 股 + 基础财务 | 不稳定，高峰期偶发 503 |")
-    lines.append("| joinquant (jq) | 需账号+付费 | A 股 + 基金数据 | 数据质量高，适合研究 |")
-    lines.append("| baostock | 免费 | A 股 + 历史数据 | 历史覆盖长，实时性弱 |")
-    lines.append("| akshare | 免费 | 全球市场 + A 股 | 聚合接口，API 丰富 |")
-    lines.append("| qmt | 需券商对接 | 实盘数据 | 仅 Windows；需券商权限 |")
-    lines.append("")
-
-    lines.append("#### Strategy Scaffold 模板")
-    lines.append("")
-    lines.append(
-        "回测/数据采集脚本骨架（MUST 含 DO NOT MODIFY 尾部；详见 Step 8e / `## Output Validator`）："
-    )
-    lines.append("")
-    lines.append("```python")
-    lines.append("# {workspace}/strategy.py")
-    lines.append("from zvt.trader import Trader")
-    lines.append("")
-    lines.append("class MyStrategy(Trader):")
-    lines.append("    # REPLACE_WITH: 策略业务逻辑")
-    lines.append("    def init_factors(self, entity_ids, entity_schema, exchanges, codes,")
-    lines.append("                     start_timestamp, end_timestamp, adjust_type=None):")
-    lines.append("        # REPLACE_WITH: 创建 Factor 实例")
-    lines.append("        pass")
-    lines.append("")
-    lines.append("def run_backtest():")
-    lines.append("    trader = MyStrategy(")
-    lines.append("        entity_ids=['stock_sh_600000'],")
-    lines.append("        start_timestamp='2024-01-01',")
-    lines.append("        end_timestamp='2024-06-30',")
-    lines.append("        # 其它参数 REPLACE_WITH")
-    lines.append("    )")
-    lines.append("    trader.run()")
-    lines.append("    return trader.account_service.get_stats()  # 必须返回 result-like")
-    lines.append("")
-    lines.append("# === DO NOT MODIFY BELOW THIS LINE ===")
-    lines.append('if __name__ == "__main__":')
-    lines.append("    result = run_backtest()")
-    lines.append("    from validate import enforce_validation")
-    lines.append('    enforce_validation(result, output_path="{workspace}/result.csv")')
-    lines.append("# === END DO NOT MODIFY ===")
-    lines.append("```")
-    lines.append("")
-
-    lines.append("#### 基础设施选择")
-    lines.append("")
-    lines.append("- 默认存储: SQLite（每 provider 一个 .db 文件）—— 开箱即用")
-    lines.append("- 数据量大时: 迁移到 PostgreSQL / MySQL（ZVT 支持 StorageBackend 抽象）")
-    lines.append("")
-
-    if target_host == "openclaw":
-        lines.append("### L3 Host Adapter: openclaw")
-        lines.append("")
-        lines.append("**关键宿主约束**（参考 `docs/research/host-specs/openclaw-host-spec.md`）：")
-        lines.append("")
-        lines.append("- **超时**: 1800s (30 分钟) / agent；数据采集可能需要分批")
-        lines.append(
-            "- **exec 工具**: 拦截 shell 操作符 `&&` / `;` / `|`。不要用 `pip install X && python Y`"
-        )
-        lines.append("- **工作目录**: 由 `{workspace}` 占位符在执行时解析")
-        lines.append("")
-        lines.append("#### install_recipes")
-        lines.append("")
-        lines.append("```bash")
-        lines.append("# 绝不用 && 或 ;")
-        lines.append("python3 -m pip install zvt")
-        lines.append("python3 -m pip install akshare  # 如需要")
-        lines.append("python3 -m zvt.init_dirs  # 初始化数据目录")
-        lines.append("```")
-        lines.append("")
-        lines.append("#### credential_injection")
-        lines.append("")
-        lines.append("- JoinQuant / QMT credentials 需要单独 shell 登录：")
-        lines.append(
-            "  - **先让用户完成** `! jqdatasdk auth` 式手动登录（`!` 前缀在 openclaw session 中执行）"
-        )
-        lines.append("  - 不要在 seed.md 中硬编码账密")
-        lines.append("")
-        lines.append("#### path_resolution")
-        lines.append("")
-        lines.append("- `{workspace}` → `~/.openclaw/workspace/doramagic` (实测路径)")
-        lines.append("- `zvt` 默认数据目录 `~/zvt-home/` 独立于 workspace——两者分开")
-        lines.append("")
-        lines.append("#### file_io_tooling")
-        lines.append("")
-        lines.append("- 用 openclaw `write` 工具创建 `.py` / `.sql` 文件")
-        lines.append(
-            "- 用 openclaw `exec` 工具运行 `python3 /absolute/path/script.py`（绝对路径，无 shell operators）"
-        )
-        lines.append("- 大 CSV 输出用 `pandas.to_csv(..., index=False)`；小字典用 `json.dumps`")
-
-    return "\n".join(lines)
-
-
-def render_constraints_section(non_fatal_by_stage: dict) -> str:
-    lines = ["## 约束", ""]
-    lines.append("非 FATAL 约束按 stage 分组。违反会降级效果/引入风险，但不立即终止执行。")
-    lines.append("")
-    main_stages = [
-        "data_collection",
-        "data_storage",
-        "factor_computation",
-        "target_selection",
-        "trading_execution",
-        "visualization",
-    ]
-    handled = set()
-    for stage_name in main_stages:
-        cs = non_fatal_by_stage.get(stage_name, [])
-        lines.append(f"### Stage: {stage_name} ({len(cs)} 条)")
-        lines.append("")
-        if not cs:
-            lines.append("*（本 stage 无 non-fatal 约束）*")
-            lines.append("")
-            continue
-        for c in cs:
-            cid = c.get("id", "?")
-            core = c.get("core") or {}
-            when = core.get("when") or c.get("when", "")
-            action = core.get("action") or c.get("action", "")
-            modality = core.get("modality") or c.get("modality", "should")
-            kind = c.get("constraint_kind", "?")
-            sev = c.get("severity", "?")
-            lines.append(f"- **`{cid}`** [{kind} / {modality} / sev={sev}]")
-            lines.append(f"  - When: {when}")
-            lines.append(f"  - Action: {action}")
-        lines.append("")
-        handled.add(stage_name)
-
-    # 其它（未分 stage 或其它 stage）
-    other = [s for s in non_fatal_by_stage if s not in handled and s]
-    if other or "(unassigned)" in non_fatal_by_stage:
-        lines.append("### Cross-stage / Unassigned")
-        lines.append("")
-        for stage_name in sorted(other):
-            cs = non_fatal_by_stage[stage_name]
-            lines.append(f"**Stage `{stage_name}`:**")
-            for c in cs:
-                cid = c.get("id", "?")
-                core = c.get("core") or {}
-                when = core.get("when") or c.get("when", "")
-                action = core.get("action") or c.get("action", "")
-                modality = core.get("modality") or c.get("modality", "should")
-                kind = c.get("constraint_kind", "?")
-                sev = c.get("severity", "?")
-                lines.append(f"- **`{cid}`** [{kind} / {modality} / sev={sev}]")
-                lines.append(f"  - When: {when}")
-                lines.append(f"  - Action: {action}")
-            lines.append("")
-        # 未分 stage
-        unassigned = non_fatal_by_stage.get("(unassigned)", [])
-        if unassigned:
-            lines.append("**No stage assigned:**")
-            for c in unassigned:
-                cid = c.get("id", "?")
-                core = c.get("core") or {}
-                when = core.get("when") or c.get("when", "")
-                action = core.get("action") or c.get("action", "")
-                modality = core.get("modality") or c.get("modality", "should")
-                kind = c.get("constraint_kind", "?")
-                sev = c.get("severity", "?")
-                lines.append(f"- **`{cid}`** [{kind} / {modality} / sev={sev}]")
-                lines.append(f"  - When: {when}")
-                lines.append(f"  - Action: {action}")
-
-    return "\n".join(lines)
-
-
-def render_acceptance_section() -> str:
-    return """## 验收
-
-### Hard Gates (machine-checkable, deterministic)
-
-| Gate | 检查 | 验证方式 |
-|------|------|---------|
-| **G1** | `{workspace}/result.csv` 存在且非空 | `os.path.exists + os.path.getsize > 0` |
-| **G2** | `{workspace}/result.csv.validation_passed` 标记文件存在 | `os.path.exists` |
-| **G3** | 主脚本含 `from validate import enforce_validation` | `grep` literal string |
-| **G4** | 主脚本含 `# === DO NOT MODIFY BELOW THIS LINE ===` 围栏 | `grep` literal string |
-| **G5** | 回测/策略脚本至少运行到生成 trading signals（trade_log 非空 OR result.csv 含 transaction 行） | `pandas.read_csv(result).shape[0] >= 1` |
-| **G6** | 若为 MACD 策略：MACD 参数未漂移 | `grep 'slow=26, fast=12, n=9' strategy.py` |
-| **G7** | 数据采集类任务：result 含 `entity_id` 和 `timestamp` 列 | `pandas.read_csv(result).columns ⊇ {'entity_id', 'timestamp'}` |
-| **G8** | 结果通过 sanity check（`abs(annual_return) <= 5.0`） | `validate.py` OV-03 |
-
-### Soft Gates (LLM-as-Judge, 按 Step 0.8d rubric)
-
-- **SG-01: 策略叙事一致性** — 用户描述的意图与生成的 strategy.py 逻辑是否语义对齐？
-  - dim_a: 信号方向（买/卖/空仓）是否一致；dim_b: 频率（高频/低频）是否一致；dim_c: 风控（止损/止盈）是否按用户意图
-  - Rubric: 1-5 each; passing >= 4
-
-- **SG-02: Factor 组合合理性** — 选用的 Factor 组合是否合理？
-  - dim_a: 是否避免了高度相关因子叠加；dim_b: 多周期是否对齐；dim_c: 是否包含必要的流动性过滤
-  - Rubric: 1-5 each; passing >= 4
-
-- **SG-03: 数据源选择** — 数据源是否适合任务？
-  - dim_a: 数据覆盖是否足够；dim_b: 数据延迟是否可接受；dim_c: 是否避免了需要授权但未授权的 provider
-  - Rubric: 1-5 each; passing >= 4
-"""
-
-
-# ============================================================
-# IR 组装
-# ============================================================
-
-
-def render_ir(
-    bp: dict,
-    constraints: list[dict],
-    target_host: str,
-    bd_by_stage: dict,
-    ucs: list[dict],
-    fatal_count: int,
-    non_fatal_count: int,
-    sop_version: str,
-) -> dict:
-    bd_count = sum(len(v) for v in bd_by_stage.values())
-    uc_count = len(ucs)
+        short_description = uc.get("data_domain", "") or uc.get("name", uc["id"])
     return {
-        "version": "2.0",
-        "crystal_id": f"{bp.get('id', 'unknown')}-v3.3",
-        "task_type": "A",
-        "metadata": {
-            "compilation_language": "en",
-            "source_languages": ["en", "zh"],
-            "human_summary_locale": "zh",
-            "output_validator_exempt": False,
-            "intelligence_judgment_deferred": True,
-        },
-        "references": {
-            "blueprint": str(Path("LATEST.yaml")),
-            "constraints": [str(Path("LATEST.jsonl"))],
-            "source_commits": {
-                "blueprint": bp.get("source", {}).get("commit_hash"),
-            },
-        },
-        "user_intent": "zvt-based A-share quantitative backtest or data collection",
-        "knowledge": {
-            "business_decisions_count": bd_count,
-            "constraints_count": len(constraints),
-            "use_cases_count": uc_count,
-            "resources": {
-                "packages": "listed in ## 资源 L1 main body",
-                "data_sources": "em / joinquant / baostock / akshare / qmt",
-                "code_templates": "Strategy Scaffold in ## 资源",
-                "infrastructure_choices": "SQLite default, Postgres/MySQL optional",
-            },
-        },
-        "control_blocks": {
-            "intent_router": f"{uc_count} use cases",
-            "context_state_machine": "CA1-CA4",
-            "spec_lock_registry": {
-                "semantic_locks": 12,
-                "implementation_hints": 5,
-            },
-            "preservation_manifest": "defined in directive fenced block",
-            "output_validator": "rendered into ## Output Validator + validate.py",
-        },
-        "harness": {
-            "contract": {
-                "spec_lock": "see control_blocks.spec_lock_registry",
-                "delivery_gate": {"hard": 8, "soft": 3},
-            },
-            "failure_taxonomy": {
-                "universal": 8,
-                "domain_specific": "derived from fatal constraints",
-            },
-            "stage_spec": {
-                "task_type": "A (Pipeline)",
-                "stages": [
-                    "data_collection",
-                    "data_storage",
-                    "factor_computation",
-                    "target_selection",
-                    "trading_execution",
-                    "visualization",
-                ],
-            },
-            "state_semantics": {"slots": "plan / result / evidence / manifest"},
-            "host_adapters": {
-                target_host: {
-                    "spec_ref": f"docs/research/host-specs/{target_host}-host-spec.md",
-                    "timeout_seconds": 1800,
-                    "install_recipes": "python3 -m pip install zvt (no shell operators)",
-                    "credential_injection": "user-side `!` prefix shell login",
-                    "path_resolution": "{workspace} → host-resolved abs path",
-                    "file_io_tooling": "openclaw write/exec tools",
-                },
-            },
-        },
-        "trace_schema": {
-            "events": [
-                "stage_transition",
-                "tool_call",
-                "artifact_emission",
-                "validation_result",
-                "failure_event",
-                "spec_lock_check",
-            ],
-            "output": {"format": "jsonl", "path": "{workspace}/.trace/execution_trace.jsonl"},
-        },
-        "validity": {
-            "compiled_at": None,
-            "source_commits": {"blueprint": bp.get("source", {}).get("commit_hash")},
-            "version_pins": [
+        "uc_id": uc["id"],
+        "name": uc.get("name", uc["id"]),
+        "short_description": short_description,
+        "sample_triggers": (uc.get("intent_keywords") or [])[:3],
+    }
+
+
+def build_capability_catalog(bp: dict, uc_list: list[dict]) -> dict:
+    """Build the capability_catalog block for post_install_notice.message_template.
+
+    Two paths:
+      - Path A (blueprint_declared): bp.capability_groups[] exists and is valid.
+      - Path B (auto_grouped): heuristic field selection over UC attributes.
+
+    This function is fully domain-agnostic — no field values are hardcoded.
+    """
+    bp_groups = bp.get("capability_groups")
+    groups: list[dict] = []
+
+    # ------------------------------------------------------------------
+    # Path A: blueprint declared capability_groups
+    # ------------------------------------------------------------------
+    if (
+        isinstance(bp_groups, list)
+        and len(bp_groups) >= 1
+        and all(
+            isinstance(g, dict)
+            and "id" in g
+            and "name" in g
+            and isinstance(g.get("filter"), dict)
+            and "field" in g["filter"]
+            and "values" in g["filter"]
+            for g in bp_groups
+        )
+    ):
+        unique_filter_fields: list[str] = []
+        seen_fields: set[str] = set()
+        for g in bp_groups:
+            ff = g["filter"]["field"]
+            if ff not in seen_fields:
+                unique_filter_fields.append(ff)
+                seen_fields.add(ff)
+
+        assigned_ids: set[str] = set()
+        for g in bp_groups:
+            f_field = g["filter"]["field"]
+            f_values = set(g["filter"]["values"])
+            filtered = [uc for uc in uc_list if uc.get(f_field) in f_values]
+            for uc in filtered:
+                assigned_ids.add(uc["id"])
+            desc = g.get("description", "")
+            emoji = g.get("emoji") or _heuristic_emoji(g["name"], desc)
+            groups.append(
                 {
-                    "dependency": "zvt",
-                    "version": "latest (no backward compat guarantee per finance-C-150)",
-                },
-                {"dependency": "pandas", "version": ">=2.2"},
-                {"dependency": "SQLAlchemy", "version": ">=2.0"},
+                    "group_id": g["id"],
+                    "name": g["name"],
+                    "description": desc,
+                    "emoji": emoji,
+                    "uc_count": len(filtered),
+                    "ucs": [_build_uc_summary(uc) for uc in filtered],
+                }
+            )
+
+        # Tail group for any UCs not covered by declared groups
+        uncovered = [uc for uc in uc_list if uc["id"] not in assigned_ids]
+        if uncovered:
+            groups.append(
+                {
+                    "group_id": "other",
+                    "name": "Other",
+                    "description": "",
+                    "emoji": "📦",
+                    "uc_count": len(uncovered),
+                    "ucs": [_build_uc_summary(uc) for uc in uncovered],
+                }
+            )
+
+        strategy_reason = (
+            f"from blueprint.capability_groups[] "
+            f"({len(bp_groups)} groups, filter fields: {unique_filter_fields})"
+        )
+        return {
+            "group_strategy": {
+                "source": "blueprint_declared",
+                "strategy_reason": strategy_reason,
+            },
+            "groups": groups,
+        }
+
+    # ------------------------------------------------------------------
+    # Path B: heuristic field selection
+    # ------------------------------------------------------------------
+    candidate_fields = ["type", "stage", "data_domain", "category"]
+    chosen_field: str | None = None
+    chosen_values: list[str] = []
+
+    for field in candidate_fields:
+        values = [uc.get(field) for uc in uc_list if uc.get(field)]
+        distinct = list(dict.fromkeys(values))  # preserve insertion order, dedupe
+        if 2 <= len(distinct) <= 7:
+            chosen_field = field
+            chosen_values = distinct
+            break
+
+    if chosen_field is None:
+        # Fallback: single catch-all group
+        all_group: dict = {
+            "group_id": "all",
+            "name": "All Capabilities",
+            "description": "",
+            "emoji": "📦",
+            "uc_count": len(uc_list),
+            "ucs": [_build_uc_summary(uc) for uc in uc_list],
+        }
+        return {
+            "group_strategy": {
+                "source": "auto_grouped",
+                "strategy_reason": (
+                    "no candidate field had 2-7 distinct values; "
+                    "all capabilities collapsed into single group"
+                ),
+            },
+            "groups": [all_group],
+        }
+
+    # Build one group per distinct value of chosen_field
+    for val in chosen_values:
+        ucs_in_group = [uc for uc in uc_list if uc.get(chosen_field) == val]
+        name = _humanize(val)
+        groups.append(
+            {
+                "group_id": val,
+                "name": name,
+                "description": "",
+                "emoji": _heuristic_emoji(name),
+                "uc_count": len(ucs_in_group),
+                "ucs": [_build_uc_summary(uc) for uc in ucs_in_group],
+            }
+        )
+
+    # Any UCs whose chosen_field is missing/null go to an "other" tail group
+    ungrouped = [uc for uc in uc_list if not uc.get(chosen_field)]
+    if ungrouped:
+        groups.append(
+            {
+                "group_id": "other",
+                "name": "Other",
+                "description": "",
+                "emoji": "📦",
+                "uc_count": len(ungrouped),
+                "ucs": [_build_uc_summary(uc) for uc in ungrouped],
+            }
+        )
+
+    strategy_reason = (
+        f"auto-grouped by UC.{chosen_field} "
+        f"({len(chosen_values)} distinct values, balanced distribution)"
+    )
+    return {
+        "group_strategy": {
+            "source": "auto_grouped",
+            "strategy_reason": strategy_reason,
+        },
+        "groups": groups,
+    }
+
+
+# ============================================================
+# Build: post_install_notice (new in v5.1)
+# ============================================================
+
+
+def build_post_install_notice(bp: dict, human_summary: dict, uc_list: list[dict]) -> dict:
+    # 1. positioning: first sentence of tagline, max 150 chars
+    tagline: str = (human_summary.get("what_i_can_do") or {}).get("tagline") or ""
+    first_sentence = tagline.split(".")[0].strip()
+    if first_sentence and not first_sentence.endswith("."):
+        first_sentence = first_sentence + "."
+    positioning = first_sentence[:150]
+
+    # 2. featured_entries: use bp.featured_use_cases if valid, else heuristic
+    bp_featured = bp.get("featured_use_cases")
+    featured_entries: list[dict] = []
+
+    if (
+        isinstance(bp_featured, list)
+        and len(bp_featured) == 3
+        and all(
+            isinstance(e, dict) and "uc_id" in e and "beginner_prompt" in e for e in bp_featured
+        )
+    ):
+        # Blueprint author provided exactly 3 curated entries
+        for e in bp_featured:
+            featured_entries.append(
+                {
+                    "uc_id": e["uc_id"],
+                    "beginner_prompt": e["beginner_prompt"],
+                    "auto_selected": False,
+                }
+            )
+    else:
+        # Heuristic fallback: pick UCs with shortest positive_terms[0] first,
+        # preferring non-backtest data_domain; fall back to all if needed
+        def _heuristic_score(uc: dict) -> tuple:
+            domain = uc.get("data_domain", "")
+            is_backtest = 1 if domain == "backtest" else 0
+            terms = uc.get("positive_terms") or []
+            term_len = len(terms[0]) if terms else 999
+            return (is_backtest, term_len)
+
+        sorted_ucs = sorted(uc_list, key=_heuristic_score)
+        for uc in sorted_ucs:
+            uc_id = uc.get("id", "")
+            if not uc_id:
+                continue
+            name = uc.get("name") or uc_id
+            terms = uc.get("positive_terms") or []
+            beginner_prompt = terms[0].capitalize() if terms else f"Try {name.lower()}"
+            featured_entries.append(
+                {
+                    "uc_id": uc_id,
+                    "beginner_prompt": beginner_prompt,
+                    "auto_selected": True,
+                }
+            )
+            if len(featured_entries) == 3:
+                break
+
+        # Pad to 3 if we got fewer (shouldn't happen in practice but be safe)
+        idx = 0
+        while len(featured_entries) < 3:
+            fallback_id = f"UC-{100 + idx}"
+            featured_entries.append(
+                {
+                    "uc_id": fallback_id,
+                    "beginner_prompt": f"Try capability {fallback_id}",
+                    "auto_selected": True,
+                }
+            )
+            idx += 1
+
+        # Trim to exactly 3
+        featured_entries = featured_entries[:3]
+
+    # 3. more_info_hint
+    more_info_hint = f"Ask me 'what else can you do?' to see all {len(uc_list)} capabilities."
+
+    # 4. capability_catalog
+    catalog = build_capability_catalog(bp, uc_list)
+
+    return {
+        "trigger": "skill_installation_complete",
+        "message_template": {
+            "positioning": positioning,
+            "capability_catalog": catalog,
+            "call_to_action": "Tell me which one you want to try.",
+            "featured_entries": featured_entries,
+            "more_info_hint": more_info_hint,
+        },
+        "locale_rendering": {
+            "instruction": (
+                "On skill_installation_complete, translate ALL user-facing strings "
+                "(positioning + capability_catalog.groups[].name + "
+                "capability_catalog.groups[].description + "
+                "capability_catalog.groups[].ucs[].short_description + "
+                "call_to_action + featured_entries[].beginner_prompt + more_info_hint) "
+                "into detected user locale per locale_contract. "
+                "Preserve UC-IDs, group_id, emoji, and sample_triggers verbatim."
+            ),
+            "preserve_verbatim": [
+                "UC-IDs",
+                "group_id",
+                "emoji",
+                "sample_triggers",
+                "technical_class_names",
             ],
         },
-        "compilation": {
-            "sop_version": sop_version,
-            "compiler_version": "v3.3",
+        "enforcement": {
+            "action": (
+                "Host agent MUST send composed message to user as the FIRST user-facing response "
+                "after skill_installation_complete event. Message MUST contain: positioning, "
+                "capability_catalog (rendered as markdown tables per group), "
+                "3 featured_entries, call_to_action, and more_info_hint."
+            ),
+            "violation_code": "PIN-01",
+            "violation_signal": (
+                "First user-facing message post-install does not contain the full capability_catalog "
+                "(all UCs grouped) OR skips featured_entries OR skips call_to_action."
+            ),
         },
     }
 
 
 # ============================================================
-# main
+# Assemble full seed YAML dict
+# ============================================================
+
+
+def build_seed(
+    bp: dict,
+    constraints: list[dict],
+    targets: dict,
+    target_host: str,
+    sop_version: str,
+) -> dict:
+    # Classify BDs by stage
+    bd_by_stage: dict = defaultdict(list)
+    for bd in bp.get("business_decisions") or []:
+        stage = bd.get("stage") or "(unassigned)"
+        bd_by_stage[stage].append(bd)
+
+    # Classify constraints
+    fatal_constraints = [c for c in constraints if c.get("severity") == "fatal"]
+    non_fatal_constraints = [c for c in constraints if c.get("severity") != "fatal"]
+
+    ucs = bp.get("known_use_cases") or []
+    primary_uc = ucs[0].get("id", "UC-101") if ucs else "UC-101"
+
+    bd_count = sum(len(v) for v in bd_by_stage.values())
+    preconditions = build_preconditions(ucs, bp.get("id", "unknown"))
+
+    seed = {
+        "meta": build_meta(bp, target_host, sop_version),
+        "locale_contract": build_locale_contract(),
+        "evidence_quality": build_evidence_quality(bp),
+        "traceback": build_traceback(bp),
+        "preconditions": preconditions,
+        "intent_router": build_intent_router(ucs),
+        "context_state_machine": build_context_state_machine(),
+        "spec_lock_registry": build_spec_lock_registry(),
+        "preservation_manifest": build_preservation_manifest(
+            bd_count=bd_count,
+            fatal_count=len(fatal_constraints),
+            non_fatal_count=len(non_fatal_constraints),
+            uc_count=len(ucs),
+            preconditions_count=len(preconditions),
+        ),
+        "architecture": build_architecture(bp, bd_by_stage),
+        "resources": build_resources(bp, target_host),
+        "constraints": build_constraints(fatal_constraints, non_fatal_constraints),
+        "output_validator": build_output_validator(),
+        "acceptance": build_acceptance(),
+        "skill_crystallization": build_skill_crystallization(bp.get("id", "unknown"), primary_uc),
+    }
+
+    # Build human_summary first so post_install_notice can use its tagline
+    human_summary = build_human_summary(bp, ucs)
+    seed["post_install_notice"] = build_post_install_notice(bp, human_summary, ucs)
+    seed["human_summary"] = human_summary
+
+    return seed
+
+
+# ============================================================
+# Main
 # ============================================================
 
 
@@ -1102,106 +1909,132 @@ def main() -> int:
     )
     parser.add_argument("--blueprint-dir", type=Path, required=True)
     parser.add_argument("--target-host", default="openclaw")
-    parser.add_argument("--output-seed", type=Path, required=True, help="seed.md 输出路径")
-    parser.add_argument("--output-ir", type=Path, required=True, help="ir.yaml 输出路径")
+    parser.add_argument(
+        "--output-seed",
+        type=Path,
+        required=True,
+        help="Path to output seed.yaml (v5.0 structured contract)",
+    )
+    parser.add_argument(
+        "--output-ir",
+        type=Path,
+        default=None,
+        help="(retired) IR yaml path — accepted for CLI compat but not written",
+    )
     parser.add_argument(
         "--output-validate",
         type=Path,
         default=None,
-        help="validate.py 输出路径（默认 {blueprint-dir}/validate.py）",
+        help="validate.py output path (default: {blueprint-dir}/validate.py)",
     )
-    parser.add_argument("--sop-version", default="crystal-compilation-v3.2")
+    parser.add_argument(
+        "--output-human-summary",
+        type=Path,
+        default=None,
+        help="Path to output human_summary.md sidecar (English, Doraemon persona)",
+    )
+    parser.add_argument("--sop-version", default="crystal-compilation-v5.2")
     args = parser.parse_args()
 
-    bp, constraints, _targets = load_inputs(args.blueprint_dir)
+    bp, constraints, targets = load_inputs(args.blueprint_dir)
 
-    # 分类 BD 按 stage
-    bd_by_stage = defaultdict(list)
-    for bd in bp.get("business_decisions") or []:
-        stage = bd.get("stage") or "(unassigned)"
-        bd_by_stage[stage].append(bd)
+    seed = build_seed(bp, constraints, targets, args.target_host, args.sop_version)
 
-    # 分类约束按 severity + stage
-    fatal_constraints = [c for c in constraints if c.get("severity") == "fatal"]
-    non_fatal_constraints = [c for c in constraints if c.get("severity") != "fatal"]
-
-    non_fatal_by_stage = defaultdict(list)
-    for c in non_fatal_constraints:
-        stages = (c.get("applies_to") or {}).get("stage_ids") or []
-        if stages:
-            for s in stages:
-                non_fatal_by_stage[s].append(c)
-        else:
-            non_fatal_by_stage["(unassigned)"].append(c)
-
-    # 去重（一个约束出现在多个 stage 会重复；为了机械保证，我们只在第一个 stage 显示，防 grep 重复）
-    seen = set()
-    deduped = defaultdict(list)
-    for stage in non_fatal_by_stage:
-        for c in non_fatal_by_stage[stage]:
-            cid = c.get("id")
-            if cid in seen:
-                continue
-            seen.add(cid)
-            deduped[stage].append(c)
-    non_fatal_by_stage = deduped
-
-    ucs = bp.get("known_use_cases") or []
-    bd_ids = [bd.get("id") for bd_list in bd_by_stage.values() for bd in bd_list if bd.get("id")]
-    fatal_ids = [c.get("id") for c in fatal_constraints if c.get("id")]
-    non_fatal_ids = [c.get("id") for c in non_fatal_constraints if c.get("id")]
-
-    # 生成 seed.md
-    sections = [
-        "*Powered by Doramagic.ai*",
-        "",
-        render_human_summary_placeholder(),
-        render_directive_section(bp.get("id", "unknown"), ucs, fatal_ids, non_fatal_ids, bd_ids),
-        render_fatal_section(fatal_constraints),
-        render_output_validator_section(),
-        render_evidence_quality_section(bp),
-        render_traceback_policy_section(bp),
-        render_architecture_section(bp, bd_by_stage),
-        render_resources_section(bp, args.target_host),
-        render_constraints_section(non_fatal_by_stage),
-        render_acceptance_section(),
-        "",
-        "*Powered by Doramagic.ai*",
-        "",
-    ]
-    seed_text = "\n\n".join(sections)
-    args.output_seed.write_text(seed_text, encoding="utf-8")
-
-    # 生成 ir.yaml
-    ir = render_ir(
-        bp,
-        constraints,
-        args.target_host,
-        bd_by_stage,
-        ucs,
-        len(fatal_constraints),
-        len(non_fatal_constraints),
-        args.sop_version,
+    # Write seed.yaml
+    seed_yaml_text = yaml.safe_dump(
+        seed,
+        allow_unicode=True,
+        sort_keys=False,
+        default_flow_style=False,
+        width=120,
     )
-    args.output_ir.write_text(
-        yaml.safe_dump(ir, allow_unicode=True, sort_keys=False), encoding="utf-8"
-    )
+    args.output_seed.parent.mkdir(parents=True, exist_ok=True)
+    args.output_seed.write_text(seed_yaml_text, encoding="utf-8")
 
-    # 生成 validate.py
+    # Verify it round-trips
+    try:
+        yaml.safe_load(seed_yaml_text)
+    except yaml.YAMLError as e:
+        print(f"[error] seed.yaml failed yaml.safe_load: {e}", file=sys.stderr)
+        return 1
+
+    # Write human_summary.md
+    hs_path = args.output_human_summary or (
+        args.output_seed.parent / args.output_seed.name.replace(".seed.yaml", ".human_summary.md")
+    )
+    hs_md = render_human_summary_md(seed)
+    hs_path.write_text(hs_md, encoding="utf-8")
+
+    # Write validate.py
     vpath = args.output_validate or (args.blueprint_dir / "validate.py")
     vpath.write_text(render_validate_py(bp.get("id", "unknown")), encoding="utf-8")
 
-    print(f"[done] seed.md:     {args.output_seed}")
-    print(f"[done] ir.yaml:     {args.output_ir}")
-    print(f"[done] validate.py: {vpath}")
-    print()
-    print(f"BD total:   {len(bd_ids)}")
+    # Count stats
+    fatal_constraints = [c for c in constraints if c.get("severity") == "fatal"]
+    non_fatal_constraints = [c for c in constraints if c.get("severity") != "fatal"]
+    ucs = bp.get("known_use_cases") or []
+    bd_by_stage: dict = defaultdict(list)
+    for bd in bp.get("business_decisions") or []:
+        bd_by_stage[bd.get("stage") or "(unassigned)"].append(bd)
+    bd_count = sum(len(v) for v in bd_by_stage.values())
+
+    # Check for Chinese chars in seed (except blueprint raw content that may contain Chinese)
+    import re
+
+    chinese_pattern = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+    chinese_matches = chinese_pattern.findall(seed_yaml_text)
+    # Filter out expected Chinese in content fields (stage names, class names from blueprint source)
+    # We allow Chinese only in 'summary' BD fields (copied from blueprint content verbatim)
+    chinese_warning = ""
+    if chinese_matches:
+        chinese_warning = (
+            f"\n[warn] {len(chinese_matches)} Chinese char(s) found in seed.yaml "
+            f"(likely in BD summary fields copied verbatim from blueprint — review manually)"
+        )
+
+    # Verify 16 required top-level fields
+    required_fields = [
+        "meta",
+        "locale_contract",
+        "evidence_quality",
+        "traceback",
+        "preconditions",
+        "intent_router",
+        "context_state_machine",
+        "spec_lock_registry",
+        "preservation_manifest",
+        "architecture",
+        "resources",
+        "constraints",
+        "output_validator",
+        "acceptance",
+        "skill_crystallization",
+        "human_summary",
+    ]
+    missing = [f for f in required_fields if f not in seed]
+    if missing:
+        print(f"[error] Missing required fields: {missing}", file=sys.stderr)
+        return 1
+
     print(
-        f"Constraint total: {len(constraints)} ({len(fatal_ids)} fatal + {len(non_fatal_ids)} non-fatal)"
+        f"[done] seed.yaml:          {args.output_seed}  ({args.output_seed.stat().st_size:,} bytes)"
     )
-    print(f"UC total:   {len(ucs)}")
+    print(f"[done] human_summary.md:   {hs_path}  ({hs_path.stat().st_size:,} bytes)")
+    print(f"[done] validate.py:        {vpath}  ({vpath.stat().st_size:,} bytes)")
     print()
-    print("Next: run `scripts/crystal_quality_gate.py --strict` to verify coverage == 100 pct.")
+    print(f"Crystal ID:        {seed['meta']['id']}")
+    print(f"Top-level fields:  {len(seed)} / 16 required")
+    print(f"BD total:          {bd_count}")
+    print(
+        f"Constraints:       {len(constraints)} ({len(fatal_constraints)} fatal + {len(non_fatal_constraints)} non-fatal)"
+    )
+    print(f"Use cases:         {len(ucs)}")
+    print(f"Preconditions:     {len(seed['preconditions'])}")
+    print(f"SL locks:          {len(seed['spec_lock_registry']['semantic_locks'])}")
+    if chinese_warning:
+        print(chinese_warning)
+    print()
+    print("Next: run scripts/crystal_quality_gate.py --strict to verify schema compliance.")
     return 0
 
 

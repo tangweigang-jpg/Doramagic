@@ -161,8 +161,8 @@ sop-resume:
 .PHONY: crystal-prepare crystal-compile crystal-gate crystal-full crystal-clean
 
 CRYSTAL_BP_DIR = knowledge/sources/finance/$(BP)
-CRYSTAL_SEED = $(CRYSTAL_BP_DIR)/$(BP_ID)-$(VERSION).seed.md
-CRYSTAL_IR = $(CRYSTAL_BP_DIR)/$(BP_ID)-$(VERSION).ir.yaml
+CRYSTAL_SEED = $(CRYSTAL_BP_DIR)/$(BP_ID)-$(VERSION).seed.yaml
+CRYSTAL_HUMAN_SUMMARY = $(CRYSTAL_BP_DIR)/$(BP_ID)-$(VERSION).human_summary.md
 CRYSTAL_VALIDATE = $(CRYSTAL_BP_DIR)/validate.py
 
 # Derive blueprint ID from BP (strip the --suffix portion)
@@ -180,8 +180,9 @@ crystal-compile:
 		--blueprint-dir $(CRYSTAL_BP_DIR) \
 		--target-host $(or $(HOST),openclaw) \
 		--output-seed $(CRYSTAL_SEED) \
-		--output-ir $(CRYSTAL_IR) \
-		--output-validate $(CRYSTAL_VALIDATE)
+		--output-human-summary $(CRYSTAL_HUMAN_SUMMARY) \
+		--output-validate $(CRYSTAL_VALIDATE) \
+		--sop-version $(or $(SOP_VERSION),crystal-compilation-v5.2)
 
 crystal-gate:
 	@test -n "$(BP)" || (echo "Usage: make crystal-gate BP=finance-bp-009--zvt VERSION=v3.3" && exit 1)
@@ -190,6 +191,7 @@ crystal-gate:
 		--blueprint $(CRYSTAL_BP_DIR)/LATEST.yaml \
 		--constraints $(CRYSTAL_BP_DIR)/LATEST.jsonl \
 		--crystal $(CRYSTAL_SEED) \
+		--schema schemas/crystal_contract.schema.yaml \
 		--strict
 
 # One-shot: prepare → compile → gate
@@ -205,6 +207,6 @@ crystal-full: crystal-prepare crystal-compile crystal-gate
 
 crystal-clean:
 	@test -n "$(BP)" || (echo "Usage: make crystal-clean BP=finance-bp-009--zvt VERSION=v3.3" && exit 1)
-	rm -f $(CRYSTAL_SEED) $(CRYSTAL_IR) $(CRYSTAL_SEED:.seed.md=.seed.quality_report.json)
+	rm -f $(CRYSTAL_SEED) $(CRYSTAL_HUMAN_SUMMARY) $(CRYSTAL_SEED:.seed.yaml=.seed.quality_report.json)
 	rm -rf $(CRYSTAL_BP_DIR)/crystal_inputs
 	@echo "Cleaned $(BP) $(VERSION) crystal artifacts"
