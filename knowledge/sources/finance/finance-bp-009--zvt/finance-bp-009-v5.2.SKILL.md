@@ -174,7 +174,7 @@ Each assertion has a business_meaning; purely structural checks are forbidden:
 
 After all Hard Gates pass, agent MUST emit `.skill` to `{workspace}/../skills/{slug}.skill`. Captured fields: name, intent_keywords, entry_point_script, validate_script, fatal_constraints, spec_locks, preconditions, human_summary_translated.
 
-**Action**: After G1-G8 PASS, write .skill YAML file at {workspace}/../skills/fin-bp-009-uc_101.skill then notify user in user's locale: 'Skill saved as fin-bp-009-uc_101.skill — say backtest or zvt next time to invoke directly.'
+**Action**: After all Hard Gates PASS, resolve slug via slug_template using the executed UC, then write the .skill YAML file at output_path_template. Notify user in their detected locale: 'Skill saved as {slug}.skill — next time say one of {sample_triggers} from the matched UC to invoke directly.'
 
 **Violation signal**: All hard gates passed but no .skill file exists at expected path
 ---

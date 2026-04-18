@@ -144,7 +144,10 @@ def build_locale_contract() -> dict:
     return {
         "source_language": "en",
         "user_facing_fields": [
-            "human_summary",
+            "human_summary.what_i_can_do.tagline",
+            "human_summary.what_i_can_do.use_cases[]",
+            "human_summary.what_i_auto_fetch[]",
+            "human_summary.what_i_ask_you[]",
             "evidence_quality.user_disclosure_template",
             "post_install_notice.message_template.positioning",
             "post_install_notice.message_template.capability_catalog.groups[].name",
@@ -1193,10 +1196,44 @@ def build_acceptance() -> dict:
 # ============================================================
 
 
-def build_skill_crystallization(bp_id: str, primary_uc: str) -> dict:
-    bp_id_short = bp_id.replace("finance-", "fin-").replace("--", "-")
-    uc_lower = primary_uc.lower().replace("-", "_") if primary_uc else "zvt"
-    slug = f"{bp_id_short}-{uc_lower}"
+def build_skill_crystallization(
+    bp_id: str,
+    primary_uc: str,
+    *,
+    meta: dict,
+    intent_router: dict,
+    spec_lock_registry: dict,
+    preconditions_list: list[dict],
+    resources: dict,
+) -> dict:
+    """Build the skill_crystallization contract.
+
+    All placeholders ({workspace} / {slug}) in action / output_path_template are
+    resolved by the runtime emitter — not at compile time. skill_file_schema is
+    populated with ACTUAL values derived from the crystal's other sections
+    (intent_router / spec_lock_registry / preconditions / resources) so the
+    emitter can use it as a direct template for the .skill YAML file.
+
+    Domain-agnostic: no hardcoded finance/zvt/macd terms.
+    """
+    # Find the primary UC entry for intent_keywords
+    primary_uc_entry = next(
+        (e for e in (intent_router.get("uc_entries") or []) if e.get("uc_id") == primary_uc),
+        None,
+    )
+    primary_uc_name = primary_uc_entry.get("name", primary_uc) if primary_uc_entry else primary_uc
+    primary_uc_keywords = (primary_uc_entry or {}).get("positive_terms", [])[:6]
+
+    # Collect all SL-IDs and fatal SL-IDs
+    sl_entries = spec_lock_registry.get("semantic_locks") or []
+    all_sl_ids = [sl.get("id") for sl in sl_entries if sl.get("id")]
+    fatal_sl_ids = [sl.get("id") for sl in sl_entries if sl.get("violation_is") == "fatal"]
+
+    # Collect all PC-IDs
+    all_pc_ids = [pc.get("id") for pc in preconditions_list if pc.get("id")]
+
+    # Entry point from resources
+    entry_point = (resources.get("strategy_scaffold") or {}).get("entry_point_name", "main")
 
     return {
         "trigger": "all_hard_gates_passed AND user_opt_out_skill_saving != true",
@@ -1213,19 +1250,21 @@ def build_skill_crystallization(bp_id: str, primary_uc: str) -> dict:
             "human_summary_translated",
         ],
         "action": (
-            f"After G1-G8 PASS, write .skill YAML file at {{workspace}}/../skills/{slug}.skill "
-            f"then notify user in user's locale: "
-            f"'Skill saved as {slug}.skill — say backtest or zvt next time to invoke directly.'"
+            "After all Hard Gates PASS, resolve slug via slug_template using the "
+            "executed UC, then write the .skill YAML file at output_path_template. "
+            "Notify user in their detected locale: "
+            "'Skill saved as {slug}.skill — next time say one of {sample_triggers} "
+            "from the matched UC to invoke directly.'"
         ),
         "violation_signal": "All hard gates passed but no .skill file exists at expected path",
         "skill_file_schema": {
-            "name": f"{bp_id} ZVT Strategy",
-            "version": "v5.0",
-            "intent_keywords": ["backtest", "zvt", "A-share", "factor", "macd", "strategy"],
-            "entry_point": "run_backtest",
-            "fatal_guards": ["SL-01", "SL-02", "SL-08", "SL-10"],
-            "spec_locks": ["SL-01", "SL-02", "SL-03", "SL-04", "SL-05", "SL-06", "SL-07", "SL-08"],
-            "preconditions": ["PC-01", "PC-02", "PC-03"],
+            "name": f"{bp_id} / {primary_uc_name}",
+            "version": meta.get("version", "v5.2"),
+            "intent_keywords": primary_uc_keywords,
+            "entry_point": entry_point,
+            "fatal_guards": fatal_sl_ids,
+            "spec_locks": all_sl_ids,
+            "preconditions": all_pc_ids,
         },
     }
 
@@ -1887,8 +1926,18 @@ def build_seed(
         "constraints": build_constraints(fatal_constraints, non_fatal_constraints),
         "output_validator": build_output_validator(),
         "acceptance": build_acceptance(),
-        "skill_crystallization": build_skill_crystallization(bp.get("id", "unknown"), primary_uc),
     }
+    # Build skill_crystallization using data from already-assembled crystal sections
+    # (needs intent_router, spec_lock_registry, preconditions to populate real values)
+    seed["skill_crystallization"] = build_skill_crystallization(
+        bp_id=bp.get("id", "unknown"),
+        primary_uc=primary_uc,
+        meta=seed["meta"],
+        intent_router=seed["intent_router"],
+        spec_lock_registry=seed["spec_lock_registry"],
+        preconditions_list=seed["preconditions"],
+        resources=seed["resources"],
+    )
 
     # Build human_summary first so post_install_notice can use its tagline
     human_summary = build_human_summary(bp, ucs)
