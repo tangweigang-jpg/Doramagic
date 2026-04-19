@@ -164,3 +164,26 @@
 3. 行为未变时的排查顺序：先查字段作用域（该字段的消费者是谁？）→ 再查 host 解读能力
 
 **关联 memory**：`feedback_crystal_host_relationship.md`（晶体被宿主解读而非字面执行）
+
+### P-07: 编译脚本 build_resources 有 4 处 ZVT 领域硬编码（2026-04-19）
+
+**现象**：v5.3 编译脚本 `scripts/compile_crystal_skeleton.py` 的 `build_resources()` / `build_spec_lock_registry()` / `build_output_validator()` 三个函数大量使用 ZVT-specific 静态默认值。v5.0 用 bp-009 调试时合理，但批量编译 53 颗跨领域蓝图（freqtrade / qlib / akshare / ccxt / FinanceToolkit 等）时会被错误注入。
+
+**具体硬编码位置**（见 `scripts/compile_crystal_skeleton.py`）：
+1. `build_resources()` L891-L901：兜底包列表硬写 `zvt / akshare / baostock / pandas / SQLAlchemy / plotly / dash` —— 非 A 股量化项目（freqtrade/qlib）会被误注入
+2. `build_resources()` L903-L912：`strategy_scaffold.entry_point_name = "run_backtest"` + `tail_template` 硬编码 `result.csv` —— 数据采集/训练类蓝图入口不该叫 run_backtest，非 CSV 输出会报错
+3. `build_resources()` L917-L941：OpenClaw host_adapter 的 `install_recipes` 硬写 `python3 -m zvt.init_dirs` —— 对所有非 ZVT 蓝图无意义
+4. `build_spec_lock_registry()` L513+：**整个函数是 ZVT 专属静态 12 条 SL**（SL-01 sell-before-buy / SL-02 next-bar execution / SL-03 entity_id 格式等），未从 `bp.business_decisions[type=semantic_lock]` 真正抽取
+5. `build_output_validator()` L1005+：**整个函数是静态 OV-01~OV-06**，未从蓝图业务语义派生
+
+**根因**：编译脚本 v5.0 时 bp-009 是唯一编译标的，静态默认 = bp-009 特征。v5.0 → v5.2 期间没有第二颗跨领域晶体被编出来，静态默认一路传递到 v5.3 未被挑战。
+
+**解决方案**（v5.3.1 必修）：
+1. `build_resources` 兜底改为"空即留空 + host_adapter 只写 target-host 通用指令"；领域包由蓝图 `resources[]` 显式声明
+2. `strategy_scaffold.entry_point_name` 从 UC 类型派生（data_collection→run_collector / backtest→run_backtest / training→run_training / serving→run_server）
+3. `build_spec_lock_registry` 真正从 `bp.business_decisions[type=semantic_lock]` 抽取
+4. `build_output_validator` 从 UC 业务语义派生
+
+**验证方式**：批编 3 颗跨领域蓝图（bp-079 akshare 数据采集 / bp-087 qlib 量化研究 / bp-085 freqtrade 数字货币）→ 看 `resources.packages` / `strategy_scaffold` / `spec_lock_registry` 是否退化为 ZVT 模板。
+
+**关联文档**：`docs/designs/2026-04-19-crystal-compilation-pipeline.md` §5.3 债务清单
