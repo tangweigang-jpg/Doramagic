@@ -1,0 +1,3977 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-099
+name: TradingAgents-CN
+sop_version: '3.6'
+source:
+  projects:
+  - TradingAgents-CN
+  commit_hash: bd599607e83cd0d249482e57869216d52b1cb2aa
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Multi-agent AI stock analysis and investment research
+  description: Multi-agent AI stock analysis learning platform supporting A-share, Hong Kong, and US markets
+    with dual-LLM architecture for parallel market/social/news/fundamentals analysis, investment debate,
+    and risk evaluation
+  prerequisites: Understanding of AI/LLM concepts, basic stock market knowledge, Python programming experience
+  not_suitable_for: Real-time trading, production deployment without proper configuration, users unfamiliar
+    with AI limitations, non-Chinese market focus without adaptation
+  activation:
+    triggers:
+    - 用户调用trading_graph.propagate(ticker, date)方法
+    - 批量分析任务被Worker进程从Redis队列中取出执行
+    - API调用触发分析任务
+    emphasis:
+    - Use ESPECIALLY when analyzing stocks across multiple markets (A股、港股、美股)
+    - Use ESPECIALLY when needing comprehensive multi-dimensional analysis
+    - Use ESPECIALLY when requiring explainable investment decisions
+    anti_skip:
+    - Don't skip analyst parallel execution even for time-critical requests - data quality depends on
+      complete analysis
+    - Don't skip risk debate phase - it provides essential risk control even if it slows execution
+    - Don't skip signal processing - structured decisions are required for system integration
+stages:
+- id: data_collection
+  name: Data Collection
+  order: 1
+  responsibility: Aggregate market data from multiple providers (Tushare, AKShare, BaoStock for China;
+    yfinance, Finnhub for US/HK) with automatic fallback and caching to ensure uninterrupted data access
+  interface:
+    inputs:
+    - stock_symbol (str)
+    - date_range (start, end)
+    outputs:
+    - market_data (DataFrame)
+    - stock_info (Dict)
+    - fundamentals (Dict)
+    - news (List)
+  required_methods:
+  - name: DataSourceManager.get_fundamentals_data
+    description: 'Retrieves fundamental financial data with priority-based fallback chain: MongoDB cache
+      → Tushare → AKShare → BaoStock'
+    evidence: tradingagents/dataflows/data_source_manager.py:249
+  - name: DataSourceManager.get_data_source_manager
+    description: Factory method returning singleton DataSourceManager for unified China/US data routing
+    evidence: tradingagents/dataflows/data_source_manager.py:2133
+  - name: TushareProvider._get_token_from_database
+    description: Retrieves API token from MongoDB with environment variable fallback, enabling runtime
+      config changes
+    evidence: tradingagents/dataflows/providers/china/tushare.py:40
+  key_behaviors:
+  - behavior: Priority-based fallback chain
+    description: Data is first checked in MongoDB cache, then fetched from Tushare, AKShare, BaoStock
+      in order until successful
+    evidence: tradingagents/dataflows/data_source_manager.py:249(get_fundamentals_data)
+  - behavior: Multi-market detection
+    description: StockUtils.get_market_info() returns is_china/is_hk/is_us flags and currency info for
+      correct data source selection
+    evidence: tradingagents/utils/stock_utils.py:get_market_info
+  - behavior: Graceful degradation
+    description: System continues with reduced functionality if databases are unavailable
+    evidence: tradingagents/config/database_manager.py:159(_detect_databases)
+  replaceable_points:
+  - name: data_source_provider
+    description: Swap any data provider implementation for China/US stock data
+    options:
+    - name: TushareProvider
+      traits:
+      - Pro API
+      - Requires token
+      - High quality CN data
+      fit_for:
+      - China A-share analysis
+      - Professional users with API access
+      not_fit_for:
+      - Free tier users
+      - Non-Tushare markets
+    - name: AKShareProvider
+      traits:
+      - Free
+      - Open source
+      - Broad market coverage
+      fit_for:
+      - Cost-sensitive users
+      - Initial exploration
+      not_fit_for:
+      - High-frequency data needs
+      - Real-time requirements
+    - name: BaoStockProvider
+      traits:
+      - Free
+      - Historical focus
+      - China specific
+      fit_for:
+      - Historical backtesting
+      - China stock research
+      not_fit_for:
+      - Real-time data
+      - US/HK markets
+    default: TushareProvider
+  design_decisions:
+  - 'Fallback chain: MongoDB → Tushare → AKShare → BaoStock prioritizes cached data for speed, degrades
+    gracefully to free sources when APIs unavailable (tradingagents/dataflows/data_source_manager.py:249)'
+  - Token stored in DB with env var fallback allows runtime config changes via Web UI without code deployment
+    (tradingagents/dataflows/providers/china/tushare.py:40)
+  - DataSourceManager as global singleton provides single point for source priority and caching logic
+    across each data consumers (tradingagents/dataflows/data_source_manager.py:2133)
+  acceptance_hints:
+  - Successfully retrieves market data for each three markets (CN/HK/US) without manual intervention
+  - Fallback mechanism triggers correctly when primary data source fails
+  - Cached data returned within 100ms, fresh data within 30s
+- id: multi_analyst_pipeline
+  name: Multi-Analyst Pipeline
+  order: 2
+  responsibility: Run parallel analysts (market, social, news, fundamentals) using LangGraph ToolNode
+    with bounded tool calls to prevent infinite loops while gathering comprehensive investment data
+  interface:
+    inputs:
+    - company_of_interest (str)
+    - trade_date (str)
+    - AgentState (TypedDict)
+    outputs:
+    - market_report
+    - sentiment_report
+    - news_report
+    - fundamentals_report (each str)
+  required_methods:
+  - name: MarketAnalyst.analyze
+    description: Performs market trend and technical analysis for given stock symbol
+    evidence: tradingagents/agents/analysts/market_analyst.py:95
+  - name: FundamentalsAnalyst.analyze
+    description: Analyzes financial metrics and valuation data
+    evidence: tradingagents/agents/analysts/fundamentals_analyst.py:98
+  - name: NewsAnalyst.analyze
+    description: Extracts sentiment and key events from news sources
+    evidence: tradingagents/agents/analysts/news_analyst.py:19
+  - name: SocialMediaAnalyst.analyze
+    description: Tracks social media sentiment for target stock
+    evidence: tradingagents/agents/analysts/social_media_analyst.py:10
+  - name: ConditionalLogic.should_continue_market
+    description: Controls tool call loop prevention with max_tool_calls=3 limit
+    evidence: tradingagents/graph/conditional_logic.py:28
+  key_behaviors:
+  - behavior: Sequential analyst execution with MsgClear nodes
+    description: Each analyst runs in sequence with message clearing between them to ensure each builds
+      on previous analysis context without memory overflow
+    evidence: tradingagents/graph/setup.py:186(add_conditional_edges)
+  - behavior: Tool call loop prevention
+    description: max_tool_calls=3 per analyst prevents LLM from entering infinite tool-call loops while
+      allowing sufficient data gathering
+    evidence: tradingagents/graph/conditional_logic.py:28
+  - behavior: Report field enforcement
+    description: Every analysts must populate their report field in AgentState before graph advances to
+      next stage
+    evidence: tradingagents/graph/conditional_logic.py:51
+  replaceable_points:
+  - name: analyst_type
+    description: Add, remove, or configure analyst types in the pipeline
+    options:
+    - name: market
+      traits:
+      - Technical analysis
+      - Trend detection
+      - Requires market data
+      fit_for:
+      - Trend-following strategies
+      - Short-term analysis
+      not_fit_for:
+      - Long-term value investing
+    - name: social
+      traits:
+      - Social sentiment
+      - Reddit/Weibo
+      - Real-time
+      fit_for:
+      - Momentum trading
+      - Viral event detection
+      not_fit_for:
+      - Fundamental analysis
+      - Low-volatility stocks
+    - name: news
+      traits:
+      - News sentiment
+      - Event-driven
+      - Google News
+      fit_for:
+      - Event-driven strategies
+      - Catalyst identification
+      not_fit_for:
+      - Quiet market periods
+      - Long holding periods
+    - name: fundamentals
+      traits:
+      - Financial metrics
+      - Valuation
+      - PE/PB/ROE
+      fit_for:
+      - Value investing
+      - Long-term positioning
+      not_fit_for:
+      - Short-term trading
+      - Technical traders
+    default: '[''market'', ''social'', ''news'', ''fundamentals'']'
+  design_decisions:
+  - max_tool_calls=3 per analyst prevents infinite loops while allowing sufficient data gathering (tradingagents/graph/conditional_logic.py:28)
+  - Analysts run in sequence with MsgClear nodes between them ensures each builds on previous context
+    (tradingagents/graph/setup.py:186)
+  - StockUtils.get_market_info() for multi-market detection handles China/US/HK detection with single
+    utility (tradingagents/agents/analysts/market_analyst.py:29)
+  acceptance_hints:
+  - Every four analyst reports are generated without timeout errors
+  - No agent enters infinite tool-call loops
+  - Each report is non-empty and contains domain-specific analysis
+- id: investment_debate
+  name: Investment Debate
+  order: 3
+  responsibility: Bull and Bear researchers debate investment thesis using Long-Term Memory retrieval,
+    then Research Manager synthesizes opposing viewpoints into coherent investment_plan
+  interface:
+    inputs:
+    - market_report
+    - sentiment_report
+    - news_report
+    - fundamentals_report (each str)
+    outputs:
+    - investment_plan (str)
+    - investment_debate_state (InvestDebateState)
+  required_methods:
+  - name: BullResearcher.research
+    description: Constructs bull case with supporting evidence from analyst reports
+    evidence: tradingagents/agents/researchers/bull_researcher.py:10
+  - name: BearResearcher.research
+    description: Constructs bear case with opposing evidence and risk factors
+    evidence: tradingagents/agents/researchers/bear_researcher.py:10
+  - name: ResearchManager.judge
+    description: Deep-thinking synthesis of bull/bear debate into investment decision
+    evidence: tradingagents/agents/managers/research_manager.py:9
+  - name: FinancialSituationMemory.get_memories
+    description: Retrieves n most similar past investment situations from ChromaDB vector store
+    evidence: tradingagents/agents/utils/memory.py:69
+  key_behaviors:
+  - behavior: Retrieval-augmented generation
+    description: Researchers receive past_memory_str from reflection layer, enabling learning from analogous
+      historical situations
+    evidence: tradingagents/agents/researchers/bull_researcher.py:121
+  - behavior: Single debate round by default
+    description: max_debate_rounds=1 balances thoroughness with latency; single round sufficient for opposing
+      viewpoint synthesis
+    evidence: tradingagents/default_config.py:17
+  - behavior: ChromaDB vector similarity search
+    description: Semantic search enables finding analogous past situations for informed decision-making
+    evidence: tradingagents/agents/utils/memory.py:69
+  replaceable_points:
+  - name: debate_memory
+    description: Swap vector store backend for long-term memory persistence
+    options:
+    - name: ChromaDB
+      traits:
+      - Local embedding
+      - Persistent
+      - Easy setup
+      fit_for:
+      - Development
+      - Single-node deployments
+      - Privacy-sensitive
+      not_fit_for:
+      - Distributed systems
+      - High-scale production
+    - name: Pinecone
+      traits:
+      - Cloud-native
+      - Managed
+      - Scalable
+      fit_for:
+      - Production
+      - Multi-instance
+      - Enterprise scale
+      not_fit_for:
+      - Local development
+      - Cost-sensitive projects
+    - name: FAISS
+      traits:
+      - Facebook library
+      - In-memory
+      - Fast
+      fit_for:
+      - Batch processing
+      - Research
+      - Offline use
+      not_fit_for:
+      - Real-time updates
+      - Distributed deployment
+    default: ChromaDB
+  design_decisions:
+  - max_debate_rounds=1 default balances thoroughness with latency (tradingagents/default_config.py:17)
+  - ChromaDB for vector similarity search enables semantic retrieval of analogous past situations (tradingagents/agents/utils/memory.py:69)
+  - prompt includes past_memory_str from reflection enables learning from historical mistakes via RAG
+    (tradingagents/agents/researchers/bull_researcher.py:121)
+  acceptance_hints:
+  - Bull and bear cases present genuinely opposing viewpoints
+  - Research Manager synthesis incorporates both perspectives
+  - Historical memory retrieval returns relevant past situations
+- id: trading_decision
+  name: Trading Decision
+  order: 4
+  responsibility: Trader agent converts research output into concrete investment plan with position sizing,
+    entry/exit strategy, and actionable recommendations
+  interface:
+    inputs:
+    - investment_plan (str)
+    - investment_debate_state
+    outputs:
+    - trader_investment_plan (str)
+  required_methods:
+  - name: Trader.execute
+    description: Generates actionable trading plan from bull/bear research and market conditions
+    evidence: tradingagents/agents/trader/trader.py:10
+  key_behaviors:
+  - behavior: Quick-thinking LLM usage
+    description: Trader uses quick_thinking_llm (faster, cheaper) as trading plan generation is template-driven
+      and doesn't need deep reasoning
+    evidence: tradingagents/graph/setup.py:149(trader_node)
+  - behavior: Position sizing and entry/exit
+    description: Outputs concrete position size, entry price range, stop-loss, and target exit price
+    evidence: tradingagents/agents/trader/trader.py:10
+  replaceable_points:
+  - name: trader_llm
+    description: LLM model for trading decision generation
+    options:
+    - name: quick_thinking_llm
+      traits:
+      - Fast
+      - Cheap
+      - Template-driven
+      fit_for:
+      - Standard analysis
+      - High volume
+      not_fit_for:
+      - Complex strategies
+      - Edge cases
+    - name: deep_thinking_llm
+      traits:
+      - Slow
+      - Expensive
+      - Deep reasoning
+      fit_for:
+      - Complex situations
+      - Large positions
+      not_fit_for:
+      - High-frequency analysis
+      - Cost-sensitive
+    default: quick_thinking_llm
+  design_decisions:
+  - Trader uses quick_thinking_llm (faster, cheaper) as trading plan generation is template-driven and
+    doesn't need deep reasoning (tradingagents/graph/setup.py:149)
+  acceptance_hints:
+  - Trading plan includes specific entry/exit prices with reasoning
+  - Position sizing considers risk parameters
+  - Output is actionable without requiring human interpretation
+- id: risk_debate
+  name: Risk Debate
+  order: 5
+  responsibility: Three-way debate (Risky/Neutral/Safe debaters) evaluating risk/reward profile, culminating
+    in Risk Manager synthesis into final_trade_decision with risk-adjusted recommendations
+  interface:
+    inputs:
+    - trader_investment_plan (str)
+    outputs:
+    - final_trade_decision (str)
+    - risk_debate_state (RiskDebateState)
+  required_methods:
+  - name: RiskyDebator.debate
+    description: Argues for aggressive risk-taking and maximum position sizing
+    evidence: tradingagents/agents/risk_mgmt/aggresive_debator.py:9
+  - name: SafeDebator.debate
+    description: Argues for conservative risk management and position limits
+    evidence: tradingagents/agents/risk_mgmt/conservative_debator.py:10
+  - name: NeutralDebator.debate
+    description: Balances risk perspectives with moderate recommendations
+    evidence: tradingagents/agents/risk_mgmt/neutral_debator.py:9
+  - name: RiskManager.judge
+    description: Deep-thinking synthesis of three-way debate into final risk-adjusted decision
+    evidence: tradingagents/agents/managers/risk_manager.py:9
+  key_behaviors:
+  - behavior: Three-way risk spectrum
+    description: Captures full risk spectrum (Risky/Neutral/Safe) rather than binary risk-on/risk-off
+      for nuanced risk assessment
+    evidence: tradingagents/agents/utils/agent_states.py:29(RiskDebateState)
+  - behavior: Single risk debate round
+    description: max_risk_discuss_rounds=1 as risk debate is supplementary to investment debate
+    evidence: tradingagents/default_config.py:18
+  - behavior: Risk score output
+    description: Synthesizes debate into quantitative risk score (0-1) for downstream processing
+    evidence: tradingagents/agents/managers/risk_manager.py:9
+  replaceable_points:
+  - name: risk_debater
+    description: Add or modify risk debate participants
+    options:
+    - name: RiskyDebator
+      traits:
+      - Aggressive
+      - High exposure
+      - Growth-focused
+      fit_for:
+      - Bull markets
+      - Risk-tolerant investors
+      not_fit_for:
+      - Bear markets
+      - Conservative portfolios
+    - name: NeutralDebator
+      traits:
+      - Balanced
+      - Moderate exposure
+      - Defensive
+      fit_for:
+      - Neutral markets
+      - Balanced portfolios
+      not_fit_for:
+      - Extreme conditions
+    - name: SafeDebator
+      traits:
+      - Conservative
+      - Low exposure
+      - Preservation-focused
+      fit_for:
+      - High volatility
+      - Capital preservation
+      not_fit_for:
+      - Bull markets
+      - Growth strategies
+    default: each three
+  design_decisions:
+  - Three-way debate pattern (Risky/Neutral/Safe) captures full risk spectrum rather than binary risk-on/risk-off
+    (tradingagents/agents/utils/agent_states.py:29)
+  - max_risk_discuss_rounds=1 default as risk debate is supplementary to investment debate (tradingagents/default_config.py:18)
+  acceptance_hints:
+  - Every three debater perspectives are represented in final decision
+  - Risk score is consistent with market conditions and stock volatility
+  - Final decision incorporates risk-adjusted recommendations
+- id: signal_processing
+  name: Signal Processing
+  order: 6
+  responsibility: Convert unstructured final_trade_decision into structured JSON with action (买入/持有/卖出),
+    target_price, confidence, and risk_score for downstream trading systems
+  interface:
+    inputs:
+    - final_trade_decision (str)
+    - stock_symbol (str)
+    outputs:
+      action: 买入/持有/卖出
+      target_price: float
+      confidence: 0-1
+      risk_score: 0-1
+      reasoning: str
+  required_methods:
+  - name: SignalProcessor.process
+    description: Extracts structured signal from LLM output with regex fallback for price parsing
+    evidence: tradingagents/graph/signal_processing.py:11
+  - name: SignalProcessor._get_default_decision
+    description: Returns fail-safe '持有' with confidence=0.5 on invalid or malformed input
+    evidence: tradingagents/graph/signal_processing.py:34
+  - name: SignalProcessor.get_market_info
+    description: Currency-aware price extraction using market_info for CNY/USD/HKD handling
+    evidence: tradingagents/graph/signal_processing.py:55
+  key_behaviors:
+  - behavior: LLM extraction with regex fallback
+    description: Attempts structured LLM JSON extraction first, falls back to regex patterns for unstructured
+      text
+    evidence: tradingagents/graph/signal_processing.py:146
+  - behavior: Fail-safe defaults
+    description: Defaults to '持有' with confidence=0.5 on invalid input to prevent trading on malformed
+      signals
+    evidence: tradingagents/graph/signal_processing.py:34
+  - behavior: Chinese action enforcement
+    description: action_map enforces 中文 labels (买入/持有/卖出), any English output is converted silently
+    evidence: tradingagents/graph/signal_processing.py:127
+  replaceable_points:
+  - name: signal_llm
+    description: LLM for structured signal extraction
+    options:
+    - name: quick_thinking_llm
+      traits:
+      - Fast
+      - Template extraction
+      - Cost-effective
+      fit_for:
+      - Standard signals
+      - High volume
+      not_fit_for:
+      - Complex edge cases
+    - name: deep_thinking_llm
+      traits:
+      - Deep extraction
+      - Complex reasoning
+      fit_for:
+      - Ambiguous decisions
+      - Edge cases
+      not_fit_for:
+      - High-frequency needs
+      - Cost-sensitive
+    default: quick_thinking_llm
+  design_decisions:
+  - LLM extraction with regex fallback handles both structured LLM output and unstructured text (tradingagents/graph/signal_processing.py:146)
+  - Default to '持有' with confidence=0.5 on invalid input prevents trading on malformed signals (tradingagents/graph/signal_processing.py:34)
+  - Currency-aware price extraction using market_info handles CNY/USD/HKD symbols correctly (tradingagents/graph/signal_processing.py:55)
+  acceptance_hints:
+  - Output JSON contains each required fields (action, target_price, confidence, risk_score)
+  - Action is always Chinese (买入/持有/卖出), never English
+  - Invalid inputs result in '持有' default, never exceptions
+- id: reflection_memory
+  name: Reflection & Memory
+  order: 7
+  responsibility: After execution, reflect on returns/losses and update ChromaDB memory with insights
+    for future analogous situations, enabling continuous learning from investment outcomes
+  interface:
+    inputs:
+    - returns_losses (float)
+    - final_state (AgentState)
+    outputs:
+    - Updated ChromaDB memory vectors
+  required_methods:
+  - name: Reflector.reflect_bull_researcher
+    description: Generates reflection prompts for bull researcher based on actual outcomes
+    evidence: tradingagents/graph/reflection.py:77
+  - name: FinancialSituationMemory.add_memory
+    description: Stores reflection insights into ChromaDB vector store with embeddings
+    evidence: tradingagents/agents/utils/memory.py:99
+  - name: FinancialSituationMemory.get_memories
+    description: Retrieves 2 most similar past situations to current analysis context
+    evidence: tradingagents/agents/researchers/bull_researcher.py:91
+  key_behaviors:
+  - behavior: Per-agent independent reflection
+    description: Each agent (bull/bear/trader/judge/risk) learns independently from its domain-specific
+      mistakes
+    evidence: tradingagents/graph/reflection.py:77
+  - behavior: ChromaDBManager singleton pattern
+    description: Thread-safe singleton prevents concurrent collection creation conflicts across analyst
+      nodes
+    evidence: tradingagents/agents/utils/memory.py:16
+  - behavior: Retrieval with n_matches=2
+    description: Retrieves 2 most similar past situations for focused analogy learning
+    evidence: tradingagents/agents/researchers/bull_researcher.py:91
+  replaceable_points:
+  - name: memory_backend
+    description: Vector store for situation memory persistence and retrieval
+    options:
+    - name: ChromaDB
+      traits:
+      - Local persistence
+      - Embedded vectors
+      - Easy setup
+      fit_for:
+      - Development
+      - Single-node
+      - Privacy
+      not_fit_for:
+      - Distributed
+      - Enterprise scale
+    - name: FAISS
+      traits:
+      - In-memory
+      - Fast similarity
+      - No persistence
+      fit_for:
+      - Research
+      - Batch
+      - Offline
+      not_fit_for:
+      - Real-time updates
+      - Persistence needs
+    - name: Pinecone
+      traits:
+      - Cloud-managed
+      - Scalable
+      - Distributed
+      fit_for:
+      - Production
+      - Enterprise
+      - Multi-instance
+      not_fit_for:
+      - Local dev
+      - Cost-sensitive
+    default: ChromaDB
+  design_decisions:
+  - Reflection on every agent (bull/bear/trader/judge/risk) enables independent learning from domain-specific
+    mistakes (tradingagents/graph/reflection.py:77)
+  - get_memories called with n_matches=2 retrieves 2 most similar past situations to current analysis
+    context (tradingagents/agents/researchers/bull_researcher.py:91)
+  acceptance_hints:
+  - Memory vectors are successfully stored after each analysis cycle
+  - Retrieval returns semantically similar past situations
+  - Reflection prompts generate meaningful learning insights
+- id: web_api_service
+  name: Web API Service
+  order: 8
+  responsibility: FastAPI layer exposing analysis endpoints with async task queuing, Redis progress tracking,
+    MongoDB persistence, and real-time WebSocket updates for frontend integration
+  interface:
+    inputs:
+    - SingleAnalysisRequest
+    - BatchAnalysisRequest
+    outputs:
+    - task_id, status, result via WebSocket/REST
+  required_methods:
+  - name: AnalysisService.submit_single_analysis
+    description: Orchestrates TradingAgentsGraph execution with progress tracking
+    evidence: app/services/analysis_service.py:46
+  - name: QueueService.enqueue
+    description: Redis-based FIFO queue with concurrency limits for background task management
+    evidence: app/services/queue_service.py:45
+  - name: RedisProgressTracker.track
+    description: Real-time progress updates via Redis pub/sub for WebSocket push
+    evidence: app/services/redis_progress_tracker.py:10
+  - name: SimpleAnalysisService.analyze
+    description: Simplified analysis service with config lookup from MongoDB system_configs
+    evidence: app/services/simple_analysis_service.py:1
+  key_behaviors:
+  - behavior: AsyncIO with BackgroundTasks
+    description: HTTP requests return immediately while analysis runs in background thread/process
+    evidence: app/routers/analysis.py:41
+  - behavior: Config lookup priority
+    description: 'API key priority: model_config > provider_config > env_var allows per-model API keys
+      for multi-provider'
+    evidence: app/services/simple_analysis_service.py:136
+  - behavior: Middleware graceful degradation
+    description: If Redis unavailable, rate limiting allows each requests through; removes single point
+      of failure
+    evidence: app/middleware/rate_limit.py:49
+  replaceable_points:
+  - name: task_queue
+    description: Backend for background task queuing
+    options:
+    - name: Redis
+      traits:
+      - Fast
+      - Pub/sub support
+      - Progress tracking
+      fit_for:
+      - Real-time UI
+      - WebSocket integration
+      not_fit_for:
+      - High durability needs
+      - Complex workflows
+    - name: RabbitMQ
+      traits:
+      - Enterprise
+      - Reliable
+      - Complex routing
+      fit_for:
+      - Production
+      - Complex workflows
+      not_fit_for:
+      - Simple use cases
+      - Development
+    - name: database
+      traits:
+      - Simple
+      - Persistent
+      - No extra deps
+      fit_for:
+      - Simple deployments
+      - Minimal infrastructure
+      not_fit_for:
+      - High throughput
+      - Real-time needs
+    default: Redis
+  - name: progress_pubsub
+    description: Real-time progress notification transport
+    options:
+    - name: WebSocket
+      traits:
+      - Bidirectional
+      - Low latency
+      - Real-time
+      fit_for:
+      - Live UI updates
+      - Interactive apps
+      not_fit_for:
+      - Firewall-restricted
+      - Simple polling
+    - name: SSE
+      traits:
+      - Simple
+      - HTTP-based
+      - Unidirectional
+      fit_for:
+      - Server push
+      - Simple clients
+      not_fit_for:
+      - Bidirectional needs
+    - name: polling
+      traits:
+      - Simple
+      - HTTP only
+      - Cacheable
+      fit_for:
+      - Simple clients
+      - Firewall-restricted
+      not_fit_for:
+      - Real-time needs
+      - High frequency
+    default: WebSocket
+  design_decisions:
+  - AsyncIO with BackgroundTasks for non-blocking analysis keeps HTTP responsive during long analysis
+    (app/routers/analysis.py:41)
+  - Redis progress tracker with WebSocket push enables real-time UI updates without polling overhead (app/services/redis_progress_tracker.py:10)
+  - Config lookup from MongoDB system_configs enables LLM provider/model configurable via Web UI (app/services/simple_analysis_service.py:121)
+  - 'API key priority: model_config > provider_config > env_var allows using multiple providers simultaneously
+    (app/services/simple_analysis_service.py:136)'
+  acceptance_hints:
+  - Analysis requests return task_id immediately (< 1s response time)
+  - WebSocket delivers progress updates within 1s of stage completion
+  - System continues operating if Redis unavailable (degraded mode)
+- id: llm_provider_abstraction
+  name: LLM Provider Abstraction
+  order: 9
+  responsibility: Unified factory for creating LLM instances supporting multiple providers (OpenAI, DeepSeek,
+    DashScope, Google, Anthropic, etc.) with token tracking and capability matching
+  interface:
+    inputs:
+    - provider, model, api_key, base_url, temperature, max_tokens, timeout
+    outputs:
+    - ChatOpenAI-compatible LLM instance
+  required_methods:
+  - name: create_llm_by_provider
+    description: Factory function routing to correct adapter based on provider string
+    evidence: tradingagents/graph/trading_graph.py:41
+  - name: OpenAICompatibleBase._generate
+    description: Base LLM generation with token tracking via _track_token_usage()
+    evidence: tradingagents/llm_adapters/openai_compatible_base.py:155
+  - name: ChatDeepSeekOpenAI.invoke
+    description: DeepSeek-specific adapter with rate limiting and retry logic
+    evidence: tradingagents/llm_adapters/openai_compatible_base.py:197
+  - name: ChatDashScopeOpenAIUnified.invoke
+    description: Alibaba DashScope adapter with unified interface
+    evidence: tradingagents/llm_adapters/openai_compatible_base.py:220
+  key_behaviors:
+  - behavior: OpenAI-compatible inheritance
+    description: Every adapters inherit ChatOpenAI for drop-in LangChain compatibility
+    evidence: tradingagents/llm_adapters/openai_compatible_base.py:32
+  - behavior: Token usage tracking
+    description: Unified token tracking across each providers for cost monitoring
+    evidence: tradingagents/llm_adapters/openai_compatible_base.py:155
+  - behavior: Dual-LLM role assignment
+    description: quick/deep LLMs can come from different providers for cost optimization
+    evidence: tradingagents/graph/trading_graph.py:242
+  replaceable_points:
+  - name: llm_provider
+    description: LLM backend vendor for model hosting
+    options:
+    - name: openai
+      traits:
+      - GPT-4
+      - GPT-3.5
+      - Tool calling
+      - Broad support
+      fit_for:
+      - General purpose
+      - Tool use
+      - Production
+      not_fit_for:
+      - Cost-sensitive
+      - China access
+    - name: deepseek
+      traits:
+      - Cost-effective
+      - Strong reasoning
+      - Chinese-optimized
+      fit_for:
+      - Budget-conscious
+      - China users
+      - Deep analysis
+      not_fit_for:
+      - Max quality
+      - Non-Chinese tasks
+    - name: dashscope
+      traits:
+      - Alibaba cloud
+      - Qwen models
+      - China-native
+      fit_for:
+      - China users
+      - Qwen ecosystem
+      not_fit_for:
+      - International access
+    - name: google
+      traits:
+      - Gemini
+      - Long context
+      - Multimodal
+      fit_for:
+      - Long documents
+      - Multimodal
+      - Google ecosystem
+      not_fit_for:
+      - Simple tasks
+      - Cost-sensitive
+    - name: anthropic
+      traits:
+      - Claude
+      - Long context
+      - Safety-focused
+      fit_for:
+      - High quality
+      - Long documents
+      not_fit_for:
+      - Cost-sensitive
+      - Tool calling heavy
+    - name: ollama
+      traits:
+      - Local
+      - Private
+      - Open models
+      fit_for:
+      - Privacy
+      - Offline
+      - Development
+      not_fit_for:
+      - Production
+      - API reliability
+    default: openai
+  design_decisions:
+  - Factory function create_llm_by_provider() with provider routing provides single entry point for each
+    LLM creation (tradingagents/graph/trading_graph.py:41)
+  - OpenAICompatibleBase inherits ChatOpenAI for drop-in replacement maintaining LangChain compatibility
+    (tradingagents/llm_adapters/openai_compatible_base.py:32)
+  - Token tracking in _generate() with _track_token_usage() enables unified cost logging across each providers
+    (tradingagents/llm_adapters/openai_compatible_base.py:155)
+  - 'Mixed-mode: quick/deep LLMs can come from different providers allows cheap fast model for simple
+    tasks and expensive deep model for synthesis (tradingagents/graph/trading_graph.py:242)'
+  acceptance_hints:
+  - Successfully creates LLM instances for at least 3 different providers
+  - Token usage is tracked consistently across each providers
+  - Quick and deep LLMs can be from different providers
+data_flow:
+- from_stage: data_collection
+  to_stage: multi_analyst_pipeline
+  data: market_data, stock_info, fundamentals, news (via LangGraph tool calls)
+- from_stage: multi_analyst_pipeline
+  to_stage: investment_debate
+  data: market_report + sentiment_report + news_report + fundamentals_report concatenated
+- from_stage: investment_debate
+  to_stage: trading_decision
+  data: investment_plan string + investment_debate_state
+- from_stage: trading_decision
+  to_stage: risk_debate
+  data: trader_investment_plan string with position sizing and entry/exit
+- from_stage: risk_debate
+  to_stage: signal_processing
+  data: final_trade_decision string + risk_debate_state
+- from_stage: signal_processing
+  to_stage: reflection_memory
+  data: structured signal dict {action, target_price, confidence, risk_score, reasoning}
+- from_stage: reflection_memory
+  to_stage: investment_debate
+  data: past_memory_str (retrieved via get_memories(n_matches=2))
+global_contracts:
+- contract: AgentState TypedDict is the single state carrier across each graph nodes (tradingagents/agents/utils/agent_states.py:54)
+  evidence: ''
+- contract: Every analysts must populate their report field in AgentState before advancing to next stage
+    (tradingagents/graph/conditional_logic.py:51)
+  evidence: ''
+- contract: company_of_interest + trade_date are required in initial state for each analysis workflows
+    (tradingagents/graph/propagation.py:32)
+  evidence: ''
+- contract: MongoDB for persistence (tasks, configs, results), Redis for transient state (progress, queue)
+    (app/core/database.py:30)
+  evidence: ''
+- contract: StockUtils.get_market_info() returns {is_china, is_hk, is_us, currency_name, currency_symbol}
+    for each market detection (tradingagents/utils/stock_utils.py)
+  evidence: ''
+- contract: Every LLM-generated text must be Chinese (enforced in prompts) (tradingagents/agents/researchers/bull_researcher.py:107)
+  evidence: ''
+- contract: SignalProcessor outputs only 买入/持有/卖出 (no English buy/hold/sell) (tradingagents/graph/signal_processing.py:127)
+  evidence: ''
+- contract: Max tool calls per analyst = 3 prevents infinite loops (tradingagents/graph/conditional_logic.py:28)
+  evidence: ''
+- contract: Max recursion limit = 100 in LangGraph config prevents runaway recursion (tradingagents/graph/propagation.py:67)
+  evidence: ''
+- contract: Temperature defaults to 0.1 (very low) across each LLM adapters for deterministic output (tradingagents/llm_adapters/openai_compatible_base.py:45)
+  evidence: ''
+- contract: 'Dual-LLM architecture: quick_think_llm for data collection/reports, deep_think_llm for synthesis/judgment
+    (tradingagents/default_config.py:13-14)'
+  evidence: ''
+- contract: 'Analysis workflow enforces strict order: Market→Social→News→Fundamentals→Bull/Bear→InvestJudge→Trader→RiskDebate
+    (tradingagents/graph/setup.py:51-150)'
+  evidence: ''
+business_decisions:
+- id: BD-001
+  type: BA
+  content: 'Fallback chain: MongoDB → Tushare → AKShare → BaoStock'
+  rationale: Prioritizes cached data from MongoDB for speed and cost efficiency, then degrades gracefully
+    to increasingly accessible free sources (Tushare → AKShare → BaoStock) when paid APIs are unavailable
+    or rate-limited. This cascade ensures continuous data availability even during service disruptions.
+  evidence: tradingagents/dataflows/data_source_manager.py:249(get_fundamentals_data)
+  stage: data_collection
+  alternative_considered: Direct polling of single data source without fallback would cause analysis gaps
+- id: BD-002
+  type: BA
+  content: Token stored in DB with env var fallback
+  rationale: Runtime configuration via MongoDB allows updating API tokens through the Web UI without code
+    deployment or service restarts. This enables quick recovery when API credentials expire or need rotation,
+    reducing operational downtime and enabling stateless configuration management.
+  evidence: tradingagents/dataflows/providers/china/tushare.py:40(_get_token_from_database)
+  stage: data_collection
+  alternative_considered: Hardcoded tokens would require deployment for every credential change
+- id: BD-003
+  type: B
+  content: DataSourceManager as global singleton
+  rationale: Centralized data source management through a singleton pattern eliminates redundant source
+    priority calculations and ensures consistent caching behavior across each data consumers. This architectural
+    constraint enforces single-source-of-truth for data acquisition logic throughout the system.
+  evidence: tradingagents/dataflows/data_source_manager.py:2195(get_data_source_manager)
+  stage: data_collection
+  alternative_considered: Distributed source managers would risk priority conflicts and cache fragmentation
+- id: BD-004
+  type: B
+  content: max_tool_calls=3 per analyst to prevent infinite loops
+  rationale: The tool-call budget of 3 per analyst iteration prevents runaway LLM agent loops while preserving
+    sufficient capacity for legitimate multi-step data gathering. This boundary ensures agents can fetch
+    necessary context (stock data, fundamentals, news) without entering indefinite reasoning cycles.
+  evidence: tradingagents/graph/conditional_logic.py:18(should_continue_market)
+  stage: multi_analyst_pipeline
+  alternative_considered: Unlimited calls risk infinite loops; zero calls prevent data gathering
+- id: BD-005
+  type: B
+  content: Analysts run in sequence with MsgClear nodes between
+  rationale: Sequential analyst execution ensures each agent builds on the accumulated context from previous
+    analyses (bull research → bear research → trading decision), creating a coherent investment thesis
+    rather than independent parallel opinions. MsgClear nodes prevent context pollution between analyst
+    turns.
+  evidence: tradingagents/graph/setup.py:186(add_conditional_edges)
+  stage: multi_analyst_pipeline
+  alternative_considered: Parallel execution would lose context dependency and synthesis value
+  _evidence_issues:
+  - 'FN_NOT_FOUND: add_conditional_edges in tradingagents/graph/setup.py'
+- id: BD-006
+  type: BA/DK
+  content: StockUtils.get_market_info() for multi-market detection
+  rationale: Unified market detection utility handles China/US/HK stock symbol variations, returning boolean
+    flags (is_china/is_hk/is_us) to downstream logic. This centralization prevents inconsistent market
+    classification and ensures correct data source routing and currency handling across the multi-market
+    system.
+  evidence: tradingagents/agents/analysts/market_analyst.py:17(_get_company_name)
+  stage: multi_analyst_pipeline
+  alternative_considered: Per-agent market detection would risk inconsistent classification
+- id: BD-007
+  type: B/BA
+  content: max_debate_rounds=1 default (configurable)
+  rationale: Single debate round provides sufficient adversarial analysis to surface key bull/bear arguments
+    without excessive latency. Configurable default allows tuning the tradeoff between analysis thoroughness
+    and response time based on market volatility or user urgency.
+  evidence: tradingagents/default_config.py:17(module)
+  stage: investment_debate
+  alternative_considered: Multiple rounds increase thoroughness but multiply latency proportionally
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/default_config.py'
+- id: BD-008
+  type: BA/DK
+  content: ChromaDB for vector similarity search in memory
+  rationale: Vector embedding storage enables semantic similarity search to retrieve analogous historical
+    market situations, sector patterns, or trading outcomes. This RAG capability allows the system to
+    learn from past decisions rather than treating each analysis as a blank slate.
+  evidence: tradingagents/agents/utils/memory.py:69(get_or_create_collection)
+  stage: investment_debate
+  alternative_considered: Keyword search would miss semantically similar situations
+- id: BD-009
+  type: B
+  content: prompt includes past_memory_str from reflection
+  rationale: Retrieval-augmented generation with past reflection memories allows agents to learn from
+    domain-specific historical mistakes. This feedback loop enables the bull researcher to incorporate
+    prior analysis failures, improving future recommendation quality without requiring explicit rule updates.
+  evidence: tradingagents/agents/researchers/bull_researcher.py:121(module)
+  stage: investment_debate
+  alternative_considered: Stateless analysis would repeat historical mistakes
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/agents/researchers/bull_researcher.py'
+- id: BD-010
+  type: BA/M
+  content: Trader uses quick_thinking_llm (faster, cheaper)
+  rationale: Trading plan generation is structured and template-driven, not requiring deep reasoning capabilities.
+    Using a faster, cheaper LLM for this task significantly reduces per-analysis cost while maintaining
+    output quality, reserving expensive deep-thinking models for synthesis tasks.
+  evidence: tradingagents/graph/setup.py:149(trader_node)
+  stage: trading_decision
+  alternative_considered: Deep reasoning model for trading would be overkill and expensive
+  _evidence_issues:
+  - 'FN_NOT_FOUND: trader_node in tradingagents/graph/setup.py'
+- id: BD-011
+  type: BA/DK
+  content: Three-way debate pattern (Risky/Neutral/Safe)
+  rationale: Risk posture spectrum (Risky/Neutral/Safe) captures full investment context beyond binary
+    risk-on/risk-off decisions. This nuanced framing enables appropriate position sizing and hedging strategies
+    that match investor risk tolerance, not just market direction.
+  evidence: tradingagents/agents/utils/agent_states.py:29(RiskDebateState)
+  stage: risk_debate
+  alternative_considered: Binary risk classification would lose granularity needed for position sizing
+  vague_rationale: true
+- id: BD-012
+  type: B/BA
+  content: max_risk_discuss_rounds=1 default
+  rationale: Risk debate supplements rather than drives the investment decision, so single-round discussion
+    balances coverage with latency. Risk considerations are already partially addressed in the main investment
+    debate; additional rounds would yield diminishing returns relative to their cost.
+  evidence: tradingagents/default_config.py:18(module)
+  stage: risk_debate
+  alternative_considered: Extended risk debates would slow response without proportional insight gain
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/default_config.py'
+  vague_rationale: true
+- id: BD-013
+  type: BA/M
+  content: LLM extraction with regex fallback for price parsing
+  rationale: Hybrid extraction handles both structured LLM JSON output and unstructured text descriptions
+    containing price information. Regex fallback ensures price extraction succeeds even when the LLM generates
+    narrative responses, preventing analysis failures from output format variance.
+  evidence: tradingagents/graph/signal_processing.py:146(price_patterns)
+  stage: signal_processing
+  alternative_considered: LLM-only extraction would fail on non-JSON outputs
+  _evidence_issues:
+  - 'FN_NOT_FOUND: price_patterns in tradingagents/graph/signal_processing.py'
+- id: BD-014
+  type: B/BA
+  content: Default to '持有' with confidence=0.5 on invalid input
+  rationale: Fail-safe default of 'hold' with neutral confidence prevents erroneous trading actions when
+    signal parsing fails. This defensive boundary ensures malformed signals default to inaction rather
+    than unintended position changes, protecting against downstream processing errors.
+  evidence: tradingagents/graph/signal_processing.py:328(_get_default_decision)
+  stage: signal_processing
+  alternative_considered: No default would risk propagating errors to trading execution
+- id: BD-015
+  type: B/DK
+  content: Currency-aware price extraction using market_info
+  rationale: Market-aware price extraction applies correct currency context (CNY/USD/HKD) based on the
+    stock's exchange, preventing cross-currency comparison errors and ensuring consistent position sizing
+    across the multi-market portfolio analysis.
+  evidence: tradingagents/graph/signal_processing.py:55(get_market_info)
+  stage: signal_processing
+  alternative_considered: Assuming single currency would cause wrong position sizing for cross-market
+    stocks
+  _evidence_issues:
+  - 'FN_NOT_FOUND: get_market_info in tradingagents/graph/signal_processing.py'
+- id: BD-016
+  type: B
+  content: Reflection on every agent (bull/bear/trader/judge/risk)
+  rationale: Per-agent reflection loops enable domain-specific learning, where each agent extracts lessons
+    from its own mistakes (research errors, trading oversights, risk miscalculations). This distributed
+    learning approach preserves specialized knowledge rather than generalizing across domains.
+  evidence: tradingagents/graph/reflection.py:77(reflect_bull_researcher)
+  stage: reflection_memory
+  alternative_considered: Global reflection would lose domain-specific learning granularity
+- id: BD-017
+  type: BA
+  content: get_memories called with n_matches=2 in researchers
+  rationale: Retrieving exactly 2 most similar past situations provides relevant context without overwhelming
+    the prompt with historical noise. This boundary balances memory benefits against LLM context limits,
+    ensuring each analysis incorporates relevant precedent without dilution.
+  evidence: tradingagents/agents/researchers/bull_researcher.py:91(module)
+  stage: reflection_memory
+  alternative_considered: More matches would risk diluting relevance; fewer would miss valuable analogies
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/agents/researchers/bull_researcher.py'
+- id: BD-018
+  type: T
+  content: AsyncIO with BackgroundTasks for non-blocking analysis
+  rationale: Asynchronous request handling ensures HTTP connections return immediately while analysis
+    runs in the background, preventing WebSocket timeout and enabling real-time progress updates. This
+    infrastructure choice supports the UX requirement for live analysis feedback.
+  evidence: app/routers/analysis.py:41(submit_single_analysis)
+  stage: web_api_service
+  alternative_considered: Synchronous blocking would cause WebSocket timeouts on long analyses
+- id: BD-019
+  type: BA
+  content: Redis progress tracker with WebSocket push
+  rationale: Real-time progress updates via WebSocket eliminate client polling overhead and provide instant
+    feedback during long-running analyses. Redis pub/sub ensures reliable message delivery to each connected
+    WebSocket clients tracking the same analysis.
+  evidence: app/services/redis_progress_tracker.py:10(module)
+  stage: web_api_service
+  alternative_considered: HTTP polling would waste bandwidth and add latency
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/services/redis_progress_tracker.py'
+- id: BD-020
+  type: BA/M
+  content: Config lookup from MongoDB system_configs
+  rationale: Dynamic configuration storage in MongoDB enables runtime LLM provider and model changes through
+    the Web UI without code deployment. This supports A/B testing different models, cost optimization,
+    and provider failover without service interruption.
+  evidence: app/services/simple_analysis_service.py:121(module)
+  stage: web_api_service
+  alternative_considered: Static config files would require deployment for every model change
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/services/simple_analysis_service.py'
+- id: BD-021
+  type: B
+  content: 'API key priority: model_config > provider_config > env_var'
+  rationale: Hierarchical API key resolution (model → provider → environment) enables fine-grained multi-provider
+    usage where different models can use different API keys. This supports cost optimization by mixing
+    providers (e.g., cheap gpt-3.5 for research, claude-3 for synthesis) within a single analysis.
+  evidence: app/services/simple_analysis_service.py:136(module)
+  stage: web_api_service
+  alternative_considered: Single key per provider would prevent optimal cost routing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/services/simple_analysis_service.py'
+- id: BD-022
+  type: T
+  content: Factory function create_llm_by_provider() with provider routing
+  rationale: Centralized LLM factory function provides a single entry point for each LLM instantiation
+    across the system, making provider addition straightforward and ensuring consistent initialization
+    patterns. This architectural constraint prevents scattered LLM creation logic.
+  evidence: tradingagents/graph/trading_graph.py:41(module)
+  stage: llm_provider_abstraction
+  alternative_considered: Distributed LLM creation would complicate provider management
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/graph/trading_graph.py'
+- id: BD-023
+  type: T
+  content: OpenAICompatibleBase inherits ChatOpenAI
+  rationale: Inheriting from LangChain's ChatOpenAI ensures drop-in compatibility with existing LangChain
+    tools, chains, and evaluation frameworks. This avoids re-implementing integration layers and enables
+    use of the full LangChain ecosystem for any OpenAI-compatible API provider.
+  evidence: tradingagents/llm_adapters/openai_compatible_base.py:32(module)
+  stage: llm_provider_abstraction
+  alternative_considered: Custom adapter would require reimplementing each LangChain integrations
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/llm_adapters/openai_compatible_base.py'
+- id: BD-024
+  type: BA/M
+  content: Token tracking in _generate() with _track_token_usage()
+  rationale: Unified token usage logging across each LLM providers enables accurate cost tracking per
+    analysis, per user, and per model. This visibility is essential for cost allocation, budget enforcement,
+    and identifying opportunities for model downgrading without quality loss.
+  evidence: tradingagents/llm_adapters/openai_compatible_base.py:155(module)
+  stage: llm_provider_abstraction
+  alternative_considered: No tracking would prevent cost optimization and budget enforcement
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/llm_adapters/openai_compatible_base.py'
+- id: BD-025
+  type: BA/DK
+  content: 'Mixed-mode: quick/deep LLMs can come from different providers'
+  rationale: Cross-provider LLM routing enables cost optimization by using cheap fast models (e.g., local
+    llama) for simple tasks like data extraction while reserving expensive deep models (e.g., claude-3)
+    for complex synthesis and judgment tasks. This mixed-mode approach can reduce costs by 50-70%.
+  evidence: tradingagents/graph/trading_graph.py:242(module)
+  stage: llm_provider_abstraction
+  alternative_considered: Single model for each tasks would either be expensive or insufficient
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/graph/trading_graph.py'
+- id: BD-026
+  type: B/BA
+  content: Default LLM provider is OpenAI with o4-mini (deep) and gpt-4o-mini (quick) models
+  rationale: OpenAI selected as default provider due to superior performance on financial analysis tasks.
+    Dual-model strategy (o4-mini deep for complex reasoning, gpt-4o-mini quick for fast responses) balances
+    accuracy and latency. These models have proven reliability on financial domain tasks and consistent
+    API availability.
+  evidence: tradingagents/default_config.py:12-14(module)
+  stage: Configuration
+  alternative_considered: Anthropic Claude models were considered but rejected due to higher cost and
+    less proven financial domain performance at time of selection
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/default_config.py'
+- id: BD-027
+  type: B/BA
+  content: Max debate rounds defaults to 1, max risk discuss rounds defaults to 1
+  rationale: Single-round debate limits execution time while still enabling contrarian viewpoints. Multi-round
+    deliberation significantly increases latency (each round adds LLM call overhead). Initial conservative
+    defaults allow rapid prototyping; teams can increase rounds for high-stakes decisions where thorough
+    debate justifies higher latency.
+  evidence: tradingagents/default_config.py:17-18(module)
+  stage: risk_debate
+  alternative_considered: Multi-round (3-5) debate was rejected for default as it would increase analysis
+    time by 3-5x with diminishing returns for routine analysis
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/default_config.py'
+- id: BD-028
+  type: B/BA
+  content: Online tools disabled by default (ONLINE_TOOLS_ENABLED defaults to false)
+  rationale: Disabling online tools by default reduces external API dependencies and prevents rate limiting
+    issues in production. This ensures deterministic behavior and faster execution for cached/local data
+    scenarios. Teams must explicitly enable for real-time data fetching that may incur costs and latency.
+  evidence: tradingagents/default_config.py:21(module)
+  stage: data_collection
+  alternative_considered: Enabling by default was rejected due to potential uncontrolled API costs and
+    reliability issues with external data sources
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/default_config.py'
+- id: BD-029
+  type: B/BA
+  content: Online news enabled by default (ONLINE_NEWS_ENABLED defaults to true)
+  rationale: News is critical for market sentiment analysis and time-sensitive trading decisions. News
+    APIs typically have generous free tiers and reasonable rate limits compared to financial data APIs.
+    Disabling news would significantly reduce analysis quality for momentum-driven strategies.
+  evidence: tradingagents/default_config.py:22(module)
+  stage: data_collection
+  alternative_considered: Making news opt-in was considered but rejected because sentiment analysis without
+    current news is significantly less actionable
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/default_config.py'
+- id: BD-030
+  type: B/RC
+  content: Quick analysis uses temperature 0.7, max_tokens 4000, timeout 180 seconds
+  rationale: Temperature 0.7 provides balanced creativity without sacrificing coherence for quick analysis
+    tasks. Max tokens 4000 allows detailed responses within reasonable cost bounds. 180-second timeout
+    balances user experience against potential LLM latency spikes during high-demand periods.
+  evidence: tradingagents/graph/trading_graph.py:41(create_llm_by_provider)
+  stage: Model Configuration
+  alternative_considered: Higher temperature (0.9) was rejected for quick mode as it increases unpredictability
+    without commensurate benefit for rapid analysis
+- id: BD-031
+  type: B/BA
+  content: 'Analysis focus types: comprehensive, technical, fundamental, risk, comparison'
+  rationale: 'Five distinct analysis types cover the primary dimensions investors evaluate: technical
+    indicators, fundamental financials, risk assessment, comparative analysis, and comprehensive multi-factor
+    evaluation. This taxonomy aligns with institutional investment research frameworks and enables modular
+    agent design.'
+  evidence: examples/custom_analysis_demo.py:64-117(module)
+  stage: Analysis Configuration
+  alternative_considered: Simpler binary (bullish/bearish) classification was rejected as it loses nuance
+    required for actionable investment decisions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in examples/custom_analysis_demo.py'
+- id: BD-032
+  type: B
+  content: Temperature 0.1 for stock analysis (low randomness for consistent results)
+  rationale: Temperature 0.1 produces highly deterministic outputs essential for financial analysis consistency.
+    Low temperature ensures the same input produces comparable recommendations, critical for backtesting
+    and comparing analyst performance over time. High consistency reduces noise that could lead to erratic
+    trading signals.
+  evidence: examples/my_stock_analysis.py:47(module)
+  stage: Model Configuration
+  alternative_considered: Temperature 0 (greedy) was considered but rejected as it can produce repetitive
+    patterns; 0.1 provides margin while maintaining consistency
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in examples/my_stock_analysis.py'
+- id: BD-033
+  type: B
+  content: Max tokens 4000 for analysis reports (allows detailed analysis output)
+  rationale: 4000 tokens provides sufficient space for comprehensive analysis covering multiple data points,
+    reasoning steps, and nuanced recommendations. This limit balances verbosity against API costs (pricing
+    is often per-token). Shorter limits would truncate analysis; longer limits increase costs without
+    proportional quality improvement.
+  evidence: examples/my_stock_analysis.py:48(module)
+  stage: Model Configuration
+  alternative_considered: 8000 tokens was rejected due to 2x cost increase; 2000 tokens was rejected as
+    insufficient for comprehensive multi-factor analysis
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in examples/my_stock_analysis.py'
+- id: BD-034
+  type: B/BA
+  content: 'Analysis requires 4 analyst types: market, social, news, fundamentals'
+  rationale: 'Four-analyst architecture ensures comprehensive coverage of investment-relevant information
+    dimensions: market data/technicals, social sentiment/trends, news events, and fundamental financials.
+    Missing any dimension would create blind spots in analysis. This structure mirrors institutional research
+    teams with specialized analysts.'
+  evidence: tradingagents/default_config.py:198(module)
+  stage: Agent Selection
+  alternative_considered: Three-analyst model (combining social+news) was rejected as social sentiment
+    and news require different data sources and processing approaches
+  _evidence_issues:
+  - 'LINE_OOB: tradingagents/default_config.py:198 > 27'
+- id: BD-035
+  type: B/DK
+  content: Market analyst tool call limit is 3, social/news/fundamentals same
+  rationale: Uniform 3-call limit across non-fundamental analysts balances depth of research against execution
+    speed and cost. This limit prevents infinite loops while allowing multiple data source queries. Fundamentals
+    uses separate limit because single comprehensive API calls (e.g., financial statements) are more efficient
+    than multiple smaller calls.
+  evidence: tradingagents/graph/conditional_logic.py:28,72,110(module)
+  stage: Tool Execution Control
+  alternative_considered: Higher limits (5-10) were rejected as they significantly increase latency without
+    proportional insight gains for most queries
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/graph/conditional_logic.py'
+- id: BD-036
+  type: B
+  content: Fundamentals analyst tool call limit is 1 (single call fetches each data)
+  rationale: Fundamental data APIs (like financial statement providers) are designed to return comprehensive
+    data in single calls. Multiple calls would be redundant and wasteful. Single-call architecture leverages
+    API design efficiently, reducing both latency and cost while ensuring data consistency from a single
+    snapshot.
+  evidence: tradingagents/graph/conditional_logic.py:149(module)
+  stage: Tool Execution Control
+  alternative_considered: Multiple sequential calls were rejected as they could return inconsistent data
+    if API updates between calls
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/graph/conditional_logic.py'
+- id: BD-037
+  type: B/BA
+  content: Investment debate total rounds = 2 * max_debate_rounds (Bull speaks first)
+  rationale: Bull-first ordering assumes initial positive framing reduces anchoring effects and encourages
+    thorough examination of investment merits before risk concerns. Multiplier of 2 reflects that each
+    round involves both bull and bear perspectives, so 1 config round = 2 speaking turns. This structure
+    ensures balanced debate within bounded time.
+  evidence: tradingagents/graph/conditional_logic.py:203-204(module)
+  stage: risk_debate
+  alternative_considered: Bear-first ordering was rejected as research suggests positive framing first
+    improves information retention and reduces defensive reactions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/graph/conditional_logic.py'
+- id: BD-038
+  type: B
+  content: Risk debate total rounds = 3 * max_risk_discuss_rounds (3 analysts)
+  rationale: Three-analyst structure (Risky, Safe, Neutral) requires 3x multiplier because each round
+    involves each three perspectives sequentially. This ensures each risk analyst contributes per round,
+    creating thorough multi-perspective risk assessment. Balanced rotation prevents any single viewpoint
+    from dominating the risk discussion.
+  evidence: tradingagents/graph/conditional_logic.py:222(module)
+  stage: risk_debate
+  alternative_considered: Two-analyst risk model was rejected as insufficient diversity for comprehensive
+    risk assessment in investment decisions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/graph/conditional_logic.py'
+- id: BD-039
+  type: B
+  content: 'Signal processing extracts: action (买入/持有/卖出), target_price, confidence (0-1), risk_score
+    (0-1)'
+  rationale: Four-field output structure (action, price, confidence, risk) provides complete trading signal
+    specification. Action drives execution, target_price sets entry/exit levels, confidence indicates
+    signal strength for filtering, and risk_score enables position sizing. Missing any field would incompletely
+    specify a tradeable signal.
+  evidence: tradingagents/graph/signal_processing.py:74-78(module)
+  stage: trading_decision
+  alternative_considered: Additional fields (holding period, stop-loss) were considered but deferred to
+    future iterations to maintain MVP simplicity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/graph/signal_processing.py'
+- id: BD-040
+  type: B/BA
+  content: Default confidence is 0.7, default risk_score is 0.5 when not specified
+  rationale: Default confidence 0.7 assumes moderate certainty by default, requiring explicit high confidence
+    for aggressive signals. Risk score 0.5 represents neutral risk, neither risk-on nor risk-off bias.
+    These defaults enable system operation without explicit values while maintaining reasonable risk posture
+    until model provides specific estimates.
+  evidence: tradingagents/graph/signal_processing.py:76-77(module)
+  stage: trading_decision
+  alternative_considered: Zero defaults were rejected as they would create signals that cannot be executed
+    without manual override
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/graph/signal_processing.py'
+- id: BD-041
+  type: B/BA
+  content: 'Action must be Chinese: 买入/持有/卖出 (no English buy/hold/sell)'
+  rationale: Chinese action labels ensure consistency with Chinese market conventions and internal data
+    storage which uses Chinese financial terminology. This prevents encoding errors and ensures compatibility
+    with Chinese market data sources, broker APIs, and regulatory reporting requirements in the primary
+    operating market.
+  evidence: tradingagents/graph/signal_processing.py:82(module)
+  stage: trading_decision
+  alternative_considered: Bilingual support was considered but rejected as it would double validation
+    logic and increase error surface
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/graph/signal_processing.py'
+- id: BD-042
+  type: B/BA
+  content: Buy target price defaults to 15% (China) or 12% (US) above current price
+  rationale: 'Different market volatility profiles justify different default upside targets: Chinese A-shares
+    have historically shown higher volatility requiring wider bands (15%), while US markets tend toward
+    smaller moves (12%). These percentages balance profit potential against realistic price target achievement
+    within typical holding periods.'
+  evidence: tradingagents/graph/signal_processing.py:269-270(module)
+  stage: Smart Price Estimation
+  alternative_considered: Uniform 10% was rejected as it underestimates Chinese market potential and overestimates
+    US market moves
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/graph/signal_processing.py'
+- id: BD-043
+  type: B/BA
+  content: Sell stop-loss defaults to 5% (China) or 8% (US) below current price
+  rationale: Tighter Chinese stop-loss (5%) reflects higher volatility and faster price movements in A-shares
+    markets where liquidation needs to be decisive. Wider US stop-loss (8%) accommodates normal daily
+    fluctuations while still protecting against significant drawdowns. Both defaults aim to cut losses
+    at 1-2 standard deviation moves.
+  evidence: tradingagents/graph/signal_processing.py:272-273(module)
+  stage: Smart Price Estimation
+  alternative_considered: Tighter 3% stop for both markets was rejected as it would trigger excessive
+    false stops in volatile periods
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/graph/signal_processing.py'
+- id: BD-044
+  type: B/DK
+  content: Trader must provide specific target_price, null values not allowed
+  rationale: Null target prices would create incomplete orders that cannot be executed by broker systems.
+    This validation ensures each trading decisions have defined entry/exit points before reaching execution
+    layer. Prevents downstream errors and ensures risk parameters are fully specified.
+  evidence: tradingagents/agents/trader/trader.py:67(module)
+  stage: trading_decision
+  alternative_considered: Default target calculation was rejected as it would mask potentially flawed
+    analysis decisions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/agents/trader/trader.py'
+- id: BD-045
+  type: B/DK
+  content: 'Currency unit must match stock market: RMB for A-shares, USD for US/HK stocks'
+  rationale: Currency mismatch would cause order rejection by brokers and potential significant financial
+    errors (e.g., submitting $100 order intended as $100 RMB = $14). Market-specific currency enforcement
+    ensures orders align with exchange requirements and prevents costly routing failures.
+  evidence: tradingagents/agents/trader/trader.py:86-89(module)
+  stage: trading_decision
+  alternative_considered: Auto-conversion was rejected as it introduces exchange rate risk and complicates
+    P&L reporting
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/agents/trader/trader.py'
+- id: BD-046
+  type: B/BA
+  content: Memory system uses ChromaDB for vector storage of past decisions
+  rationale: ChromaDB is purpose-built for embedding similarity search with minimal operational overhead.
+    Its file-based persistence simplifies deployment compared to dedicated vector databases. Enables efficient
+    retrieval of semantically similar past decisions, supporting learning from historical trading patterns.
+  evidence: tradingagents/agents/utils/memory.py:16-31(module)
+  stage: reflection_memory
+  alternative_considered: Pinecone/Weaviate were considered but rejected due to cloud dependency and operational
+    complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/agents/utils/memory.py'
+- id: BD-047
+  type: B/BA
+  content: Memory embedding uses DashScope text-embedding-v3 by default
+  rationale: DashScope text-embedding-v3 provides high-quality embeddings optimized for Chinese text,
+    essential for processing Chinese financial documents and news. Integration with Alibaba Cloud infrastructure
+    provides reliable API access with competitive pricing for high-volume embedding operations.
+  evidence: tradingagents/agents/utils/memory.py:113(module)
+  stage: reflection_memory
+  alternative_considered: OpenAI embeddings were rejected as they underperform on Chinese text and introduce
+    dependency on foreign API
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/agents/utils/memory.py'
+- id: BD-048
+  type: B
+  content: Max embedding content length is 50,000 characters
+  rationale: 50,000 character limit accommodates full analyst reports and extended news articles while
+    preventing embedding of entire document dumps. This boundary balances retrieval granularity against
+    API costs and embedding quality (longer texts dilute semantic focus). Most financial documents fit
+    within this limit.
+  evidence: tradingagents/agents/utils/memory.py:105(module)
+  stage: reflection_memory
+  alternative_considered: 100,000 limit was rejected as it significantly increases embedding costs with
+    marginal benefit
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/agents/utils/memory.py'
+- id: BD-049
+  type: B
+  content: 'Single analysis rate limit: 10 requests per minute per user'
+  rationale: 10 requests/minute allows intensive research workflows while preventing abuse. Most users
+    conducting thorough analysis will not exceed this limit. Combined with daily quotas, this prevents
+    both burst abuse and sustained overuse of compute resources.
+  evidence: app/middleware/rate_limit.py:24(module)
+  stage: Rate Limiting
+  alternative_considered: Higher 20/min was rejected as it would allow excessive parallel abuse; lower
+    5/min would frustrate legitimate intensive users
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/middleware/rate_limit.py'
+- id: BD-050
+  type: B/BA
+  content: 'Batch analysis rate limit: 5 requests per minute per user'
+  rationale: Batch requests consume significantly more resources than single analyses. Lower rate (5 vs
+    10) for batches reflects higher per-request cost. Batch submissions are typically scheduled activities
+    where users tolerate slower submission rates in exchange for parallel processing.
+  evidence: app/middleware/rate_limit.py:25(module)
+  stage: Rate Limiting
+  alternative_considered: Equal 10/min batch limit was rejected as batches multiply resource consumption
+    quadratically
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/middleware/rate_limit.py'
+- id: BD-051
+  type: B/BA
+  content: 'Daily quota default: 1000 requests per user'
+  rationale: 1000 daily requests accommodates heavy professional usage while preventing any single user
+    from dominating shared compute resources. This quota allows 40+ analyses per hour over a 24-hour period,
+    sufficient for institutional workloads while ensuring fair resource distribution among users.
+  evidence: app/core/config.py:93(module)
+  stage: Rate Limiting
+  alternative_considered: 2000 quota was rejected as it would allow excessive resource consumption; 500
+    was rejected as too restrictive for power users
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/core/config.py'
+- id: BD-052
+  type: B/BA
+  content: 'MongoDB connection pool: 10-100 connections, 30s idle timeout'
+  rationale: 'Dynamic pool (10-100) adapts to load: minimum ensures baseline capacity, maximum prevents
+    connection exhaustion. 30-second idle timeout releases unused connections back to pool, preventing
+    connection leaks during low-traffic periods while keeping connections warm for active usage patterns.'
+  evidence: app/core/database.py:47-54(module)
+  stage: Database Configuration
+  alternative_considered: Fixed 50-connection pool was rejected as it cannot adapt to varying load patterns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/core/database.py'
+- id: BD-053
+  type: B/RC
+  content: 'MongoDB socket timeout: 60 seconds, connection timeout: 30 seconds'
+  rationale: Socket timeout (60s) allows complex queries to complete while preventing indefinite hangs.
+    Connection timeout (30s) fails fast on unreachable databases, enabling quicker circuit-breaker activation.
+    These balances provide resilience without excessive resource holding during failures.
+  evidence: app/core/config.py:40-42(module)
+  stage: Database Configuration
+  alternative_considered: Shorter 30s socket timeout was rejected as complex financial aggregations can
+    exceed this
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/core/config.py'
+- id: BD-054
+  type: B/BA
+  content: 'Redis connection pool: 20 max connections with retry on timeout'
+  rationale: Redis serves caching and session management where 20 connections typically suffice for application-layer
+    workloads. Retry-on-timeout ensures transient Redis issues don't immediately fail requests. Lower
+    pool size vs MongoDB reflects Redis's single-threaded nature where fewer connections are more efficient.
+  evidence: app/core/config.py:62-63(module)
+  stage: Database Configuration
+  alternative_considered: 50 Redis connections was rejected as it would waste resources for typical application
+    needs
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/core/config.py'
+- id: BD-055
+  type: B/BA
+  content: 'Stock screening limit: 1-500 results per query (default 50)'
+  rationale: Maximum 500 results prevents memory exhaustion on broad queries while allowing comprehensive
+    screening. Default 50 provides manageable result sets for detailed review. Minimum 1 ensures queries
+    always return something when criteria match, preventing empty-result confusion.
+  evidence: app/models/screening.py:55(module)
+  stage: Screening
+  alternative_considered: No limit was rejected as unrestricted queries could crash the application with
+    excessive results
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/models/screening.py'
+- id: BD-056
+  type: B/DK
+  content: 'Data source priority for China: MongoDB > AKShare > Tushare > BaoStock'
+  rationale: MongoDB first leverages locally cached/curated data for speed and reliability. AKShare second
+    provides free public API access for supplemental data. Tushare offers higher quality but rate-limited
+    professional data. BaoStock last as backup when others fail. This priority cascade maximizes data
+    freshness while minimizing costs.
+  evidence: tradingagents/dataflows/data_source_manager.py:164-169(module)
+  stage: data_collection
+  alternative_considered: Tushare-first was rejected as rate limits would quickly exhaust free tier on
+    high-volume operations
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/dataflows/data_source_manager.py'
+- id: BD-057
+  type: B
+  content: 'Tushare rate limits: 100-800 calls/minute based on tier (free to VIP)'
+  rationale: Tushare's tiered rate limiting (100 free to 800 VIP) requires dynamic throttling based on
+    user's subscription level. Enforcing these limits prevents API key suspension and ensures fair access.
+    This tiered approach enables both free exploration and professional high-volume usage.
+  evidence: app/core/rate_limiter.py:108-114(module)
+  stage: Rate Limiting
+  alternative_considered: Ignoring limits was rejected as it would cause account suspension and service
+    interruption
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/core/rate_limiter.py'
+- id: BD-058
+  type: B/BA
+  content: 'AKShare conservative limit: 60 calls/minute (no official limit)'
+  rationale: AKShare has no official rate limit, but conservative 60 calls/minute prevents potential IP
+    blocking or service degradation from aggressive scraping. This limit respects the free nature of AKShare
+    data while acknowledging that even unofficial limits may exist at scale.
+  evidence: app/core/rate_limiter.py:154(module)
+  stage: Rate Limiting
+  alternative_considered: Higher 120/min was rejected as it approaches levels that could trigger blocking
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/core/rate_limiter.py'
+- id: BD-059
+  type: B
+  content: 'Research depth levels: 快速(1), 基础(2), 标准(3), 深度(4), 全面(5)'
+  rationale: 'Five-tier depth system provides clear user choice between speed and thoroughness: 快速 for
+    quick checks, 基础 for overview, 标准 for standard research, 深度 for comprehensive analysis, 全面 for exhaustive
+    examination. This mirrors professional research workflows where different decisions warrant different
+    analysis depths.'
+  evidence: app/models/analysis.py:37-45(module)
+  stage: Analysis Configuration
+  alternative_considered: Binary fast/deep was rejected as it loses nuance needed for varied use cases
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/models/analysis.py'
+- id: BD-060
+  type: B
+  content: Batch analysis max 10 stocks per request
+  rationale: Ten-stock batch size balances parallel processing efficiency against memory constraints and
+    failure blast radius. Larger batches risk overwhelming system resources; smaller batches create excessive
+    overhead. This limit enables meaningful portfolio screening while maintaining responsive individual
+    stock analysis.
+  evidence: app/models/analysis.py:169(module)
+  stage: signal_processing
+  alternative_considered: 20-stock batches were rejected as they risk timeout failures on comprehensive
+    analysis
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/models/analysis.py'
+- id: BD-061
+  type: B
+  content: 'Max retries for failed analysis: 3 attempts'
+  rationale: Three retries balance resilience against latency accumulation. Most transient failures (network
+    hiccups, temporary service unavailability) resolve within 2-3 attempts. More than 3 retries would
+    significantly delay user experience with diminishing success probability. Failed analyses after 3
+    retries suggest deeper issues requiring intervention.
+  evidence: app/models/analysis.py:97(module)
+  stage: Error Handling
+  alternative_considered: 5 retries was rejected as it would multiply latency for marginal success gains
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/models/analysis.py'
+- id: BD-062
+  type: B/DK
+  content: 'Operator types for screening: GT, LT, GTE, LTE, EQ, NE, BETWEEN, IN, NOT_IN, CONTAINS, CROSS_UP,
+    CROSS_DOWN'
+  rationale: 'Twelve operator types cover each common financial screening scenarios: comparison (GT/LT/GTE/LTE/EQ/NE),
+    range (BETWEEN/IN/NOT_IN), text matching (CONTAINS), and technical signals (CROSS_UP/CROSS_DOWN).
+    Missing any would create gaps in screening expressiveness for common financial criteria.'
+  evidence: app/models/screening.py:10-23(module)
+  stage: Screening
+  alternative_considered: Minimal 5-operator set was rejected as it would prevent common screening patterns
+    like price crossover
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/models/screening.py'
+- id: BD-063
+  type: B/BA
+  content: 'Default market type: A-shares (CN), adj type: qfq (forward adjusted)'
+  rationale: A-shares as default reflects primary user base. Forward-adjusted prices (qfq) are standard
+    for Chinese stock analysis as they show realistic historical returns without dividend distortion.
+    This default minimizes configuration for the majority use case while allowing explicit overrides for
+    other markets.
+  evidence: app/models/screening.py:46-48(module)
+  stage: data_collection
+  alternative_considered: Unadjusted prices were rejected as they misrepresent historical performance
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/models/screening.py'
+- id: BD-064
+  type: B/BA
+  content: 'NO_PROXY list includes: localhost, 127.0.0.1, eastmoney domains, tushare.pro, baostock.com'
+  rationale: Local addresses bypass proxy to avoid unnecessary proxy overhead for internal services. Financial
+    data domains excluded from proxy ensure direct connection to data sources, preventing proxy-related
+    latency and potential connection issues with financial APIs that may reject proxied requests.
+  evidence: app/core/config.py:111-113(module)
+  stage: Network Configuration
+  alternative_considered: Proxying each traffic was rejected as it would cause connectivity issues with
+    financial data APIs
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/core/config.py'
+- id: BD-065
+  type: B/BA
+  content: Stock screening uses database optimization by default
+  rationale: Database-side filtering (MongoDB aggregation pipeline) is dramatically faster than application-side
+    filtering for large datasets. This optimization reduces network transfer and leverages indexed fields.
+    Default-on ensures users get best performance without requiring technical knowledge to enable optimization.
+  evidence: app/models/screening.py:59(module)
+  stage: Screening Optimization
+  alternative_considered: Application-side filtering default was rejected as it would cause unacceptable
+    latency for broad screenings
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/models/screening.py'
+- id: BD-066
+  type: B/BA
+  content: 'Quotes ingestion interval: 360 seconds (6 minutes) default'
+  rationale: Six-minute refresh interval balances data freshness against API rate limits and storage overhead.
+    Most trading strategies don't require real-time quotes; 6-minute data suffices for swing trading and
+    daily rebalancing. This interval also aligns with typical trading platform quote refresh patterns.
+  evidence: app/core/config.py:163-164(module)
+  stage: data_collection
+  alternative_considered: 1-minute interval was rejected as it would exhaust API rate limits quickly
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/core/config.py'
+- id: BD-067
+  type: B
+  content: 'Model capability levels: 1=BASIC, 2=STANDARD, 3=ADVANCED, 4=PROFESSIONAL, 5=FLAGSHIP'
+  rationale: Five-tier capability system maps to both user needs and model pricing tiers. BASIC for simple
+    tasks, escalating to FLAGSHIP for complex reasoning requiring frontier models. This framework enables
+    flexible model selection based on task requirements and budget constraints.
+  evidence: app/constants/model_capabilities.py:17-23(module)
+  stage: Model Selection
+  alternative_considered: Binary tier was rejected as it loses nuance for varying task complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/constants/model_capabilities.py'
+- id: BD-068
+  type: B/RC
+  content: 'Required model feature: TOOL_CALLING for each analysis depths'
+  rationale: Tool calling enables models to interact with data sources, execute calculations, and perform
+    web searches essential for financial analysis. Without tool calling, models cannot access real-time
+    data or perform the research tasks required. This requirement ensures each analysis uses capable models.
+  evidence: app/constants/model_capabilities.py:59(module)
+  stage: Model Selection
+  alternative_considered: Non-tool-calling models were rejected as they cannot perform required financial
+    research
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/constants/model_capabilities.py'
+- id: BD-069
+  type: B
+  content: Deep analysis (levels 4-5) requires REASONING feature
+  rationale: Deep and comprehensive analysis (levels 4-5) require multi-step reasoning, hypothesis generation,
+    and synthesis capabilities that standard models lack. REASONING models (with extended thinking) produce
+    significantly better investment analysis by working through complex scenarios methodically.
+  evidence: app/constants/model_capabilities.py:80-88(module)
+  stage: Model Selection
+  alternative_considered: Using non-reasoning models for deep analysis was rejected as it produces inferior
+    investment research
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/constants/model_capabilities.py'
+- id: BD-070
+  type: B
+  content: 'Risk analysts debate order: Risky → Safe → Neutral (cycling)'
+  rationale: Risk-first ordering (Risky, Safe, Neutral) ensures extreme perspectives are heard before
+    moderate views. This structure prevents anchoring on neutral positions and forces explicit consideration
+    of both bullish and bearish scenarios. Cycling through perspectives ensures no single viewpoint dominates
+    the risk discussion.
+  evidence: tradingagents/graph/conditional_logic.py:234-239(module)
+  stage: risk_debate
+  alternative_considered: Neutral-first ordering was rejected as it could anchor the discussion on moderate
+    positions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/graph/conditional_logic.py'
+  vague_rationale: true
+- id: BD-071
+  type: B/DK
+  content: Stock screening creates MongoDB view joining stock_basic_info, market_quotes, stock_financial_data
+  rationale: Pre-joined view eliminates expensive application-side joins and reduces network round-trips.
+    This denormalized structure enables single-query screening across fundamental, price, and financial
+    data. Views are materialized at query time, ensuring data consistency while maintaining normalized
+    source tables.
+  evidence: app/core/database.py:241-332(module)
+  stage: Database Design
+  alternative_considered: Application-side joins were rejected as they would cause unacceptable query
+    latency
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/core/database.py'
+- id: BD-072
+  type: B/DK
+  content: Pre_close calculated using shift(1) to get previous day's close price
+  rationale: shift(1) correctly retrieves the previous row's close price for calculating daily changes.
+    This standard pandas pattern ensures pre-market and post-market periods are correctly handled. Correct
+    pre_close calculation is essential for accurate return computation and technical indicator calculations.
+  evidence: app/services/historical_data_service.py:122-123(module)
+  stage: data_collection
+  alternative_considered: Manual previous-day lookup was rejected as it would be slower and error-prone
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/services/historical_data_service.py'
+- id: BD-073
+  type: B/BA
+  content: Confidence and risk_score range 0-1, with 0.7 and 0.5 as defaults
+  rationale: Normalized 0-1 range enables consistent signal comparison across different analysts and time
+    periods. Default confidence 0.7 reflects moderate certainty bias, requiring explicit evidence for
+    high-confidence calls. Risk score 0.5 represents neutral positioning. This normalization enables proper
+    position sizing and signal filtering.
+  evidence: tradingagents/graph/signal_processing.py:199-200(module)
+  stage: trading_decision
+  alternative_considered: Percentage 0-100 was rejected as 0-1 is standard for ML/AI systems and simplifies
+    probability calculations
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/graph/signal_processing.py'
+- id: BD-074
+  type: B/DK
+  content: Moving Average (MA) uses simple rolling mean with configurable window and min_periods=1
+  rationale: Moving Average provides smoothed price trend visibility for traders. The simple rolling mean
+    offers interpretability over exponential alternatives. min_periods=1 enables calculation from the
+    first data point, ensuring results are available even with limited historical data while maintaining
+    a window-based smoothing effect. This balance supports both responsive early signals and trend confirmation.
+  evidence: tradingagents/tools/analysis/indicators.py:25(ma)
+  stage: tradingagents.tools.analysis
+  alternative_considered: EMA-based moving average would weight recent prices more heavily but adds complexity
+    without clear benefit for each use cases
+- id: BD-075
+  type: B
+  content: MACD uses EMA-based calculation with fixed standard parameters
+  rationale: MACD employs exponential moving averages (12/26/9 standard periods) to detect trend changes
+    and momentum. The EMA weighting provides faster response to price changes compared to SMA while avoiding
+    excessive noise. Fixed parameters ensure consistency across calculations and align with industry-standard
+    interpretation for trading decisions.
+  evidence: tradingagents/tools/analysis/indicators.py:56(macd)
+  stage: tradingagents.tools.analysis
+  alternative_considered: Custom MACD periods could be tuned for specific assets but would reduce comparability
+    across markets
+- id: BD-076
+  type: B/DK
+  content: 'RSI uses three calculation methods: EMA (Wilder''s international standard), SMA (simple),
+    and China-style (com=n-1, adjust=True)'
+  rationale: 'RSI calculation method selection accommodates different regional standards and analytical
+    preferences. The three variants support global trading operations: EMA follows Wilder''s original
+    specification for international markets, SMA provides simple interpretation, and China-style matches
+    TongDaXin、同花顺 platforms for A-share market accuracy. This flexibility enables accurate RSI reporting
+    regardless of which market data source is primary.'
+  evidence: tradingagents/tools/analysis/indicators.py:78(rsi)
+  stage: tradingagents.tools.analysis
+  alternative_considered: Single RSI method would force users to adapt to one regional standard, reducing
+    accuracy for non-primary markets
+- id: BD-077
+  type: B/BA
+  content: Bollinger Bands uses n-period SMA centerline with k=2.0 standard deviation bands
+  rationale: Bollinger Bands use 2.0 standard deviations (k=2.0) to capture approximately 95% of price
+    action within bands under normal distribution assumptions. This parameter is the industry standard,
+    providing reliable volatility visualization. The n-period SMA centerline offers a clear baseline for
+    identifying price position relative to recent average, enabling overbought/oversold detection and
+    volatility breakout identification.
+  evidence: tradingagents/tools/analysis/indicators.py:124(boll)
+  stage: tradingagents.tools.analysis
+  alternative_considered: k=1.5 would create tighter bands with more signals but higher false positive
+    rate
+- id: BD-078
+  type: B/DK
+  content: ATR uses True Range calculation averaged over n periods with min_periods=n
+  rationale: Average True Range measures market volatility by averaging True Range values over n periods.
+    min_periods=n ensures volatility calculations only begin producing results after the full lookback
+    window, preventing misleading early signals from incomplete data. This approach provides accurate
+    volatility measurement essential for position sizing, stop-loss determination, and market regime identification.
+  evidence: tradingagents/tools/analysis/indicators.py:149(atr)
+  stage: tradingagents.tools.analysis
+  alternative_considered: min_periods=1 would show early values but with reduced reliability until sufficient
+    history accumulates
+- id: BD-079
+  type: B/DK
+  content: KDJ uses RSV calculation from n-period lowest-low/highest-high range with recursive EMA smoothing
+  rationale: KDJ indicator derives from stochastic oscillator principles, calculating RSV (Raw Stochastic
+    Value) using the n-period price range. The recursive EMA smoothing produces K and D lines that oscillate
+    0-100, enabling momentum and reversal signal identification. This combination of range-based RSV and
+    EMA smoothing is particularly effective for volatile markets and provides earlier signals than pure
+    stochastic indicators.
+  evidence: tradingagents/tools/analysis/indicators.py:159(kdj)
+  stage: tradingagents.tools.analysis
+  alternative_considered: Simple stochastic without EMA would produce more erratic signals in trending
+    markets
+- id: BD-080
+  type: B
+  content: Enhanced news filtering combines rule-based, semantic similarity, and classification scores
+    with weighted average
+  rationale: News filtering combines multiple signal types (rule-based keywords, semantic embedding similarity,
+    and ML classification probabilities) using weighted averaging. This multi-layered approach reduces
+    false positives from any single method and improves relevance accuracy for trading signal extraction.
+    The weighted combination balances deterministic rules, semantic understanding, and learned patterns.
+  evidence: tradingagents/utils/enhanced_news_filter.py:205(calculate_enhanced_relevance_score)
+  stage: tradingagents.utils
+  alternative_considered: Single-method filtering (rules-only or ML-only) would sacrifice either interpretability
+    or pattern recognition capability
+- id: BD-081
+  type: B
+  content: Semantic similarity uses cosine similarity between text embeddings and company embeddings
+  rationale: Cosine similarity between news text embeddings and company embeddings quantifies semantic
+    relevance without keyword matching limitations. This approach captures contextual meaning, enabling
+    detection of relevant news that mentions companies indirectly or uses synonyms. The embedding-based
+    method is language-agnostic and robust to paraphrasing.
+  evidence: tradingagents/utils/enhanced_news_filter.py:109(calculate_semantic_similarity)
+  stage: tradingagents.utils
+  alternative_considered: BM25 or keyword matching would miss semantically related content using different
+    vocabulary
+- id: BD-082
+  type: B/DK
+  content: 'Data source fallback priority: MongoDB > AKShare > Tushare > BaoStock for China stocks'
+  rationale: Data source fallback priority balances data quality, latency, and reliability for China stock
+    data. MongoDB provides cached consistency, AKShare offers free public data, Tushare provides structured
+    financial data, and BaoStock serves as final fallback. This cascade ensures data availability even
+    when primary sources fail while preferring higher-quality and lower-latency sources when available.
+  evidence: tradingagents/dataflows/data_source_manager.py:2250(_get_data_source_priority_order)
+  stage: tradingagents.dataflows
+  alternative_considered: Random or round-robin fallback would reduce data consistency and potentially
+    select inferior sources
+- id: BD-083
+  type: B/BA
+  content: Stock screening evaluates DSL conditions on latest row data with cross_up/cross_down detection
+    using t0 vs t1 comparison
+  rationale: Stock screening evaluates conditions on the latest data row with t0 vs t1 comparison to detect
+    crossover events. This enables detection of technical indicators crossing thresholds (e.g., price
+    crossing above moving average) which are important trading signals. The temporal comparison captures
+    regime changes and momentum shifts essential for quantitative screening strategies.
+  evidence: app/services/screening/eval_utils.py:78(evaluate_conditions)
+  stage: app.services.screening
+  alternative_considered: Single-point evaluation without t0/t1 comparison would miss crossover events
+    and momentum indicators
+- id: BD-084
+  type: B/BA
+  content: Screening logic supports AND/OR boolean combination of condition groups
+  rationale: Boolean combination of screening conditions (AND/OR) enables complex multi-factor queries
+    required for quantitative strategies. AND logic screens for stocks meeting each criteria simultaneously,
+    while OR logic expands coverage to include stocks meeting any criterion. This flexibility supports
+    diverse screening strategies from conservative (each criteria must match) to expansive (any match
+    acceptable).
+  evidence: app/services/screening/eval_utils.py:31(evaluate_fund_conditions)
+  stage: app.services.screening
+  alternative_considered: Single-condition-only screening would severely limit strategy expression and
+    query capability
+- id: BD-085
+  type: B
+  content: Commission calculation uses rate-based model with minimum fee floor per trade
+  rationale: Commission calculation uses a rate-based model (percentage of trade value) with a minimum
+    fee floor to ensure transaction costs cover processing overhead. The minimum floor prevents extremely
+    small trades from having negligible commission that wouldn't justify the operational cost. This model
+    mirrors real-world broker fee structures for accurate paper trading simulation.
+  evidence: app/routers/paper.py:127(_calculate_commission)
+  stage: app.routers
+  alternative_considered: Pure percentage commission would allow artificially profitable micro-trades
+    that don't exist in real markets
+- id: BD-086
+  type: B
+  content: 'Cost basis uses quantity-weighted average: new_avg = (old_cost*old_qty + price*qty) / new_qty'
+  rationale: Cost basis calculation uses quantity-weighted average pricing (VWAP) to accurately represent
+    the average purchase price across multiple position entries. This method ensures P&L calculations
+    reflect the true average cost, critical for determining realistic profit/loss and exit decisions.
+    The formula properly accounts for position accumulation and averaging-in effects.
+  evidence: app/routers/paper.py:434(module)
+  stage: app.routers
+  alternative_considered: FIFO/LIFO methods would require strict ordering assumptions that may not match
+    actual trading patterns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/routers/paper.py'
+- id: BD-087
+  type: RC
+  content: T+1 settlement restricts selling A-share stocks purchased on same trading day
+  rationale: T+1 settlement is a regulatory requirement for Chinese A-share markets where stock purchases
+    cannot be sold until the next trading day. This restriction is enforced in the paper trading simulator
+    to ensure realistic position management and prevent strategy over-optimization. The rule reflects
+    actual market mechanics and settlement processes in China exchanges.
+  evidence: app/routers/paper.py:160(_get_available_quantity)
+  stage: app.routers
+  alternative_considered: T+0 trading would enable strategies that violate actual market rules and produce
+    misleading backtest results
+- id: BD-088
+  type: B
+  content: Technical indicator data retrieval uses 60-day lookback with +365 day buffer for calculation
+  rationale: Technical indicator calculation requires 60-day lookback for recent data plus 365-day buffer
+    to ensure sufficient history for indicator computation. The buffer accounts for indicators requiring
+    extended history (e.g., 200-day MA) and provides data continuity. This lookback balance ensures indicators
+    are calculable from day one while minimizing unnecessary data retrieval.
+  evidence: tradingagents/dataflows/providers/us/yfinance.py:201(module)
+  stage: tradingagents.dataflows.providers.us
+  alternative_considered: Shorter buffer would cause missing data for long-period indicators; longer buffer
+    increases latency unnecessarily
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/dataflows/providers/us/yfinance.py'
+- id: BD-089
+  type: B/DK
+  content: China-style RSI uses exponential weighted moving average with com=n-1 and adjust=True to match
+    TongDaXin/同花顺
+  rationale: China-style RSI with com=n-1 and adjust=True matches TongDaXin and 同花顺 platform calculations
+    for A-share market analysis. The com parameter controls exponential decay rate to replicate Wilder's
+    smoothing effect, while adjust=True ensures calculation accuracy. This compatibility enables consistent
+    RSI values when comparing against popular Chinese trading platforms.
+  evidence: tradingagents/tools/analysis/indicators.py:110(module)
+  stage: tradingagents.tools.analysis
+  alternative_considered: Standard pandas ewm without com parameter would produce different values than
+    Chinese platforms
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/tools/analysis/indicators.py'
+- id: BD-090
+  type: B/BA
+  content: Market analyst requires minimum 250 trading days for professional-grade technical analysis
+    accuracy
+  rationale: Market analyst requires minimum 250 trading days (approximately one year) for professional-grade
+    technical analysis accuracy. This threshold ensures sufficient data for reliable indicator calculations,
+    statistical significance, and pattern recognition. The requirement prevents strategy deployment with
+    insufficient historical context that would produce unreliable signals.
+  evidence: tests/test_market_analyst_lookback.py:167(module)
+  stage: tradingagents
+  alternative_considered: Shorter lookback would allow earlier trading but with unreliable signals due
+    to limited sample size
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tests/test_market_analyst_lookback.py'
+- id: BD-091
+  type: B/BA
+  content: 'MACD histogram multiplied by 2 for TongDaXin compatibility: macd = (dif - dea) * 2'
+  rationale: MACD histogram multiplication by 2 ensures compatibility with TongDaXin platform display
+    standards. The (DIF - DEA) * 2 formula produces histogram values that match the visual representation
+    expected by Chinese traders. This scaling is essential for cross-platform signal verification and
+    ensures the visualization matches popular Chinese trading software.
+  evidence: tradingagents/tools/analysis/indicators.py:344(module)
+  stage: tradingagents.tools.analysis
+  alternative_considered: Unadjusted MACD would display differently than Chinese platforms, causing confusion
+    for users comparing signals
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/tools/analysis/indicators.py'
+- id: BD-092
+  type: B
+  content: Screening sample limit capped at 120 stocks for performance control
+  rationale: Stock screening is limited to 120 symbols to control computational performance and prevent
+    resource exhaustion. The cap balances comprehensive screening coverage against system responsiveness.
+    Without this boundary, screening thousands of symbols would cause unacceptable latency and memory
+    usage during real-time queries.
+  evidence: app/services/screening_service.py:80(module)
+  stage: app.services
+  alternative_considered: Unlimited screening would cause severe performance issues; pagination or batching
+    could provide partial solutions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/services/screening_service.py'
+- id: BD-093
+  type: B/BA
+  content: 'Percentage change calculated as: pct_chg = (close_t / close_t-1 - 1) * 100'
+  rationale: Percentage change calculation uses standard (current/previous - 1) * 100 formula, which is
+    the financial industry standard for returns calculation. This method produces the percentage gain
+    or loss relative to the previous close, enabling accurate performance comparison and threshold-based
+    screening. The formula handles price discontinuities correctly across trading sessions.
+  evidence: app/services/screening_service.py:115(module)
+  stage: app.services
+  alternative_considered: Log returns would provide different values useful for compounding but less intuitive
+    for threshold-based screening
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/services/screening_service.py'
+- id: BD-094
+  type: B/DK
+  content: Market value unit conversion from frontend万元 to backend亿元 using division by 10000
+  rationale: Market value unit conversion from frontend 万元 (10,000 CNY) to backend 亿元 (100,000,000 CNY)
+    uses division by 10,000. This conversion bridges the display preference (smaller numbers for user
+    readability) with backend storage (standard financial reporting unit). The conversion ensures consistent
+    data interpretation across frontend display and backend processing.
+  evidence: app/routers/screening.py:133(module)
+  stage: app.routers
+  alternative_considered: Storing everything in single units (either 万 or 亿) would cause display awkwardness
+    or storage inefficiency
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/routers/screening.py'
+- id: BD-095
+  type: B/BA
+  content: News classification uses softmax probability over logits to get class probabilities
+  rationale: News classification applies softmax over model logits to produce normalized probability distributions
+    across classes. Softmax ensures probabilities sum to 1.0 and exponentially scales logits to emphasize
+    confident predictions. This approach enables threshold-based filtering (e.g., >80% confidence) and
+    provides calibrated confidence scores for downstream decision-making.
+  evidence: tradingagents/utils/enhanced_news_filter.py:188(module)
+  stage: tradingagents.utils
+  alternative_considered: Raw logits without softmax would lack interpretability and calibrated confidence
+    thresholds
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/utils/enhanced_news_filter.py'
+- id: BD-096
+  type: B/BA
+  content: 'Initial paper trading capital by market: CNY=1,000,000, HKD=1,000,000, USD=100,000'
+  rationale: Initial paper trading capital varies by market currency to reflect realistic account sizes.
+    CNY and HKD start at 1,000,000 (1 million) while USD starts at 100,000. The difference reflects typical
+    account sizing in these markets and currency values. This allocation enables realistic position sizing
+    and capital utilization simulation for each market context.
+  evidence: app/routers/paper.py:17(module)
+  stage: app.routers
+  alternative_considered: Equal capital across currencies would create unrealistic position sizing relative
+    to actual market values
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/routers/paper.py'
+- id: BD-097
+  type: B
+  content: 'Unrealized PnL calculation: pnl = (last_price - avg_cost) * quantity'
+  rationale: Unrealized P&L uses the standard (current price - average cost) × quantity formula, representing
+    the paper profit or loss if the position were closed at current prices. This calculation provides
+    real-time performance visibility essential for trading decisions. The method correctly accounts for
+    partial positions and varying entry costs through average cost basis.
+  evidence: app/routers/paper.py:308(module)
+  stage: app.routers
+  alternative_considered: Entry price only would ignore averaging effects; mark-to-market requires current
+    pricing which this provides
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/routers/paper.py'
+- id: BD-098
+  type: B/DK
+  content: Pandas min_periods=1 for MA/BOLL allows calculation from first available data point
+  rationale: Pandas min_periods=1 setting enables moving average and Bollinger Bands calculations from
+    the first available data point rather than waiting for a full window. This ensures indicators are
+    available immediately without empty leading periods. While early values may be less stable, this approach
+    improves usability for shorter datasets and provides immediate visual feedback.
+  evidence: tradingagents/tools/analysis/indicators.py:38(module)
+  stage: tradingagents.tools.analysis
+  alternative_considered: min_periods=window would require waiting for full window before any values appear,
+    reducing initial usability
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tradingagents/tools/analysis/indicators.py'
+- id: BD-099
+  type: BA/M
+  content: OpenAICompatibleBase temperature defaults to 0.1 (very low) across each LLM adapters
+  rationale: 'Low temperature (0.1) enforces deterministic, focused outputs critical for trading decisions
+    where variance could introduce costly inconsistent recommendations. Boundary: Applies to ALL LLM adapters
+    inheriting from OpenAICompatibleBase, ensuring consistent randomness control across quick_think and
+    deep_think pathways.'
+  evidence: tradingagents/llm_adapters/openai_compatible_base.py:32(OpenAICompatibleBase)
+  stage: default_value
+  alternative_considered: Higher temperature (0.7) used in default_config.py creates potential inconsistency
+    for graph node invocations vs adapter-level defaults
+- id: BD-100
+  type: T
+  content: 'Dual-LLM architecture: quick_think_llm for data collection vs deep_think_llm for reasoning'
+  rationale: 'Separating quick and deep LLM processing enables efficient data gathering with fast models
+    while reserving expensive deep reasoning for critical decision nodes. Boundary: Dual-LLM contract
+    is enforced at TradingAgentsGraph initialization; each agent node binds to either quick_think or deep_think
+    based on its role classification.'
+  evidence: tradingagents/graph/trading_graph.py:196(TradingAgentsGraph.__init__)
+  stage: pattern_choice
+  alternative_considered: Single LLM approach rejected due to cost/latency tradeoffs; ensemble approach
+    deferred for complexity
+- id: BD-101
+  type: T
+  content: 'Analysis workflow enforces strict order: Market→Social→News→Fundamentals→Bull/Bear Debate→Invest
+    Judge→Trader→Risk Manager'
+  rationale: 'Sequential workflow ensures information flows from broad market context to specific investment
+    judgment, with risk validation as final gate. Boundary: Order is hardcoded in setup_graph; deviation
+    breaks data dependencies between stages (e.g., Bull/Bear requires each prior context).'
+  evidence: tradingagents/graph/setup.py:51-150(setup_graph)
+  stage: ordering_contract
+  alternative_considered: Parallel execution rejected due to dependent information requirements; conditional
+    branching deferred
+- id: BD-102
+  type: B/DK
+  content: 'Currency enforcement: SignalProcessor requires Chinese action labels (买入/持有/卖出) and validates
+    currency match to stock market'
+  rationale: 'Chinese action labels enforce localization and prevent misaligned trading instructions;
+    currency validation prevents cross-market signal errors. Boundary: SignalProcessor validates at action_map
+    construction time; mismatch throws ValueError blocking invalid signals.'
+  evidence: tradingagents/graph/signal_processing.py:11(SignalProcessor)
+  stage: invariant
+  alternative_considered: Multi-currency support rejected for MVP scope; English labels considered but
+    rejected for China market localization
+- id: BD-103
+  type: M/BA
+  content: max_debate_rounds defaults to 1 (min=1), max_tool_calls per analyst defaults to 3
+  rationale: 'Conservative debate limits prevent resource exhaustion while allowing minimum adversarial
+    reasoning. Boundary: max_debate_rounds enforced in conditional_logic.py validate_debate_rounds();
+    max_tool_calls enforced per analyst node initialization.'
+  evidence: tradingagents/default_config.py:17-18(tradingagents)
+  stage: default_value
+  alternative_considered: Dynamic rounds based on disagreement intensity considered but deferred for simplicity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: tradingagents in tradingagents/default_config.py'
+- id: BD-104
+  type: T
+  content: DataSourceAdapter ABC defines priority-based fallback order with MongoDB as highest priority
+    cache
+  rationale: 'Priority-based fallback ensures data availability even when primary sources fail, with MongoDB
+    cache providing low-latency reads before falling back to remote providers. Boundary: Fallback order
+    defined in DataSourceAdapter.abstract get_data(); concrete implementations must respect priority contract.'
+  evidence: app/services/data_sources/base.py:9(DataSourceAdapter)
+  stage: inheritance
+  alternative_considered: Round-robin fallback rejected; Redis-only cache rejected due to persistence
+    requirements
+- id: BD-105
+  type: B/BA
+  content: ChromaDBManager singleton pattern with thread-safe collection caching
+  rationale: 'Singleton ensures single ChromaDB connection point preventing resource exhaustion; thread-safe
+    caching reduces repeated collection lookups. Boundary: Singleton initialized once per process; collection
+    cache keyed by collection_name with lazy initialization.'
+  evidence: tradingagents/agents/utils/memory.py:16-96(ChromaDBManager)
+  stage: pattern_choice
+  alternative_considered: Connection pooling rejected for scope; per-request ChromaDB instances rejected
+    due to initialization overhead
+- id: BD-106
+  type: B/BA
+  content: 'Middleware ordering: RateLimitMiddleware → QuotaMiddleware → ErrorHandlerMiddleware enforces
+    request governance before error handling'
+  rationale: 'Middleware ordering ensures rate limiting and quota checks execute before error handling,
+    preventing abuse from reaching error paths. Boundary: Order enforced at app initialization; violating
+    order breaks rate quota enforcement.'
+  evidence: app/middleware/rate_limit.py:15(RateLimitMiddleware)
+  stage: ordering_contract
+  alternative_considered: Error-first ordering rejected; distributed rate limiting via Redis considered
+    but adds complexity
+- id: BD-107
+  type: BA
+  content: 'Middleware graceful degradation chain: Redis failure triggers quota bypass instead of request
+    rejection'
+  rationale: 'Graceful degradation on Redis failure prevents system unavailability from blocking legitimate
+    requests, prioritizing business continuity. Boundary: Degradation applies only to quota checks; rate
+    limiting continues via in-memory counters on Redis failure.'
+  evidence: app/middleware/rate_limit.py:129(module)
+  stage: ordering_contract
+  alternative_considered: Strict rejection on Redis failure rejected for availability; circuit breaker
+    pattern deferred
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in app/middleware/rate_limit.py'
+- id: BD-108
+  type: M/BA
+  content: Daily quota (1000 requests) and per-endpoint rate limits are hardcoded defaults, not configurable
+    via DB
+  rationale: 'Hardcoded defaults enable rapid deployment without infrastructure dependency, but prevent
+    runtime adjustment. Boundary: Defaults set at middleware initialization; DB-driven configuration deferred
+    for v2.'
+  evidence: app/middleware/rate_limit.py:98(QuotaMiddleware)
+  stage: invariant
+  alternative_considered: Dynamic quota via DB considered but adds latency; feature flag system deferred
+- id: BD-109
+  type: DK
+  content: 'Temperature mismatch: default_config uses 0.7 for graph nodes, but LLM adapters default to
+    0.1'
+  rationale: 'Configuration mismatch creates unpredictable behavior where adapter-level temperature (0.1)
+    may override graph-level settings (0.7). Boundary: Inconsistency occurs when adapters are instantiated
+    without explicit temperature override.'
+  evidence: tradingagents/llm_adapters/openai_compatible_base.py:400(__init__)
+  stage: default_value
+  alternative_considered: Unified temperature config considered; adapter-level 0.1 may be intentional
+    for determinism
+- id: BD-110
+  type: BA/M
+  content: Model capability level system (1-5) with role matching (QUICK_ANALYSIS vs DEEP_ANALYSIS)
+  rationale: 'Capability levels enable appropriate model selection based on task complexity, preventing
+    over/under-provisioning. Boundary: ANALYSIS_DEPTH_REQUIREMENTS maps task types to minimum capability
+    levels; mismatches trigger fallback or error.'
+  evidence: app/constants/model_capabilities.py:17(ModelCapabilityLevel)
+  stage: pattern_choice
+  alternative_considered: Single model approach rejected; dynamic model selection deferred
+  vague_rationale: true
+- id: BD-111
+  type: T
+  content: 'Multi-agent debate architecture: Bull/Bear researchers debate, then InvestJudge; Risky/Safe/Neutral
+    debate, then RiskJudge'
+  rationale: 'Debate architecture ensures adversarial analysis before judgment, improving decision quality
+    through opposing viewpoints. Boundary: Debate flow defined in agent_states.py; each debate requires
+    minimum participants and rounds before judgment proceeds.'
+  evidence: tradingagents/agents/utils/agent_states.py:15(InvestDebateState)
+  stage: subdirectory
+  alternative_considered: Single-agent analysis rejected for lack of adversarial validation; human-in-loop
+    deferred
+- id: BD-112
+  type: B/DK
+  content: pre_close calculation via shift(1) must use pandas shift NOT datetime offset for前日收盘价
+  rationale: 'Pandas shift(1) ensures correct row-wise previous value reference for time series; datetime
+    offset would produce incorrect temporal alignment. Boundary: Invalid shift method produces NaN or
+    misaligned prices triggering downstream calculation errors.'
+  evidence: tradingagents/tools/analysis/indicators.py:150(tradingagents)
+  stage: default_value
+  alternative_considered: 'Datetime offset considered but rejected for row-alignment requirement; alternative:
+    resample-then-shift deferred'
+  _evidence_issues:
+  - 'FN_NOT_FOUND: tradingagents in tradingagents/tools/analysis/indicators.py'
+- id: BD-113
+  type: BA/DK
+  content: 'Chinese investment recommendations ONLY: SignalProcessor action_map enforces 中文 (买入/持有/卖出)'
+  rationale: 'Chinese action labels enforce localization and prevent English/Chinese ambiguity in trading
+    instructions. Boundary: action_map validated at SignalProcessor init; non-Chinese labels rejected
+    with ValueError.'
+  evidence: tradingagents/graph/signal_processing.py:11(SignalProcessor)
+  stage: invariant
+  alternative_considered: Bilingual support rejected for scope; ISO 4217 action codes deferred
+- id: BD-114
+  type: T
+  content: ToolNode contains ALL tools per category (online+offline) but LLM only invokes bound tools;
+    graceful degradation chain
+  rationale: 'ToolNode aggregates each category tools ensuring availability, while binding limits LLM
+    invocation scope preventing unauthorized tool access. Boundary: Graceful degradation attempts online
+    tools first, falls back to offline; unavailability triggers tool exclusion.'
+  evidence: tradingagents/graph/trading_graph.py:814-870(_create_tool_nodes)
+  stage: pattern_choice
+  alternative_considered: Separate nodes per tool rejected for graph complexity; eager binding rejected
+    for flexibility
+- id: BD-115
+  type: B/BA
+  content: 'INTERACTION: [BD-099] × [BD-030] × [BD-032] → Temperature cascade inconsistency across LLM
+    adapters and graph nodes'
+  rationale: Adapter-level temperature (0.1) conflicts with graph node defaults (0.7 for quick_think,
+    0.1 for analysis). When LLM adapters are instantiated without explicit temperature override, the adapter
+    default (0.1) takes precedence over graph-level settings, creating unpredictable output consistency.
+    This manifests when quick_think_llm is expected to be creative (0.7) but actually runs at 0.1 determinism.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Unified temperature configuration would require refactoring adapter inheritance
+    hierarchy
+- id: BD-116
+  type: B/DK
+  content: 'INTERACTION: [BD-005] × [BD-004] × [BD-034] → Sequential analyst execution with per-analyst
+    tool budget creates information starvation risk'
+  rationale: Sequential execution (BD-005) means each analyst runs in isolation with only 3 tool calls
+    (BD-004). When Market→Social→News→Fundamentals run sequentially, later analysts have no access to
+    data fetched by earlier analysts. If social analyst needs context from market data but exhausts its
+    3 calls on generic social queries, the cross-domain insight is lost. This contradicts the comprehensive
+    analysis goal (BD-034).
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Shared context buffer between sequential analysts would allow data reuse but
+    adds complexity
+- id: BD-117
+  type: B/DK
+  content: 'INTERACTION: [BD-001] × [BD-056] × [BD-082] → Redundant fallback chain decisions create maintenance
+    inconsistency risk'
+  rationale: 'Three separate BDs define the same data source fallback priority: BD-001 (architecture fallback
+    chain), BD-056 (priority for China), and BD-082 (explicit priority order). When these decisions are
+    duplicated across code locations and documentation, they can drift out of sync during updates. The
+    architecture decision (BD-001) lists Tushare before AKShare while BD-056 reverses this, creating contradictory
+    guidance for developers.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Single source of truth for fallback priority would eliminate drift but requires
+    centralizing config
+- id: BD-118
+  type: BA/DK
+  content: 'INTERACTION: [BD-006] × [BD-015] × [BD-045] → Currency validation across market detection
+    creates double-validation overhead'
+  rationale: Market detection (BD-006), price extraction (BD-015), and trading validation (BD-045) each
+    perform currency/market validation independently. StockUtils.get_market_info() detects is_china/is_hk/is_us,
+    then SignalProcessor extracts currency-aware prices, then Trader validates currency match. This triple-validation
+    adds latency and could produce different results if implementations diverge. The same logical concern
+    is handled three times.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Single currency validation service would centralize logic but add dependency
+    coupling
+- id: BD-119
+  type: B/DK
+  content: 'INTERACTION: [BD-017] × [BD-009] × [BD-046] → Memory retrieval limit conflicts with reflection
+    goal of learning from mistakes'
+  rationale: Reflection (BD-009) aims to learn from historical mistakes, but memory retrieval (BD-017)
+    limits to only 2 matches. If an analyst made repeated errors in a specific domain (e.g., misjudging
+    A-share volatility), the 2-match limit may not surface enough historical context to recognize the
+    pattern. The system claims learning capability but artificially caps the evidence available for pattern
+    recognition.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Adaptive n_matches based on query similarity scores could fetch more matches
+    when relevance is high
+- id: BD-120
+  type: T
+  content: 'RISK CASCADE: [BD-004] → [BD-035] → [BD-036] → [BD-101] → Analysis quality degradation under
+    complex scenarios'
+  rationale: 'Tool call limits create a cascade: max_tool_calls=3 (BD-004/035) means complex analyses
+    may not gather sufficient data before debate begins. The strict sequential order (BD-101) means if
+    market analyst exhausts calls on tangential data, the subsequent bull/bear debate lacks foundational
+    context. Fundamentals has only 1 call (BD-036) which fetches each data, but other analysts must budget
+    3 calls across potentially multiple data sources. This creates systemic risk where edge cases produce
+    incomplete analysis.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Dynamic tool call allocation based on query complexity would require real-time
+    estimation
+- id: BD-121
+  type: T
+  content: 'RISK CASCADE: [BD-028] → [BD-029] → [BD-066] → Real-time data availability paradox for investment
+    decisions'
+  rationale: 'Default settings create conflicting signals: online tools disabled (BD-028) but news enabled
+    (BD-029), while quotes refresh every 6 minutes (BD-066). For momentum-driven strategies that rely
+    on current news sentiment, the 6-minute quote lag plus disabled online tools means the system uses
+    stale prices with fresh news. This mismatch can trigger contradictory signals where news suggests
+    immediate action but price data doesn''t reflect recent moves.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Synchronized data freshness settings would require co-configuration of tools
+    and refresh intervals
+- id: BD-122
+  type: B/BA
+  content: 'CONTRADICTION: [BD-014] default ''持有'' vs [BD-044] requires specific target_price → Conservative
+    fail-safe conflicts with strict validation'
+  rationale: BD-014 defaults to '持有' (hold) with confidence=0.5 on invalid input as a fail-safe to prevent
+    erroneous actions. However, BD-044 strictly requires a specific target_price and rejects null values.
+    When signal processing defaults to hold, the trader node then requires a price to proceed, creating
+    an impossible state. The fail-safe creates a hold decision that cannot be executed because no price
+    was specified. This contradiction means the safety mechanism doesn't work end-to-end.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Default target_price calculation when hold is triggered would bridge the contradiction
+- id: BD-123
+  type: BA/DK
+  content: 'AMPLIFICATION: [BD-100] × [BD-025] × [BD-021] → Cross-provider LLM routing enables multiplicative
+    cost optimization but increases operational complexity'
+  rationale: 'Dual-LLM architecture (BD-100) combined with cross-provider routing (BD-025) and hierarchical
+    key priority (BD-021) creates multiplicative flexibility. A single analysis could route quick_think
+    to local llama (free), deep_think to Claude ($15/1M tokens), and specific tools to OpenAI, each with
+    different API keys. This flexibility can reduce costs by 70%+ but amplifies operational complexity:
+    each provider has different rate limits, latency profiles, and failure modes.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Single provider simplicity would reduce flexibility but improve reliability
+- id: BD-GAP-001
+  type: RC
+  content: 'Missing: float vs Decimal for currency'
+  rationale: 'Audit finding: missing: float vs decimal for currency. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-002
+  type: M
+  content: 'Missing: Matrix ill-conditioning and stability'
+  rationale: 'Audit finding: missing: matrix ill-conditioning and stability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-003
+  type: B
+  content: 'Missing: Train/test time split integrity'
+  rationale: 'Audit finding: missing: train/test time split integrity. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-004
+  type: B
+  content: 'Missing: 资金成本建模（Carry/Funding）'
+  rationale: 'Audit finding: missing: 资金成本建模（carry/funding）. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-005
+  type: B
+  content: 'Missing: 回测过拟合防护'
+  rationale: 'Audit finding: missing: 回测过拟合防护. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-006
+  type: B
+  content: 'Missing: 执行可行性/流动性约束'
+  rationale: 'Audit finding: missing: 执行可行性/流动性约束. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-007
+  type: M
+  content: 'Missing: 协方差矩阵 PSD 修复策略'
+  rationale: 'Audit finding: missing: 协方差矩阵 psd 修复策略. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-008
+  type: B
+  content: 'Missing: 协方差估计量选择与收缩'
+  rationale: 'Audit finding: missing: 协方差估计量选择与收缩. RSK-3 | 收益率频率与年化因子 | ❠️ partial | Risk-related code
+    exists but no annualization factor enforcement. This gap affects production reliability and should
+    be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: RSK-3 | 收益率频率与年化因子 | ❠️ partial | Risk-related code exists but no annualization factor enforcement
+- id: BD-GAP-009
+  type: B
+  content: 'Missing: 波动率模型族与分布选择'
+  rationale: 'Audit finding: missing: 波动率模型族与分布选择. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-010
+  type: B
+  content: 'Missing: 因子 IC 的 demean 与分组对齐'
+  rationale: 'Audit finding: missing: 因子 ic 的 demean 与分组对齐. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-011
+  type: B
+  content: 'Missing: 违约定义与 IFRS 9 分阶段'
+  rationale: 'Audit finding: missing: 违约定义与 ifrs 9 分阶段. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-012
+  type: B
+  content: 'Missing: PD/LGD/EAD 估计方法'
+  rationale: 'Audit finding: missing: pd/lgd/ead 估计方法. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-013
+  type: B
+  content: 'Missing: Vasicek 单因子资产相关性假设'
+  rationale: 'Audit finding: missing: vasicek 单因子资产相关性假设. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-014
+  type: M
+  content: 'Missing: 转移矩阵时间同质性与条件调整'
+  rationale: 'Audit finding: missing: 转移矩阵时间同质性与条件调整. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-015
+  type: B
+  content: 'Missing: 压力测试情景宏观驱动变量'
+  rationale: 'Audit finding: missing: 压力测试情景宏观驱动变量. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-016
+  type: B
+  content: 'Missing: NPL 组合 EBA 字段完整性'
+  rationale: 'Audit finding: missing: npl 组合 eba 字段完整性. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-017
+  type: B
+  content: 'Missing: RL 奖励函数交易成本建模'
+  rationale: 'Audit finding: missing: rl 奖励函数交易成本建模. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-018
+  type: B
+  content: 'Missing: Covariates 时间可用性约束'
+  rationale: 'Audit finding: missing: covariates 时间可用性约束. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-019
+  content: 'Missing: 定价模型选择与适用边界'
+  type: B
+  rationale: 'Audit finding: missing: 定价模型选择与适用边界. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-020
+  content: 'Missing: 隐含波动率求解器'
+  type: B
+  rationale: 'Audit finding: missing: 隐含波动率求解器. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-021
+  content: 'Missing: Greeks 计算方法'
+  type: B
+  rationale: 'Audit finding: missing: greeks 计算方法. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-022
+  content: 'Missing: 模型校准残差与收敛诊断'
+  type: B
+  rationale: 'Audit finding: missing: 模型校准残差与收敛诊断. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-023
+  content: 'Missing: 无套利约束验证'
+  type: B
+  rationale: 'Audit finding: missing: 无套利约束验证. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-024
+  content: 'Missing: 协方差估计量选择与收缩'
+  type: B
+  rationale: 'Audit finding: missing: 协方差估计量选择与收缩. RSK-3 | 收益率频率与年化因子 | ❠️ partial | Risk-related code
+    exists but no annualization factor enforcement. This gap affects production reliability and should
+    be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: RSK-3 | 收益率频率与年化因子 | ❠️ partial | Risk-related code exists but no annualization factor enforcement
+  known_gap: true
+- id: BD-GAP-025
+  content: 'Missing: 波动率模型族与分布选择'
+  type: B
+  rationale: 'Audit finding: missing: 波动率模型族与分布选择. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: LLM Adapter Template for OpenAI-Compatible Providers
+  source: docs/LLM_ADAPTER_TEMPLATE.py
+  type: extension_example
+  business_problem: Users need a template to create custom LLM adapters for OpenAI-compatible API providers
+    to integrate with TradingAgents framework.
+  intent_keywords:
+  - llm adapter
+  - openai compatible
+  - custom provider
+  - api integration
+  - model configuration
+  stage: integration
+  negative_keywords:
+  - stock analysis
+  - trading strategy
+  - data crawling
+  - news filtering
+  disambiguation: Are you looking to integrate a new LLM provider into TradingAgents, or do you need to
+    analyze stocks?
+  data_domain: mixed
+- id: UC-102
+  name: Batch Stock Analysis with Comparison Reports
+  source: examples/batch_analysis.py
+  type: research_analysis
+  business_problem: Investors need to analyze multiple stocks simultaneously and generate comparison reports
+    for portfolio selection and sector analysis.
+  intent_keywords:
+  - batch analysis
+  - multiple stocks
+  - comparison report
+  - portfolio analysis
+  - sector comparison
+  stage: research_analysis
+  negative_keywords:
+  - single stock
+  - real-time trading
+  - live execution
+  - news filtering
+  disambiguation: Do you want to analyze multiple stocks at once for comparison, or analyze a single stock
+    in depth?
+  data_domain: financial_data
+- id: UC-103
+  name: CLI Tool Chinese Localization Demo
+  source: examples/cli_demo.py
+  type: reporting
+  business_problem: Chinese-speaking users need to see how TradingAgents CLI tools support Chinese language
+    output and commands.
+  intent_keywords:
+  - cli
+  - command line
+  - chinese localization
+  - 中文支持
+  - terminal interface
+  stage: reporting
+  negative_keywords:
+  - web interface
+  - gui
+  - batch processing
+  - data crawling
+  disambiguation: Are you using the command line interface or a web-based interface?
+  data_domain: mixed
+- id: UC-104
+  name: Model Configuration and Cost Management
+  source: examples/config_management_demo.py
+  type: data_pipeline
+  business_problem: Users need to manage multiple LLM model configurations, track token usage, and monitor
+    API costs across different providers.
+  intent_keywords:
+  - configuration management
+  - model settings
+  - cost tracking
+  - token usage
+  - api key management
+  stage: data_collection
+  negative_keywords:
+  - stock analysis
+  - trading execution
+  - news crawling
+  - factor computation
+  disambiguation: Are you setting up LLM models and tracking costs, or do you want to analyze stocks?
+  data_domain: mixed
+- id: UC-105
+  name: Internal Message Data Crawling Pipeline
+  source: examples/crawlers/internal_message_crawler.py
+  type: data_pipeline
+  business_problem: System needs to crawl internal messages from corporate sources and store them in the
+    message database for analysis.
+  intent_keywords:
+  - internal message
+  - web crawler
+  - data collection
+  - database storage
+  - message ingestion
+  stage: data_collection
+  negative_keywords:
+  - social media
+  - public news
+  - stock quotes
+  - technical analysis
+  disambiguation: Are you crawling internal/proprietary messages or public social media data?
+  data_domain: market_data
+- id: UC-106
+  name: Unified Message Crawler Scheduler
+  source: examples/crawlers/message_crawler_scheduler.py
+  type: data_pipeline
+  business_problem: System needs to coordinate and schedule crawling tasks for both social media and internal
+    messages in a unified pipeline.
+  intent_keywords:
+  - crawler scheduler
+  - task scheduling
+  - message crawler
+  - automation
+  - batch crawling
+  stage: data_collection
+  negative_keywords:
+  - manual analysis
+  - single stock
+  - trading execution
+  - factor computation
+  disambiguation: Do you need to set up automated scheduled crawling or perform a one-time data collection?
+  data_domain: market_data
+- id: UC-107
+  name: Social Media Message Crawling
+  source: examples/crawlers/social_media_crawler.py
+  type: data_pipeline
+  business_problem: System needs to crawl social media platforms for stock-related discussions and sentiment
+    data.
+  intent_keywords:
+  - social media crawler
+  - sentiment analysis
+  - weibo
+  - douyin
+  - platform data
+  stage: data_collection
+  negative_keywords:
+  - internal messages
+  - financial statements
+  - technical indicators
+  - historical prices
+  disambiguation: Are you collecting social media sentiment or internal company communications?
+  data_domain: market_data
+- id: UC-108
+  name: Custom Stock Analysis with Focus Selection
+  source: examples/custom_analysis_demo.py
+  type: research_analysis
+  business_problem: Investors need customized stock analysis with selectable focus areas like technical,
+    fundamental, risk assessment, or sector comparison.
+  intent_keywords:
+  - custom analysis
+  - analysis focus
+  - personalized
+  - comprehensive
+  - technical fundamental
+  stage: research_analysis
+  negative_keywords:
+  - batch multiple
+  - automated trading
+  - data collection
+  - configuration setup
+  disambiguation: Do you want a single stock with specific analysis focus or multiple stocks analyzed
+    together?
+  data_domain: financial_data
+- id: UC-109
+  name: Alibaba BaiLian LLM Stock Analysis
+  source: examples/dashscope_examples/demo_dashscope.py
+  type: research_analysis
+  business_problem: Users need to run TradingAgents framework using Alibaba's BaiLian (通义千问) large language
+    model for stock analysis.
+  intent_keywords:
+  - dashscope
+  - 通义千问
+  - bai lian
+  - alibaba llm
+  - chinese ai model
+  stage: research_analysis
+  negative_keywords:
+  - deepseek
+  - openai
+  - gpt
+  - local model
+  disambiguation: Are you specifically using Alibaba's BaiLian model or do you want to use other LLM providers?
+  data_domain: financial_data
+- id: UC-110
+  name: Chinese Language Stock Analysis with BaiLian
+  source: examples/dashscope_examples/demo_dashscope_chinese.py
+  type: research_analysis
+  business_problem: Chinese-speaking users need stock analysis powered by BaiLian with complete Chinese
+    language output and localized analysis.
+  intent_keywords:
+  - chinese output
+  - 中文分析
+  - localized
+  - bilingual
+  - chinese market
+  stage: research_analysis
+  negative_keywords:
+  - english only
+  - multi-language
+  - international markets
+  - forex
+  disambiguation: Do you need Chinese language output specifically, or is English output acceptable?
+  data_domain: financial_data
+- id: UC-111
+  name: BaiLian Stock Analysis without Memory
+  source: examples/dashscope_examples/demo_dashscope_no_memory.py
+  type: research_analysis
+  business_problem: Users need stateless stock analysis using BaiLian model without conversation history
+    memory for independent analysis sessions.
+  intent_keywords:
+  - no memory
+  - stateless
+  - independent session
+  - fresh analysis
+  - context-free
+  stage: research_analysis
+  negative_keywords:
+  - with memory
+  - conversation history
+  - contextual
+  - continuous chat
+  disambiguation: Do you need analysis with conversation memory (context-aware) or without (stateless)?
+  data_domain: financial_data
+- id: UC-112
+  name: Simple BaiLian LLM Integration Test
+  source: examples/dashscope_examples/demo_dashscope_simple.py
+  type: research_analysis
+  business_problem: Users need a simple test to verify BaiLian API connectivity and basic LLM functionality
+    before running full analysis.
+  intent_keywords:
+  - simple test
+  - llm verification
+  - api connection
+  - quick check
+  - basic demo
+  stage: research_analysis
+  negative_keywords:
+  - full analysis
+  - comprehensive
+  - production
+  - trading execution
+  disambiguation: Are you testing API connectivity or ready to run full stock analysis?
+  data_domain: financial_data
+- id: UC-113
+  name: Data Directory Configuration Management
+  source: examples/data_dir_config_demo.py
+  type: data_pipeline
+  business_problem: Users need to configure and manage data storage directories for TradingAgents including
+    cache, logs, and output paths.
+  intent_keywords:
+  - data directory
+  - storage config
+  - path management
+  - file system
+  - cache settings
+  stage: data_collection
+  negative_keywords:
+  - analysis
+  - trading
+  - crawling
+  - factor computation
+  disambiguation: Are you configuring data storage paths or performing stock analysis?
+  data_domain: mixed
+- id: UC-114
+  name: DeepSeek V3 Stock Analysis
+  source: examples/demo_deepseek_analysis.py
+  type: research_analysis
+  business_problem: Users need to perform stock investment analysis using DeepSeek V3 large language model
+    as an alternative to other providers.
+  intent_keywords:
+  - deepseek
+  - deepseek v3
+  - alternative llm
+  - v3 model
+  - chinese ai
+  stage: research_analysis
+  negative_keywords:
+  - dashscope
+  - openai
+  - gpt-4
+  - claude
+  - bai lian
+  disambiguation: Are you specifically using DeepSeek V3 or do you have access to other LLM providers?
+  data_domain: financial_data
+- id: UC-115
+  name: Simplified DeepSeek LLM Demo
+  source: examples/demo_deepseek_simple.py
+  type: research_analysis
+  business_problem: Users need a minimal, dependency-light demonstration of DeepSeek API integration without
+    complex TradingAgents imports.
+  intent_keywords:
+  - minimal demo
+  - simple test
+  - lightweight
+  - direct api
+  - basic chat
+  stage: research_analysis
+  negative_keywords:
+  - full framework
+  - comprehensive
+  - multi-agent
+  - production ready
+  disambiguation: Do you need a minimal test of DeepSeek API or the full TradingAgents multi-agent framework?
+  data_domain: financial_data
+- id: UC-116
+  name: News Filtering for Stock Sentiment
+  source: examples/demo_news_filtering.py
+  type: screening
+  business_problem: Investors need to filter and clean news data to remove irrelevant or low-quality content
+    before sentiment analysis.
+  intent_keywords:
+  - news filtering
+  - sentiment analysis
+  - data cleaning
+  - news quality
+  - signal extraction
+  stage: factor_computation
+  negative_keywords:
+  - price data
+  - technical indicators
+  - fundamental data
+  - trading execution
+  disambiguation: Are you filtering news data or looking at price/technical data for trading signals?
+  data_domain: market_data
+- id: UC-117
+  name: Enhanced Analysis History Management
+  source: examples/enhanced_history_demo.py
+  type: reporting
+  business_problem: Users need to view, load, and review historical stock analysis results for tracking
+    investment decisions over time.
+  intent_keywords:
+  - analysis history
+  - historical results
+  - past analysis
+  - review
+  - tracking
+  stage: reporting
+  negative_keywords:
+  - real-time
+  - live analysis
+  - current data
+  - new analysis
+  disambiguation: Are you reviewing past analysis results or performing new analysis?
+  data_domain: financial_data
+- id: UC-118
+  name: Personal Stock Analysis Custom Script
+  source: examples/my_stock_analysis.py
+  type: research_analysis
+  business_problem: Individual investors need a personalized script to analyze stocks of their choice
+    with custom focus areas.
+  intent_keywords:
+  - personal analysis
+  - my stock
+  - custom focus
+  - individual investor
+  - custom analysis
+  stage: research_analysis
+  negative_keywords:
+  - batch multiple
+  - portfolio optimization
+  - automated trading
+  - institutional
+  disambiguation: Do you want to analyze a single stock personally or run batch analysis on multiple stocks?
+  data_domain: financial_data
+- id: UC-119
+  name: Message Crawler Execution Runner
+  source: examples/run_message_crawlers.py
+  type: data_pipeline
+  business_problem: Users need to execute message crawling tasks for social media and internal communications
+    through a unified runner script.
+  intent_keywords:
+  - run crawler
+  - execute crawling
+  - message collection
+  - automated scraping
+  - scheduled task
+  stage: data_collection
+  negative_keywords:
+  - analysis
+  - trading
+  - reporting
+  - configuration
+  disambiguation: Are you running the crawler to collect data or analyzing collected data?
+  data_domain: market_data
+- id: UC-120
+  name: Quick Stock Analysis Demo
+  source: examples/simple_analysis_demo.py
+  type: research_analysis
+  business_problem: New users need a quick, simple demonstration of TradingAgents-CN capabilities for
+    rapid stock analysis.
+  intent_keywords:
+  - quick start
+  - quick analysis
+  - simple demo
+  - beginner
+  - getting started
+  stage: research_analysis
+  negative_keywords:
+  - advanced
+  - custom
+  - complex
+  - production
+  - batch
+  disambiguation: Are you a beginner looking for a quick demo or an advanced user needing custom configuration?
+  data_domain: financial_data
+- id: UC-121
+  name: Extended Stock Data Model for Chinese A-Stocks
+  source: examples/stock_data_model_usage.py
+  type: data_pipeline
+  business_problem: Users need to access extended stock data models with comprehensive company information
+    for Chinese A-share markets.
+  intent_keywords:
+  - stock data model
+  - extended model
+  - chinese stocks
+  - a-share
+  - company info
+  stage: data_collection
+  negative_keywords:
+  - us stocks
+  - forex
+  - crypto
+  - options
+  disambiguation: Are you analyzing Chinese A-share stocks or other markets (US, crypto, forex)?
+  data_domain: financial_data
+- id: UC-122
+  name: Enhanced Stock List Fetcher with Failover
+  source: examples/stock_list_example.py
+  type: data_pipeline
+  business_problem: Users need to fetch comprehensive stock lists with server failover capability from
+    configuration files for robust data access.
+  intent_keywords:
+  - stock list
+  - list fetcher
+  - server failover
+  - comprehensive
+  - etf index
+  stage: data_collection
+  negative_keywords:
+  - single stock
+  - analysis
+  - trading
+  - real-time quotes
+  disambiguation: Do you need a list of each available stocks or data for a specific stock?
+  data_domain: financial_data
+- id: UC-123
+  name: Stock Query API with Fallback Mechanism
+  source: examples/stock_query_examples.py
+  type: data_pipeline
+  business_problem: Users need to query stock data through a robust API that falls back to traditional
+    methods when primary services fail.
+  intent_keywords:
+  - stock query
+  - api query
+  - fallback
+  - degraded mode
+  - reliable query
+  stage: data_collection
+  negative_keywords:
+  - crawling
+  - scraping
+  - batch processing
+  - historical analysis
+  disambiguation: Are you querying stock data through API or scraping/crawling data from websites?
+  data_domain: financial_data
+- id: UC-124
+  name: Enhanced Data Integration with MongoDB Cache
+  source: examples/test_enhanced_data_integration.py
+  type: data_pipeline
+  business_problem: Users need to test the MongoDB app cache integration for faster data access when TA_USE_APP_CACHE
+    is enabled.
+  intent_keywords:
+  - mongodb cache
+  - app cache
+  - enhanced adapter
+  - cache mode
+  - performance test
+  stage: data_collection
+  negative_keywords:
+  - no cache
+  - raw data
+  - slow query
+  - database only
+  disambiguation: Are you testing MongoDB cache integration or traditional database access?
+  data_domain: financial_data
+- id: UC-125
+  name: System Installation Verification
+  source: examples/test_installation.py
+  type: monitoring
+  business_problem: Users need to verify that TradingAgents-CN is correctly installed with each dependencies
+    and proper environment configuration.
+  intent_keywords:
+  - installation
+  - verification
+  - test setup
+  - environment check
+  - dependencies
+  stage: integration
+  negative_keywords:
+  - analysis
+  - trading
+  - crawling
+  - production use
+  disambiguation: Are you setting up the system for the first time or already have it installed and want
+    to analyze stocks?
+  data_domain: mixed
+- id: UC-126
+  name: News Timeout Handling and Polling Test
+  source: examples/test_news_timeout.py
+  type: monitoring
+  business_problem: Users need to test news retrieval timeout handling, especially for Google News which
+    may timeout, with polling retry mechanism.
+  intent_keywords:
+  - news timeout
+  - polling retry
+  - timeout handling
+  - google news
+  - retry mechanism
+  stage: data_collection
+  negative_keywords:
+  - no timeout
+  - instant retrieval
+  - guaranteed response
+  - unlimited wait
+  disambiguation: Are you experiencing news retrieval timeouts that need retry handling?
+  data_domain: market_data
+- id: UC-127
+  name: Token Usage Tracking and Cost Monitoring
+  source: examples/token_tracking_demo.py
+  type: monitoring
+  business_problem: Users need to track LLM token consumption, calculate API costs, and monitor usage
+    statistics across different models.
+  intent_keywords:
+  - token tracking
+  - cost monitoring
+  - usage statistics
+  - api cost
+  - expense tracking
+  stage: monitoring
+  negative_keywords:
+  - free usage
+  - unlimited
+  - no cost
+  - billing not needed
+  disambiguation: Are you concerned about LLM API costs and usage monitoring?
+  data_domain: mixed
+- id: UC-128
+  name: Tushare China A-Stock Data Provider
+  source: examples/tushare_demo.py
+  type: data_pipeline
+  business_problem: Users need to access Chinese A-share market data (stocks, indices, fundamentals) through
+    Tushare professional data API.
+  intent_keywords:
+  - tushare
+  - china a-share
+  - chinese stocks
+  - a股数据
+  - 基本面数据
+  stage: data_collection
+  negative_keywords:
+  - us stocks
+  - us markets
+  - nyse
+  - nasdaq
+  - american stocks
+  disambiguation: Are you analyzing Chinese A-share stocks or US/international markets?
+  data_domain: financial_data
+- id: UC-129
+  name: Tushare Unified Data Provider and Sync Service
+  source: examples/tushare_unified_demo.py
+  type: data_pipeline
+  business_problem: Users need to use the unified TushareProvider and TushareSyncService for consistent
+    access to Chinese market data with async support.
+  intent_keywords:
+  - tushare provider
+  - unified provider
+  - async sync
+  - data sync service
+  - modern api
+  stage: data_collection
+  negative_keywords:
+  - legacy api
+  - synchronous only
+  - old interface
+  - basic tushare
+  disambiguation: Are you using the modern unified TushareProvider or the legacy basic Tushare interface?
+  data_domain: financial_data
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 37
+  evidence_invalid: 77
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.32456140350877194
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+- type: depends_on
+  target: LangGraph
+  description: 核心框架依赖LangGraph实现状态图工作流
+  evidence: docs/architecture/v0.1.13/system-architecture.md:§Core-Framework-Layer
+- type: depends_on
+  target: tushare_utils.py
+  description: A股数据获取依赖Tushare数据源
+  evidence: docs/architecture/v0.1.16/system-architecture.md:§队列系统-Redis
+- type: depends_on
+  target: Redis
+  description: 批量分析任务队列依赖Redis
+  evidence: docs/architecture/v0.1.16/system-architecture.md:§队列系统-Redis
+- type: depends_on
+  target: MongoDB
+  description: 用户数据和分析历史存储依赖MongoDB
+  evidence: docs/architecture/v0.1.16/system-architecture.md:§MongoDB集合设计
+- type: contains
+  target: analysts.md
+  description: 分析师团队是架构的核心组件
+  evidence: docs/architecture/v0.1.13/agent-architecture.md:§Analysis-Layer
+- type: contains
+  target: researchers.md
+  description: 研究员团队是辩论机制的核心组件
+  evidence: docs/architecture/v0.1.13/agent-architecture.md:§Research-Layer
+- type: contains
+  target: trader.md
+  description: 交易员是执行层的核心组件
+  evidence: docs/architecture/v0.1.13/agent-architecture.md:§Execution-Layer
+- type: contains
+  target: risk-management.md
+  description: 风险管理团队是风险层的核心组件
+  evidence: docs/architecture/v0.1.13/agent-architecture.md:§Risk-Layer
+- type: contains
+  target: managers.md
+  description: 管理层是管理层的核心组件
+  evidence: docs/architecture/v0.1.13/agent-architecture.md:§Management-Layer
+- type: complementary
+  target: docs/configuration/
+  description: 配置文档提供系统配置指南，与架构文档配合使用
+  evidence: docs/configuration/
+- type: complementary
+  target: docs/deployment/
+  description: 部署文档提供Docker和系统部署指南
+  evidence: docs/deployment/
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 6
+    warn: 10
+    fail: 4
+  subdomain_totals:
+    pass: 9
+    warn: 13
+    fail: 29
+  coverage: 71/71 (100%)
+  pass_rate: 15/71 (21%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: china_stock_data_source
+  description: 'Choose based on: budget constraints, data quality requirements, real-time needs, and SLA
+    requirements'
+  used_in_stages: []
+  options:
+  - name: AKShare
+    traits:
+    - free
+    - open-source
+    - no-auth-required
+    - webscraping
+    fit_for:
+    - Quick setup, free tier, development/testing, A-share and HK stocks
+    not_fit_for:
+    - Production requiring stable SLA, high-frequency trading, professional financial analysis
+  - name: Tushare
+    traits:
+    - professional
+    - api-based
+    - token-required
+    - high-quality
+    fit_for:
+    - Professional A-share analysis, comprehensive data, financial research
+    not_fit_for:
+    - Free tier has rate limits; real-time data requires paid subscription
+  - name: BaoStock
+    traits:
+    - free
+    - no-auth-required
+    - stable
+    - historical-focus
+    fit_for:
+    - A-share historical data, backup data source, long-term analysis
+    not_fit_for:
+    - Real-time data needs, comprehensive coverage
+  - name: Wind
+    traits:
+    - professional
+    - commercial
+    - comprehensive
+    - institutional-grade
+    fit_for:
+    - Institutional trading, professional research, full market coverage
+    not_fit_for:
+    - Individual investors, budget-constrained users
+  default: AKShare
+  _source: worker_resource
+- id: slot-002
+  name: us_stock_data_source
+  description: 'Choose based on: budget, real-time needs, coverage requirements'
+  used_in_stages: []
+  options:
+  - name: yfinance
+    traits:
+    - free
+    - open-source
+    - no-auth-required
+    - global-coverage
+    fit_for:
+    - Free tier users, development, global market coverage including US/HK
+    not_fit_for:
+    - High-frequency trading, real-time requirements, professional trading
+  - name: Finnhub
+    traits:
+    - free-tier
+    - api-based
+    - real-time
+    - news-included
+    fit_for:
+    - US stock real-time data, news integration, sentiment analysis
+    not_fit_for:
+    - High-volume trading (60 calls/min limit), comprehensive fundamentals
+  - name: Alpha Vantage
+    traits:
+    - free-tier
+    - technical-focus
+    - fx-crypto
+    fit_for:
+    - Technical analysis, currency data, crypto data
+    not_fit_for:
+    - High-frequency needs (5 calls/min free tier), comprehensive news
+  - name: IEX Cloud
+    traits:
+    - professional
+    - real-time
+    - high-quality
+    fit_for:
+    - Professional trading, real-time US data needs
+    not_fit_for:
+    - Budget-constrained users
+  default: yfinance
+  _source: worker_resource
+- id: slot-003
+  name: vector_memory
+  description: ChromaDB is default for simplicity; switch to managed services for production scale
+  used_in_stages: []
+  options:
+  - name: ChromaDB
+    traits:
+    - embedded
+    - lightweight
+    - langchain-compatible
+    fit_for:
+    - Development, single-instance deployments, embedded use
+    not_fit_for:
+    - Distributed deployments, high-scale production
+  - name: Pinecone
+    traits:
+    - managed
+    - scalable
+    - cloud-native
+    fit_for:
+    - Production deployments requiring scalability
+    not_fit_for:
+    - Budget-constrained users, air-gapped environments
+  - name: Weaviate
+    traits:
+    - open-source
+    - hybrid-search
+    - scalable
+    fit_for:
+    - Self-hosted production, hybrid search requirements
+    not_fit_for:
+    - Quick setup needs
+  default: ChromaDB
+  _source: worker_resource
+- id: slot-004
+  name: cache_backend
+  description: integrated strategy auto-selects based on availability; configure based on infrastructure
+  used_in_stages: []
+  options:
+  - name: MongoDB Cache
+    traits:
+    - persistent
+    - structured
+    - distributed
+    fit_for:
+    - Production with MongoDB already deployed
+    not_fit_for:
+    - Environments without MongoDB
+  - name: Redis Cache
+    traits:
+    - fast
+    - in-memory
+    - distributed
+    fit_for:
+    - High-performance caching, session management
+    not_fit_for:
+    - Environments without Redis
+  - name: File Cache
+    traits:
+    - simple
+    - no-dependency
+    - local-only
+    fit_for:
+    - Development, single-machine setups, environments without databases
+    not_fit_for:
+    - Distributed systems, high-performance needs
+  default: integrated (MongoDB + Redis fallback to File)
+  _source: worker_resource
+- id: slot-005
+  name: primary_database
+  description: MongoDB is the only option currently supported
+  used_in_stages: []
+  options:
+  - name: MongoDB
+    traits:
+    - document-store
+    - async
+    - flexible-schema
+    fit_for:
+    - Flexible data models, async Python, document storage
+    not_fit_for:
+    - Strict ACID transactions, relational data
+  default: MongoDB
+  _source: worker_resource
+- id: slot-006
+  name: cache_session_store
+  description: Redis is the only option currently supported
+  used_in_stages: []
+  options:
+  - name: Redis
+    traits:
+    - in-memory
+    - fast
+    - pub-sub
+    fit_for:
+    - Session management, real-time features, caching
+    not_fit_for:
+    - Persistent storage requirements
+  default: Redis
+  _source: worker_resource
+resources:
+- id: res-001
+  type: python_package
+  name: fastapi
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-002
+  type: python_package
+  name: uvicorn[standard]
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-003
+  type: python_package
+  name: pydantic>=2.0.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-004
+  type: python_package
+  name: motor>=3.3.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-005
+  type: python_package
+  name: pymongo>=4.0.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-006
+  type: python_package
+  name: redis>=6.2.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-007
+  type: python_package
+  name: openai>=1.0.0,<2.0.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-008
+  type: python_package
+  name: langchain-openai>=0.3.23
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: python_package
+  name: langchain-anthropic>=0.3.15
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: python_package
+  name: langchain-google-genai>=2.1.12
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: code_example
+  name: LLM Adapter Template for OpenAI-Compatible Providers
+  path: docs/LLM_ADAPTER_TEMPLATE.py
+  description: Users need a template to create custom LLM adapters for OpenAI-compatible API providers
+    to integrate with TradingAgents framework.
+  used_in_stages:
+  - integration
+  _source: uc_list
+- id: res-012
+  type: code_example
+  name: Batch Stock Analysis with Comparison Reports
+  path: examples/batch_analysis.py
+  description: Investors need to analyze multiple stocks simultaneously and generate comparison reports
+    for portfolio selection and sector analysis.
+  used_in_stages:
+  - research_analysis
+  _source: uc_list
+- id: res-013
+  type: code_example
+  name: CLI Tool Chinese Localization Demo
+  path: examples/cli_demo.py
+  description: Chinese-speaking users need to see how TradingAgents CLI tools support Chinese language
+    output and commands.
+  used_in_stages:
+  - reporting
+  _source: uc_list
+- id: res-014
+  type: code_example
+  name: Model Configuration and Cost Management
+  path: examples/config_management_demo.py
+  description: Users need to manage multiple LLM model configurations, track token usage, and monitor
+    API costs across different providers.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-015
+  type: code_example
+  name: Internal Message Data Crawling Pipeline
+  path: examples/crawlers/internal_message_crawler.py
+  description: System needs to crawl internal messages from corporate sources and store them in the message
+    database for analysis.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-016
+  type: code_example
+  name: Unified Message Crawler Scheduler
+  path: examples/crawlers/message_crawler_scheduler.py
+  description: System needs to coordinate and schedule crawling tasks for both social media and internal
+    messages in a unified pipeline.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-017
+  type: code_example
+  name: Social Media Message Crawling
+  path: examples/crawlers/social_media_crawler.py
+  description: System needs to crawl social media platforms for stock-related discussions and sentiment
+    data.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-018
+  type: code_example
+  name: Custom Stock Analysis with Focus Selection
+  path: examples/custom_analysis_demo.py
+  description: Investors need customized stock analysis with selectable focus areas like technical, fundamental,
+    risk assessment, or sector comparison.
+  used_in_stages:
+  - research_analysis
+  _source: uc_list
+- id: res-019
+  type: code_example
+  name: Alibaba BaiLian LLM Stock Analysis
+  path: examples/dashscope_examples/demo_dashscope.py
+  description: Users need to run TradingAgents framework using Alibaba's BaiLian (通义千问) large language
+    model for stock analysis.
+  used_in_stages:
+  - research_analysis
+  _source: uc_list
+- id: res-020
+  type: code_example
+  name: Chinese Language Stock Analysis with BaiLian
+  path: examples/dashscope_examples/demo_dashscope_chinese.py
+  description: Chinese-speaking users need stock analysis powered by BaiLian with complete Chinese language
+    output and localized analysis.
+  used_in_stages:
+  - research_analysis
+  _source: uc_list
+- id: res-021
+  type: code_example
+  name: BaiLian Stock Analysis without Memory
+  path: examples/dashscope_examples/demo_dashscope_no_memory.py
+  description: Users need stateless stock analysis using BaiLian model without conversation history memory
+    for independent analysis sessions.
+  used_in_stages:
+  - research_analysis
+  _source: uc_list
+- id: res-022
+  type: code_example
+  name: Simple BaiLian LLM Integration Test
+  path: examples/dashscope_examples/demo_dashscope_simple.py
+  description: Users need a simple test to verify BaiLian API connectivity and basic LLM functionality
+    before running full analysis.
+  used_in_stages:
+  - research_analysis
+  _source: uc_list
+- id: res-023
+  type: code_example
+  name: Data Directory Configuration Management
+  path: examples/data_dir_config_demo.py
+  description: Users need to configure and manage data storage directories for TradingAgents including
+    cache, logs, and output paths.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-024
+  type: code_example
+  name: DeepSeek V3 Stock Analysis
+  path: examples/demo_deepseek_analysis.py
+  description: Users need to perform stock investment analysis using DeepSeek V3 large language model
+    as an alternative to other providers.
+  used_in_stages:
+  - research_analysis
+  _source: uc_list
+- id: res-025
+  type: code_example
+  name: Simplified DeepSeek LLM Demo
+  path: examples/demo_deepseek_simple.py
+  description: Users need a minimal, dependency-light demonstration of DeepSeek API integration without
+    complex TradingAgents imports.
+  used_in_stages:
+  - research_analysis
+  _source: uc_list
+- id: res-026
+  type: code_example
+  name: News Filtering for Stock Sentiment
+  path: examples/demo_news_filtering.py
+  description: Investors need to filter and clean news data to remove irrelevant or low-quality content
+    before sentiment analysis.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list
+- id: res-027
+  type: code_example
+  name: Enhanced Analysis History Management
+  path: examples/enhanced_history_demo.py
+  description: Users need to view, load, and review historical stock analysis results for tracking investment
+    decisions over time.
+  used_in_stages:
+  - reporting
+  _source: uc_list
+- id: res-028
+  type: code_example
+  name: Personal Stock Analysis Custom Script
+  path: examples/my_stock_analysis.py
+  description: Individual investors need a personalized script to analyze stocks of their choice with
+    custom focus areas.
+  used_in_stages:
+  - research_analysis
+  _source: uc_list
+- id: res-029
+  type: code_example
+  name: Message Crawler Execution Runner
+  path: examples/run_message_crawlers.py
+  description: Users need to execute message crawling tasks for social media and internal communications
+    through a unified runner script.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-030
+  type: code_example
+  name: Quick Stock Analysis Demo
+  path: examples/simple_analysis_demo.py
+  description: New users need a quick, simple demonstration of TradingAgents-CN capabilities for rapid
+    stock analysis.
+  used_in_stages:
+  - research_analysis
+  _source: uc_list
+- id: res-031
+  type: code_example
+  name: Extended Stock Data Model for Chinese A-Stocks
+  path: examples/stock_data_model_usage.py
+  description: Users need to access extended stock data models with comprehensive company information
+    for Chinese A-share markets.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-032
+  type: code_example
+  name: Enhanced Stock List Fetcher with Failover
+  path: examples/stock_list_example.py
+  description: Users need to fetch comprehensive stock lists with server failover capability from configuration
+    files for robust data access.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-033
+  type: code_example
+  name: Stock Query API with Fallback Mechanism
+  path: examples/stock_query_examples.py
+  description: Users need to query stock data through a robust API that falls back to traditional methods
+    when primary services fail.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-034
+  type: code_example
+  name: Enhanced Data Integration with MongoDB Cache
+  path: examples/test_enhanced_data_integration.py
+  description: Users need to test the MongoDB app cache integration for faster data access when TA_USE_APP_CACHE
+    is enabled.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-035
+  type: code_example
+  name: System Installation Verification
+  path: examples/test_installation.py
+  description: Users need to verify that TradingAgents-CN is correctly installed with all dependencies
+    and proper environment configuration.
+  used_in_stages:
+  - integration
+  _source: uc_list
+- id: res-036
+  type: code_example
+  name: News Timeout Handling and Polling Test
+  path: examples/test_news_timeout.py
+  description: Users need to test news retrieval timeout handling, especially for Google News which may
+    timeout, with polling retry mechanism.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-037
+  type: code_example
+  name: Token Usage Tracking and Cost Monitoring
+  path: examples/token_tracking_demo.py
+  description: Users need to track LLM token consumption, calculate API costs, and monitor usage statistics
+    across different models.
+  used_in_stages:
+  - monitoring
+  _source: uc_list
+- id: res-038
+  type: code_example
+  name: Tushare China A-Stock Data Provider
+  path: examples/tushare_demo.py
+  description: Users need to access Chinese A-share market data (stocks, indices, fundamentals) through
+    Tushare professional data API.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-039
+  type: code_example
+  name: Tushare Unified Data Provider and Sync Service
+  path: examples/tushare_unified_demo.py
+  description: Users need to use the unified TushareProvider and TushareSyncService for consistent access
+    to Chinese market data with async support.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
