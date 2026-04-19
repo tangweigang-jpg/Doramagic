@@ -22,6 +22,7 @@ from doramagic_extraction_agent.sop.blueprint_enrich import (
     _patch_id,
     _patch_relations,
     _patch_required_methods,
+    _patch_resource_injection,
     _patch_sop_version,
     _patch_stage_id_validation,
     _patch_uc_merge,
@@ -1292,3 +1293,149 @@ class TestCodexRegressions:
         # Only 1 missing gap available — should warn, not pretend 3
         assert len(missing) == 1
         assert "only 1 missing gaps" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# P14 — resource_injection Bug A fix: replaceable_component → replaceable_slots
+# ---------------------------------------------------------------------------
+
+
+class TestPatchResourceInjectionBugA:
+    """Bug A fix: replaceable_component entries must NOT appear in resources[].
+
+    They are architecture decision points (LLM/API/DB provider choices) and
+    belong in bp["replaceable_slots"], not bp["resources"].
+
+    Ref: PRODUCT_CONSTITUTION §1.3; blueprint-extraction-sop.md L897.
+    """
+
+    def _make_worker_resource_json(self, tmp_path: Path) -> Path:
+        """Write a minimal worker_resource.json with one replaceable slot
+        and one external_service data source."""
+        data = {
+            "replaceable_resource_matrix": [
+                {
+                    "slot_name": "llm_provider",
+                    "selection_criteria": "Choose based on cost and rate limits",
+                    "default": "Gemini (GEMINI_API_KEY)",
+                    "options": [
+                        {
+                            "name": "Gemini",
+                            "traits": ["free_tier", "multilingual"],
+                            "fit_for": "prototyping",
+                            "not_fit_for": "production",
+                        },
+                        {
+                            "name": "DeepSeek",
+                            "traits": ["low_cost"],
+                            "fit_for": "",
+                            "not_fit_for": "",
+                        },
+                    ],
+                }
+            ],
+            "data_sources": [
+                {
+                    "provider": "Yahoo Finance",
+                    "data_type": "OHLCV",
+                    "coverage": "US equities",
+                    "auth_requirements": "none",
+                }
+            ],
+            "external_services": [],
+            "dependencies": [],
+        }
+        p = tmp_path / "worker_resource.json"
+        p.write_text(json.dumps(data), encoding="utf-8")
+        return tmp_path
+
+    def test_replaceable_component_goes_to_replaceable_slots_not_resources(
+        self, tmp_path: Path
+    ) -> None:
+        """Core assertion: after P14, resources[] has NO type=replaceable_component entry."""
+        artifacts_dir = self._make_worker_resource_json(tmp_path)
+        bp: dict[str, Any] = {"stages": []}
+
+        injected = _patch_resource_injection(bp, artifacts_dir)
+
+        assert injected > 0, "P14 should inject at least one entry"
+
+        # --- resources[] must NOT contain replaceable_component ---
+        resources = bp.get("resources", [])
+        rc_in_resources = [r for r in resources if r.get("type") == "replaceable_component"]
+        assert rc_in_resources == [], (
+            f"Bug A regression: found replaceable_component entries in resources[]: "
+            f"{rc_in_resources}"
+        )
+
+    def test_replaceable_component_appears_in_replaceable_slots(self, tmp_path: Path) -> None:
+        """replaceable_slots[] must contain the slot injected from worker_resource.json."""
+        artifacts_dir = self._make_worker_resource_json(tmp_path)
+        bp: dict[str, Any] = {"stages": []}
+
+        _patch_resource_injection(bp, artifacts_dir)
+
+        slots = bp.get("replaceable_slots", [])
+        assert slots, "bp['replaceable_slots'] should be populated by P14"
+        names = [s["name"] for s in slots]
+        assert "llm_provider" in names, (
+            f"Expected 'llm_provider' slot in replaceable_slots, got: {names}"
+        )
+
+    def test_slot_entry_has_correct_shape(self, tmp_path: Path) -> None:
+        """Each replaceable_slot entry must have: id, name, description, options, default."""
+        artifacts_dir = self._make_worker_resource_json(tmp_path)
+        bp: dict[str, Any] = {"stages": []}
+
+        _patch_resource_injection(bp, artifacts_dir)
+
+        slot = bp["replaceable_slots"][0]
+        assert slot["name"] == "llm_provider"
+        assert slot["description"] == "Choose based on cost and rate limits"
+        assert slot["default"] == "Gemini (GEMINI_API_KEY)"
+        assert len(slot["options"]) == 2
+        assert slot["options"][0]["name"] == "Gemini"
+        assert "free_tier" in slot["options"][0]["traits"]
+        assert slot.get("id", "").startswith("slot-"), (
+            f"id should start with 'slot-', got: {slot.get('id')}"
+        )
+        # Must NOT have 'type' key (that was the bug)
+        assert "type" not in slot, (
+            f"Slot entry must not carry a 'type' field (was 'replaceable_component'): {slot}"
+        )
+
+    def test_external_service_data_source_still_goes_to_resources(self, tmp_path: Path) -> None:
+        """data_sources in worker_resource.json must still land in resources[] as external_service."""
+        artifacts_dir = self._make_worker_resource_json(tmp_path)
+        bp: dict[str, Any] = {"stages": []}
+
+        _patch_resource_injection(bp, artifacts_dir)
+
+        resources = bp.get("resources", [])
+        ext_services = [r for r in resources if r.get("type") == "external_service"]
+        assert ext_services, "data_sources should produce external_service entries in resources[]"
+        names = [r["name"] for r in ext_services]
+        assert "Yahoo Finance" in names
+
+    def test_no_double_injection_when_slot_already_exists(self, tmp_path: Path) -> None:
+        """If a slot name already appears in replaceable_slots, P14 must not duplicate it."""
+        artifacts_dir = self._make_worker_resource_json(tmp_path)
+        bp: dict[str, Any] = {
+            "stages": [],
+            "replaceable_slots": [
+                {"id": "slot-000", "name": "llm_provider", "description": "pre-existing"}
+            ],
+        }
+
+        _patch_resource_injection(bp, artifacts_dir)
+
+        llm_slots = [s for s in bp["replaceable_slots"] if s["name"] == "llm_provider"]
+        assert len(llm_slots) == 1, f"Expected exactly 1 llm_provider slot, got {len(llm_slots)}"
+
+    def test_missing_worker_resource_json_returns_zero(self, tmp_path: Path) -> None:
+        """When worker_resource.json is absent, P14 returns 0 and touches nothing."""
+        bp: dict[str, Any] = {"stages": []}
+        result = _patch_resource_injection(bp, tmp_path)
+        assert result == 0
+        assert "replaceable_slots" not in bp
+        assert "resources" not in bp

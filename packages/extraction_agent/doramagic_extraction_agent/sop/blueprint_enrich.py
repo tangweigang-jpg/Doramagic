@@ -1324,17 +1324,25 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
             if isinstance(rp, dict):
                 all_existing_names.add(rp.get("name", "").lower())
 
-    # v7: use "resources" (schema-compliant) instead of "global_resources"
-    resources = bp.get("resources", bp.get("global_resources", []))
-    res_counter = len(resources)
+    # Bug A fix (P0-A): replaceable_component slots are NOT resources —
+    # they are architecture decision points (API/LLM/DB provider choices).
+    # Route them to bp["replaceable_slots"] per PRODUCT_CONSTITUTION §1.3 and
+    # blueprint-extraction-sop.md L897 (resources[] = sub-tech docs / tool
+    # scripts / code examples / external services only).
+    # The downstream scan_resource_pool.py already expects this field to exist
+    # as a separate concern from resources[].
+    replaceable_slots: list[dict[str, Any]] = list(bp.get("replaceable_slots", []))
+    existing_slot_names: set[str] = {s.get("name", "").lower() for s in replaceable_slots}
+    slot_counter = len(replaceable_slots)
     for slot_name, slot_data in resource_slots.items():
-        if slot_name.lower() not in all_existing_names:
-            res_counter += 1
-            new_rp = {
-                "id": f"res-slot-{res_counter:03d}",
-                "type": "replaceable_component",
+        if (
+            slot_name.lower() not in all_existing_names
+            and slot_name.lower() not in existing_slot_names
+        ):
+            slot_counter += 1
+            new_slot = {
+                "id": f"slot-{slot_counter:03d}",
                 "name": slot_name,
-                "path": None,
                 "description": slot_data.get("selection_criteria", ""),
                 "used_in_stages": [],
                 "options": [
@@ -1351,11 +1359,16 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
                 "default": slot_data.get("default"),
                 "_source": "worker_resource",
             }
-            resources.append(new_rp)
+            replaceable_slots.append(new_slot)
             injected += 1
+
+    if replaceable_slots:
+        bp["replaceable_slots"] = replaceable_slots
 
     # v7: also inject data_sources and external_services into resources[]
     # with schema-compliant format (id/type/name/path/description/used_in_stages)
+    # (replaceable_component entries are routed to replaceable_slots above, NOT here)
+    resources: list[dict[str, Any]] = list(bp.get("resources", bp.get("global_resources", [])))
     res_counter = len(resources)
     data_sources = resource_data.get("data_sources", [])
     for ds in data_sources:

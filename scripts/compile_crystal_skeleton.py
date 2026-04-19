@@ -874,7 +874,20 @@ def build_architecture(bp: dict, bd_by_stage: dict) -> dict:
 # ============================================================
 
 
-def build_resources(bp: dict, target_host: str) -> dict:
+def _load_domain_pool(domain: str = "finance") -> dict:
+    """Load domain-level resource pool. Returns empty dict if absent."""
+    pool_path = Path("knowledge/sources") / domain / "_shared" / "resources.yaml"
+    if not pool_path.exists():
+        return {}
+    try:
+        with pool_path.open() as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f"[warn] pool load failed: {e}", file=sys.stderr)
+        return {}
+
+
+def build_resources(bp: dict, target_host: str, domain: str = "finance") -> dict:
     resources_raw = bp.get("resources") or []
     packages = []
     for r in resources_raw:
@@ -887,30 +900,88 @@ def build_resources(bp: dict, target_host: str) -> dict:
                 }
             )
 
-    # Default packages if blueprint has none
+    # Fix 1: Default packages — derive from domain pool, not ZVT hardcodes
     if not packages:
+        pool = _load_domain_pool(domain)
+        pool_entries = pool.get("resources") or []
         packages = [
-            {"name": "zvt", "version_pin": "latest"},
-            {"name": "pandas", "version_pin": ">=2.2"},
-            {"name": "numpy", "version_pin": ">=2.1"},
-            {"name": "SQLAlchemy", "version_pin": ">=2.0"},
-            {"name": "plotly", "version_pin": ">=5"},
-            {"name": "dash", "version_pin": ">=2"},
-            {"name": "akshare", "version_pin": "latest"},
-            {"name": "baostock", "version_pin": "latest"},
+            {
+                "name": entry.get("name", ""),
+                "version_pin": entry.get("version_range", "latest"),
+            }
+            for entry in pool_entries
+            if entry.get("kind") == "python_package"
+            and entry.get("scope") == "cross_domain"
+            and entry.get("name")
         ]
+        # If pool also absent or empty, return empty list (no ZVT fallback)
 
-    strategy_scaffold = {
-        "entry_point_name": "run_backtest",
+    # Fix 2: entry_point_name derived from blueprint UC architecture signals
+    # Priority: stage (architecture action) > type (pipeline shape) > data_domain (domain semantics)
+    # Rationale: data_domain values like "holding_data" / "market_data" are semantic labels,
+    # NOT executable actions. stage ("data_collection") and type ("data_pipeline") reflect
+    # what the script actually does.
+    ucs = bp.get("known_use_cases") or []
+    primary_uc = ucs[0] if ucs else {}
+    uc_stage = (primary_uc.get("stage") or "").lower()
+    uc_type = (primary_uc.get("type") or "").lower()
+    uc_domain = (primary_uc.get("data_domain") or "").lower()
+    uc_kind = (primary_uc.get("kind") or "").lower()
+
+    _stage_to_entry: dict[str, str] = {
+        "data_collection": "run_collector",
+        "data_storage": "run_collector",
+        "factor_computation": "run_factor",
+        "backtest": "run_backtest",
+        "training": "run_training",
+        "serving": "run_server",
+        "research": "run_research",
+    }
+    _type_to_entry: dict[str, str] = {
+        "data_pipeline": "run_collector",
+        "backtest_engine": "run_backtest",
+        "training_pipeline": "run_training",
+        "inference_service": "run_server",
+    }
+    _domain_to_entry: dict[str, str] = {
+        "data_collection": "run_collector",
+        "backtest": "run_backtest",
+        "training": "run_training",
+        "research": "run_research",
+        "serving": "run_server",
+    }
+    _kind_to_entry: dict[str, str] = {
+        "data_collection": "run_collector",
+        "backtest": "run_backtest",
+        "training": "run_training",
+    }
+    entry_point_name: str = (
+        _stage_to_entry.get(uc_stage)
+        or _type_to_entry.get(uc_type)
+        or _domain_to_entry.get(uc_domain)
+        or _kind_to_entry.get(uc_kind)
+        or "main"
+    )
+
+    # Fix 3: tail_template uses derived entry_point_name; result.json instead of result.csv
+    strategy_scaffold: dict = {
+        "entry_point_name": entry_point_name,
         "tail_template": (
             "# === DO NOT MODIFY BELOW THIS LINE ===\n"
             'if __name__ == "__main__":\n'
-            "    result = run_backtest()  # implement above\n"
+            f"    result = {entry_point_name}()  # implement above\n"
             "    from validate import enforce_validation\n"
-            '    enforce_validation(result, output_path="{workspace}/result.csv")\n'
+            '    enforce_validation(result, output_path="{workspace}/result.json")\n'
             "# === END DO NOT MODIFY ==="
         ),
     }
+
+    # Fix 4: install_recipes derived from blueprint packages only — no zvt.init_dirs
+    install_recipes: list[str] = [
+        f"python3 -m pip install {r['name']}"
+        for r in resources_raw
+        if r.get("type") == "python_package" and r.get("name")
+    ][:3]
 
     host_adapter: dict = {}
     if target_host == "openclaw":
@@ -921,18 +992,13 @@ def build_resources(bp: dict, target_host: str) -> dict:
                 "exec tool intercepts && / ; / | — "
                 "never chain: 'pip install X && python Y'. Use separate exec calls."
             ),
-            "install_recipes": [
-                "python3 -m pip install zvt",
-                "python3 -m pip install akshare",
-                "python3 -m zvt.init_dirs",
-            ],
+            "install_recipes": install_recipes,
             "credential_injection": (
                 "JoinQuant/QMT credentials require user-side '!' prefix shell login. "
                 "Never hardcode credentials in generated scripts."
             ),
             "path_resolution": (
-                "{workspace} resolves to ~/.openclaw/workspace/doramagic at execution time. "
-                "ZVT default data dir ~/zvt-home/ is separate from workspace."
+                "{workspace} resolves to ~/.openclaw/workspace/doramagic at execution time."
             ),
             "file_io_tooling": (
                 "Use openclaw 'write' tool for .py/.sql files; "
@@ -943,14 +1009,14 @@ def build_resources(bp: dict, target_host: str) -> dict:
         host_adapter = {
             "target": "claude_code",
             "timeout_seconds": 600,
-            "install_recipes": ["pip install zvt", "python3 -m zvt.init_dirs"],
+            "install_recipes": install_recipes,
             "path_resolution": "{workspace} resolves to current working directory",
         }
     else:
         host_adapter = {
             "target": target_host,
             "timeout_seconds": 1800,
-            "install_recipes": ["pip install zvt"],
+            "install_recipes": install_recipes,
             "path_resolution": "{workspace} resolves to host-specific working directory",
         }
 
