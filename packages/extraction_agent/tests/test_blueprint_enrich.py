@@ -1026,6 +1026,34 @@ class TestPatchRelations:
         count = _patch_relations(bp)
         assert count == 1
 
+    def test_handles_list_domain_in_applicability(self) -> None:
+        """bp-050 regression: applicability.domain may be a list of subdomain
+        labels. Must not raise TypeError on Path / list."""
+        bp: dict[str, Any] = {
+            "applicability": {"domain": ["CRD", "DAT", "Credit Scoring"]},
+            "id": "finance-bp-050",
+        }
+        count = _patch_relations(bp)
+        assert count >= 1
+        assert isinstance(bp["relations"], list)
+
+    def test_state_domain_takes_precedence(self) -> None:
+        """When state.domain is set, use it over applicability.domain."""
+        from doramagic_extraction_agent.state.schema import AgentState
+
+        bp: dict[str, Any] = {
+            "applicability": {"domain": ["X", "Y"]},
+            "id": "finance-bp-050",
+        }
+        state = AgentState(
+            blueprint_id="finance-bp-050",
+            domain="finance",
+            run_dir="/tmp",
+            output_dir="/tmp",
+        )
+        count = _patch_relations(bp, state=state)
+        assert count >= 1
+
 
 # ---------------------------------------------------------------------------
 # P13 _patch_execution_paradigm

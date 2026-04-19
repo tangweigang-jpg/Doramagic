@@ -1030,7 +1030,19 @@ def _patch_relations(bp: dict[str, Any], state: AgentState | None = None) -> int
     # Try to discover related blueprints from the knowledge directory
     from pathlib import Path as _Path
 
-    domain = bp.get("applicability", {}).get("domain", "finance")
+    # Prefer the authoritative domain from AgentState. Fall back to
+    # applicability.domain, which may be a list of subdomain labels
+    # (e.g. ['CRD', 'DAT', ...]) rather than a single top-level domain name.
+    if state is not None and getattr(state, "domain", None):
+        domain = state.domain
+    else:
+        raw = bp.get("applicability", {}).get("domain", "finance")
+        if isinstance(raw, list):
+            domain = next((x for x in raw if isinstance(x, str) and x), "finance")
+        elif isinstance(raw, str) and raw:
+            domain = raw
+        else:
+            domain = "finance"
     bp_id = bp.get("id", "")
     bp_dir = _Path("knowledge/blueprints") / domain
 
