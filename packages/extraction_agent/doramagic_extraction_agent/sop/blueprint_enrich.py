@@ -979,10 +979,21 @@ def _patch_audit_checklist(bp: dict[str, Any], state: AgentState, artifacts_dir:
 
         total_all = sum(universal.values()) + sum(subdomain_totals.values())
         total_pass = universal["pass"] + subdomain_totals["pass"]
-
+        # Bug D fix: coverage = examined items / total items.
+        # All items with a status (pass/warn/fail) are "examined".
+        # Previously this computed pass/total which gave misleadingly low
+        # numbers like "3/71 (4%)" — that is a pass-rate, not audit coverage.
+        # The correct metric is (pass+warn+fail)/total = 100% when all items
+        # have been audited.  We keep pass_rate as a separate field.
+        total_examined = total_all  # every row that got a ✅/⚠️/❌ is examined
         audit_data["finance_universal"] = universal
         audit_data["subdomain_totals"] = subdomain_totals
         audit_data["coverage"] = (
+            f"{total_examined}/{total_all} ({total_examined * 100 // total_all}%)"
+            if total_all
+            else "0/0 (0%)"
+        )
+        audit_data["pass_rate"] = (
             f"{total_pass}/{total_all} ({total_pass * 100 // total_all}%)"
             if total_all
             else "0/0 (0%)"
@@ -1303,8 +1314,11 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
         return 0
 
     matrix = resource_data.get("replaceable_resource_matrix", [])
-    if not matrix:
-        return 0
+    # Bug C fix: do NOT return early when matrix is empty.
+    # Previously this returned 0 before processing data_sources /
+    # external_services / dependencies, causing resources[] to remain absent
+    # on blueprints where the LLM produced no replaceable_resource_matrix.
+    # The data_sources / external_services loops below must always execute.
 
     # Build lookup: slot_name → resource options
     resource_slots: dict[str, dict[str, Any]] = {}
@@ -1443,6 +1457,74 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
             }
         )
         injected += 1
+
+    # Bug B fix: inject code_example and technique_document resources that
+    # the SOP requires but worker_resource.json never provided.
+    # Previously resources[] only had external_service and python_package.
+    # Now we also extract:
+    #   code_example — from uc_list.json (example .py / .ipynb files the
+    #                  UC phase already identified)
+    #   technique_document — from repo_index.json document_sources (SKILL.md
+    #                  CLAUDE.md, agent definition files)
+    #
+    # Build a path dedup set across all resource sources to prevent duplicates.
+    _seen_paths: set[str] = {r.get("path", "") for r in resources if r.get("path")}
+
+    uc_list_path = artifacts_dir / "uc_list.json"
+    if uc_list_path.exists():
+        try:
+            uc_list: list[dict[str, Any]] = json.loads(uc_list_path.read_text(encoding="utf-8"))
+            for uc in uc_list:
+                src = uc.get("source", "")
+                if not src:
+                    continue
+                if not (src.endswith(".py") or src.endswith(".ipynb")):
+                    continue
+                if src in _seen_paths:
+                    continue
+                _seen_paths.add(src)
+                res_counter += 1
+                resources.append(
+                    {
+                        "id": f"res-{res_counter:03d}",
+                        "type": "code_example",
+                        "name": uc.get("name", src.split("/")[-1]),
+                        "path": src,
+                        "description": uc.get("business_problem", ""),
+                        "used_in_stages": [uc["stage"]] if uc.get("stage") else [],
+                        "_source": "uc_list",
+                    }
+                )
+                injected += 1
+        except (json.JSONDecodeError, OSError, TypeError) as exc:
+            logger.debug("P14 (resource_injection): could not read uc_list.json: %s", exc)
+
+    repo_index_path = artifacts_dir / "repo_index.json"
+    if repo_index_path.exists():
+        try:
+            repo_index: dict[str, Any] = json.loads(repo_index_path.read_text(encoding="utf-8"))
+            doc_sources: dict[str, Any] = repo_index.get("document_sources", {})
+            # skill_files, claude_md, agent_files are document knowledge sources
+            for key in ("skill_files", "claude_md", "agent_files"):
+                for doc_path in doc_sources.get(key, []):
+                    if not doc_path or doc_path in _seen_paths:
+                        continue
+                    _seen_paths.add(doc_path)
+                    res_counter += 1
+                    resources.append(
+                        {
+                            "id": f"res-{res_counter:03d}",
+                            "type": "technique_document",
+                            "name": doc_path.split("/")[-1],
+                            "path": doc_path,
+                            "description": f"Document knowledge source ({key})",
+                            "used_in_stages": [],
+                            "_source": "repo_index",
+                        }
+                    )
+                    injected += 1
+        except (json.JSONDecodeError, OSError, TypeError) as exc:
+            logger.debug("P14 (resource_injection): could not read repo_index.json: %s", exc)
 
     if resources:
         bp["resources"] = resources

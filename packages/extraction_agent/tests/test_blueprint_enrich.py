@@ -1439,3 +1439,403 @@ class TestPatchResourceInjectionBugA:
         assert result == 0
         assert "replaceable_slots" not in bp
         assert "resources" not in bp
+
+
+# ---------------------------------------------------------------------------
+# Bug B: code_example and technique_document injection
+# ---------------------------------------------------------------------------
+
+
+class TestPatchResourceInjectionBugB:
+    """Bug B fix: resources[] must include code_example and technique_document
+    entries, not only external_service and python_package.
+
+    Sources:
+      - code_example  ← uc_list.json (UC phase output, .py / .ipynb sources)
+      - technique_document ← repo_index.json document_sources
+    """
+
+    def _make_worker_resource_json(self, tmp_path: Path) -> None:
+        """Write a minimal worker_resource.json with empty matrix but
+        non-empty external_services so the function doesn't short-circuit."""
+        data: dict[str, Any] = {
+            "replaceable_resource_matrix": [],
+            "data_sources": [],
+            "external_services": [
+                {
+                    "name": "SomeAPI",
+                    "description": "Some external API",
+                }
+            ],
+            "dependencies": [],
+        }
+        (tmp_path / "worker_resource.json").write_text(json.dumps(data), encoding="utf-8")
+
+    def _make_uc_list_json(self, tmp_path: Path) -> None:
+        """Write a uc_list.json with .py and .ipynb examples."""
+        uc_list = [
+            {
+                "id": "UC-001",
+                "name": "Stock Trading Example",
+                "source": "examples/stock_trading.py",
+                "type": "trading_strategy",
+                "business_problem": "Automated stock trading using DRL",
+                "intent_keywords": ["trading"],
+                "stage": "model_training",
+            },
+            {
+                "id": "UC-002",
+                "name": "Portfolio Demo",
+                "source": "examples/portfolio_demo.ipynb",
+                "type": "portfolio",
+                "business_problem": "Portfolio optimization demo",
+                "intent_keywords": ["portfolio"],
+                "stage": "risk_management",
+            },
+            {
+                "id": "UC-003",
+                "name": "Non-file UC",
+                "source": "",  # empty source — should be skipped
+                "type": "other",
+                "business_problem": "No file source",
+                "intent_keywords": [],
+                "stage": "data_collection",
+            },
+        ]
+        (tmp_path / "uc_list.json").write_text(json.dumps(uc_list), encoding="utf-8")
+
+    def _make_repo_index_json(self, tmp_path: Path) -> None:
+        """Write a repo_index.json with document_sources."""
+        repo_index = {
+            "files": [],
+            "entry_points": [],
+            "examples": [],
+            "document_sources": {
+                "skill_files": ["SKILL.md"],
+                "claude_md": ["CLAUDE.md"],
+                "agent_files": [],
+            },
+            "stats": {},
+        }
+        (tmp_path / "repo_index.json").write_text(json.dumps(repo_index), encoding="utf-8")
+
+    def test_code_example_injected_from_uc_list(self, tmp_path: Path) -> None:
+        """code_example entries must appear in resources[] from uc_list.json."""
+        self._make_worker_resource_json(tmp_path)
+        self._make_uc_list_json(tmp_path)
+        bp: dict[str, Any] = {"stages": []}
+
+        _patch_resource_injection(bp, tmp_path)
+
+        resources = bp.get("resources", [])
+        code_examples = [r for r in resources if r.get("type") == "code_example"]
+        assert len(code_examples) == 2, (
+            f"Expected 2 code_example resources (.py + .ipynb), got {len(code_examples)}"
+        )
+
+    def test_code_example_has_correct_fields(self, tmp_path: Path) -> None:
+        """Each code_example resource must have id, type, name, path, description,
+        used_in_stages and _source='uc_list'."""
+        self._make_worker_resource_json(tmp_path)
+        self._make_uc_list_json(tmp_path)
+        bp: dict[str, Any] = {"stages": []}
+
+        _patch_resource_injection(bp, tmp_path)
+
+        resources = bp.get("resources", [])
+        examples = [r for r in resources if r.get("type") == "code_example"]
+        ex = examples[0]
+        assert ex["id"].startswith("res-")
+        assert ex["path"] == "examples/stock_trading.py"
+        assert ex["name"] == "Stock Trading Example"
+        assert ex["description"] == "Automated stock trading using DRL"
+        assert ex["used_in_stages"] == ["model_training"]
+        assert ex["_source"] == "uc_list"
+
+    def test_empty_source_uc_not_injected(self, tmp_path: Path) -> None:
+        """A use case with an empty source must NOT be converted to code_example."""
+        self._make_worker_resource_json(tmp_path)
+        self._make_uc_list_json(tmp_path)
+        bp: dict[str, Any] = {"stages": []}
+
+        _patch_resource_injection(tmp_path.parent if False else bp, tmp_path)
+
+        resources = bp.get("resources", [])
+        code_examples = [r for r in resources if r.get("type") == "code_example"]
+        # UC-003 has empty source — must be excluded
+        paths = [r["path"] for r in code_examples]
+        assert "" not in paths
+
+    def test_technique_document_injected_from_repo_index(self, tmp_path: Path) -> None:
+        """technique_document entries must appear from repo_index.json document_sources."""
+        self._make_worker_resource_json(tmp_path)
+        self._make_repo_index_json(tmp_path)
+        bp: dict[str, Any] = {"stages": []}
+
+        _patch_resource_injection(bp, tmp_path)
+
+        resources = bp.get("resources", [])
+        tech_docs = [r for r in resources if r.get("type") == "technique_document"]
+        assert len(tech_docs) == 2, (
+            f"Expected 2 technique_document entries (SKILL.md + CLAUDE.md), "
+            f"got {len(tech_docs)}: {tech_docs}"
+        )
+        paths = {r["path"] for r in tech_docs}
+        assert "SKILL.md" in paths
+        assert "CLAUDE.md" in paths
+
+    def test_technique_document_has_correct_fields(self, tmp_path: Path) -> None:
+        """technique_document must have id/type/name/path/description/_source."""
+        self._make_worker_resource_json(tmp_path)
+        self._make_repo_index_json(tmp_path)
+        bp: dict[str, Any] = {"stages": []}
+
+        _patch_resource_injection(bp, tmp_path)
+
+        resources = bp.get("resources", [])
+        td = next(r for r in resources if r.get("type") == "technique_document")
+        assert td["id"].startswith("res-")
+        assert td["_source"] == "repo_index"
+        assert td["name"] in ("SKILL.md", "CLAUDE.md")
+        assert "technique_document" in [r["type"] for r in resources]
+
+    def test_no_duplicate_code_examples_if_already_in_resources(self, tmp_path: Path) -> None:
+        """If a code_example path is already in resources[], don't re-inject it."""
+        self._make_worker_resource_json(tmp_path)
+        self._make_uc_list_json(tmp_path)
+        pre_existing = {
+            "id": "res-001",
+            "type": "code_example",
+            "path": "examples/stock_trading.py",
+            "name": "pre-existing",
+            "description": "",
+            "used_in_stages": [],
+        }
+        bp: dict[str, Any] = {"stages": [], "resources": [pre_existing]}
+
+        _patch_resource_injection(bp, tmp_path)
+
+        py_examples = [r for r in bp["resources"] if r.get("path") == "examples/stock_trading.py"]
+        assert len(py_examples) == 1, (
+            f"Expected exactly 1 entry for stock_trading.py, got {len(py_examples)}"
+        )
+
+    def test_missing_uc_list_and_repo_index_gracefully_skipped(self, tmp_path: Path) -> None:
+        """If uc_list.json and repo_index.json are absent, P14 still works."""
+        self._make_worker_resource_json(tmp_path)
+        # Don't create uc_list.json or repo_index.json
+        bp: dict[str, Any] = {"stages": []}
+
+        result = _patch_resource_injection(bp, tmp_path)
+
+        # Should still inject the external_service from worker_resource.json
+        assert result > 0
+        resources = bp.get("resources", [])
+        assert any(r.get("type") == "external_service" for r in resources)
+        # Must not crash
+        assert "code_example" not in {r.get("type") for r in resources}
+
+
+# ---------------------------------------------------------------------------
+# Bug C: resources field must not be absent when matrix is empty
+# ---------------------------------------------------------------------------
+
+
+class TestPatchResourceInjectionBugC:
+    """Bug C fix: when replaceable_resource_matrix is empty or absent, the
+    function must still populate resources[] with data_sources / external_services
+    / dependencies.  Previously an empty matrix caused an early return.
+    """
+
+    def test_resources_populated_when_matrix_empty(self, tmp_path: Path) -> None:
+        """Empty replaceable_resource_matrix must NOT prevent resources[] injection."""
+        data: dict[str, Any] = {
+            "replaceable_resource_matrix": [],  # empty — was causing early return
+            "data_sources": [
+                {
+                    "provider": "Yahoo Finance",
+                    "data_type": "OHLCV",
+                    "coverage": "US equities",
+                    "auth_requirements": "none",
+                }
+            ],
+            "external_services": [],
+            "dependencies": [],
+        }
+        (tmp_path / "worker_resource.json").write_text(json.dumps(data), encoding="utf-8")
+        bp: dict[str, Any] = {"stages": []}
+
+        result = _patch_resource_injection(bp, tmp_path)
+
+        assert result > 0, "Injected count must be > 0 when data_sources are present"
+        assert "resources" in bp, "Bug C regression: resources field absent when matrix is empty"
+        ext_services = [r for r in bp["resources"] if r.get("type") == "external_service"]
+        assert ext_services, "data_source entries must become external_service resources"
+
+    def test_resources_populated_when_matrix_missing(self, tmp_path: Path) -> None:
+        """Missing replaceable_resource_matrix key must not prevent resources[]."""
+        data: dict[str, Any] = {
+            # No 'replaceable_resource_matrix' key at all
+            "data_sources": [
+                {
+                    "provider": "FRED",
+                    "data_type": "Macroeconomic data",
+                    "coverage": "US",
+                    "auth_requirements": "API key",
+                }
+            ],
+            "external_services": [{"name": "Polygon.io", "description": "US equities"}],
+            "dependencies": [],
+        }
+        (tmp_path / "worker_resource.json").write_text(json.dumps(data), encoding="utf-8")
+        bp: dict[str, Any] = {"stages": []}
+
+        result = _patch_resource_injection(bp, tmp_path)
+
+        assert result > 0
+        assert "resources" in bp
+        names = {r.get("name") for r in bp["resources"]}
+        assert "FRED" in names or "Polygon.io" in names
+
+    def test_external_services_injected_without_matrix(self, tmp_path: Path) -> None:
+        """external_services must be injected even if matrix is absent/empty."""
+        data: dict[str, Any] = {
+            "replaceable_resource_matrix": [],
+            "data_sources": [],
+            "external_services": [
+                {"name": "Alpaca", "description": "Trading API"},
+                {"service": "IB Gateway", "purpose": "Order routing"},
+            ],
+            "dependencies": [],
+        }
+        (tmp_path / "worker_resource.json").write_text(json.dumps(data), encoding="utf-8")
+        bp: dict[str, Any] = {"stages": []}
+
+        _patch_resource_injection(bp, tmp_path)
+
+        resources = bp.get("resources", [])
+        ext = [r for r in resources if r.get("type") == "external_service"]
+        assert len(ext) == 2, f"Expected 2 external_service entries, got {len(ext)}"
+
+    def test_replaceable_slots_absent_when_matrix_empty(self, tmp_path: Path) -> None:
+        """When matrix is empty, bp['replaceable_slots'] should not be set."""
+        data: dict[str, Any] = {
+            "replaceable_resource_matrix": [],
+            "data_sources": [],
+            "external_services": [],
+            "dependencies": [],
+        }
+        (tmp_path / "worker_resource.json").write_text(json.dumps(data), encoding="utf-8")
+        bp: dict[str, Any] = {"stages": []}
+
+        _patch_resource_injection(bp, tmp_path)
+
+        # Empty matrix → no replaceable_slots should be added
+        assert bp.get("replaceable_slots", []) == []
+
+
+# ---------------------------------------------------------------------------
+# Bug D: audit_checklist coverage metric fix
+# ---------------------------------------------------------------------------
+
+
+class TestPatchAuditChecklistBugD:
+    """Bug D fix: audit coverage must count EXAMINED items (pass+warn+fail),
+    not only PASSED items.
+
+    Previously: coverage = pass / total → "3/71 (4%)" for bp-009
+    Correctly:  coverage = examined / total = total / total = "71/71 (100%)"
+    The pass_rate field is added separately to preserve the original metric.
+    """
+
+    def _write_audit_md(self, tmp_path: Path, content: str) -> Path:
+        p = tmp_path / "worker_audit.md"
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_coverage_counts_examined_not_pass_only(self, tmp_path: Path) -> None:
+        """coverage = (pass+warn+fail)/total — all rows with a status are examined."""
+        audit_md = (
+            "## Universal Finance Checklist\n"
+            "| # | Item | Status | Evidence |\n"
+            "|---|------|--------|----------|\n"
+            "| 1 | item1 | ✅ | file:1 |\n"
+            "| 2 | item2 | ⚠️ | file:2 |\n"
+            "| 3 | item3 | ❌ | not found |\n"
+        )
+        self._write_audit_md(tmp_path, audit_md)
+        bp: dict[str, Any] = {}
+        state = make_state(subdomain_labels=["TRD"])
+
+        _patch_audit_checklist(bp, state, tmp_path)
+
+        summary = bp["audit_checklist_summary"]
+        # 3 examined out of 3 total → coverage 100%
+        assert summary["coverage"] == "3/3 (100%)", (
+            f"Bug D: coverage should be examined/total, got: {summary['coverage']}"
+        )
+
+    def test_pass_rate_field_added(self, tmp_path: Path) -> None:
+        """pass_rate must be present and reflect only ✅ items."""
+        audit_md = (
+            "## Universal Finance Checklist\n"
+            "| # | Item | Status | Evidence |\n"
+            "|---|------|--------|----------|\n"
+            "| 1 | item1 | ✅ | file:1 |\n"
+            "| 2 | item2 | ⚠️ | file:2 |\n"
+            "| 3 | item3 | ❌ | not found |\n"
+        )
+        self._write_audit_md(tmp_path, audit_md)
+        bp: dict[str, Any] = {}
+        state = make_state(subdomain_labels=["TRD"])
+
+        _patch_audit_checklist(bp, state, tmp_path)
+
+        summary = bp["audit_checklist_summary"]
+        assert "pass_rate" in summary, "pass_rate field must be added by Bug D fix"
+        assert summary["pass_rate"] == "1/3 (33%)", (
+            f"pass_rate should be pass/total, got: {summary['pass_rate']}"
+        )
+
+    def test_coverage_not_misleadingly_low_like_zvt(self, tmp_path: Path) -> None:
+        """Simulate bp-009 (zvt) scenario: 3 pass / 71 total.
+
+        Old behavior: coverage = '3/71 (4%)' (misleadingly low)
+        New behavior: coverage = '71/71 (100%)' (all items examined)
+        pass_rate = '3/71 (4%)' (preserved separately)
+        """
+        lines = ["## Universal Finance Checklist\n"]
+        lines.append("| # | Item | Status | Evidence |\n")
+        lines.append("|---|------|--------|----------|\n")
+        # 3 pass, 11 warn, 8 fail (universal: mimics bp-009)
+        for _ in range(3):
+            lines.append("| x | item | ✅ | file:1 |\n")
+        for _ in range(11):
+            lines.append("| x | item | ⚠️ | file:1 |\n")
+        for _ in range(8):
+            lines.append("| x | item | ❌ | file:1 |\n")
+        # subdomain: 2 pass, 21 warn, 26 fail
+        lines.append("## TRD 交易与执行\n")
+        lines.append("| # | Item | Status | Evidence |\n")
+        lines.append("|---|------|--------|----------|\n")
+        for _ in range(2):
+            lines.append("| x | item | ✅ | file:1 |\n")
+        for _ in range(21):
+            lines.append("| x | item | ⚠️ | file:1 |\n")
+        for _ in range(26):
+            lines.append("| x | item | ❌ | file:1 |\n")
+        audit_content = "".join(lines)
+        self._write_audit_md(tmp_path, audit_content)
+        bp: dict[str, Any] = {}
+        state = make_state(subdomain_labels=["TRD"])
+
+        _patch_audit_checklist(bp, state, tmp_path)
+
+        summary = bp["audit_checklist_summary"]
+        total = 3 + 11 + 8 + 2 + 21 + 26  # 71
+        assert summary["coverage"] == f"{total}/{total} (100%)", (
+            f"Bug D: coverage should be 71/71 (100%), got: {summary['coverage']}"
+        )
+        assert "pass_rate" in summary
+        total_pass = 3 + 2  # 5
+        assert summary["pass_rate"] == f"{total_pass}/{total} ({total_pass * 100 // total}%)"
