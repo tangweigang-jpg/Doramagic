@@ -21,6 +21,20 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _safe_int(v: object, default: int = 0) -> int:
+    """Coerce *v* to int; return *default* when v is None or non-numeric.
+
+    Handles the manifest edge-cases where source_blueprint_version is stored as
+    None (never written) or a filename string like "blueprint.v17.yaml".
+    """
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _setup_path() -> Path:
     """Add packages/ to sys.path and return project root."""
     # Walk up from this file to find the project root (has packages/ dir)
@@ -218,7 +232,11 @@ def _scan_stale_projects(sources_dir: Path, project_root: Path) -> list[dict]:
         # STALE if blueprint is newer OR previous extraction failed (and retries remain)
         extraction_status = m.get("constraint_extraction_status", "")
         retry_count = m.get("constraint_retry_count", 0)
-        is_stale = latest_bp_version > source_bp_version
+        # Use _safe_int to handle None / filename-string source_blueprint_version values.
+        # -1 default for sbv ensures "None means stale" semantics.
+        lbv = _safe_int(latest_bp_version, 0)
+        sbv = _safe_int(source_bp_version, -1)
+        is_stale = lbv > sbv
         is_failed = extraction_status == "failed"
 
         # Permanently-failed bps (>= 3 attempts) are never re-queued
