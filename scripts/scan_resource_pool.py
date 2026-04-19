@@ -127,14 +127,17 @@ def extract_bp_id(dir_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def scan_blueprints(domain_dir: Path) -> tuple[list[dict], int, int]:
+def scan_blueprints(domain_dir: Path) -> tuple[list[dict], list[dict], int, int, int]:
     """Scan all blueprint LATEST.yaml files in domain_dir.
 
     Returns:
-        (raw_records, source_blueprints_count, total_entries_scanned)
+        (resource_records, slot_records, source_blueprints_count,
+         total_resource_entries, total_slot_entries)
 
-    raw_records is a list of dicts, one per unique (base_name) per blueprint:
-        {bp_id, base_name, raw_name, resource_dict}
+    resource_records: one dict per unique (base_name) per blueprint (pool candidates):
+        {bp_id, base_name, raw_name, resource}
+    slot_records: one dict per unique (slot_name) per blueprint (slot candidates):
+        {bp_id, slot_name, slot}
     """
     bp_dirs = sorted(
         [d for d in domain_dir.iterdir() if d.is_dir() and re.match(r"[a-z]+-bp-\d+", d.name)],
@@ -145,8 +148,10 @@ def scan_blueprints(domain_dir: Path) -> tuple[list[dict], int, int]:
         print(f"[error] No blueprint directories found in {domain_dir}", file=sys.stderr)
         sys.exit(1)
 
-    records: list[dict[str, Any]] = []
-    total_entries = 0
+    resource_records: list[dict[str, Any]] = []
+    slot_records: list[dict[str, Any]] = []
+    total_resource_entries = 0
+    total_slot_entries = 0
     bp_count = 0
 
     for bp_dir in bp_dirs:
@@ -158,15 +163,18 @@ def scan_blueprints(domain_dir: Path) -> tuple[list[dict], int, int]:
             bp_data = yaml.safe_load(f) or {}
 
         resources: list[dict] = bp_data.get("resources", []) or []
-        if not resources:
+        top_level_slots: list[dict] = bp_data.get("replaceable_slots", []) or []
+
+        if not resources and not top_level_slots:
             continue
 
         bp_count += 1
         bp_id = extract_bp_id(bp_dir.name)
-        seen_names_this_bp: set[str] = set()
 
+        # --- Pool candidates: resources[] (excluding replaceable_component) ---
+        seen_names_this_bp: set[str] = set()
         for res in resources:
-            total_entries += 1
+            total_resource_entries += 1
             raw_name: str = res.get("name", "") or ""
             if not raw_name:
                 continue
@@ -177,7 +185,7 @@ def scan_blueprints(domain_dir: Path) -> tuple[list[dict], int, int]:
                 continue
             seen_names_this_bp.add(base_name)
 
-            records.append(
+            resource_records.append(
                 {
                     "bp_id": bp_id,
                     "base_name": base_name,
@@ -186,16 +194,58 @@ def scan_blueprints(domain_dir: Path) -> tuple[list[dict], int, int]:
                 }
             )
 
-    return records, bp_count, total_entries
+        # --- Slot candidates: bp.replaceable_slots[] (new schema, commit 3009f72) ---
+        # Also pick up legacy resources[].type == "replaceable_component" for backward compat.
+        # Dedupe by slot_name within this BP (top-level slots take precedence).
+        seen_slot_names_this_bp: set[str] = set()
+
+        for slot in top_level_slots:
+            total_slot_entries += 1
+            slot_name: str = slot.get("name", "") or ""
+            if not slot_name:
+                continue
+            if slot_name in seen_slot_names_this_bp:
+                continue
+            seen_slot_names_this_bp.add(slot_name)
+            slot_records.append({"bp_id": bp_id, "slot_name": slot_name, "slot": slot})
+
+        # Legacy path: resources[].type == "replaceable_component"
+        for res in resources:
+            if (res.get("type", "") or "").lower() != "replaceable_component":
+                continue
+            total_slot_entries += 1
+            slot_name = res.get("name", "") or ""
+            if not slot_name:
+                continue
+            if slot_name in seen_slot_names_this_bp:
+                continue  # already captured from top-level slots
+            seen_slot_names_this_bp.add(slot_name)
+            slot_records.append({"bp_id": bp_id, "slot_name": slot_name, "slot": res})
+
+    return resource_records, slot_records, bp_count, total_resource_entries, total_slot_entries
+
+
+def _merge_slot_options(existing: list[dict], incoming: list[dict]) -> list[dict]:
+    """Union-merge two options lists by options[].name (first-seen wins on conflict)."""
+    seen_names: set[str] = {opt.get("name", "") for opt in existing}
+    merged = list(existing)
+    for opt in incoming:
+        opt_name = opt.get("name", "")
+        if opt_name and opt_name not in seen_names:
+            seen_names.add(opt_name)
+            merged.append(opt)
+    return merged
 
 
 def build_pool_and_slots(
     records: list[dict[str, Any]],
+    slot_records: list[dict[str, Any]],
     min_shared: int,
     cross_domain_threshold: int,
     domain: str,
     bp_count: int,
-    total_entries: int,
+    total_resource_entries: int,
+    total_slot_entries: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Aggregate records into the shared pool + replaceable_slots structures.
 
@@ -204,7 +254,8 @@ def build_pool_and_slots(
 
     Changes vs v1:
     - replaceable_component entries are excluded from pool_entries
-    - replaceable_component entries are written to slots_doc instead
+    - top-level bp.replaceable_slots[] entries (commit 3009f72) are the primary slot source
+    - legacy resources[].type == "replaceable_component" still merges in for backward compat
     - external_service entries gain a 'subkind' field
     """
 
@@ -220,6 +271,54 @@ def build_pool_and_slots(
     project_specific_count = 0
     slot_id_counter = 1
 
+    # --- Slot aggregation from slot_records (new schema + legacy merged) ---
+    # Group by slot_name across blueprints
+    slot_name_to_recs: dict[str, list[dict]] = defaultdict(list)
+    for srec in slot_records:
+        slot_name_to_recs[srec["slot_name"]].append(srec)
+
+    for slot_name, srecs in slot_name_to_recs.items():
+        bp_ids = sorted(set(r["bp_id"] for r in srecs))
+
+        if len(bp_ids) < min_shared:
+            project_specific_count += 1
+            continue
+
+        # Representative slot dict: first BP by sort order
+        repr_srec = min(srecs, key=lambda r: r["bp_id"])
+        repr_slot = repr_srec["slot"]
+
+        slot_id = f"res-slot-{slot_id_counter:03d}"
+        slot_id_counter += 1
+
+        scope = "cross_domain" if len(bp_ids) >= cross_domain_threshold else "domain"
+
+        # Union-merge options across all BPs (first-seen by bp_id sort wins on name conflict)
+        merged_options: list[dict] = list(repr_slot.get("options") or [])
+        for srec in sorted(srecs, key=lambda r: r["bp_id"])[1:]:
+            incoming_opts = srec["slot"].get("options") or []
+            merged_options = _merge_slot_options(merged_options, incoming_opts)
+
+        slot_entry: dict[str, Any] = {
+            "id": slot_id,
+            "name": slot_name,
+            "scope": scope,
+            "description": repr_slot.get("description", ""),
+            "used_by": bp_ids,
+        }
+        if merged_options:
+            slot_entry["options"] = merged_options
+        default = repr_slot.get("default")
+        if default is not None:
+            slot_entry["default"] = default
+
+        slot_entries.append(slot_entry)
+
+    # Sort slots: by used_by count desc, then name asc
+    slot_entries.sort(key=lambda s: (-len(s["used_by"]), s["name"]))
+
+    # --- Pool aggregation from resource_records ---
+    # (replaceable_component in resources[] goes to slot stream above, not here)
     for base_name, recs in name_to_records.items():
         bp_ids = sorted(set(r["bp_id"] for r in recs))
 
@@ -231,33 +330,13 @@ def build_pool_and_slots(
         repr_rec = min(recs, key=lambda r: r["bp_id"])
         repr_res = repr_rec["resource"]
 
-        # Derive kind
+        # Derive kind — skip replaceable_component (now handled via slot_records above)
         resource_type = repr_res.get("type", "")
         kind = derive_kind(resource_type)
 
-        # --- replaceable_component → slots doc, NOT pool ---
         if kind == "replaceable_component":
-            slot_id = f"res-slot-{slot_id_counter:03d}"
-            slot_id_counter += 1
-
-            # Determine scope by used_by count
-            scope = "cross_domain" if len(bp_ids) >= cross_domain_threshold else "domain"
-
-            slot_entry: dict[str, Any] = {
-                "id": slot_id,
-                "name": base_name,
-                "scope": scope,
-                "description": repr_res.get("description", ""),
-                "used_by": bp_ids,
-            }
-            options = repr_res.get("options")
-            if options is not None:
-                slot_entry["options"] = options
-            default = repr_res.get("default")
-            if default is not None:
-                slot_entry["default"] = default
-
-            slot_entries.append(slot_entry)
+            # Backward compat: old-style resources[].type == "replaceable_component"
+            # already captured in slot_records by scan_blueprints; skip here to avoid double-count.
             continue
 
         # --- regular resource → pool ---
@@ -314,8 +393,7 @@ def build_pool_and_slots(
     KIND_ORDER = {"python_package": 0, "external_service": 1}
     pool_entries.sort(key=lambda e: (KIND_ORDER.get(e["kind"], 99), -len(e["used_by"]), e["name"]))
 
-    # Sort slots: by used_by count desc, then name asc
-    slot_entries.sort(key=lambda s: (-len(s["used_by"]), s["name"]))
+    # Note: slot_entries already sorted above after aggregation
 
     # Count subkinds for meta
     subkind_breakdown: dict[str, int] = {}
@@ -328,7 +406,8 @@ def build_pool_and_slots(
         "domain": domain,
         "scanned_at": scanned_at,
         "source_blueprints_count": bp_count,
-        "total_entries_scanned": total_entries,
+        "total_resource_entries_scanned": total_resource_entries,
+        "total_slot_entries_scanned": total_slot_entries,
         "pool_entries": len(pool_entries),
         "replaceable_slots_count": len(slot_entries),
         "project_specific_count": project_specific_count,
@@ -341,9 +420,11 @@ def build_pool_and_slots(
         "domain": domain,
         "scanned_at": scanned_at,
         "source_blueprints_count": bp_count,
+        "total_slot_entries_scanned": total_slot_entries,
         "total_slots": len(slot_entries),
         "description": (
             "架构可替换槽位（非资源）。每个 slot 声明一个位置可以插入多种具体实现（resources[]）。"
+            " 主要来源: bp.replaceable_slots[]（commit 3009f72），兼容旧 resources[].type==replaceable_component。"
             " options[].name 不自动展开进资源池（v2.2 P1 enrichment 工作）。"
         ),
     }
@@ -368,7 +449,10 @@ def print_stats(pool: dict[str, Any], slots: dict[str, Any]) -> None:
     print("=" * 60)
     print(f"  Domain              : {meta['domain']}")
     print(f"  Source blueprints   : {meta['source_blueprints_count']}")
-    print(f"  Total entries       : {meta['total_entries_scanned']}")
+    print(
+        f"  Resource entries    : {meta.get('total_resource_entries_scanned', meta.get('total_entries_scanned', '?'))}"
+    )
+    print(f"  Slot entries        : {meta.get('total_slot_entries_scanned', '?')}")
     print(f"  Pool entries        : {meta['pool_entries']}")
     print(f"  Replaceable slots   : {meta['replaceable_slots_count']}")
     print(f"  Project-specific    : {meta['project_specific_count']}")
@@ -488,17 +572,23 @@ def main() -> None:
 
     # Scan
     print(f"[scan] Scanning blueprints in {domain_dir} ...")
-    records, bp_count, total_entries = scan_blueprints(domain_dir)
-    print(f"[scan] Found {bp_count} blueprints, {total_entries} resource entries.")
+    resource_records, slot_records, bp_count, total_resource_entries, total_slot_entries = (
+        scan_blueprints(domain_dir)
+    )
+    print(
+        f"[scan] Found {bp_count} blueprints, {total_resource_entries} resource entries, {total_slot_entries} slot entries."
+    )
 
     # Build pool + slots
     pool, slots = build_pool_and_slots(
-        records=records,
+        records=resource_records,
+        slot_records=slot_records,
         min_shared=args.min_shared,
         cross_domain_threshold=args.cross_domain_threshold,
         domain=args.domain,
         bp_count=bp_count,
-        total_entries=total_entries,
+        total_resource_entries=total_resource_entries,
+        total_slot_entries=total_slot_entries,
     )
 
     # Print stats
