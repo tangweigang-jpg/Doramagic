@@ -1236,6 +1236,34 @@ def _patch_evidence_verify(bp: dict[str, Any], repo_path: str) -> int:
                 )
                 invalid += 1
                 continue
+        elif fn_name and fn_name != "see_rationale":
+            # Non-Python file with a cited symbol: do a lightweight
+            # substring check in a ±5 line window around line_no. This
+            # catches Go/Rust/JS symbol hallucinations that previously
+            # slipped through because we only ran AST checks on .py.
+            #
+            # Accept any symbol that appears verbatim or as its bare
+            # form (after stripping Class. / package. prefix) within
+            # the window. Abstain (count as verified) only when the
+            # symbol is non-identifier-like — e.g. natural language
+            # phrases the LLM sometimes emits.
+            bare_fn = fn_name.split(".")[-1] if "." in fn_name else fn_name
+            if not _ident_pattern.match(bare_fn):
+                # Non-identifier symbol — can't reliably grep. Treat
+                # file+line existence as sufficient (prior behavior).
+                verified += 1
+            else:
+                window_lo = max(0, line_no - 1 - 5)
+                window_hi = min(len(lines), line_no - 1 + 6)
+                window = "\n".join(lines[window_lo:window_hi])
+                if bare_fn in window or fn_name in window:
+                    verified += 1
+                else:
+                    bd.setdefault("_evidence_issues", []).append(
+                        f"SYMBOL_NOT_IN_WINDOW: {fn_name} near {file_path}:{line_no}"
+                    )
+                    invalid += 1
+                    continue
         else:
             verified += 1
 

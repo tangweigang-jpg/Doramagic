@@ -18,6 +18,7 @@ from doramagic_extraction_agent.sop.blueprint_enrich import (
     _patch_bd_type_enum_fix,
     _patch_commit_hash,
     _patch_evidence_format,
+    _patch_evidence_verify,
     _patch_execution_paradigm,
     _patch_id,
     _patch_relations,
@@ -1053,6 +1054,78 @@ class TestPatchRelations:
         )
         count = _patch_relations(bp, state=state)
         assert count >= 1
+
+
+# ---------------------------------------------------------------------------
+# P5.5 _patch_evidence_verify — non-Python symbol check
+# ---------------------------------------------------------------------------
+
+
+class TestPatchEvidenceVerifyNonPython:
+    """Regression: non-Python files used to auto-verify without checking
+    the (symbol) component (bp-073 myth). Now we grep the symbol in a ±5
+    line window around the cited line.
+    """
+
+    def _make_repo(self, tmp_path: Path, filename: str, content: str) -> str:
+        (tmp_path / filename).write_text(content, encoding="utf-8")
+        return str(tmp_path)
+
+    def test_go_symbol_present_in_window_verifies(self, tmp_path: Path) -> None:
+        repo = self._make_repo(
+            tmp_path,
+            "machine.go",
+            "\n".join(["package vm"] * 50 + ["func opcodes() {}"] + ["// tail"] * 30),
+        )
+        bp = {"business_decisions": [{"id": "BD-001", "evidence": "machine.go:51(opcodes)"}]}
+        _patch_evidence_verify(bp, repo)
+        meta = bp["_enrich_meta"]
+        assert meta["evidence_verified"] == 1
+        assert meta["evidence_invalid"] == 0
+
+    def test_go_symbol_absent_from_window_invalidates(self, tmp_path: Path) -> None:
+        repo = self._make_repo(
+            tmp_path,
+            "machine.go",
+            "\n".join(["package vm", "func unrelated() {}"] + ["// filler"] * 50),
+        )
+        bp = {"business_decisions": [{"id": "BD-001", "evidence": "machine.go:30(opcodes)"}]}
+        _patch_evidence_verify(bp, repo)
+        meta = bp["_enrich_meta"]
+        assert meta["evidence_verified"] == 0
+        assert meta["evidence_invalid"] == 1
+        issues = bp["business_decisions"][0]["_evidence_issues"]
+        assert any("SYMBOL_NOT_IN_WINDOW" in s for s in issues)
+
+    def test_non_identifier_symbol_falls_back_to_verified(self, tmp_path: Path) -> None:
+        """Natural-language symbols like 'see rationale' or 'some pattern'
+        can't be grepped reliably — fall back to file+line existence."""
+        repo = self._make_repo(
+            tmp_path, "README.md", "\n".join(["line " + str(i) for i in range(100)])
+        )
+        bp = {
+            "business_decisions": [
+                {"id": "BD-001", "evidence": "README.md:50(Event Rate rounding)"}
+            ]
+        }
+        _patch_evidence_verify(bp, repo)
+        meta = bp["_enrich_meta"]
+        assert meta["evidence_verified"] == 1
+        assert meta["evidence_invalid"] == 0
+
+    def test_dotted_symbol_matches_bare_name(self, tmp_path: Path) -> None:
+        """Go receiver-style or package-qualified refs: 'pkg.Type.Method'
+        should match if the bare 'Method' appears in the window."""
+        repo = self._make_repo(
+            tmp_path,
+            "store.go",
+            "\n".join(["line"] * 9 + ["func (s *Store) Get() {}"] + ["line"] * 50),
+        )
+        bp = {"business_decisions": [{"id": "BD-001", "evidence": "store.go:10(Store.Get)"}]}
+        _patch_evidence_verify(bp, repo)
+        meta = bp["_enrich_meta"]
+        assert meta["evidence_verified"] == 1
+        assert meta["evidence_invalid"] == 0
 
 
 # ---------------------------------------------------------------------------
