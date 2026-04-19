@@ -464,13 +464,39 @@ class ConstraintBatchOrchestrator:
         status: str,
         source_blueprint_version: int,
     ) -> None:
-        """Write constraint_extraction_status into manifest.json."""
+        """Write constraint_extraction_status (and retry_count) into manifest.json.
+
+        - On failure: increment constraint_retry_count (default 0 if missing).
+          Log attempt N/3 or a permanent-failure message when count reaches 3.
+        - On success: reset constraint_retry_count to 0.
+        """
         manifest_path = output_mgr.output_dir / "manifest.json"
         try:
             m = json.loads(manifest_path.read_text(encoding="utf-8"))
             m["constraint_extraction_status"] = status
             if m.get("constraint_versions"):
                 m["constraint_versions"][0]["source_blueprint_version"] = source_blueprint_version
+
+            bp_id = m.get("blueprint_id", str(output_mgr.output_dir.name))
+            if status == "failed":
+                new_count = m.get("constraint_retry_count", 0) + 1
+                m["constraint_retry_count"] = new_count
+                if new_count >= 3:
+                    logger.error(
+                        "%s: failed permanently after %d attempts",
+                        bp_id,
+                        new_count,
+                    )
+                else:
+                    logger.info(
+                        "%s: failed (attempt %d/3) — will retry next discover round",
+                        bp_id,
+                        new_count,
+                    )
+            else:
+                # Completed — clear retry counter
+                m["constraint_retry_count"] = 0
+
             manifest_path.write_text(
                 json.dumps(m, indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",

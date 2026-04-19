@@ -215,10 +215,20 @@ def _scan_stale_projects(sources_dir: Path, project_root: Path) -> list[dict]:
         if con_versions:
             source_bp_version = con_versions[0].get("source_blueprint_version", 0)
 
-        # STALE if blueprint is newer OR previous extraction failed
+        # STALE if blueprint is newer OR previous extraction failed (and retries remain)
         extraction_status = m.get("constraint_extraction_status", "")
+        retry_count = m.get("constraint_retry_count", 0)
         is_stale = latest_bp_version > source_bp_version
         is_failed = extraction_status == "failed"
+
+        # Permanently-failed bps (>= 3 attempts) are never re-queued
+        if is_failed and not is_stale and retry_count >= 3:
+            logger.info(
+                "  %s: skipped (failed permanently after %d attempts)",
+                project_dir.name,
+                retry_count,
+            )
+            continue
 
         if is_stale or is_failed:
             # Resolve repo_path from blueprint YAML
@@ -254,14 +264,19 @@ def _scan_stale_projects(sources_dir: Path, project_root: Path) -> list[dict]:
                     "source_bp_version": source_bp_version,
                 }
             )
-            reason = "FAILED (retry)" if is_failed and not is_stale else "STALE"
-            logger.info(
-                "  %s: %s (blueprint v%d, constraints based on v%d)",
-                project_dir.name,
-                reason,
-                latest_bp_version,
-                source_bp_version,
-            )
+            if is_failed and not is_stale:
+                logger.info(
+                    "  %s: FAILED (attempt %d/3) — will retry next discover round",
+                    project_dir.name,
+                    retry_count + 1,
+                )
+            else:
+                logger.info(
+                    "  %s: STALE (blueprint v%d, constraints based on v%d)",
+                    project_dir.name,
+                    latest_bp_version,
+                    source_bp_version,
+                )
         else:
             logger.debug(
                 "  %s: up-to-date (v%d)",
