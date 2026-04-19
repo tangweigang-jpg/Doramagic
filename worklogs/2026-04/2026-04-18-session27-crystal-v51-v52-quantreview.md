@@ -332,3 +332,32 @@ skill_crystallization:
 ---
 
 *v1.0 | 2026-04-18 | Session 27 | 主线程 Opus 4.7 (1M) + N× Sonnet 子代理 + OpenClaw 2× 实测*
+
+---
+
+## 十一、Post-mortem 补遗（2026-04-19，08:46 追问后）
+
+### 事件
+
+2026-04-19 08:45 用户将 commit `7ec70de`（8.72 分）v5.2 晶体提交 OpenClaw，08:46 后主动追问 "帮我用 MACD 多头策略回测茅台" → OpenClaw 真实执行 3 轮回测 + 基本面筛选。行为层可观察。
+
+### Fix 效果对照（vs 8.30 版本 23:39 首次 PIN-01）
+
+| Fix | 设计意图 | 文件层可见 | 行为层可见 | 判定 |
+|---|---|---|---|---|
+| A. `skill_crystallization` 动态化（name/keywords/guards）| 让 Notice 反映 UC 专属定位 | ✅ | ❌ | **分层错位** |
+| B. `locale_contract.user_facing_fields` 12 条精细子路径 | 翻译粒度更细 | ✅ | ⚠️ 部分 | `beginner_prompt` 中文化可见，`what_i_auto_fetch[]` 逐条独立翻译未见 |
+
+### Fix A 分层错位根因
+
+`skill_file_schema`（skill_crystallization 下）是**给 host 做 skill 路由匹配的元数据**（intent_keywords 影响 "say X to invoke"），而 **Notice 渲染源是 `post_install_notice.message_template`**。这两个字段作用域独立。Fix A 改了前者，后者不受影响——因此 OpenClaw 安装 Notice 依然叫 "ZVT v5.2 Skill"，而不是 "Actor Data Recorder"。
+
+### 修正方向（下次迭代）
+
+要让 Notice 反映 UC 专属定位，应改 `post_install_notice.message_template.positioning` 或新增 `skill_identity` 段（从 featured_use_cases 派生），让编译脚本 build_post_install_notice 时把 UC-1 的 name 注入 positioning 首句。不再改 skill_crystallization。
+
+### 教训
+
+"改了字段但行为不变" 的第一归因应是**作用域检查**，而非"host 忽略了声明"。Session 27 前半段的 v6.0 Runtime 弯路也是这种误判的极端形态——这次是小规模复发。
+
+*v1.1 | 2026-04-19 | Fix A/B 行为层验证补录*
