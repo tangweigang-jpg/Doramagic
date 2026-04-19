@@ -14,6 +14,9 @@ Patch summary
 6. enum_fix          — remap common LLM enum spelling errors to canonical values
 7. commit_hash       — inject commit hash into evidence_refs source for code_analysis constraints
 8. vague_words       — tag constraints with vague action words for manual review
+18. resolve_placeholders — replace {var} tokens in validation_threshold with
+    evidence_refs[0].path; clear threshold + set machine_checkable=false when
+    no reliable path is available
 """
 
 from __future__ import annotations
@@ -23,6 +26,10 @@ import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Matches bash-style placeholder tokens like {file}, {path}, {xml_file}
+# Does NOT match ${VAR} (shell variable interpolation — those are intentional)
+_PLACEHOLDER_RE = re.compile(r"(?<!\$)\{([a-z_]+)\}")
 
 # ---------------------------------------------------------------------------
 # Enum fix maps (Patch 6)
@@ -906,6 +913,79 @@ def _patch_modality_severity(constraints: list[dict[str, Any]]) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Patch 18: resolve {var} placeholders in validation_threshold
+# ---------------------------------------------------------------------------
+
+
+def _is_file_path(s: str) -> bool:
+    """Return True if *s* looks like a real file path (contains '/' and a file suffix)."""
+    return "/" in s and "." in s.rsplit("/", 1)[-1]
+
+
+def _patch_resolve_placeholders(constraints: list[dict[str, Any]]) -> int:
+    """Patch 18: replace {var} placeholders in validation_threshold with real paths.
+
+    For each constraint whose validation_threshold contains one or more tokens
+    matching {[a-z_]+} (bash-style placeholders, NOT ${VAR} shell variables):
+
+    1. Extract evidence_refs[0]["path"] as the candidate replacement path.
+       "evidence_refs" is the top-level flat list populated by Patch 1.
+    2. If the path looks like a real file path (contains '/' and a suffix):
+       - Replace ALL {var} placeholder tokens with that single path.
+       - After substitution, check again for remaining placeholders.
+       - If any remain -> clear threshold + set machine_checkable=False.
+    3. If no reliable path is available -> clear threshold + machine_checkable=False.
+
+    Rationale: multiple different placeholder names in one threshold almost always
+    refer to the same file (the one identified in evidence_refs[0]).
+
+    Returns the number of constraints modified.
+    """
+    count = 0
+    for raw in constraints:
+        threshold = raw.get("validation_threshold") or ""
+        if not isinstance(threshold, str):
+            continue
+
+        # Only process entries that contain at least one {var} placeholder
+        if not _PLACEHOLDER_RE.search(threshold):
+            continue
+
+        # Attempt to resolve using evidence_refs[0]["path"]
+        refs = raw.get("evidence_refs")
+        resolved_path: str = ""
+        if isinstance(refs, list) and refs:
+            first_ref = refs[0]
+            if isinstance(first_ref, dict):
+                candidate = first_ref.get("path", "")
+                if isinstance(candidate, str) and _is_file_path(candidate):
+                    resolved_path = candidate
+
+        if resolved_path:
+            new_threshold = _PLACEHOLDER_RE.sub(resolved_path, threshold)
+            # Verify no placeholders remain after substitution
+            if _PLACEHOLDER_RE.search(new_threshold):
+                # Still has {var} tokens -> clear threshold
+                raw["validation_threshold"] = ""
+                raw["machine_checkable"] = False
+            else:
+                raw["validation_threshold"] = new_threshold
+        else:
+            # No reliable path available -> clear threshold entirely
+            raw["validation_threshold"] = ""
+            raw["machine_checkable"] = False
+
+        count += 1
+
+    if count:
+        logger.info(
+            "Patch 18 (resolve_placeholders): %d validation_threshold entries updated",
+            count,
+        )
+    return count
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -917,7 +997,7 @@ def enrich_constraints(
     commit_hash: str,
     sop_version: str = "2.3",
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    """Apply 16 deterministic enrichment patches (P1-P16) to raw constraints.
+    """Apply 17 deterministic enrichment patches (P1-P18) to raw constraints.
 
     Args:
         raw_list:    List of raw constraint dicts (from agentic extraction).
@@ -960,6 +1040,9 @@ def enrich_constraints(
     patch_stats["p14_hardcoded_constants"] = _patch_hardcoded_constants(raw_list)
     patch_stats["p16_guard_pattern"] = _patch_guard_pattern(raw_list)
     patch_stats["p17_modality_severity"] = _patch_modality_severity(raw_list)
+    # P18 runs AFTER all other patches (other patches may add validation_threshold)
+    # and BEFORE P15 (hash must reflect final resolved threshold value)
+    patch_stats["p18_resolve_placeholders"] = _patch_resolve_placeholders(raw_list)
     patch_stats["p15_hash_compute"] = _patch_hash_compute(raw_list)  # MUST be last
 
     total_affected = sum(patch_stats.values())
