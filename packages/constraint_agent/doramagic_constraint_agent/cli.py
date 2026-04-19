@@ -65,7 +65,10 @@ def _cmd_run(args: argparse.Namespace, project_root: Path) -> None:
         try:
             bp_data = yaml.safe_load(blueprint_path.read_text(encoding="utf-8"))
             bp_id = bp_data.get("id", "") if isinstance(bp_data, dict) else ""
-        except Exception:
+        except (OSError, yaml.YAMLError) as e:
+            logger.warning(
+                "Failed to read blueprint YAML for bp_id (path=%s): %s", blueprint_path, e
+            )
             bp_id = ""
     if not bp_id:
         bp_id = blueprint_path.stem
@@ -232,8 +235,12 @@ def _scan_stale_projects(sources_dir: Path, project_root: Path) -> list[dict]:
                 if projects:
                     repo_name = projects[0].split("/")[-1] if "/" in projects[0] else projects[0]
                     repo_path = str(project_root / "repos" / repo_name)
-            except Exception:
-                pass
+            except (OSError, yaml.YAMLError) as e:
+                logger.warning(
+                    "Failed to read blueprint YAML for repo_path (path=%s): %s",
+                    blueprint_path,
+                    e,
+                )
 
             bp_id = m.get("blueprint_id", project_dir.name.split("--")[0])
             stale.append(
