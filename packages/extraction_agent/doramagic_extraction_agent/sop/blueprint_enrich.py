@@ -1113,6 +1113,70 @@ def _patch_execution_paradigm(bp: dict[str, Any]) -> int:
     return 0
 
 
+def _patch_evidence_backfill_from_md(bp: dict[str, Any], artifacts_dir: Path) -> int:
+    """P5.3: recover evidence refs from step2c_business_decisions.md.
+
+    When bp_synthesis_v5 (or any downstream phase) falls through to L3
+    recovery, BDs missing an 'evidence' field get defaulted to
+    'N/A:0(see_rationale)'. The LLM's original step2c_business_decisions.md
+    table, however, often carries real 'path:line(fn)' or 'path:line' refs
+    — written earlier in the pipeline by a markdown-lenient write_artifact
+    call that predates structured validation.
+
+    This patch reads that markdown table (if present) and backfills the
+    evidence field for any BD whose current evidence is N/A, matching rows
+    by content prefix (first 60 chars, case-insensitive, whitespace
+    normalized). Returns the number of BDs backfilled. Zero LLM calls.
+    """
+    md_path = artifacts_dir / "step2c_business_decisions.md"
+    if not md_path.exists():
+        return 0
+    try:
+        text = md_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return 0
+
+    row_re = re.compile(
+        r"^\|\s*\d+\s*\|(.+?)\|(.+?)\|(.+?)\|(.+?)\|(.+?)\|$",
+        re.MULTILINE,
+    )
+    md_by_key: dict[str, str] = {}
+    for m in row_re.finditer(text):
+        content = m.group(1).strip()
+        evidence = m.group(4).strip()
+        if not content or not evidence:
+            continue
+        if evidence.startswith("N/A") or evidence in ("-", "—", "N/A"):
+            continue
+        key = " ".join(content[:60].lower().split())
+        if key and key not in md_by_key:
+            md_by_key[key] = evidence
+
+    if not md_by_key:
+        return 0
+
+    backfilled = 0
+    for bd in bp.get("business_decisions", []):
+        ev = bd.get("evidence", "") or ""
+        if not ev.startswith("N/A"):
+            continue
+        content = bd.get("content", "") or ""
+        key = " ".join(content[:60].lower().split())
+        if key in md_by_key:
+            bd["evidence"] = md_by_key[key]
+            bd.setdefault("_evidence_issues", []).append(
+                "BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md"
+            )
+            backfilled += 1
+
+    if backfilled:
+        logger.info(
+            "P5.3 (evidence_backfill): recovered %d BDs from step2c markdown",
+            backfilled,
+        )
+    return backfilled
+
+
 def _patch_evidence_verify(bp: dict[str, Any], repo_path: str) -> int:
     """P5.5: deterministic verification of evidence file:line(fn) references.
 
@@ -2436,6 +2500,11 @@ def enrich_blueprint(
             file_path_map[_bare] = _full_path
 
     patch_stats["p5_evidence_format"] = _patch_evidence_format(bp, file_path_map=file_path_map)
+    # P5.3: recover evidence from step2c_business_decisions.md for BDs
+    # whose evidence got defaulted to N/A in L3 recovery (see
+    # blueprint_phases.py:1986 and related). Runs before verify so
+    # recovered refs also get validated.
+    patch_stats["p5_3_evidence_backfill"] = _patch_evidence_backfill_from_md(bp, artifacts_dir)
     # P5.5: deterministic evidence verification (v6)
     if repo_path:
         patch_stats["p5_5_evidence_verify"] = _patch_evidence_verify(bp, repo_path)

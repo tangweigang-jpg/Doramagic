@@ -17,6 +17,7 @@ from doramagic_extraction_agent.sop.blueprint_enrich import (
     _patch_bd_injection,
     _patch_bd_type_enum_fix,
     _patch_commit_hash,
+    _patch_evidence_backfill_from_md,
     _patch_evidence_format,
     _patch_evidence_verify,
     _patch_execution_paradigm,
@@ -1054,6 +1055,93 @@ class TestPatchRelations:
         )
         count = _patch_relations(bp, state=state)
         assert count >= 1
+
+
+# ---------------------------------------------------------------------------
+# P5.3 _patch_evidence_backfill_from_md — recover refs from step2c markdown
+# ---------------------------------------------------------------------------
+
+
+class TestPatchEvidenceBackfillFromMd:
+    """Regression: bp-062 had step2c.md with real refs (PD/README.md:21-26)
+    but bd_list.json had 117/117 'N/A:0(see_rationale)'. Root cause:
+    bp_synthesis_v5 L3 recovery defaults missing evidence to N/A rather
+    than reading back from the markdown the LLM already wrote.
+    """
+
+    def test_backfills_na_from_md_by_content_match(self, tmp_path: Path) -> None:
+        md = (
+            "## Business Decision Report\n\n"
+            "### Business Decision Table\n\n"
+            "| # | Content | Type | Rationale | Evidence | Stage |\n"
+            "|---|---------|------|-----------|----------|-------|\n"
+            "| 1 | Three PD dimensions separated for validation | B/RC | "
+            "rationale text | PD/README.md:21-26 | pd_probability_of_default |\n"
+            "| 2 | Vasicek model for macro adjustment | M/BA | rat | "
+            "PD/vasicek.ipynb:12(fit) | macro_forward_looking |\n"
+        )
+        (tmp_path / "step2c_business_decisions.md").write_text(md)
+        bp = {
+            "business_decisions": [
+                {
+                    "id": "BD-001",
+                    "content": "Three PD dimensions separated for validation",
+                    "evidence": "N/A:0(see_rationale)",
+                },
+                {
+                    "id": "BD-002",
+                    "content": "Vasicek model for macro adjustment",
+                    "evidence": "N/A:0(see_rationale)",
+                },
+            ]
+        }
+        n = _patch_evidence_backfill_from_md(bp, tmp_path)
+        assert n == 2
+        assert bp["business_decisions"][0]["evidence"] == "PD/README.md:21-26"
+        assert bp["business_decisions"][1]["evidence"] == "PD/vasicek.ipynb:12(fit)"
+        assert "BACKFILLED_FROM_MD" in bp["business_decisions"][0]["_evidence_issues"][0]
+
+    def test_skips_bds_with_real_evidence(self, tmp_path: Path) -> None:
+        md = (
+            "| # | Content | Type | Rationale | Evidence | Stage |\n"
+            "|---|---------|------|-----------|----------|-------|\n"
+            "| 1 | Some BD | B | rat | a/b.py:10(f) | s |\n"
+        )
+        (tmp_path / "step2c_business_decisions.md").write_text(md)
+        bp = {
+            "business_decisions": [
+                {
+                    "id": "BD-001",
+                    "content": "Some BD",
+                    "evidence": "existing/real.py:99(existing)",
+                },
+            ]
+        }
+        n = _patch_evidence_backfill_from_md(bp, tmp_path)
+        assert n == 0
+        assert bp["business_decisions"][0]["evidence"] == "existing/real.py:99(existing)"
+
+    def test_no_md_file_is_noop(self, tmp_path: Path) -> None:
+        bp = {
+            "business_decisions": [
+                {"id": "BD-001", "content": "x", "evidence": "N/A:0(see_rationale)"},
+            ]
+        }
+        assert _patch_evidence_backfill_from_md(bp, tmp_path) == 0
+
+    def test_md_with_only_na_refs_is_noop(self, tmp_path: Path) -> None:
+        md = (
+            "| # | Content | Type | Rationale | Evidence | Stage |\n"
+            "|---|---------|------|-----------|----------|-------|\n"
+            "| 1 | X | B | rat | N/A:0(see_rationale) | s |\n"
+        )
+        (tmp_path / "step2c_business_decisions.md").write_text(md)
+        bp = {
+            "business_decisions": [
+                {"id": "BD-001", "content": "X", "evidence": "N/A:0(see_rationale)"},
+            ]
+        }
+        assert _patch_evidence_backfill_from_md(bp, tmp_path) == 0
 
 
 # ---------------------------------------------------------------------------
