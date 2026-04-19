@@ -1,0 +1,2760 @@
+id: finance-bp-071
+name: OpenSanctions
+sop_version: '3.6'
+source:
+  projects:
+  - opensanctions
+  commit_hash: e058206518b6617b0c42a4ad6edfeedc413468be
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: sanctions and PEP data aggregation, deduplication, and multi-format export
+  description: OpenSanctions aggregates sanctions lists, politically exposed persons
+    databases, and related entity data from multiple external sources, transforms
+    them into the FollowTheMoney schema, performs cross-dataset entity deduplication,
+    and exports to multiple formats including FtM JSON, CSV, Senzing, and delta feeds.
+  prerequisites: Python development experience, basic understanding of FollowTheMoney
+    schema model, familiarity with sanctions/AML domain concepts helpful but not required
+  not_suitable_for: Real-time sanctions screening or transaction monitoring (use yente
+    API instead), single-entity lookup queries (use OpenSanctions API), processing
+    unstructured or non-standard data sources without custom crawlers
+  activation:
+    triggers:
+    - Creating a new dataset crawler in datasets/<country_code>/<dataset_name>/
+    - Updating an existing crawler when source data format or URL changes
+    - Adding new entity types or properties to an existing crawler
+    emphasis:
+    - Use ESPECIALLY when the source data is semi-structured government data with
+      inconsistencies and manual data entry errors
+    - Use ESPECIALLY when data cleaning decisions need to be documented and auditable
+      (use lookups in YAML)
+    - Use ESPECIALLY for sanctions lists where data quality has serious downstream
+      consequences
+    anti_skip:
+    - Don't skip validation (zavod validate) because assertions catch silent regressions
+      in entity counts
+    - Don't skip type annotations because zavod code needs to be fully typed, unit
+      tested, and thoroughly documented
+    - Don't skip context.audit_data() because it surfaces new fields when the source
+      changes, preventing silent data loss
+stages:
+- id: data_collection
+  name: Data Collection
+  order: 1
+  responsibility: 'Fetch raw data from external sources (HTTP, files, APIs) and store
+    it locally for processing. WHY: Decouples network I/O from entity extraction and
+    provides reproducibility via caching.'
+  interface:
+    inputs: Dataset metadata (URLs, auth config, HTTP settings), External data sources
+    outputs: Cached raw files in dataset_data_path, HTTP responses with caching fingerprints
+  required_methods:
+  - name: Context.fetch_text
+    description: Fetches HTTP text resources with caching fingerprinting to avoid
+      redundant downloads across runs
+    evidence: zavod/zavod/context.py:244(fetch_text)
+  - name: Context.fetch_json
+    description: Fetches JSON HTTP resources with automatic decoding and caching
+    evidence: zavod/zavod/context.py:280(fetch_json)
+  - name: Context.get_resource_path
+    description: Returns local filesystem path for dataset resource files, creating
+      directories as needed
+    evidence: zavod/zavod/context.py:310(get_resource_path)
+  key_behaviors:
+  - behavior: Entity-level isolation
+    description: Context is dataset-scoped with single object lifecycle matching dataset
+      run; prevents cross-contamination between datasets
+    evidence: zavod/zavod/context.py:56(Context.__init__)
+  - behavior: HTTP caching via request_hash fingerprinting
+    description: URLs are cached using request_hash; same URL returns cached response
+      on re-run within cache_days TTL
+    evidence: zavod/zavod/runtime/http_.py:54(request_hash)
+  - behavior: Backend abstraction for HTTP
+    description: fetch_* methods return decoded content vs raw response; allows switching
+      between requests.Session and ZyteAPI backends without changing crawler code
+    evidence: zavod/zavod/context.py:244(fetch_text)
+  replaceable_points:
+  - name: HTTP session backend
+    description: The make_session factory creates requests.Session with configured
+      adapters for HTTP communication
+    options:
+    - name: requests.Session
+      traits:
+      - Standard Python HTTP client
+      - Synchronous
+      - Local SSL verification control
+      fit_for:
+      - Development
+      - Most public data sources
+      - Custom SSL requirements
+      not_fit_for:
+      - JavaScript-heavy sites
+      - Complex bot detection
+      - High-volume cloud scraping
+    - name: ZyteAPI
+      traits:
+      - Cloud-based scraping service
+      - Automatic JavaScript rendering
+      - Bot mitigation
+      fit_for:
+      - Difficult-to-scrape sites
+      - High-volume production crawling
+      - Sites requiring browser automation
+      not_fit_for:
+      - Local development without API keys
+      - Budget-constrained projects
+      - Simple static sources
+    default: requests.Session
+  design_decisions:
+  - 'HTTP caching via request_hash fingerprinting: zavod/zavod/runtime/http_.py:54(request_hash)
+    - Avoid re-fetching same URLs across runs; cache_days param allows TTL control'
+  - 'Context holds dataset-scoped resources (stats, issues, resources): zavod/zavod/context.py:56(Context.__init__)
+    - Single object lifecycle matches dataset run; prevents cross-contamination between
+    datasets'
+  - 'Context.fetch_* methods return decoded content vs raw response: zavod/zavod/context.py:244(fetch_text)
+    - Abstraction allows switching HTTP backends (requests, Zyte) without changing
+    crawlers'
+  acceptance_hints:
+  - Raw files appear in dataset_data_path after successful crawl
+  - Same URL returns cached response on re-run without network request
+  - HTTP errors (404, 500, timeout) are logged to issues and don't crash the crawl
+  - HTTP.verify=False applied for government data sources
+- id: entity_extraction
+  name: Entity Extraction
+  order: 2
+  responsibility: 'Parse raw source data and emit typed Entity objects with schema
+    validation. WHY: Transforms unstructured/structured data into FollowTheMoney model
+    with audit trail.'
+  interface:
+    inputs: Cached raw files, Dataset metadata, Lookup tables
+    outputs: Entity objects with statements, Issues log entries, Resource metadata
+  required_methods:
+  - name: Context.make
+    description: Factory method for creating new Entity objects with dataset prefix
+      and validation
+    evidence: zavod/zavod/context.py:418(make)
+  - name: Context.emit
+    description: Sends entity to store with external flag and origin tracking for
+      statement persistence
+    evidence: zavod/zavod/context.py:547(emit)
+  - name: Entity.add_schema
+    description: Progressive schema typing that tries to make entity more specific
+      (e.g., Person can become Politician)
+    evidence: zavod/zavod/entity.py:155(add_schema)
+  key_behaviors:
+  - behavior: Entity.make_id raises NotImplementedError
+    description: Forces crawler implementations to define custom ID generation; prevents
+      accidental use of FtM's generic make_id which would create non-dataset-scoped
+      IDs
+    evidence: zavod/zavod/entity.py:28(make_id)
+  - behavior: Statements are primary storage format
+    description: Entities are stored as individual property-value statements, not
+      as assembled dicts; enables incremental updates, full auditing, and entity reconstruction
+      from statements
+    evidence: zavod/zavod/entity.py:75(unsafe_add)
+  - behavior: Progressive schema typing
+    description: Entity schema can be made more specific over time (e.g., UnknownPerson
+      -> Person -> Politician -> PEP) allowing for gradual classification improvements
+    evidence: zavod/zavod/entity.py:155(add_schema)
+  replaceable_points:
+  - name: Entity ID generation strategy
+    description: Crawler implements make_id() or make_slug() to generate dataset-scoped
+      entity identifiers
+    options:
+    - name: make_id (hash-based)
+      traits:
+      - Cryptographic hash of entity properties
+      - Collision-resistant
+      - Dataset-scoped prefix
+      fit_for:
+      - Most use cases
+      - When ID stability across runs is required
+      - Multi-dataset environments
+      not_fit_for:
+      - When human-readable IDs are needed
+      - When external ID mapping is required
+    - name: make_slug (deterministic)
+      traits:
+      - Human-readable slug from entity name
+      - Predictable
+      - URL-safe
+      fit_for:
+      - Datasets with stable naming conventions
+      - When IDs should be interpretable
+      not_fit_for:
+      - Entities with similar names
+      - Names with special characters
+      - Large-scale datasets
+    default: make_id
+  design_decisions:
+  - 'Entity.make_id raises NotImplementedError: zavod/zavod/entity.py:28(make_id)
+    - Forces crawlers to implement ID generation; prevents accidental use of FtM''s
+    generic make_id'
+  - 'Statements are primary storage format, not entity dicts: zavod/zavod/entity.py:75(unsafe_add)
+    - Enables incremental updates, auditing, and entity reconstruction from statements'
+  - 'Entity.add_schema tries to make entity more specific: zavod/zavod/entity.py:155(add_schema)
+    - PEP can become Person, then Politician; enables progressive typing'
+  acceptance_hints:
+  - Every emitted entities have valid dataset-scoped IDs matching pattern {dataset_prefix}:{hash}
+  - Every entity properties conform to FollowTheMoney schema definitions
+  - Malformed or invalid data results in logged issues without crashing the crawl
+  - Person schema names REQUIRE spaces (require_space=True); single-token Person names
+    are flagged
+- id: statement_storage
+  name: Statement Storage
+  order: 3
+  responsibility: 'Persist statements to LevelDB with entity assembly and resolver
+    integration. WHY: Provides fast random-access to entities via statement reconstruction.'
+  interface:
+    inputs: Entity statements (prop-value pairs), Resolver/Linker for entity matching
+    outputs: LevelDB store with assembled entities, Entity views scoped by dataset/external
+  required_methods:
+  - name: Store.sync
+    description: Syncs external/input datasets to LevelDB, indexing each statements
+      for cross-dataset lookups
+    evidence: zavod/zavod/store.py:59(iter_dataset_statements)
+  - name: Store.assemble
+    description: Reconstructs entity object from stored statements, handling InvalidData
+      exceptions gracefully
+    evidence: zavod/zavod/store.py:37(assemble)
+  - name: Store.view
+    description: Returns scoped entity view filtering by dataset, external status,
+      or custom criteria
+    evidence: zavod/zavod/store.py:24(class Store)
+  key_behaviors:
+  - behavior: Store extends LevelDBStore from nomenklatura
+    description: Leverages nomenklatura's resolver integration, entity view abstraction,
+      and statement storage optimizations for write performance
+    evidence: zavod/zavod/store.py:24(class Store)
+  - behavior: Entity assembly on-demand from statements
+    description: Entities are reconstructed from stored statements when accessed,
+      not pre-assembled; enables incremental updates without full entity rebuild
+    evidence: zavod/zavod/store.py:37(assemble)
+  - behavior: Cross-dataset indexing via Store.sync
+    description: Input datasets must be indexed to LevelDB before dependent datasets
+      can reference entities; enables fast cross-dataset lookups during entity enrichment
+    evidence: zavod/zavod/store.py:59(iter_dataset_statements)
+  replaceable_points:
+  - name: Linker/resolver backend
+    description: Nomenklatura resolver for entity matching and deduplication across
+      datasets
+    options:
+    - name: Resolver (nomenklatura)
+      traits:
+      - Full fuzzy matching with scoring
+      - Cross-dataset entity resolution
+      - Statement-level storage
+      fit_for:
+      - Production multi-dataset environments
+      - When entities appear in multiple sources
+      - Complex matching scenarios
+      not_fit_for:
+      - Single isolated datasets
+      - Simple exact-match deduplication
+      - When resolver overhead is too high
+    - name: LocalEnricher
+      traits:
+      - Blocking-based matching
+      - Local dataset enrichment
+      - Lower overhead
+      fit_for:
+      - Enriching with local datasets
+      - When full resolver is overkill
+      - Testing scenarios
+      not_fit_for:
+      - Cross-dataset production matching
+      - Complex fuzzy matching requirements
+    default: Resolver
+  design_decisions:
+  - 'Store extends LevelDBStore from nomenklatura: zavod/zavod/store.py:24(class Store)
+    - Leverages nomenklatura''s resolver integration and entity view abstraction'
+  - 'Store.assemble wraps InvalidData exceptions: zavod/zavod/store.py:37(assemble)
+    - Prevents single bad entity from crashing the export; logs debug info for forensics'
+  - 'Store.sync indexes each external statements for cross-dataset lookups: zavod/zavod/store.py:59(iter_dataset_statements)
+    - Inputs datasets must be indexed before derived datasets can reference them'
+  acceptance_hints:
+  - Entities reconstruct correctly from stored statements with each properties intact
+  - Cross-dataset entity references resolve without errors
+  - No data loss occurs during sync operation
+  - Assemble errors are logged but don't crash the process
+- id: validation
+  name: Validation
+  order: 4
+  responsibility: 'Verify entity constraints, schema compliance, and cross-entity
+    assertions. WHY: Ensures data quality before export and catches broken transformations
+    early.'
+  interface:
+    inputs: Store view with assembled entities, Dataset assertions config
+    outputs: Validation issues, Entity counts by schema
+  required_methods:
+  - name: Assertion.check
+    description: Evaluates declarative constraint (metric + comparison + value) against
+      entity statistics
+    evidence: zavod/zavod/meta/assertion.py:43(Assertion)
+  - name: DatasetIssues.write
+    description: Appends issue to append-only JSON lines log without holding memory
+    evidence: zavod/zavod/runtime/issues.py:59(write)
+  - name: Statistics.count
+    description: Counts entities by schema type for assertion validation
+    evidence: zavod/zavod/exporters/statistics.py:16(Statistics)
+  key_behaviors:
+  - behavior: Issues use append-only JSON lines format
+    description: Crash-resistant logging that can append during processing without
+      holding data in memory; survives process crashes without data loss
+    evidence: zavod/zavod/runtime/issues.py:59(write)
+  - behavior: Assertions are declarative config, not code
+    description: Non-programmers can define data quality constraints in dataset YAML;
+      assertions live with dataset metadata rather than in crawler code
+    evidence: zavod/zavod/meta/assertion.py:43(Assertion)
+  - behavior: No issues backfill for collections
+    description: Collections aggregate from source datasets; previous run issues would
+      be misleading as they don't reflect collection state
+    evidence: zavod/zavod/runtime/issues.py:81(all)
+  replaceable_points:
+  - name: Assertion types
+    description: Metric (count, hasProperty, uniqueValue) compared to expected value
+      for data quality checks
+    options:
+    - name: entityCount
+      traits:
+      - Counts entities matching criteria
+      - Supports schema and property filters
+      fit_for:
+      - Basic quality checks
+      - Entity volume validation
+      - Schema distribution verification
+      not_fit_for:
+      - Property-level validation
+      - Complex cross-entity assertions
+    - name: hasProperty
+      traits:
+      - Verifies entity has specific property
+      - Property and schema scoped
+      fit_for:
+      - Required field validation
+      - Schema compliance checking
+      not_fit_for:
+      - Count-based assertions
+      - Cross-entity relationships
+    - name: uniqueValue
+      traits:
+      - Verifies property uniqueness across entities
+      - Detects duplicate values
+      fit_for:
+      - ID uniqueness validation
+      - External ID deduplication
+      not_fit_for:
+      - Non-unique properties
+      - Complex uniqueness rules
+    default: entityCount
+  design_decisions:
+  - 'Issues use append-only JSON lines format: zavod/zavod/runtime/issues.py:59(write)
+    - Crash-resistant logging; can append during processing without holding memory'
+  - 'Assertions are declarative config, not code: zavod/zavod/meta/assertion.py:43(Assertion)
+    - Non-programmers can define constraints; assertions live in dataset YAML'
+  - 'No issues backfill for collections: zavod/zavod/runtime/issues.py:81(all) - Collections
+    aggregate from sources; previous run issues would be misleading'
+  acceptance_hints:
+  - Every configured assertions pass or failures are documented in issues
+  - Entity counts match expected ranges defined in assertions
+  - Schema violations result in logged issues with entity IDs
+  - Issue counts are reasonable relative to entity volume
+- id: consolidation
+  name: Consolidation
+  order: 5
+  responsibility: 'Entity deduplication via resolver and edge merging. WHY: Multiple
+    sources may describe the same real-world entity; consolidation creates unified
+    records.'
+  interface:
+    inputs: Raw entities, Resolver state with merged IDs
+    outputs: Consolidated entities with simplified properties, Edge groups for dedup
+  required_methods:
+  - name: consolidate_entity
+    description: Simplifies entity names and applies resolver merges to create consolidated
+      representation
+    evidence: zavod/zavod/exporters/consolidate.py:93(consolidate_entity)
+  - name: dedupe_edges
+    description: Groups duplicate edges by source-target-schema-temporal key to merge
+      equivalent relationships
+    evidence: zavod/zavod/integration/edges.py:261(dedupe_edges)
+  key_behaviors:
+  - behavior: feed_unconsolidated called BEFORE consolidate_entity
+    description: Consolidation mutates entity in place; must export raw data first
+      to preserve forensics trail
+    evidence: zavod/zavod/exporters/__init__.py:75-80(export_data)
+  - behavior: Edge dedup merges temporal overlaps
+    description: Same-source-target-schema edges with overlapping time periods are
+      merged; sanctions/programs listing same relationship multiple times are deduplicated
+      to reduce noise
+    evidence: zavod/zavod/integration/edges.py:36(Key)
+  - behavior: UNIQUE_DATASETS prevents cross-list merging
+    description: Entities in OFAC/UK/EU sanctions lists are never merged across lists
+      regardless of match score; prevents false positives in sanctions compliance
+    evidence: zavod/zavod/integration/logic.py:11(UNIQUE_DATASETS)
+  replaceable_points:
+  - name: Entity matching algorithm
+    description: Nomenklatura resolver uses fuzzy matching on names, identifiers,
+      and other properties for entity deduplication
+    options:
+    - name: nomenklatura resolver
+      traits:
+      - Full fuzzy matching with confidence scoring
+      - Handles names, DUNS, LEIs, etc.
+      - Cross-dataset resolution
+      fit_for:
+      - Production multi-dataset environments
+      - Complex matching scenarios
+      - When precision is critical
+      not_fit_for:
+      - Local-only datasets
+      - Exact-match requirements
+      - High-performance single-dataset processing
+    - name: LocalEnricher blocking
+      traits:
+      - Deterministic blocking keys
+      - Lower computational overhead
+      - Local dataset focus
+      fit_for:
+      - Enriching with another local dataset
+      - When full resolver is overkill
+      - Batch processing
+      not_fit_for:
+      - Cross-dataset matching
+      - Fuzzy matching requirements
+      - Production resolver workflows
+    default: nomenklatura resolver
+  design_decisions:
+  - 'Consolidation happens after unconsolidated export feeds: zavod/zavod/exporters/__init__.py:78(feed_unconsolidated)
+    - Preserves raw data for forensics while producing simplified output'
+  - 'Edge dedup merges same-source-target-schema edges with temporal overlap: zavod/zavod/integration/edges.py:36(Key)
+    - Sanctions/programs can list same relationship multiple times; dedup reduces
+    noise'
+  acceptance_hints:
+  - Duplicate entities from multiple sources are correctly merged into single records
+  - Edge groups contain semantically equivalent relationships without excessive duplicates
+  - Entities in UNIQUE_DATASETS (OFAC, EU, UK sanctions) remain separate from each
+    other
+  - Consolidated entities have simplified, standardized properties
+- id: export
+  name: Export
+  order: 6
+  responsibility: 'Transform consolidated entities into multiple output formats. WHY:
+    Different consumers need different formats (FtM for tools, CSV for analysis, Senzing
+    for GRC).'
+  interface:
+    inputs: Consolidated entities via ViewFragment, Dataset metadata
+    outputs: FtM JSON, CSV, Nested JSON, Senzing, Statements CSV, Delta (ADD/MOD/DEL)
+  required_methods:
+  - name: export_dataset
+    description: Orchestrates exporter instantiation, entity iteration, and metadata
+      writing for each configured export formats
+    evidence: zavod/zavod/exporters/__init__.py:89(export_dataset)
+  - name: DeltaExporter.feed
+    description: Generates ADD/MOD/DEL delta based on entity hash comparison with
+      previous version
+    evidence: zavod/zavod/exporters/delta.py:10(DeltaExporter)
+  - name: Exporter.feed
+    description: Abstract method for feeding entities to format-specific output generation
+    evidence: zavod/zavod/exporters/common.py:10(Exporter)
+  key_behaviors:
+  - behavior: Exporter registry maps string names to classes
+    description: Dataset YAML specifies exports as string list (e.g., ['ftm', 'csv']);
+      registry decouples config from code allowing new formats without YAML changes
+    evidence: zavod/zavod/exporters/__init__.py:35(EXPORTERS)
+  - behavior: Default exporters applied if dataset specifies no exports
+    description: Sensible defaults (FtM JSON, nested JSON, CSV) applied automatically;
+      dataset can opt-out or add extras via configuration
+    evidence: zavod/zavod/exporters/__init__.py:54(DEFAULT_EXPORTERS)
+  - behavior: Delta uses SHA1 hash for MOD detection
+    description: Deterministic, version-independent entity fingerprint using canonical
+      form; MOD detection is O(n) via LevelDB iterator over entity hashes
+    evidence: zavod/zavod/runtime/delta.py:49(feed)
+  replaceable_points:
+  - name: Export format
+    description: Plug in new Exporter subclass for custom output formats; each exporter
+      defines FILE_NAME, MIME_TYPE, and format-specific output logic
+    options:
+    - name: FtMExporter
+      traits:
+      - FollowTheMoney JSON format
+      - Full statement coverage
+      - Tool-compatible
+      fit_for:
+      - OpenSanctions tools
+      - Data pipelines
+      - Statement-level queries
+      not_fit_for:
+      - Human inspection
+      - Spreadsheet analysis
+      - GRC systems
+    - name: SimpleCSVExporter
+      traits:
+      - Flat CSV format
+      - Human-readable
+      - Spreadsheet-compatible
+      fit_for:
+      - Data analysis
+      - Excel viewers
+      - Quick inspection
+      not_fit_for:
+      - Complex entity relationships
+      - Statement-level data
+      - Large datasets
+    - name: SenzingExporter
+      traits:
+      - Senzing GRC format
+      - Entity resolution ready
+      - Enterprise integration
+      fit_for:
+      - Senzing users
+      - GRC compliance systems
+      - Enterprise data platforms
+      not_fit_for:
+      - General-purpose export
+      - Simple analysis
+    - name: MaritimeExporter
+      traits:
+      - Maritime-specific format
+      - IMO/flag properties
+      - Vessel relationships
+      fit_for:
+      - Maritime compliance
+      - Shipping industry
+      - Vessel tracking
+      not_fit_for:
+      - General sanctions data
+      - Non-maritime entities
+    - name: SecuritiesExporter
+      traits:
+      - Securities-specific format
+      - CUSIP/ISIN focus
+      - Ownership structures
+      fit_for:
+      - Securities compliance
+      - Investment firms
+      - Regulatory reporting
+      not_fit_for:
+      - General sanctions data
+      - Non-securities entities
+    default: FtMExporter
+  design_decisions:
+  - 'Exporter registry maps string names to classes: zavod/zavod/exporters/__init__.py:35(EXPORTERS)
+    - Dataset YAML can specify exports as string list; decouples config from code'
+  - 'Default exporters applied if dataset specifies no exports: zavod/zavod/exporters/__init__.py:54(DEFAULT_EXPORTERS)
+    - Sensible defaults (FtM, nested, CSV) but dataset can opt-out or add extras'
+  - 'Delta uses SHA1 hash of entity canonical form: zavod/zavod/runtime/delta.py:49(feed)
+    - Deterministic, version-independent entity fingerprint; MOD detection is O(n)
+    via LevelDB iterator'
+  - 'feed_unconsolidated called BEFORE consolidate_entity: zavod/zavod/exporters/__init__.py:75(feed_unconsolidated)
+    - Consolidation mutates entity in place; must export raw first'
+  acceptance_hints:
+  - Every configured exporters produce valid output files in dataset_data_path
+  - Delta correctly identifies ADD/MOD/DEL entities based on SHA1 hash comparison
+  - Default exporters (ftm, nested, csv) produce output when no exports specified
+  - Output files are complete and not truncated
+- id: archival
+  name: Archival & Publication
+  order: 7
+  responsibility: 'Publish dataset artifacts to cloud storage with versioning and
+    metadata. WHY: Provides reproducible, timestamped datasets for downstream consumers.'
+  interface:
+    inputs: Exported files, Version ID, Dataset metadata
+    outputs: GCS or filesystem artifacts at /datasets/{name}/{version}/*, Catalog
+      index files
+  required_methods:
+  - name: publish_dataset
+    description: Uploads each artifacts to cloud storage and writes catalog entry
+      for version tracking
+    evidence: zavod/zavod/publish.py:37(publish_dataset)
+  - name: archive_failure
+    description: Uploads error information even on failed crawl to enable monitoring
+      without blocking other dataset publications
+    evidence: zavod/zavod/publish.py:71(archive_failure)
+  - name: ArchiveBackend.upload
+    description: Backend-specific upload implementation for storing artifacts
+    evidence: zavod/zavod/archive/backend.py:49(ArchiveBackend)
+  key_behaviors:
+  - behavior: ArchiveBackend is abstract
+    description: Local development uses filesystem backend; production uses GCS with
+      generations for version-preserving reads; swap via settings without code changes
+    evidence: zavod/zavod/archive/backend.py:20(ArchiveObject)
+  - behavior: publish_dataset uploads to both versioned and /latest paths
+    description: Versioned paths (e.g., /datasets/ofac/2024-01-15T00-00-00Z/) provide
+      reproducibility; /latest provides convenience for always-current access
+    evidence: zavod/zavod/publish.py:37(publish_dataset)
+  - behavior: archive_failure uploads error info even on failed crawl
+    description: Failed crawls still produce error artifacts enabling monitoring and
+      alerting; doesn't block publication of other successful datasets
+    evidence: zavod/zavod/publish.py:71(archive_failure)
+  replaceable_points:
+  - name: Storage backend
+    description: Backend selection via settings; determines where published artifacts
+      are stored
+    options:
+    - name: GoogleCloudBackend
+      traits:
+      - GCS with object versioning
+      - Generations for version-preserving reads
+      - Cloud-native
+      fit_for:
+      - Production deployments
+      - Multi-environment setups
+      - Version reproducibility requirements
+      not_fit_for:
+      - Local development
+      - Budget-constrained projects without GCS access
+    - name: FileSystemBackend
+      traits:
+      - Local filesystem storage
+      - No cloud dependencies
+      - Simple deployment
+      fit_for:
+      - Local development
+      - Testing
+      - Single-machine deployments
+      not_fit_for:
+      - Production multi-user environments
+      - High availability requirements
+      - Cross-machine access
+    default: GoogleCloudBackend
+  design_decisions:
+  - 'ArchiveBackend is abstract with FileSystemObject and GoogleCloudObject implementations:
+    zavod/zavod/archive/backend.py:20(ArchiveObject) - Local dev uses filesystem;
+    production uses GCS; swap via settings without code changes'
+  - 'publish_dataset uploads to both versioned and /latest paths: zavod/zavod/publish.py:37(publish_dataset)
+    - Versioned for reproducibility; /latest for convenience'
+  - 'archive_failure uploads error info even on failed crawl: zavod/zavod/publish.py:71(archive_failure)
+    - Enables monitoring of failures without blocking publication of other datasets'
+  acceptance_hints:
+  - Every artifacts appear at /datasets/{name}/{version}/* after successful publication
+  - /latest path points to most recently published version
+  - Failed crawls still produce error artifacts with failure details
+  - Catalog index files are updated with new version entries
+data_flow:
+- from_stage: data_collection
+  to_stage: entity_extraction
+  data: Cached HTTP responses; raw files via Context.get_resource_path
+- from_stage: entity_extraction
+  to_stage: statement_storage
+  data: Entity.emit() → PackStatementWriter → LevelDB statements
+- from_stage: statement_storage
+  to_stage: validation
+  data: Store.view() yields assembled entities for assertion checking
+- from_stage: validation
+  to_stage: consolidation
+  data: Validated entities passed to ViewFragment for export feeds
+- from_stage: consolidation
+  to_stage: export
+  data: Consolidated Entity objects with resolver-applied merges
+- from_stage: export
+  to_stage: archival
+  data: Exported files (FtM JSON, CSV, etc.) to dataset_data_path
+- from_stage: archival
+  to_stage: external
+  data: GCS/Filesystem artifacts at /datasets/{name}/{version}/
+global_contracts:
+- contract: Every entities must have a dataset-scoped ID generated via make_id or
+    make_slug
+  evidence: zavod/zavod/entity.py:27(make_id)
+- contract: Statements are the atomic unit of storage; entities are assembled from
+    statements on read
+  evidence: zavod/zavod/store.py:37(assemble)
+- contract: Context lifecycle (begin/flush/close) must be properly followed for data
+    persistence
+  evidence: zavod/zavod/context.py:107(begin)
+- contract: Issues are written as append-only JSON lines; no backfill for collections
+  evidence: zavod/zavod/runtime/issues.py:32(write)
+- contract: Version ID is ISO timestamp; used for reproducibility and delta generation
+  evidence: zavod/zavod/runtime/versions.py:15(make_version)
+- contract: Dataset inputs must be synced to store before dependent datasets can run
+  evidence: zavod/zavod/store.py:59(iter_dataset_statements)
+- contract: feed_unconsolidated MUST be called before consolidate_entity in export
+    pipeline
+  evidence: zavod/zavod/exporters/__init__.py:75-80(export_data)
+- contract: Person schema names REQUIRE spaces (require_space=True default); single-token
+    Person names are flagged as irregular
+  evidence: zavod/zavod/meta/names.py:54-57(_DEFAULT_SCHEMA_RULES)
+- contract: UNIQUE_DATASETS (OFAC, UK, EU sanctions) entities cannot be merged across
+    lists regardless of match score
+  evidence: zavod/zavod/integration/logic.py:11(UNIQUE_DATASETS)
+- contract: NEVER_REMOVE_NAMES_DATASETS protects sanctioned entity names from simplification;
+    sanctions names preserved verbatim
+  evidence: zavod/zavod/exporters/consolidate.py:26-40(NEVER_REMOVE_NAMES_DATASETS)
+business_decisions:
+- id: BD-001
+  type: B
+  content: HTTP caching via request_hash fingerprinting
+  rationale: Avoid re-fetching same URLs across runs by computing a fingerprint hash;
+    the cache_days parameter provides explicit TTL control so operators can balance
+    freshness against bandwidth costs. This boundary prevents unbounded cache growth
+    while allowing configurable retention.
+  evidence: zavod/zavod/runtime/http_.py:54(request_hash)
+  stage: data_collection
+  alternative_considered: No caching would increase API rate limit failures; unlimited
+    caching would cause stale data issues. Request-hash fingerprinting with TTL strikes
+    the balance.
+- id: BD-002
+  type: BA
+  content: Context holds dataset-scoped resources (stats, issues, resources)
+  rationale: Single object lifecycle matches dataset run scope, binding stats collection,
+    issue logging, and resource acquisition to the same temporal boundary. This prevents
+    cross-contamination between datasets when running multiple datasets in sequence
+    or parallel, ensuring each dataset's run environment is isolated.
+  evidence: zavod/zavod/context.py:42(context:)
+  stage: data_collection
+  alternative_considered: Global singletons were rejected because they prevent parallel
+    dataset runs and complicate debugging; module-level state was rejected due to
+    cross-contamination risk.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: context: in zavod/zavod/context.py'
+- id: BD-003
+  type: M
+  content: Context.fetch_* methods return decoded content vs raw response
+  rationale: Abstraction layer over HTTP backends allows seamless switching between
+    requests (local dev), Zyte (production scraping), or custom implementations. The
+    decoded-content boundary means crawlers never handle raw bytes or response objects,
+    enabling backend swaps without modifying crawler code.
+  evidence: zavod/zavod/context.py:244(fetch_text)
+  stage: data_collection
+  alternative_considered: Direct requests usage would hardcode one backend; wrapping
+    at crawler level would require changes to every crawler when switching providers.
+- id: BD-004
+  type: BA
+  content: Entity.make_id raises NotImplementedError
+  rationale: Forces each crawler developers to explicitly implement ID generation
+    logic for their entity types. This boundary prevents accidental use of Follow
+    the Money's generic make_id which produces non-deterministic IDs in the zavod
+    context, ensuring each dataset produces stable, dataset-namespaced identifiers.
+  evidence: zavod/zavod/entity.py:28(make_id)
+  stage: entity_extraction
+  alternative_considered: Inheriting FtM's make_id would cause ID instability; documentation-only
+    warnings were deemed insufficient given the critical nature of entity IDs.
+- id: BD-005
+  type: M
+  content: Statements are primary storage format, not entity dicts
+  rationale: Enables incremental updates where new statements can be added without
+    full entity reconstruction; supports complete audit trails for provenance and
+    data lineage. The statement-as-primary boundary means entities can always be reconstructed
+    deterministically, supporting rollback and diff scenarios.
+  evidence: zavod/zavod/entity.py:30(unsafe_add)
+  stage: entity_extraction
+  alternative_considered: Direct entity dict storage loses change history; separate
+    audit log tables add complexity and can drift from actual data.
+- id: BD-006
+  type: M/DK
+  content: Entity.add_schema tries to make entity more specific
+  rationale: Progressive typing allows an entity to evolve from broad schema (PEP)
+    to specific schema (Person to Politician) as more evidence is gathered. This boundary
+    enables partial extraction where initial crawlers emit low-confidence types and
+    later stages specialize them without losing existing properties.
+  evidence: zavod/zavod/entity.py:155(add_schema)
+  stage: entity_extraction
+  alternative_considered: Strict schema at extraction time would require each properties
+    known upfront; separate entity 'promotion' stages would add processing overhead.
+- id: BD-007
+  type: B
+  content: Store extends LevelDBStore from nomenklatura
+  rationale: Leverages nomenklatura's resolver integration for canonical entity identification
+    and its entity view abstraction for standardized entity access patterns. The LevelDB
+    foundation boundary provides ordered key iteration for delta detection while the
+    resolver integration enables cross-dataset entity merging.
+  evidence: zavod/zavod/store.py:24(class Store)
+  stage: statement_storage
+  alternative_considered: Custom storage layer would reinvent resolver logic; SQL
+    databases provide query flexibility but lack LevelDB's efficient ordered iteration
+    for delta processing.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: class Store in zavod/zavod/store.py'
+- id: BD-008
+  type: B
+  content: Store.assemble wraps InvalidData exceptions
+  rationale: Prevents a single malformed entity from terminating the entire export
+    pipeline. The exception-wrapping boundary logs debug information including the
+    entity ID and validation errors while continuing processing, enabling forensic
+    analysis of bad entities without blocking publication of valid data.
+  evidence: zavod/zavod/store.py:37(assemble)
+  stage: statement_storage
+  alternative_considered: Failing fast would leave operators with no dataset if any
+    entity is invalid; silent dropping would hide data quality issues.
+- id: BD-009
+  type: M
+  content: Store.sync indexes each external statements for cross-dataset lookups
+  rationale: Inputs datasets must be indexed before derived datasets can reference
+    them; this creates an explicit dependency boundary where upstream data availability
+    is verified before downstream processing begins. The indexing step builds reverse-lookup
+    structures enabling entity resolution against external datasets.
+  evidence: zavod/zavod/store.py:59(iter_dataset_statements)
+  stage: statement_storage
+  alternative_considered: Lazy indexing would cause unpredictable lookup latency;
+    in-memory resolution would limit dataset scale.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: iter_dataset_statements in zavod/zavod/store.py'
+- id: BD-010
+  type: B
+  content: Issues use append-only JSON lines format
+  rationale: Crash-resistant logging format allows issues to be appended during processing
+    without holding state in memory. The append-only boundary means process crashes
+    lose no logged issues and the file can be inspected while processing continues,
+    supporting long-running dataset builds.
+  evidence: zavod/zavod/runtime/issues.py:32(write)
+  stage: validation
+  alternative_considered: In-memory lists lose issues on crash; SQLite logging adds
+    transaction overhead; JSON array requires complete rewrite on each append.
+- id: BD-011
+  type: BA
+  content: Assertions are declarative config, not code
+  rationale: Non-programmers can define validation constraints without writing Python
+    code; assertions live in dataset YAML files and are version-controlled alongside
+    the dataset. This declarative boundary separates what must be true (data contracts)
+    from how to enforce it (implementation), enabling domain experts to specify data
+    quality requirements.
+  evidence: zavod/zavod/meta/assertion.py:43(Assertion)
+  stage: validation
+  alternative_considered: Code-based assertions require engineering involvement for
+    every rule change; GUI-based rules lack auditability and diff-friendliness.
+- id: BD-012
+  type: M
+  content: No issues backfill for collections
+  rationale: Collections aggregate entities from multiple source datasets; backfilling
+    issues from previous runs would attribute old validation warnings to the collection
+    run, which is misleading. The no-backfill boundary ensures collection issues reflect
+    only the current aggregation state, preserving the causal relationship between
+    data and warnings.
+  evidence: zavod/zavod/runtime/issues.py:81(all)
+  stage: validation
+  alternative_considered: Backfilling would create confusion about when issues were
+    introduced; showing no history loses valuable debugging information.
+- id: BD-013
+  type: M
+  content: Consolidation happens after unconsolidated export feeds
+  rationale: Processing order boundary ensures raw, unconsolidated data is exported
+    first, preserving the complete audit trail. Consolidation then mutates entities
+    in place for simplified output. This preserves forensic ability to trace entity
+    origins while still producing streamlined consolidated results for end users.
+  evidence: zavod/zavod/exporters/__init__.py:78(feed_unconsolidated)
+  stage: consolidation
+  alternative_considered: Consolidation-first would lose raw data; simultaneous export
+    would complicate debugging entity provenance.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: feed_unconsolidated in zavod/zavod/exporters/__init__.py'
+- id: BD-014
+  type: B
+  content: Edge dedup merges same-source-target-schema edges with temporal overlap
+  rationale: Sanctions lists and programs frequently list the same relationship multiple
+    times across different dates. The deduplication boundary (same source, same target,
+    same schema, temporal overlap) reduces noise while preserving meaningful duplicate
+    edges that represent genuinely different relationship instances, such as sanctions
+    from separate programs.
+  evidence: zavod/zavod/integration/edges.py:36(Key)
+  stage: consolidation
+  alternative_considered: No dedup would inflate relationship counts; aggressive dedup
+    would lose legitimate duplicate entries representing distinct sanctions.
+- id: BD-015
+  type: B
+  content: Exporter registry maps string names to classes
+  rationale: Dataset YAML configuration specifies exports as string lists, decoupling
+    configuration from code. The registry boundary allows new exporters to be added
+    without modifying YAML schemas, and operators can reference exporters by name
+    without importing Python modules, enabling plugin-style extensibility.
+  evidence: zavod/zavod/exporters/__init__.py:35(EXPORTERS)
+  stage: export
+  alternative_considered: Direct class references would require Python knowledge;
+    dynamic loading without registry would create import ordering issues.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: EXPORTERS in zavod/zavod/exporters/__init__.py'
+- id: BD-016
+  type: M/BA
+  content: Default exporters applied if dataset specifies no exports
+  rationale: Sensible defaults (Follow the Money, nested JSON, CSV) ensure new datasets
+    produce usable output without explicit configuration. The default boundary allows
+    datasets to opt-out or extend, providing 'convention over configuration' for the
+    80% case while preserving full flexibility for custom export needs.
+  evidence: zavod/zavod/exporters/__init__.py:54(DEFAULT_EXPORTERS)
+  stage: export
+  alternative_considered: No defaults would require explicit configuration for every
+    dataset; mandatory defaults would prevent lean exports.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_EXPORTERS in zavod/zavod/exporters/__init__.py'
+- id: BD-017
+  type: B
+  content: Delta uses SHA1 hash of entity canonical form
+  rationale: Deterministic, version-independent entity fingerprint computed from canonical
+    (sorted, stable) representation ensures identical entities produce identical hashes
+    regardless of property ordering. The LevelDB iterator boundary enables O(n) modification-of-determination
+    by scanning each entity hashes once per run.
+  evidence: zavod/zavod/runtime/delta.py:49(feed)
+  stage: export
+  alternative_considered: Property-level diffing would be slower; timestamp-based
+    delta would miss silent edits; full comparison would be O(n^2).
+- id: BD-018
+  type: B
+  content: feed_unconsolidated called BEFORE consolidate_entity
+  rationale: Consolidation mutates entity in place, merging properties from duplicate
+    entities. This processing-order boundary ensures raw data is captured for forensic
+    export before mutation occurs, preserving the ability to audit consolidation decisions
+    and revert to unconsolidated state if needed.
+  evidence: zavod/zavod/exporters/__init__.py:75(feed_unconsolidated)
+  stage: export
+  alternative_considered: Reversing order would lose raw data; parallel processing
+    would complicate debugging; no consolidated export would reduce utility.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: feed_unconsolidated in zavod/zavod/exporters/__init__.py'
+- id: BD-019
+  type: B
+  content: ArchiveBackend is abstract with FileSystemObject and GoogleCloudObject
+    implementations
+  rationale: Local development uses filesystem storage while production uses Google
+    Cloud Storage; swap via configuration without code changes. The abstraction boundary
+    ensures archived objects (source files, screenshots) are accessible regardless
+    of backend, enabling dev/prod parity and multi-cloud deployment flexibility.
+  evidence: zavod/zavod/archive/backend.py:20(ArchiveObject)
+  stage: archival
+  alternative_considered: Single-backend storage would require code changes for environment
+    switches; hardcoded paths would break portability.
+- id: BD-020
+  type: M/DK
+  content: publish_dataset uploads to both versioned and /latest paths
+  rationale: Versioned paths (with timestamp/commit hash) ensure reproducibility and
+    auditability of specific dataset releases; /latest path provides convenience for
+    consumers wanting current data without version tracking. This dual-path boundary
+    satisfies both reproducibility requirements and ease-of-use needs.
+  evidence: zavod/zavod/publish.py:37(publish_dataset)
+  stage: archival
+  alternative_considered: Versioned-only would require consumers to track versions;
+    latest-only would prevent reproducibility; separate 'release' workflow would add
+    complexity.
+- id: BD-021
+  type: M
+  content: archive_failure uploads error info even on failed crawl
+  rationale: Enables monitoring and alerting on crawl failures without blocking publication
+    of other successfully processed datasets. The failure-archive boundary ensures
+    error context (URL, error type, timestamp, partial content) is preserved for debugging
+    even when the overall pipeline continues processing other datasets.
+  evidence: zavod/zavod/publish.py:71(archive_failure)
+  stage: archival
+  alternative_considered: Failing hard on any dataset error would prevent partial
+    results publication; silent failure logging would prevent proactive alerting.
+- id: BD-022
+  type: B
+  content: Use hash-based entity IDs with prefix for consistent cross-run entity identification
+  rationale: Entity IDs must remain stable across pipeline runs to ensure referential
+    integrity. Using a hash-based approach with prefix ensures deterministic ID generation
+    while prefix distinguishes entity types. This enables idempotent processing where
+    the same source entity always produces the same canonical ID regardless of run
+    order or timing.
+  evidence: zavod/zavod/context.py:437(make_id)
+  stage: entity_extraction
+  alternative_considered: Sequential IDs would not be deterministic; UUIDs lack semantic
+    meaning from entity content
+- id: BD-023
+  type: B
+  content: Cache HTTP responses for configurable days using request fingerprint hashing
+  rationale: HTTP caching reduces source server load and improves pipeline performance
+    for repeated fetches. Using request fingerprint hashing ensures cache keys capture
+    each relevant request parameters while remaining deterministic. Configurable TTL
+    allows balancing freshness against performance for different dataset requirements.
+  evidence: zavod/zavod/context.py:272(request_hash)
+  stage: fetching
+  alternative_considered: No caching would increase load significantly; indefinite
+    caching risks stale data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: request_hash in zavod/zavod/context.py'
+- id: BD-024
+  type: B/RC
+  content: Disable SSL certificate verification for HTTP requests
+  rationale: SSL verification must be disabled to access internal/Corporate data sources
+    that use self-signed certificates or internal PKI. This is necessary for corporate
+    network access patterns but creates security boundary requiring host whitelisting
+    and proper network isolation. The verification=False setting is intentional for
+    controlled internal environments only.
+  evidence: zavod/zavod/runtime/http_.py:33(make_session)
+  stage: fetching
+  alternative_considered: Adding corporate CA certs to trust store requires system-level
+    changes; may not be feasible in each deployment environments
+- id: BD-025
+  type: B/BA
+  content: Use LevelDB for statement storage with batch writes every 500,000 statements
+  rationale: LevelDB provides high-throughput key-value storage suitable for statement
+    metadata with efficient batch operations. Batching writes every 500,000 statements
+    balances memory usage against write performance for large dataset processing.
+    This threshold prevents excessive memory consumption while amortizing write overhead.
+  evidence: zavod/zavod/runtime/timestamps.py:14(TimeStampIndex)
+  stage: statement_storage
+  alternative_considered: Smaller batches increase flush frequency; larger batches
+    consume more memory
+- id: BD-026
+  type: B
+  content: Calculate delta exports using SHA1 hash of entity ID, schema, and sorted
+    property values
+  rationale: Delta calculation requires stable hash computation to detect actual changes
+    between runs. Using sorted property values ensures order-independent comparison
+    so entity property ordering differences don't trigger false deltas. SHA1 provides
+    sufficient collision resistance for entity change detection while remaining computationally
+    efficient.
+  evidence: zavod/zavod/runtime/delta.py:49(digest.update)
+  stage: export
+  alternative_considered: Full comparison would be O(n²); MD5 less collision-resistant
+    for this use case
+  _evidence_issues:
+  - 'FN_NOT_FOUND: digest.update in zavod/zavod/runtime/delta.py'
+- id: BD-027
+  type: B
+  content: Use FollowTheMoney schema for each entity types with schema inheritance
+  rationale: FollowTheMoney (FtM) provides a standardized, extensible ontology for
+    integrity data that supports schema inheritance. This enables consistent entity
+    modeling across each data sources while allowing domain-specific extensions. Schema
+    inheritance reduces code duplication and ensures coherent type hierarchies for
+    Persons, Companies, and related entities.
+  evidence: zavod/zavod/entity.py:160(model.common_schema)
+  stage: entity_extraction
+  alternative_considered: Custom schemas would require more maintenance; no standard
+    alternative provides equivalent coverage
+  _evidence_issues:
+  - 'FN_NOT_FOUND: model.common_schema in zavod/zavod/entity.py'
+- id: BD-028
+  type: B/RC
+  content: Exclude OFAC SDN and other core sanctions lists from name simplification
+  rationale: Core sanctions lists like OFAC SDN must be preserved exactly as published
+    to maintain legal accuracy and regulatory compliance. Name simplification could
+    alter sanctioned entity names and potentially cause false negatives in screening.
+    This boundary ensures sanctions watchlist matching remains precise and legally
+    defensible.
+  evidence: zavod/zavod/exporters/consolidate.py:26(NEVER_REMOVE_NAMES_DATASETS)
+  stage: consolidation
+  alternative_considered: Applying simplification to sanctions lists risks compliance
+    violations; no viable alternative exists
+  _evidence_issues:
+  - 'FN_NOT_FOUND: NEVER_REMOVE_NAMES_DATASETS in zavod/zavod/exporters/consolidate.py'
+- id: BD-029
+  type: B/BA
+  content: Use 15 character threshold for weak alias detection on LegalEntity
+  rationale: Short entity names under 15 characters are statistically more likely
+    to be weak aliases or common words that create false matches during deduplication.
+    This threshold was empirically determined to balance recall (not filtering valid
+    short names) against precision (filtering noisy aliases). The boundary is specific
+    to LegalEntity due to longer typical company name lengths.
+  evidence: zavod/zavod/exporters/consolidate.py:43(simplify_names)
+  stage: consolidation
+  alternative_considered: Shorter threshold loses precision; longer threshold loses
+    recall on valid short company names
+- id: BD-030
+  type: B/RC
+  content: Apply 5-year after-office period for standard PEP positions
+  rationale: Politically Exposed Persons (PEPs) pose elevated risk during their tenure
+    and for a defined period after leaving office. The 5-year post-office window aligns
+    with standard industry practice and FATF recommendations for enhanced due diligence.
+    This boundary balances risk coverage against practical data retention and privacy
+    considerations.
+  evidence: zavod/zavod/stateful/positions.py:127(get_after_office)
+  stage: pep_logic
+  alternative_considered: Shorter periods may miss delayed risk; longer periods increase
+    false positives and privacy concerns
+  vague_rationale: true
+- id: BD-031
+  type: B/RC
+  content: Use 20-year after-office period for heads of state and IGOs
+  rationale: Heads of state and intergovernmental organization leaders represent higher
+    corruption and PEP risk that persists longer than standard positions. The 20-year
+    extended window reflects enhanced due diligence requirements for high-level political
+    figures whose influence and corruption risk extend well beyond standard post-tenure
+    periods. This exceeds FATF minimums for heightened-risk PEPs.
+  evidence: zavod/zavod/stateful/positions.py:127(get_after_office)
+  stage: pep_logic
+  alternative_considered: Standard 5-year window inadequate for senior political roles;
+    no shorter period acceptable for compliance
+- id: BD-032
+  type: B/BA
+  content: 'Reject names with characters: ;\/()[]<>{}: for Person schema'
+  rationale: Special characters in personal names are typically data entry errors,
+    OCR artifacts, or non-name content. Rejecting names containing punctuation, brackets,
+    and semicolons prevents malformed names from entering the entity database. This
+    validation boundary ensures name data quality while allowing legitimate diacritics
+    and international character sets.
+  evidence: zavod/zavod/meta/names.py:55(reject_chars_baseline)
+  stage: name_cleaning
+  alternative_considered: Allowing punctuation risks noise in names; blocking each
+    special chars would reject valid international names
+  _evidence_issues:
+  - 'FN_NOT_FOUND: reject_chars_baseline in zavod/zavod/meta/names.py'
+- id: BD-033
+  type: B
+  content: Require space in Person names (except dense scripts like Han)
+  rationale: Personal names require word boundaries (spaces) to enable proper parsing
+    into first/last name components. This requirement enforces data quality while
+    accounting for Han script and other dense writing systems where spaces are not
+    used. The exception prevents false rejections of valid CJK names while maintaining
+    parsing integrity for Latin and similar scripts.
+  evidence: zavod/zavod/meta/names.py:56(require_space=True)
+  stage: name_cleaning
+  alternative_considered: No space requirement would complicate name parsing; blanket
+    requirement would reject valid CJK names
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: require_space=True in zavod/zavod/meta/names.py'
+- id: BD-034
+  type: B
+  content: Use GPT-5.4 model for LLM-based name cleaning with DSPy signatures
+  rationale: GPT-5.4 provides sufficient reasoning capability for nuanced name cleaning
+    tasks including language detection, script normalization, and alias generation.
+    The DSPy framework enables structured LLM calls with typed signatures ensuring
+    consistent behavior. This model choice balances capability against cost and latency
+    for high-volume name processing.
+  evidence: zavod/zavod/extract/names/clean.py:32(names)
+  stage: name_cleaning
+  alternative_considered: Smaller models lack nuanced reasoning; larger models increase
+    cost without proportional accuracy gains
+  _evidence_issues:
+  - 'FN_NOT_FOUND: names in zavod/zavod/extract/names/clean.py'
+- id: BD-035
+  type: B/BA
+  content: Export targets.nested.json with entity nesting depth of 1 by default
+  rationale: Entity nesting depth of 1 provides immediate target relationships without
+    exponential JSON growth. Deeper nesting increases file size, parsing complexity,
+    and reduces downstream usability. This default balances data richness against
+    practical file sizes for most integration use cases while remaining configurable
+    for specialized needs.
+  evidence: zavod/zavod/exporters/nested.py:16(if entity.target)
+  stage: export
+  alternative_considered: No nesting loses relationship context; deeper nesting exponentially
+    increases size without proportional value
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: if entity.target in zavod/zavod/exporters/nested.py'
+- id: BD-036
+  type: B
+  content: Write issues log in newline-delimited JSON (NDJSON) format
+  rationale: NDJSON format enables streaming writes and efficient log processing without
+    loading entire files into memory. Each issue record can be written immediately
+    and parsed incrementally. This format supports standard line-based tools (grep,
+    awk) while maintaining JSON structure for programmatic access.
+  evidence: zavod/zavod/runtime/issues.py:59(orjson.OPT_APPEND_NEWLINE)
+  stage: logging
+  alternative_considered: JSON array requires full parse; plain text lacks structure
+    for programmatic access
+  _evidence_issues:
+  - 'FN_NOT_FOUND: orjson.OPT_APPEND_NEWLINE in zavod/zavod/runtime/issues.py'
+- id: BD-037
+  type: B/RC
+  content: Redact environment variables and URI credentials from each logs
+  rationale: Sensitive credentials must be redacted from logs to prevent accidental
+    exposure of secrets in log aggregation systems. Environment variables and URI
+    parameters commonly contain API keys, passwords, and connection strings. This
+    redaction boundary ensures security compliance and prevents credential leakage
+    through log files.
+  evidence: zavod/zavod/logs.py:119(configure_redactor)
+  stage: logging
+  alternative_considered: No redaction risks exposing secrets; selective redaction
+    requires maintaining allowlists
+- id: BD-038
+  type: B/DK
+  content: Use GCS cache control max-age for published blobs
+  rationale: Setting cache control headers on GCS blobs enables efficient CDN caching
+    for downstream consumers. The max-age directive instructs browsers and proxies
+    to cache published data for the specified TTL. This reduces repeated downloads
+    and improves access performance while allowing TTL configuration based on dataset
+    update frequency.
+  evidence: zavod/zavod/archive/backend.py:20(ArchiveObject)
+  stage: archiving
+  alternative_considered: No cache headers cause repeated fetches; immutable content
+    should use longer TTLs
+- id: BD-039
+  type: B/BA
+  content: Use 40MB chunk size for GCS blob operations
+  rationale: The 40MB chunk size balances memory usage against GCS transfer efficiency
+    for large blob operations. This threshold is below GCS's 5TB limit while remaining
+    efficient for typical network MTUs and memory constraints. Larger chunks improve
+    throughput but consume more memory; smaller chunks add overhead.
+  evidence: zavod/zavod/archive/backend.py:68(blob)
+  stage: archiving
+  alternative_considered: Smaller chunks increase API overhead; larger chunks risk
+    memory issues on constrained systems
+- id: BD-040
+  type: B/BA
+  content: Skip position if start date older than 40 years (MAX_OFFICE)
+  rationale: Positions starting over 40 years ago are likely data entry errors or
+    irrelevant historical records. The MAX_OFFICE threshold prevents anomalous positions
+    from distorting PEP calculations and occupancy timelines. This boundary ensures
+    data quality while accepting historically relevant positions within reasonable
+    timeframes.
+  evidence: zavod/zavod/stateful/positions.py:32(positioncategorisation)
+  stage: pep_logic
+  alternative_considered: Shorter threshold loses legitimate historical context; longer
+    threshold admits more noise
+  _evidence_issues:
+  - 'FN_NOT_FOUND: positioncategorisation in zavod/zavod/stateful/positions.py'
+- id: BD-041
+  type: B
+  content: Return OccupancyStatus.UNKNOWN for future end dates if dataset coverage
+    is past
+  rationale: When a dataset's coverage ends before today, positions with future end
+    dates cannot be reliably determined. A future end date within an ended dataset
+    suggests incomplete data rather than a current position. This boundary prevents
+    false CURRENT status while acknowledging uncertainty.
+  evidence: zavod/zavod/stateful/positions.py:210(coverage.end<current_iso)
+  stage: pep_logic
+  alternative_considered: Assuming CURRENT would create false positives; assuming
+    PAST ignores data freshness
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: coverage.end<current_iso in zavod/zavod/stateful/positions.py'
+- id: BD-042
+  type: B/DK
+  content: Use ISO 639-2 (3-letter) language codes for name language tagging
+  rationale: ISO 639-2 provides comprehensive language coverage including historical
+    and regional languages with standardized 3-letter codes. This format enables precise
+    language identification for name processing while remaining compatible with standard
+    library support and downstream systems. 3-letter codes are more descriptive than
+    2-letter alternatives.
+  evidence: zavod/zavod/extract/names/clean.py:21(ISO 639-2 language code)
+  stage: name_cleaning
+  alternative_considered: ISO 639-1 (2-letter) has limited coverage; proprietary codes
+    lack interoperability
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: ISO 639-2 language code in zavod/zavod/extract/names/clean.py'
+- id: BD-043
+  type: B
+  content: Exclude firstName, middleName, lastName from LLM review if empty
+  rationale: Empty name component fields waste LLM tokens and processing time when
+    reviewing names. Excluding empty fields from review reduces cost and noise while
+    focusing LLM attention on actual name content. This optimization applies the EXCLUDE_IF_EMPTY
+    pattern to reduce unnecessary API calls.
+  evidence: zavod/zavod/extract/names/clean.py:15(EXCLUDE_IF_EMPTY)
+  stage: name_cleaning
+  alternative_considered: Sending empty fields adds no value but increases cost; no
+    reason to include them
+  _evidence_issues:
+  - 'FN_NOT_FOUND: EXCLUDE_IF_EMPTY in zavod/zavod/extract/names/clean.py'
+- id: BD-044
+  type: B/DK
+  content: Use CSV with semicolon delimiter and Unix dialect for targets.simple.csv
+  rationale: Semicolon delimiters are standard in European locales where comma is
+    used as decimal separator. Unix dialect (LF line endings) ensures cross-platform
+    compatibility. This format choice reflects the European-centric data sources while
+    maintaining standard CSV structure for downstream processing.
+  evidence: zavod/zavod/exporters/simplecsv.py:12(SimpleCSVExporter)
+  stage: export
+  alternative_considered: Comma delimiter conflicts with European number formatting;
+    platform-specific line endings cause issues
+- id: BD-045
+  type: B/RC
+  content: Generate sanction status from endDate comparison against RUN_TIME_ISO
+  rationale: Sanction status must be evaluated against current time to determine active
+    versus expired sanctions. Comparing endDate against RUN_TIME_ISO provides deterministic
+    status determination independent of when data was collected. This boundary ensures
+    accurate real-time screening results reflecting current regulatory status.
+  evidence: zavod/zavod/helpers/sanctions.py:13(lookup_sanction_program_key)
+  stage: sanctions
+  alternative_considered: Static status loses currency; comparing against collection
+    date produces stale results
+- id: BD-046
+  type: B
+  content: Strip company type suffixes before comma splitting for name parsing
+  rationale: Company suffixes like Ltd., Inc., GmbH create noise in name parsing when
+    split on comma. Stripping these before comma splitting ensures clean name extraction
+    without suffix artifacts. This preprocessing boundary improves name component
+    extraction accuracy for legal entity names.
+  evidence: zavod/zavod/helpers/names.py:36(REGEX_CLEAN_COMMA)
+  stage: name_cleaning
+  alternative_considered: Keeping suffixes complicates parsing; ad-hoc removal creates
+    inconsistent results
+  _evidence_issues:
+  - 'FN_NOT_FOUND: REGEX_CLEAN_COMMA in zavod/zavod/helpers/names.py'
+- id: BD-047
+  type: B
+  content: Use STOPWORDS regex to remove 'of/and/&/for/in/the' from position name
+    matching
+  rationale: Common stopwords in position names create matching noise and reduce deduplication
+    precision. Removing articles and conjunctions normalizes position names for comparison
+    while preserving meaningful distinctions. This preprocessing enables more robust
+    position matching across varying name formulations.
+  evidence: contrib/dedupe/positions.py:32(crossref_positions)
+  stage: deduplication
+  alternative_considered: Keeping stopwords creates false mismatches; no stopword
+    list loses important distinctions
+- id: BD-048
+  type: B
+  content: Merge directorships with same role but missing end date into dated one
+  rationale: Director positions with gaps (missing end dates) should merge with dated
+    positions for the same role to avoid duplicate relationship records. The ALLOW_COMMON_START
+    pattern recognizes that OpenAddress/undated directorships represent ongoing positions.
+    This boundary prevents duplicate edges while maintaining relationship continuity.
+  evidence: zavod/zavod/integration/edges.py:77(ALLOW_COMMON_START contains Directorship)
+  stage: edge_deduplication
+  alternative_considered: Keeping separate edges creates duplicates; simple merge
+    loses temporal distinction
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: ALLOW_COMMON_START contains Directorship in zavod/zavod/integration/edges.py'
+- id: BD-049
+  type: B/BA
+  content: Use decimal=',' and separator='.' default for number parsing (EU format)
+  rationale: European number formats use comma as decimal separator and period for
+    thousands. Default EU format enables correct parsing of European numeric data
+    without explicit format specification. This locale-aware parsing boundary handles
+    international data sources with varying numeric conventions.
+  evidence: zavod/zavod/meta/numbers.py:4(numbersspec)
+  stage: parsing
+  alternative_considered: US format default would misparse European numbers; auto-detection
+    adds complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: numbersspec in zavod/zavod/meta/numbers.py'
+- id: BD-050
+  type: B/BA
+  content: Default to 1200 second HTTP timeout for data fetching
+  rationale: A 20-minute HTTP timeout accommodates slow or large data source responses
+    while preventing indefinite hangs. This boundary balances patience for slow servers
+    against pipeline progress requirements. The extended timeout is necessary for
+    batch data retrieval from government or large institutional sources.
+  evidence: zavod/zavod/settings.py:57(HTTP_TIMEOUT=1200)
+  stage: fetching
+  alternative_considered: Shorter timeout fails on legitimate slow sources; longer
+    timeout blocks pipeline progress
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: HTTP_TIMEOUT=1200 in zavod/zavod/settings.py'
+- id: BD-051
+  type: B/BA
+  content: Store in SQLite database by default, configurable via ZAVOD_DATABASE_URI
+  rationale: SQLite provides zero-configuration local storage suitable for single-instance
+    zavod deployments. The DATABASE_URI configuration enables PostgreSQL or other
+    databases for production scale. This default balances simplicity for development/small
+    datasets against enterprise flexibility for large-scale deployments.
+  evidence: zavod/zavod/settings.py:64(nk.DB_URL=sqlite://...)
+  stage: statement_storage
+  alternative_considered: Default PostgreSQL requires running server; no-config SQLite
+    insufficient for multi-instance production
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: nk.DB_URL=sqlite://... in zavod/zavod/settings.py'
+- id: BD-052
+  type: B/DK
+  content: 'Use enrichment topics: role.pep, role.rca, sanction, sanction.linked,
+    etc.'
+  rationale: Standardized enrichment topic vocabulary enables consistent entity enrichment
+    across datasets and downstream systems. Topics define relationship categories
+    for sanctions, PEPs, and related entities. This taxonomy provides structured categorization
+    for risk scoring and screening workflows.
+  evidence: zavod/zavod/settings.py:30(ENRICH_TOPICS)
+  stage: enrichment
+  alternative_considered: Ad-hoc topic naming creates inconsistency; no standard taxonomy
+    exists for integrity data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ENRICH_TOPICS in zavod/zavod/settings.py'
+- id: BD-053
+  type: B/BA
+  content: Parse PDF at 150 DPI resolution for page image extraction
+  rationale: 150 DPI provides sufficient resolution for OCR text extraction while
+    balancing processing time and storage requirements. Higher resolutions increase
+    accuracy marginally but significantly increase processing cost and time. This
+    threshold represents optimal balance for document processing workloads.
+  evidence: zavod/zavod/helpers/pdf.py:24(make_pdf_page_images)
+  stage: parsing
+  alternative_considered: Lower DPI reduces accuracy; higher DPI increases cost without
+    proportional accuracy gains
+- id: BD-054
+  type: B/DK
+  content: Prefer endDate over periodEnd for individual occupancy status determination
+  rationale: The endDate field represents explicit position termination while periodEnd
+    may indicate coverage boundaries rather than actual end. Preferring endDate ensures
+    occupancy status reflects actual relationship termination rather than data coverage
+    windows. This precedence boundary resolves ambiguity in temporal fields.
+  evidence: zavod/zavod/stateful/positions.py:201(end_date is not None)
+  stage: pep_logic
+  alternative_considered: Preferring periodEnd would misclassify positions with explicit
+    end dates; no precedence loses semantic meaning
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: end_date is not None in zavod/zavod/stateful/positions.py'
+- id: BD-055
+  type: B/BA
+  content: Treat future periodEnd as UNKNOWN (not CURRENT) for occupancy status
+  rationale: Future periodEnd dates indicate projections or data artifacts rather
+    than confirmed current status. Treating future dates as UNKNOWN prevents false
+    CURRENT classifications when periodEnd represents planned rather than actual termination.
+    This boundary ensures conservative occupancy determination pending confirmation.
+  evidence: zavod/zavod/stateful/positions.py:26(OccupancyStatus)
+  stage: pep_logic
+  alternative_considered: Treating as CURRENT creates false positives; ignoring periodEnd
+    loses coverage information
+- id: BD-056
+  type: B
+  content: Use LRU cache with 2000 entry limit for position categorization
+  rationale: Position categorization is frequently accessed but changes infrequently,
+    making it ideal for LRU caching. The 2000 entry limit balances cache hit rates
+    against memory consumption. This caching boundary avoids redundant categorization
+    computation while preventing unbounded memory growth.
+  evidence: zavod/zavod/stateful/positions.py:45(module)
+  stage: performance
+  alternative_considered: No caching recomputes on every access; unlimited cache risks
+    memory exhaustion
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in zavod/zavod/stateful/positions.py'
+- id: BD-057
+  type: B
+  content: Strip non-letter characters from hash computation in entity_hash for delta
+  rationale: Normalizing entity hashes by stripping non-letter characters ensures
+    consistent change detection regardless of formatting variations. Metadata fields
+    like first_seen, last_seen, and referents change frequently but don't indicate
+    actual entity changes. This canonicalization boundary ensures hash reflects substantive
+    entity content.
+  evidence: contrib/delta/delta.py:51(entity_hash)
+  stage: delta
+  alternative_considered: Including metadata would trigger deltas on every run; excluding
+    canonical form loses content changes
+- id: BD-058
+  type: B
+  content: Use csvmap with jq path expressions for flexible CSV field extraction
+  rationale: jq path expressions provide powerful, flexible field selection and transformation
+    for CSV processing. This approach enables complex data extraction patterns without
+    custom code. The csvmap approach balances flexibility against maintainability
+    for varied CSV source formats.
+  evidence: contrib/csvmap/export_flatten.py:9(module)
+  stage: export
+  alternative_considered: Hard-coded field mapping lacks flexibility; full jq integration
+    adds dependency
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in contrib/csvmap/export_flatten.py'
+- id: BD-059
+  type: B
+  content: Propagate position country to person during occupancy creation
+  rationale: Position country provides jurisdiction context for PEP risk determination
+    and sanctions screening. Propagating this to person entities ensures country-based
+    screening and enrichment applies to individuals. This propagation boundary links
+    positional context to individual risk profiles.
+  evidence: zavod/zavod/helpers/positions.py:25(make_position)
+  stage: pep_logic
+  alternative_considered: Not propagating loses jurisdiction context; alternative
+    propagation timing affects enrichment order
+- id: BD-060
+  type: B
+  content: Trim US ZIP codes to 5 digits for address comparison
+  rationale: ZIP+4 extensions create unnecessary granularity for most address matching
+    scenarios. Trimming to 5 digits enables consistent comparison between abbreviated
+    and full ZIP formats. This normalization boundary improves address deduplication
+    accuracy while reducing false negatives from format variations.
+  evidence: zavod/zavod/helpers/addresses.py:65(postal_code[:5])
+  stage: address
+  alternative_considered: Keeping full ZIP+4 format loses matches with abbreviated
+    data; no normalization creates false negatives
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: postal_code[:5] in zavod/zavod/helpers/addresses.py'
+- id: BD-061
+  type: B
+  content: Use DISK_ONLY storage level for Spark DataFrame persistence in EGRUL processing
+  rationale: EGRUL processing involves large DataFrames that may exceed available
+    memory. DISK_ONLY storage prevents OutOfMemory errors at the cost of slower access
+    times. This boundary ensures large dataset processing completes successfully without
+    requiring memory proportional to dataset size.
+  evidence: contrib/egrul/generate.py:243(StorageLevel.DISK_ONLY)
+  stage: performance
+  alternative_considered: MEMORY_AND_DISK increases memory pressure; no persistence
+    loses intermediate results
+  _evidence_issues:
+  - 'FN_NOT_FOUND: StorageLevel.DISK_ONLY in contrib/egrul/generate.py'
+- id: BD-062
+  type: B
+  content: Use associative fold-merge pattern for company record updates with Spark
+    inner join
+  rationale: 'The fold-merge pattern with inner join ensures idempotent updates when
+    processing repeated company record updates. It avoids duplicate entries while
+    maintaining the latest state of each company record. BOUNDARY: Only applies when
+    company IDs match between old and new datasets; unmatched records in new_companies
+    are discarded during the inner join.'
+  evidence: contrib/egrul/generate.py:137(update_companies_from_new_companies)
+  stage: contrib/egrul
+  alternative_considered: Full outer join with deduplication was considered but rejected
+    due to higher memory overhead
+- id: BD-063
+  type: B
+  content: Select newest duplicate by incorporation_date using numpy argsort
+  rationale: 'When multiple company records share the same ID (duplicates), selecting
+    the one with the most recent incorporation_date ensures we keep the authoritative
+    legal entity. BOUNDARY: Only applies to records identified as duplicates within
+    the same processing batch; ties are resolved by numpy''s stable sort maintaining
+    original order.'
+  evidence: contrib/egrul/generate.py:167(merge_duplicate_company_records)
+  stage: contrib/egrul
+  alternative_considered: Random selection was rejected as it does not reflect business
+    reality of which entity is most current
+- id: BD-064
+  type: B
+  content: Use DISK_ONLY storage level for expensive RDD persistence
+  rationale: 'DISK_ONLY storage level reduces memory pressure for expensive RDD operations
+    that are computed infrequently. This prevents out-of-memory errors during large
+    EGRUL archive processing while still avoiding full recomputation. BOUNDARY: Only
+    applies to RDDs that exceed available memory but are needed multiple times within
+    the job; RDDs used only once remain unpersisted.'
+  evidence: contrib/egrul/generate.py:228(crawl_archives_for_date)
+  stage: contrib/egrul
+  alternative_considered: MEMORY_AND_DISK was considered but rejected due to higher
+    memory footprint during spark operations
+- id: BD-065
+  type: B
+  content: Use coalesce(16) to reduce partitions and avoid explosion during iterative
+    joins
+  rationale: 'Coalescing to 16 partitions prevents partition explosion that occurs
+    during repeated inner joins on company record DataFrames. This balance between
+    parallelism and overhead ensures stable performance. BOUNDARY: Fixed at 16 partitions
+    for the merge_company_record_dfs operation; may require tuning if cluster node
+    count changes significantly.'
+  evidence: contrib/egrul/generate.py:368(merge_company_record_dfs)
+  stage: contrib/egrul
+  alternative_considered: Repartition with shuffle was considered but rejected due
+    to higher network overhead
+- id: BD-066
+  type: B
+  content: Use date 2025-01-01 as switchover between old and new EGRUL formats
+  rationale: '2025-01-01 marks the transition point where EGRUL switched from legacy
+    XML format to the new JSON-based format. Archives before this date require the
+    old parser; archives on or after require the new parser. BOUNDARY: Strictly applies
+    to archives with dates >= 2025-01-01; older archives continue using legacy parsing
+    logic.'
+  evidence: contrib/egrul/generate.py:392(crawl)
+  stage: contrib/egrul
+  alternative_considered: Format auto-detection was considered but rejected due to
+    complexity and potential misdetection
+- id: BD-067
+  type: B
+  content: Use date 2022-01-01 as starting point for processing archives
+  rationale: '2022-01-01 represents the earliest reliable archive availability date
+    for EGRUL data. Earlier archives either do not exist or contain unreliable/corrupted
+    data that would pollute the dataset. BOUNDARY: Processing starts from 2022-01-01
+    inclusive; each prior archives are skipped regardless of their presence in the
+    blob store.'
+  evidence: contrib/egrul/generate.py:392(crawl)
+  stage: contrib/egrul
+  alternative_considered: Starting from earliest available archive was rejected due
+    to high failure rate on pre-2022 data
+- id: BD-068
+  type: B/BA
+  content: Parse date from blob path using strptime with %d.%m.%Y format
+  rationale: 'The EGRUL blob storage naming convention embeds dates in Russian DD.MM.YYYY
+    format within the URL path. Using strptime with %d.%m.%Y extracts these dates
+    reliably without parsing the file content. BOUNDARY: Only works for blobs following
+    the naming convention; non-conforming blob URLs will raise ValueError.'
+  evidence: contrib/egrul/generate.py:333(get_archive_date_from_blob_url)
+  stage: contrib/egrul
+  alternative_considered: Extracting from filename after download was rejected due
+    to unnecessary I/O overhead
+- id: BD-069
+  type: B/BA
+  content: Use timedelta(days=1) for end date calculations when relationships expire
+  rationale: 'When company relationships expire, the end date is set to one day before
+    the next period starts, ensuring no gaps or overlaps in coverage. This reflects
+    the daily boundary convention used by EGRUL. BOUNDARY: Applies only to relationship
+    periods with defined start/end dates; open-ended relationships (no end date) remain
+    null.'
+  evidence: contrib/egrul/generate.py:70-71(day_before)
+  stage: contrib/egrul
+  alternative_considered: Same-day end/start was rejected as it creates ambiguity
+    about which relationship applies on that date
+- id: BD-070
+  type: B/BA
+  content: Assemble name components using join_text with specific ordering
+  rationale: 'Russian company names follow a standardized ordering convention for
+    prefix, full name, legal form, and suffix. Using join_text with the correct ordering
+    ensures names are assembled consistently for downstream matching. BOUNDARY: Only
+    applies to multi-component names; single-component names pass through unchanged.'
+  evidence: zavod/zavod/helpers/names.py:42(make_name)
+  stage: zavod/zavod/helpers
+  alternative_considered: Preserving original ordering was rejected due to inconsistent
+    source formatting
+- id: BD-071
+  type: B/BA
+  content: Detect single token names using is_dense_script as proxy for space separation
+  rationale: 'Names without space separation are likely single tokens (e.g., concatenated
+    Chinese characters or script runs). is_dense_script detects these cases where
+    space-based tokenization would fail. BOUNDARY: Only applied to names flagged as
+    potentially single-token; multi-script names with spaces are handled differently.'
+  evidence: zavod/zavod/helpers/names.py:274-283(_is_single_token)
+  stage: zavod/zavod/helpers
+  alternative_considered: Simple space-based detection was rejected due to poor accuracy
+    on dense scripts
+- id: BD-072
+  type: B
+  content: Suggest weakAlias for single token person names after stripping prefixes
+  rationale: 'After removing common prefixes (titles, honorifics), single-token names
+    that remain may be valid person names (surnames). weakAlias suggests these as
+    aliases to improve matching coverage. BOUNDARY: Only suggests weakAlias after
+    prefix stripping; if name has multiple tokens after stripping, no alias is suggested.'
+  evidence: zavod/zavod/helpers/names.py:286(_check_suggesting_heuristics)
+  stage: zavod/zavod/helpers
+  alternative_considered: Suggesting strong alias was rejected due to higher risk
+    of false positive matches
+- id: BD-073
+  type: B/BA
+  content: Suggest abbreviation for short uppercase org names below threshold
+  rationale: 'Short uppercase organization names (like LLC abbreviations) may be abbreviations
+    that should be matched more broadly. Suggesting abbreviation increases matching
+    flexibility for common organizational short forms. BOUNDARY: Only suggests abbreviation
+    for names below the short-length threshold AND each uppercase; mixed case names
+    are excluded.'
+  evidence: zavod/zavod/helpers/names.py:286(_check_suggesting_heuristics)
+  stage: zavod/zavod/helpers
+  alternative_considered: Always suggesting abbreviation was rejected due to false
+    positives on mixed-case names
+- id: BD-074
+  type: B
+  content: Reject names containing characters from reject_chars_consolidated set
+  rationale: 'Characters in the reject_chars_consolidated set indicate encoding errors,
+    corruption, or non-name content in source data. Rejecting these protects data
+    quality by filtering out garbage entries. BOUNDARY: Only rejects exact character
+    matches; similar-looking characters from valid encodings are allowed.'
+  evidence: zavod/zavod/helpers/names.py:329-331(_check_schema_name_specs)
+  stage: zavod/zavod/helpers
+  alternative_considered: Attempting character substitution was rejected as it masks
+    underlying encoding issues
+- id: BD-075
+  type: B/BA
+  content: Reject nullwords (stopwords) in names unless explicitly allowed
+  rationale: 'Stopwords (nullwords) in name fields typically indicate data quality
+    problems such as placeholder values, parsing errors, or test data. Rejecting them
+    unless explicitly allowed prevents garbage entries. BOUNDARY: Only applies when
+    nullword detection is enabled for the name schema; some schemas explicitly allow
+    nullwords.'
+  evidence: zavod/zavod/helpers/names.py:328(_check_schema_name_specs)
+  stage: zavod/zavod/helpers
+  alternative_considered: Stripping stopwords was rejected as it changes the semantic
+    meaning of the name
+- id: BD-076
+  type: B
+  content: Reject dense script names shorter than min_length to avoid false positives
+  rationale: 'Very short names in dense scripts (without word boundaries) are likely
+    noise or fragments that produce unreliable matches. Rejecting names below min_length
+    reduces false positive entity matches. BOUNDARY: Only applies to dense-script
+    names; Latin script names follow different length rules.'
+  evidence: zavod/zavod/helpers/names.py:328(_check_schema_name_specs)
+  stage: zavod/zavod/helpers
+  alternative_considered: Using script-specific min_length thresholds was considered
+    but adds complexity
+- id: BD-077
+  type: B
+  content: Reject single-token names shorter than single_token_min_length
+  rationale: 'Single-token names that are too short lack sufficient distinguishing
+    information for reliable entity matching. Rejecting below single_token_min_length
+    reduces false positive matches on generic terms. BOUNDARY: Only applies to names
+    identified as single-token; multi-token names use different length validation.'
+  evidence: zavod/zavod/helpers/names.py:328(_check_schema_name_specs)
+  stage: zavod/zavod/helpers
+  alternative_considered: Always accepting short single tokens was rejected due to
+    high false positive rate
+- id: BD-078
+  type: B/DK
+  content: Derive original_value from single original value when only one exists
+  rationale: 'When a name has only one original value, copying it to original_value
+    maintains data consistency and ensures downstream processing has access to the
+    source text. BOUNDARY: Only applies when name.from_values has exactly one entry;
+    multiple entries use different derivation logic.'
+  evidence: zavod/zavod/helpers/names.py:410(derive_original_values)
+  stage: zavod/zavod/helpers
+  alternative_considered: Leaving original_value empty was rejected as it breaks downstream
+    provenance tracking
+- id: BD-079
+  type: B
+  content: Parse mandate dates by splitting on whitespace and taking first token only
+  rationale: 'French Senate mandate dates in the source data consistently place the
+    date as the first token, with additional metadata (session info, etc.) following.
+    Taking only the first token extracts the date reliably. BOUNDARY: Only applies
+    to mandate fields that contain date-prefixed strings; other field formats are
+    parsed differently.'
+  evidence: datasets/fr/senat/crawler.py:115(crawl_mandates)
+  stage: datasets/fr/senat
+  alternative_considered: Full date regex parsing was rejected as source format is
+    consistently first-token
+- id: BD-080
+  type: B
+  content: Add null mandate for ACTIF senators to ensure current occupancy
+  rationale: 'ACTIF senators are currently serving and should have a mandate entry
+    indicating present occupancy. Adding a null-date mandate ensures they appear in
+    current-occupancy queries. BOUNDARY: Only applied to senators with ACTIF status;
+    other statuses receive mandate entries with concrete dates only.'
+  evidence: datasets/fr/senat/crawler.py:38(crawl_row)
+  stage: datasets/fr/senat
+  alternative_considered: Leaving current senators without mandate was rejected as
+    it breaks occupancy queries
+- id: BD-081
+  type: B
+  content: Extract years bounded between 1800 and 2100
+  rationale: 'Years outside 1800-2100 are almost certainly OCR errors or data corruption,
+    as no relevant legal entities were founded before 1800 or will exist beyond 2100.
+    Bounding the extraction filters noise. BOUNDARY: Only applies to year extraction
+    from partial date strings; full dates with out-of-range years are handled separately.'
+  evidence: zavod/zavod/helpers/dates.py:29(extract_years)
+  stage: zavod/zavod/helpers
+  alternative_considered: Using current year as upper bound was rejected as historical
+    entities are well-documented
+- id: BD-082
+  type: B
+  content: Always accept ISO prefix dates %Y-%m-%d, %Y-%m, %Y
+  rationale: 'ISO 8601 date formats are unambiguous, machine-readable, and widely
+    adopted. Always accepting them ensures consistent handling regardless of source
+    system. BOUNDARY: ISO formats are tried first before other parsing strategies;
+    they always succeed if the pattern matches.'
+  evidence: zavod/zavod/helpers/dates.py:16(dates.py)
+  stage: zavod/zavod/helpers
+  alternative_considered: Conditional ISO acceptance was rejected as it adds unnecessary
+    complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: dates.py in zavod/zavod/helpers/dates.py'
+- id: BD-083
+  type: B/BA
+  content: Use LRU cache with maxsize=5000 for date extraction
+  rationale: 'Date extraction is called frequently with repeated inputs (especially
+    for common dates across entities). LRU cache with maxsize=5000 balances memory
+    usage against hit rate for typical datasets. BOUNDARY: Cache applies only to extract_date
+    function; other date functions use different caching strategies if needed.'
+  evidence: zavod/zavod/helpers/dates.py:68(extract_date)
+  stage: zavod/zavod/helpers
+  alternative_considered: No caching was rejected due to performance impact; unlimited
+    cache was rejected due to memory risk
+- id: BD-084
+  type: B
+  content: Normalize datetime to UTC before extracting date
+  rationale: 'Datetime values may come from different timezones, which affects the
+    resulting date (e.g., 11PM PST is the next day in UTC). Normalizing to UTC ensures
+    consistent date extraction. BOUNDARY: Only applies to datetime inputs; date inputs
+    and string inputs are handled without timezone normalization.'
+  evidence: zavod/zavod/helpers/dates.py:69(extract_date)
+  stage: zavod/zavod/helpers
+  alternative_considered: Preserving original timezone was rejected as it leads to
+    inconsistent date extraction
+- id: BD-085
+  type: B
+  content: Fall back from full date to year-only extraction to original text
+  rationale: 'When full date parsing fails, extracting the year from original text
+    preserves some temporal information rather than losing the date entirely. This
+    fallback chain maximizes data retention. BOUNDARY: Only falls back to original
+    text if structured parsing fails; successfully parsed dates do not use original
+    text.'
+  evidence: zavod/zavod/helpers/dates.py:69(extract_date)
+  stage: zavod/zavod/helpers
+  alternative_considered: Returning None on parse failure was rejected due to data
+    loss
+- id: BD-086
+  type: B
+  content: Sort splitters by length descending before applying multi_split
+  rationale: 'Sorting splitters longest-first ensures longer delimiters are matched
+    before shorter ones that might be substrings. This prevents premature splitting
+    by short delimiters that fragment text incorrectly. BOUNDARY: Only affects multi_split
+    behavior when multiple splitters are provided; single splitter calls are unaffected.'
+  evidence: zavod/zavod/helpers/text.py:46(multi_split)
+  stage: zavod/zavod/helpers
+  alternative_considered: Sorting ascending was rejected as it causes fragmentation
+    on common short delimiters
+- id: BD-087
+  type: B/DK
+  content: Strip whitespace from text fragments during splitting
+  rationale: 'Splitting on delimiters often leaves leading/trailing whitespace on
+    fragments, which causes issues in downstream processing (matching, display, etc.).
+    Stripping whitespace ensures clean fragments. BOUNDARY: Only strips whitespace
+    after splitting; original text is not modified.'
+  evidence: zavod/zavod/helpers/text.py:46(multi_split)
+  stage: zavod/zavod/helpers
+  alternative_considered: Stripping before splitting was rejected as it might affect
+    delimiter detection
+- id: BD-088
+  type: B/BA
+  content: Remove bracketed content using regex BRACKETED=\(.*\)
+  rationale: 'Bracketed content in text (comments, annotations, parenthetical asides)
+    is typically not part of the core entity name and should be removed for cleaner
+    matching. The regex removes each content within parentheses. BOUNDARY: Only removes
+    content within literal parentheses; other bracket types (brackets, braces) are
+    not affected.'
+  evidence: zavod/zavod/helpers/text.py:99(remove_bracketed)
+  stage: zavod/zavod/helpers
+  alternative_considered: Preserving brackets was rejected as it causes inconsistent
+    matching with/without annotations
+- id: BD-089
+  type: B
+  content: Strip and check length for empty text detection
+  rationale: 'Text that is only whitespace should be treated as empty. Stripping before
+    length check ensures consistent empty detection regardless of whitespace-only
+    content. BOUNDARY: Only affects is_empty function behavior; other text functions
+    may handle whitespace differently.'
+  evidence: zavod/zavod/helpers/text.py:81(is_empty)
+  stage: zavod/zavod/helpers
+  alternative_considered: Checking length without strip was rejected as it leads to
+    inconsistent empty detection
+- id: BD-090
+  type: BA
+  content: DEFAULT_AFTER_OFFICE = 5 years encodes PEP 'after-office' business rule
+  rationale: 'WHY: The 5-year default encodes the standard PEP ''after-office'' cooling-off
+    period used in sanctions compliance workflows. This value represents a regulatory-derived
+    assumption that PEPs remain relevant for screening purposes for 5 years after
+    leaving office. BOUNDARY: This default applies when no explicit endDate is provided
+    for a PEP position; changing it would alter sanctions screening behavior for each
+    historical positions lacking explicit end dates, potentially expanding or contracting
+    the P'
+  evidence: zavod/zavod/stateful/positions.py:17(module)
+  stage: default_value
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in zavod/zavod/stateful/positions.py'
+- id: BD-091
+  type: BA
+  content: feed_unconsolidated MUST be called BEFORE consolidate_entity in export
+    pipeline
+  rationale: 'WHY: The export pipeline requires unconsolidated data to be fed first
+    so that consolidate_entity can then perform cross-dataset entity merging with
+    complete information. This ordering ensures that entity relationships are resolved
+    before final export, preventing duplicate entries. BOUNDARY: Reversing this order
+    would cause consolidate_entity to operate on already-consolidated data, breaking
+    the merge logic and potentially producing duplicate or missing entities in the
+    exported output.'
+  evidence: zavod/zavod/exporters/__init__.py:51(export_data)
+  stage: ordering_contract
+- id: BD-092
+  type: BA
+  content: UNIQUE_DATASETS defines authoritative sanctions lists that prevent entity
+    merging
+  rationale: 'WHY: Datasets marked as unique define the authoritative sanctions lists
+    that take precedence over any merged data from other sources. This invariant prevents
+    dilution of sanctions designations when entities from authoritative lists are
+    merged with non-authoritative duplicates. BOUNDARY: Entities from datasets in
+    UNIQUE_DATASETS cannot be merged with entities from other datasets, ensuring sanctions
+    data remains legally authoritative and unaltered by consolidation logic.'
+  evidence: zavod/zavod/integration/logic.py:11(UNIQUE_DATASETS)
+  stage: invariant
+  _evidence_issues:
+  - 'FN_NOT_FOUND: UNIQUE_DATASETS in zavod/zavod/integration/logic.py'
+- id: BD-093
+  type: BA
+  content: Person schema names REQUIRE spaces (require_space=True default)
+  rationale: 'WHY: Person names require spaces to distinguish first and last name
+    components, enabling proper name parsing, display formatting, and search functionality.
+    This is a data quality requirement for human identity records. BOUNDARY: Names
+    without spaces are rejected by the schema validator for Person entities; this
+    rule applies universally to each Person schemas but not to organizational entity
+    names where spaces are optional.'
+  evidence: zavod/zavod/meta/names.py:54-57(_DEFAULT_SCHEMA_RULES)
+  stage: default_value
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _DEFAULT_SCHEMA_RULES in zavod/zavod/meta/names.py'
+- id: BD-094
+  type: BA
+  content: NEVER_REMOVE_NAMES_DATASETS protects sanctioned entity names from simplification
+  rationale: 'WHY: Sanctions datasets require exact name preservation to maintain
+    compliance matching accuracy. Name simplification algorithms would corrupt the
+    precise spelling used in official sanctions lists, potentially causing screening
+    misses. BOUNDARY: This invariant applies to each datasets in the NEVER_REMOVE_NAMES_DATASETS
+    set; modifying this set would risk breaking sanctions screening accuracy for affected
+    entity types.'
+  evidence: zavod/zavod/exporters/consolidate.py:26-40(NEVER_REMOVE_NAMES_DATASETS)
+  stage: invariant
+  _evidence_issues:
+  - 'FN_NOT_FOUND: NEVER_REMOVE_NAMES_DATASETS in zavod/zavod/exporters/consolidate.py'
+- id: BD-095
+  type: BA
+  content: 'Context lifecycle MUST follow: begin() -> crawl -> flush() -> close()
+    pattern'
+  rationale: 'WHY: The begin()->crawl()->flush()->close() sequence ensures proper
+    resource lifecycle management: initialization happens before use, cleanup happens
+    before finalization, and resources are released in correct order. This pattern
+    prevents resource leaks and state corruption. BOUNDARY: Skipping or reordering
+    any step would leave resources uninitialized or uncleared, causing potential data
+    corruption, connection leaks, or undefined behavior in subsequent runs.'
+  evidence: zavod/zavod/crawl.py:19-75(crawl_dataset)
+  stage: pattern_choice
+- id: BD-096
+  type: B/RC
+  content: HTTP SSL verification disabled (verify=False) for government data sources
+  rationale: 'WHY: Government data sources frequently use internal PKI certificates
+    or expired certificates that fail standard SSL verification, requiring verification
+    to be disabled to access the data. This is a deliberate business decision prioritizing
+    data access for government sources over strict certificate validation. BOUNDARY:
+    This applies only to government data sources; other data sources retain standard
+    SSL verification. The security tradeoff is accepted for government data acquisition.'
+  evidence: zavod/zavod/runtime/http_.py:37(session.verify = False)
+  stage: default_value
+  alternative_considered: Requiring government sources to provide valid certificates
+    was rejected due to operational constraints
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: session.verify = False in zavod/zavod/runtime/http_.py'
+- id: BD-097
+  type: BA
+  content: ENRICH_TOPICS set defines which entity topics trigger enrichment during
+    cross-referencing
+  rationale: 'WHY: Only entities with topics in ENRICH_TOPICS undergo enrichment during
+    cross-referencing, ensuring consistent data quality enhancement for key entity
+    types while avoiding unnecessary processing overhead for other entity types. BOUNDARY:
+    Entities with topics outside this set skip enrichment entirely; adding new topics
+    requires explicit addition to ENRICH_TOPICS in settings, ensuring controlled expansion
+    of enrichment scope.'
+  evidence: zavod/zavod/settings.py:30-39(ENRICH_TOPICS)
+  stage: default_value
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ENRICH_TOPICS in zavod/zavod/settings.py'
+- id: BD-098
+  type: BA/DK
+  content: 'Occupancy status determination has specific date precedence: endDate >
+    periodEnd > dissolutionDate'
+  rationale: 'WHY: The date precedence hierarchy endDate > periodEnd > dissolutionDate
+    determines which date field takes precedence when multiple dates exist for an
+    occupancy period, ensuring deterministic occupancy status determination based
+    on regulatory requirements. BOUNDARY: When multiple date fields are present, the
+    higher-priority field determines occupancy status; changing this order would alter
+    PEP classification for entities with overlapping date fields.'
+  evidence: zavod/zavod/stateful/positions.py:137(occupancy_status)
+  stage: ordering_contract
+- id: BD-099
+  type: BA
+  content: sanctions.is_active compares end_date >= RUN_TIME_ISO for active status
+  rationale: 'WHY: The comparison end_date >= RUN_TIME_ISO correctly determines active
+    sanctions status by checking if the sanction''s end date is either unset or falls
+    in the future relative to the current run time. This implements the standard sanctions
+    active/inactive determination logic. BOUNDARY: A sanction is only active if its
+    end_date is not set or is >= the current time; changing the comparison operator
+    would misclassify active vs expired sanctions.'
+  evidence: zavod/zavod/helpers/sanctions.py:93-106(is_active)
+  stage: inheritance
+- id: BD-100
+  type: BA
+  content: HashDelta uses LevelDB for entity state tracking with version-keyed hashes
+  rationale: 'WHY: LevelDB provides efficient key-value storage for version-keyed
+    entity hashes, enabling fast state tracking and change detection across dataset
+    versions. This architecture supports incremental processing by identifying which
+    entities have changed. BOUNDARY: This is the only supported state backend for
+    HashDelta; using a different database would require reimplementation of the HashDelta
+    interface and migration of existing state data.'
+  evidence: zavod/zavod/runtime/delta.py:18-106(HashDelta)
+  stage: pattern_choice
+  alternative_considered: Alternative databases like SQLite or Redis were considered
+    but rejected for simplicity
+- id: BD-101
+  type: BA/DK
+  content: 'logic_decide runs matching heuristics in fixed order: vessel->identifiers->unique->pkpro->securities'
+  rationale: 'WHY: The fixed vessel->identifiers->unique->pkpro->securities ordering
+    ensures deterministic entity matching across different dataset types, preventing
+    non-deterministic results that could occur from hash-based ordering. The order
+    prioritizes vessel-specific matching before general identifier matching. BOUNDARY:
+    The order matters because later heuristics may override earlier matches; changing
+    it would produce different entity resolution results for edge cases.'
+  evidence: zavod/zavod/integration/logic.py:155-175(logic_decide)
+  stage: invariant
+- id: BD-102
+  type: BA
+  content: MAX_OFFICE=40 years and MAX_AGE=110 years define reasonable person lifecycle
+    bounds
+  rationale: 'WHY: The 40-year office tenure and 110-year person age limits define
+    reasonable bounds for person lifecycles, preventing unrealistic date calculations
+    and ensuring data integrity for historical positions. BOUNDARY: Values outside
+    these bounds are treated as invalid data; increasing MAX_OFFICE would extend PEP
+    lookback periods, potentially expanding the scope of historical sanctions screening.'
+  evidence: zavod/zavod/stateful/positions.py:26(OccupancyStatus)
+  stage: default_value
+- id: BD-103
+  type: B/DK
+  content: ViewFragment caches consolidated entities up to MAX_BUFFER=1000 entries
+  rationale: 'WHY: The 1000-entry buffer size balances memory usage with consolidation
+    performance, allowing efficient batching of consolidated entities before flushing
+    to downstream exporters. This is a performance tuning decision that affects memory
+    consumption during large exports. BOUNDARY: Exceeding this buffer triggers a flush
+    to disk or downstream processing; the value directly affects memory footprint
+    during entity consolidation operations.'
+  evidence: zavod/zavod/exporters/fragment.py:20-60(ViewFragment)
+  stage: pattern_choice
+- id: BD-104
+  type: BA
+  content: make_occupancy returns None if categorisation.is_pep is False
+  rationale: 'WHY: make_occupancy returns None early when is_pep is False, avoiding
+    unnecessary position calculations for non-PEP entities. This is an optimization
+    that skips occupancy logic entirely for entities that will never have PEP positions.
+    BOUNDARY: If is_pep returns True, full occupancy processing occurs including position
+    calculation; this early return is the only entry point for occupancy creation.'
+  evidence: zavod/zavod/helpers/positions.py:119(make_occupancy)
+  stage: ordering_contract
+- id: BD-105
+  type: B/RC
+  content: 'INTERACTION: [BD-024] × [BD-037] → Security boundary weakened by SSL disable
+    with credential exposure risk'
+  rationale: 'SSL verification disabled for government data sources (BD-024) creates
+    MITM vulnerability that is partially mitigated by credential redaction (BD-037).
+    However, redaction alone does not prevent intercepted plaintext content, session
+    hijacking, or response manipulation. This interaction amplifies the security risk
+    of BD-024 because even redacted logs cannot prevent an attacker from observing
+    data access patterns and entity relationships from intercepted requests. WHEN
+    PROBLEMATIC: When government'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Adding certificate pinning per-host would mitigate MITM
+    without requiring full PKI
+- id: BD-106
+  type: M
+  content: 'INTERACTION: [BD-017] × [BD-026] → Duplicate delta hash decisions create
+    maintenance inconsistency'
+  rationale: 'Both BD-017 (Delta uses SHA1 hash of entity canonical form) and BD-026
+    (Calculate delta using SHA1 hash of entity ID, schema, and sorted property values)
+    describe the same architectural decision with slightly different wording. This
+    contradiction creates confusion about which implementation is authoritative and
+    risks divergence during future modifications. WHEN PROBLEMATIC: When one implementation
+    is updated (e.g., changing hash algorithm) and the other is not, delta exports
+    become inconsistent '
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Consolidating into single authoritative BD would prevent
+    drift
+- id: BD-107
+  type: M
+  content: 'INTERACTION: [BD-018] × [BD-091] → Duplicate export ordering invariant
+    creates documentation drift risk'
+  rationale: 'BD-018 (feed_unconsolidated called BEFORE consolidate_entity) and BD-091
+    (MUST be called BEFORE) are identical decisions expressed differently. This duplication
+    increases maintenance burden and creates documentation drift risk where one statement
+    is updated without the other. WHEN PROBLEMATIC: When debugging export issues,
+    analysts may reference only BD-018 or BD-091, missing the complete picture. If
+    implementations diverge between what these two BDs describe, pipeline correctness
+    becomes unpred'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Cross-reference BDs instead of duplicating content
+- id: BD-108
+  type: M/DK
+  content: 'INTERACTION: [BD-028] × [BD-094] → Sanctions name protection duplicated
+    across different constant names'
+  rationale: 'BD-028 (Exclude OFAC SDN from name simplification) and BD-094 (NEVER_REMOVE_NAMES_DATASETS)
+    describe the same regulatory protection mechanism using different terminology.
+    BD-028 names a specific list (OFAC SDN) while BD-094 generalizes to a constant
+    set. This contradiction creates confusion about scope: is BD-028 a subset of BD-094
+    or an independent rule? WHEN PROBLEMATIC: When adding new sanctions lists, developers
+    may modify only one constant (NEVER_REMOVE_NAMES_DATASETS or the BD-028 exceptio'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Unified constant with BD referencing the shared implementation
+- id: BD-109
+  type: B
+  content: 'INTERACTION: [BD-095] × [BD-002] → Context lifecycle dependency creates
+    data integrity risk on improper cleanup'
+  rationale: 'BD-095 mandates the begin()->crawl()->flush()->close() lifecycle for
+    Context, while BD-002 states Context holds dataset-scoped resources (stats, issues,
+    resources). If lifecycle steps are skipped or reordered, BD-002''s resource isolation
+    guarantees are violated, causing cross-dataset contamination. This is a RISK CASCADE:
+    improper lifecycle (BD-095 violation) → resources leak from previous dataset (BD-002
+    violation) → entity pollution in current dataset run. WHEN PROBLEMATIC: In parallel
+    dataset'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Context could implement defensive copy on begin() but adds
+    overhead
+- id: BD-110
+  type: B/DK
+  content: 'INTERACTION: [BD-007] × [BD-025] → LevelDB storage boundary creates cascading
+    failure when storage unavailable'
+  rationale: 'BD-007 extends LevelDBStore for statement storage, and BD-025 configures
+    batch writes every 500,000 statements. If LevelDB becomes unavailable (disk full,
+    corruption, permission error), the batch write mechanism cannot function, causing
+    statement loss and breaking the Store''s promise of crash-resistant append-only
+    writes. This is a RISK CASCADE: LevelDB failure → batch writes fail → statements
+    lost → entity integrity compromised → downstream consumers receive incomplete
+    data → sanctions screenin'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Streaming writes with smaller batches would reduce but not
+    eliminate the risk
+- id: BD-111
+  type: B/RC
+  content: 'INTERACTION: [BD-030] × [BD-031] → PEP risk windows create screening scope
+    amplification for senior officials'
+  rationale: 'BD-030 sets 5-year post-office PEP screening period for standard positions,
+    while BD-031 extends this to 20 years for heads of state and IGOs. This amplification
+    creates exponential screening scope increase: senior political figures remain
+    flagged 4x longer than standard PEPs. This is BENEFICIAL AMPLIFICATION for compliance
+    but creates operational burden. WHEN PROBLEMATIC: For organizations screening
+    against multiple datasets with different PEP windows, the 20-year window may flag
+    entities other'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Risk-tiered windows beyond 20 years were considered but
+    rejected for privacy
+- id: BD-112
+  type: M
+  content: 'INTERACTION: [BD-040] × [BD-102] → MAX_OFFICE threshold duplication creates
+    consistency maintenance risk'
+  rationale: 'BD-040 states positions older than 40 years are skipped, and BD-102
+    defines MAX_OFFICE=40 years as a lifecycle bound. These describe the same threshold
+    (40 years) using different language and potentially different code paths. This
+    creates hidden dependency where changing one constant may not update the other.
+    WHEN PROBLEMATIC: If MAX_OFFICE in BD-102 is changed to 35 years for performance
+    but BD-040 is not updated, positions between 35-40 years would be processed unnecessarily,
+    wasting resources'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Single constant referenced by both business rules would
+    eliminate drift
+- id: BD-113
+  type: M
+  content: 'INTERACTION: [BD-033] × [BD-093] → Person name space requirement duplicated
+    across schema and cleaning layers'
+  rationale: 'BD-033 (Require space in Person names) and BD-093 (Person schema names
+    REQUIRE spaces) are functionally identical, one describing cleaning behavior and
+    the other schema validation. This duplication creates confusion about where enforcement
+    occurs and whether both checks must pass. WHEN PROBLEMATICIC: If the schema rule
+    (BD-093) is relaxed for edge cases but the cleaning rule (BD-033) is not, valid
+    entities created by direct API calls would fail validation, causing inconsistent
+    behavior between c'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Single enforcement point in schema with cleaning as helper
+    would be clearer
+- id: BD-114
+  type: B
+  content: 'INTERACTION: [BD-041] × [BD-055] → Future date ambiguity resolution differs
+    between occupancy and periodEnd'
+  rationale: 'BD-041 returns UNKNOWN for future end dates when dataset coverage is
+    past, while BD-055 treats future periodEnd as UNKNOWN (not CURRENT). Both return
+    UNKNOWN but for different reasons: BD-041 cites dataset staleness; BD-055 cites
+    projection uncertainty. The reasoning divergence creates unclear semantics about
+    when UNKNOWN means ''insufficient data'' versus ''future projection''. WHEN PROBLEMATIC:
+    When analyzing occupancy reports, analysts cannot distinguish between ''dataset
+    is stale'' and ''this is a '
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Differentiated UNKNOWN states (STALE_UNKNOWN vs PROJECTION_UNKNOWN)
+    would improve clarity
+- id: BD-115
+  type: M
+  content: 'INTERACTION: [BD-032] × [BD-074] → Character rejection logic duplicated
+    at different normalization stages'
+  rationale: 'BD-032 rejects names with special characters (semicolons, brackets,
+    etc.) for Person schema, while BD-074 rejects characters from reject_chars_consolidated
+    set. These are functionally similar but may use different character sets and operate
+    at different pipeline stages. This creates potential for inconsistent filtering
+    where some characters pass one check but fail the other. WHEN PROBLEMATICIC: If
+    the consolidated character set (BD-074) includes characters not in BD-032''s baseline
+    set, entities '
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Consolidated character set with single validation point
+    would eliminate stage-dependent behavior
+- id: BD-GAP-001
+  type: B
+  content: Date ranges are segmented into 6-month chunks when crawling Bosnia-Herzegovina
+    company registries, trading off between API rate limits and completeness of date-based
+    queries
+  rationale: 6-month periods balance crawl duration against server load; breaks if
+    historical data spans less than 6 months or if the registry changes rate limits
+    mid-crawl
+  evidence: datasets/ba/companies/crawler.py:491(generate_periods)
+  stage: data_collection
+  alternative_considered: 1-month periods (higher fidelity but more API calls), annual
+    periods (simpler but less granular)
+- id: BD-GAP-002
+  type: B/BA
+  content: Registration numbers are validated with a 'roughly valid' heuristic rather
+    than strict format checking, accepting edge cases from legacy registry entries
+  rationale: Bosnia's registry contains decades of legacy data with inconsistent numbering;
+    strict validation would reject valid records; breaks if registry modernizes format
+  evidence: datasets/ba/companies/crawler.py:73(roughly_valid_regno)
+  stage: data_collection
+  alternative_considered: Strict validation with manual exception queue
+- id: BD-GAP-003
+  type: BA
+  content: UK Companies House PSC (Persons with Significant Control) data is processed
+    as a separate data stream from officer appointments, requiring separate parsing
+    and merge logic
+  rationale: PSC and officer data have different update frequencies and completeness;
+    keeping separate allows independent refresh cycles; breaks if regulations mandate
+    unified disclosure
+  evidence: datasets/gb/coh/psc_parse.py:301(crawl)
+  stage: data_collection
+  alternative_considered: Unified Person-of-Interest stream with harmonized schema
+- id: BD-GAP-004
+  type: BA
+  content: ETL pipeline separates crawl, validate, export, and publish stages as discrete
+    steps, allowing intervention and error recovery between stages
+  rationale: Separation enables partial pipeline execution and debugging; breaks if
+    real-time processing is required (e.g., streaming data)
+  evidence: zavod/zavod/cli/etl.py:24(crawl),:38(validate),:57(export),:75(publish)
+  stage: pipeline_design
+  alternative_considered: Single-pass pipeline (faster but less debuggable)
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: crawl),:38(validate),:57(export),:75(publish in zavod/zavod/cli/etl.py'
+- id: BD-GAP-005
+  type: B
+  content: Database batch size of 5000 records balances memory usage against transaction
+    overhead for dataset loading
+  rationale: 5000 chosen as middle ground; smaller batches increase transaction overhead,
+    larger batches risk memory pressure; breaks on systems with <512MB RAM
+  evidence: zavod/zavod/cli/util.py:20(load_db)
+  stage: infrastructure
+  alternative_considered: Adaptive batching (complex, hard to tune)
+- id: BD-GAP-006
+  type: T
+  content: DSPy framework is used for name extraction instead of traditional rule-based
+    or ML approaches, leveraging LLM-based reasoning for disambiguation
+  rationale: DSPy provides programmatic LLM optimization without manual prompt engineering;
+    breaks if API costs become prohibitive or privacy requires on-premise models
+  evidence: zavod/zavod/extract/names/dspy/__init__.py:10(CleanNamesSignature)
+  stage: technology_selection
+  alternative_considered: Rule-based extraction (faster but less accurate), fine-tuned
+    BERT (requires training data)
+  _evidence_issues:
+  - 'LINE_OOB: zavod/zavod/extract/names/dspy/__init__.py:10 > 0'
+- id: BD-GAP-007
+  type: BA/DK
+  content: LocalEnricher uses blocking-based candidate selection before scoring, reducing
+    comparison space from O(n²) to approximately O(n×k) where k << n
+  rationale: Blocking makes entity resolution tractable at scale; breaks if blocking
+    keys have high collision rate (different entities blocked together) or high miss
+    rate (same entities not blocked)
+  evidence: zavod/zavod/runner/local_enricher.py:93(candidates)
+  stage: algorithm_design
+  alternative_considered: All-pairs comparison (intractable at scale), learned blocking
+    (requires training)
+- id: BD-GAP-008
+  type: BA
+  content: UN Sanctions list parsing distinguishes between persons and legal entities
+    with separate extraction paths, reflecting different data structures in source
+    documents
+  rationale: Persons and entities have different identifier schemes and name formats;
+    separate paths enable tailored extraction; breaks if sanctions target new entity
+    types (e.g., vessels)
+  evidence: zavod/zavod/shed/un_sc.py:29(get_persons),:40(get_legal_entities)
+  stage: data_collection
+  alternative_considered: Unified extraction with type classification downstream
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: get_persons),:40(get_legal_entities in zavod/zavod/shed/un_sc.py'
+- id: BD-GAP-009
+  type: B/BA
+  content: Enforcement actions older than 365 days (MAX_ENFORCEMENT_DAYS) are filtered
+    out, assuming older sanctions are obsolete or superseded
+  rationale: 365-day threshold balances recency with completeness; breaks if enforcement
+    actions have legitimate multi-year relevance (e.g., debarment, travel bans)
+  evidence: zavod/zavod/shed/enforcements.py:11(within_max_age)
+  stage: data_collection
+  alternative_considered: Infinite retention with recency scoring, programmatic age
+    limits per program
+- id: BD-GAP-010
+  type: BA
+  content: Dataset publishing can target either 'latest' or 'last_successful' version,
+    enabling canary deployments and rollback capability
+  rationale: Separating latest from last_successful enables testing before full promotion;
+    breaks if last_successful is never updated due to repeated failures
+  evidence: zavod/zavod/cli/archive.py:19(_get_latest_version),:28(get_last_successful_version)
+  stage: release_management
+  alternative_considered: Always publish latest (simpler but riskier), versioned releases
+    (heavier governance)
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: _get_latest_version),:28(get_last_successful_version in zavod/zavod/cli/archive.py'
+- id: BD-GAP-011
+  type: B
+  content: PEP position influence status is resolved by priority ordering (Current
+    > Ended > Unknown), with 'best status wins' semantics across merged occupancies
+  rationale: Priority ordering provides deterministic consolidation; breaks if business
+    logic requires different priority (e.g., historical roles weighted higher for
+    some use cases)
+  evidence: datasets/_analysis/ann_pep_positions/analyzer.py:39(get_best_influence_status)
+  stage: business_logic
+  alternative_considered: Weighted influence scoring, user-configurable priority
+- id: BD-GAP-012
+  type: BA
+  content: Wikidata updater session processes one entity at a time with full fetch-propose-resolve-publish
+    cycle, trading throughput for safety and reviewability
+  rationale: Single-entity processing prevents conflicts and enables human review;
+    breaks if batch accuracy is acceptable and review overhead is prohibitive
+  evidence: zavod/zavod/tools/wikidata/__init__.py:160(EditSession.__init__),:192(next)
+  stage: integration_design
+  alternative_considered: Batch API writes (faster but riskier), fully automated sync
+    (no review)
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: EditSession.__init__),:192(next in zavod/zavod/tools/wikidata/__init__.py'
+- id: BD-GAP-013
+  type: BA
+  content: Validation assertions distinguish fatal vs non-fatal failures, allowing
+    partial data publication with warnings rather than complete halt
+  rationale: Fatal/non-fatal separation enables graduated responses; breaks if non-fatal
+    assertions accumulate to hidden data quality issues
+  evidence: zavod/zavod/validators/assertions.py:23(is_assertion_fatal)
+  stage: quality_control
+  alternative_considered: Every failures halt publication (safer but rigid), each
+    failures warn only (more flexible but riskier)
+- id: BD-GAP-014
+  type: B
+  content: Company name cleaning extracts primary name and aliases in single pass,
+    returning multiple names from one input string
+  rationale: Single-pass extraction is efficient but may miss complex alias patterns;
+    breaks if alias delimiters vary significantly across jurisdictions
+  evidence: datasets/ba/companies/crawler.py:105(clean_name)
+  stage: data_collection
+  alternative_considered: Multi-pass extraction with pattern library, ML-based name
+    segmentation
+- id: BD-GAP-015
+  type: BA/M
+  content: BODS (Beneficial Ownership Data Standard) uses a statement-based format
+    with separate person, entity, and relationship statements that must be joined
+    for analysis
+  rationale: Statement model enables incremental updates and provenance tracking;
+    breaks if consumers need fully denormalized flat records
+  evidence: zavod/zavod/shed/bods.py:55(parse_statement),:171(parse_bods_fh)
+  stage: data_collection
+  alternative_considered: Flat record format (simpler queries but less flexible updates)
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: parse_statement),:171(parse_bods_fh in zavod/zavod/shed/bods.py'
+- id: BD-GAP-016
+  content: 'Missing: Matrix ill-conditioning'
+  type: M
+  rationale: 'Audit finding: missing: matrix ill-conditioning. Identified by audit
+    checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-017
+  content: 'Missing: Train/test time split integrity'
+  type: B
+  rationale: 'Audit finding: missing: train/test time split integrity. Identified
+    by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-018
+  content: 'Missing: Pipeline fit/transform isolation'
+  type: B
+  rationale: 'Audit finding: missing: pipeline fit/transform isolation. 5 | Covariates
+    time availability constraints | ❌ N/A | No temporal ML features 6 | Multi-agent
+    consensus & veto | ❌ N/A | No multi-agent decision systems. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: 5 | Covariates time availability constraints | ❌ N/A | No temporal ML features
+    6 | Multi-agent consensus & veto | ❌ N/A | No multi-agent decision systems
+  known_gap: true
+known_use_cases: []
+_enrich_meta:
+  evidence_coverage_ratio: 0.915
+  evidence_verified: 47
+  evidence_invalid: 44
+  evidence_auto_fixed: 28
+  evidence_verify_ratio: 0.3949579831932773
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - RSK
+  - CRD
+  - CMP
+  - DAT
+  - AIL
+  - AML
+  finance_universal:
+    pass: 4
+    warn: 10
+    fail: 6
+  subdomain_totals:
+    pass: 3
+    warn: 10
+    fail: 24
+  coverage: 7/57 (12%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+- type: contains
+  target: zavod_etl_framework
+  description: zavod package contains the ETL framework used by all crawlers
+  evidence: CLAUDE.md:§Repo-layout
+- type: contains
+  target: datasets_directory
+  description: Repository contains datasets directory with country-organized crawlers
+  evidence: CLAUDE.md:§Repo-layout
+- type: depends_on
+  target: followthemoney_schemata
+  description: Crawlers depend on FollowTheMoney entity schemata for entity types
+    and properties
+  evidence: datasets/CLAUDE.md:§FTM-Schemat
+- type: depends_on
+  target: rigour_cleaning
+  description: ZAVOD uses rigour for data cleaning and MIME type constants
+  evidence: CLAUDE.md:§Repo-layout
+- type: complementary
+  target: zavod_tests
+  description: All zavod code needs unit tests in the tests directory
+  evidence: CLAUDE.md:§Coding-hints
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+resources:
+- id: res-slot-001
+  type: replaceable_component
+  name: web_scraping_backend
+  path: null
+  description: Use standard requests for accessible sources; use Zyte for bot-blocked
+    sites. Zyte configured via OPENSANCTIONS_ZYTE_API_KEY.
+  used_in_stages: []
+  options:
+  - name: Zyte API
+    traits:
+    - anti-bot-circumvention
+    - browser-rendering
+    - javascript-support
+    - geolocation-targeting
+    fit_for:
+    - Websites with bot protection, JavaScript-heavy pages, geo-restricted content
+    not_fit_for:
+    - Simple HTML pages without bot protection, rate-limited APIs
+  - name: Standard HTTP requests
+    traits:
+    - simple
+    - fast
+    - no-added-latency
+    fit_for:
+    - Public APIs, simple HTML pages, rate-limited government downloads
+    not_fit_for:
+    - Bot-protected websites, JavaScript-rendered content
+  default: Standard HTTP requests (with Zyte as fallback)
+  _source: worker_resource
+- id: res-slot-002
+  type: replaceable_component
+  name: llm_extraction
+  path: null
+  description: Use OpenAI by default; Azure OpenAI for enterprise deployments via
+    OPENSANCTIONS_AZURE_OPENAI_ENDPOINT.
+  used_in_stages: []
+  options:
+  - name: OpenAI GPT-4o
+    traits:
+    - vision
+    - structured-output
+    - high-quality
+    fit_for:
+    - Image/PDF extraction, complex unstructured data parsing
+    not_fit_for:
+    - Simple structured data, high-volume batch processing
+  - name: Azure OpenAI
+    traits:
+    - enterprise-compliance
+    - vision
+    - structured-output
+    fit_for:
+    - Enterprise environments requiring Azure compliance
+    not_fit_for:
+    - Non-Azure deployments
+  default: OpenAI GPT-4o
+  _source: worker_resource
+- id: res-slot-003
+  type: replaceable_component
+  name: archive_backend
+  path: null
+  description: Set ZAVOD_ARCHIVE_BACKEND=GoogleCloudBackend for production; use FileSystemBackend
+    for local development.
+  used_in_stages: []
+  options:
+  - name: Google Cloud Storage
+    traits:
+    - cloud-native
+    - versioned
+    - global-cdn
+    fit_for:
+    - Production deployments, multi-region access
+    not_fit_for:
+    - Local-only or air-gapped deployments
+  - name: FileSystem
+    traits:
+    - simple
+    - local-only
+    - no-dependency
+    fit_for:
+    - Development, local processing, air-gapped environments
+    not_fit_for:
+    - Production multi-node deployments, global distribution
+  default: FileSystemBackend
+  _source: worker_resource
+- id: res-slot-004
+  type: replaceable_component
+  name: database
+  path: null
+  description: Use SQLite for simple crawls; PostgreSQL for production UI/review systems.
+    Override with OPENSANCTIONS_DATABASE_URI.
+  used_in_stages: []
+  options:
+  - name: SQLite
+    traits:
+    - embedded
+    - zero-config
+    - single-writer
+    fit_for:
+    - Single-node crawlers, development, small-scale deployments
+    not_fit_for:
+    - Multi-node crawlers, high concurrency, large datasets
+  - name: PostgreSQL
+    traits:
+    - server-based
+    - concurrent
+    - scalable
+    fit_for:
+    - Production multi-node crawlers, UI backend, high concurrency
+    not_fit_for:
+    - Simple single-machine crawls
+  default: SQLite (sqlite:///data/zavod.sqlite3)
+  _source: worker_resource
+- id: res-slot-005
+  type: replaceable_component
+  name: wikidata_integration
+  path: null
+  description: Configure ZAVOD_WD_* tokens for write access. Set disabled if Wikidata
+    integration not needed.
+  used_in_stages: []
+  options:
+  - name: Wikimedia API (read/write)
+    traits:
+    - read-write
+    - oauth-auth
+    - structured-data
+    fit_for:
+    - PEP enrichment, Wikidata linking, contributing back changes
+    not_fit_for:
+    - Read-only deployments (can disable)
+  default: Enabled with OAuth
+  _source: worker_resource
+- id: res-slot-006
+  type: replaceable_component
+  name: entity_matching
+  path: null
+  description: Core data model - not replaceable without major rewrite.
+  used_in_stages: []
+  options:
+  - name: followthemoney + nomenklatura
+    traits:
+    - entity-resolution
+    - deduplication
+    - enrichment
+    fit_for:
+    - Default entity matching and deduplication
+    not_fit_for:
+    - N/A (core requirement)
+  default: followthemoney + nomenklatura
+  _source: worker_resource
+- id: res-007
+  type: python_package
+  name: followthemoney==4.8.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-008
+  type: python_package
+  name: nomenklatura==4.7.4
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: python_package
+  name: plyvel==1.5.1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: python_package
+  name: rigour==1.8.1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: python_package
+  name: datapatch>=1.2.4,<1.3
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: python_package
+  name: banal>=1.1.2,<2.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: python_package
+  name: lxml==6.0.4
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-014
+  type: python_package
+  name: requests[security]
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-015
+  type: python_package
+  name: orjson==3.11.8
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: python_package
+  name: sqlalchemy[mypy]
+  description: ''
+  used_in_stages: []
+  _source: worker_resource

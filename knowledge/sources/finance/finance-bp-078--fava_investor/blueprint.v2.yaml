@@ -1,0 +1,2339 @@
+id: finance-bp-078
+name: Fava Investor
+sop_version: '3.6'
+source:
+  projects:
+  - fava_investor
+  commit_hash: f83db450ae3bd47d228c0fcc8b0db7b954f51d26
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Investment portfolio analysis and tax optimization
+  description: A plugin ecosystem for Beancount/Fava providing investment reports,
+    tax loss harvesting, asset allocation analysis, cash drag detection, and gains
+    minimization for US investors using double-entry bookkeeping.
+  prerequisites: Users need Beancount double-entry bookkeeping knowledge, Fava interface
+    familiarity, and understanding of US tax concepts (wash sales, SpecID lot identification,
+    capital gains rates)
+  not_suitable_for: Non-US investors, non-Beancount users, real-time trading systems,
+    countries with different wash sale rules, multi-currency portfolios requiring
+    complex conversions
+stages:
+- id: tax_loss_harvesting
+  name: Tax Loss Harvester
+  order: 1
+  responsibility: Identifies taxable lots with losses and detects potential wash sales
+    within 30-day windows. US-centric assuming SpecID method.
+  interface:
+    inputs:
+    - accapi (FavaInvestorAPI or AccAPI)
+    - options dict with accounts_pattern, wash_pattern, loss_threshold, account_field
+    outputs:
+    - harvestable_table (lots with losses)
+    - summary (totals)
+    - recents (recent purchases)
+    - by_commodity (aggregated losses)
+  required_methods:
+  - name: Investor.build_tlh_tables
+    description: Fava extension entrypoint exposing build_tlh_tables() to display
+      TLH reports in Fava sidebar
+    evidence: fava_investor/__init__.py:43(Investor.__init__)
+  - name: get_tables
+    description: Main orchestrator coordinating lot finding and aggregation into harvestable/recent/summary
+      tables
+    evidence: fava_investor/modules/tlh/libtlh.py:15(get_tables)
+  - name: find_harvestable_lots
+    description: Core lot detection with loss calculation and wash sale detection
+      using SQL queries
+    evidence: fava_investor/modules/tlh/libtlh.py:67(find_harvestable_lots)
+  - name: gain_term
+    description: Determines long vs short term classification using relativedelta
+      for leap-year correctness
+    evidence: fava_investor/modules/tlh/libtlh.py:37(gain_term)
+  key_behaviors:
+  - behavior: Hardcoded 30-day wash sale detection
+    description: Identifies purchases within 30 days before or after a sale as potential
+      wash sales, preventing loss harvesting
+    evidence: fava_investor/modules/tlh/libtlh.py:209(sql WHERE clause)
+  - behavior: SpecID lot tracking
+    description: Tracks individual cost lots by date, currency, and lot number to
+      identify specific positions for harvesting
+    evidence: fava_investor/modules/tlh/libtlh.py:84(GROUP BY cost_date,currency,cost_currency,cost_number)
+  - behavior: a__substidenticals wash detection
+    description: Commodity declarations drive wash detection across substantially
+      identical tickers without code changes
+    evidence: fava_investor/modules/tlh/libtlh.py:129(get_metavalue)
+  replaceable_points:
+  - name: wash_sale_window
+    description: Days to look back for wash sales (fixed IRS rule)
+    options:
+    - name: '30'
+      traits:
+      - IRS standard
+      - non-configurable
+      fit_for:
+      - US investors following IRS wash sale rules
+      not_fit_for:
+      - Non-US jurisdictions with different rules
+    default: '30'
+  - name: account_field_extraction
+    description: How to extract account grouping field for lot identification
+    options:
+    - name: LEAF(account)
+      traits:
+      - Extracts innermost account name
+      fit_for:
+      - Nested account hierarchies
+      not_fit_for:
+      - Flat account structures
+    - name: account
+      traits:
+      - Full account name
+      fit_for:
+      - Simple flat structures
+      not_fit_for:
+      - Nested accounts needing isolation
+    - name: one-but-leaf regex
+      traits:
+      - Parent account extraction
+      fit_for:
+      - Multi-tier hierarchies where parent grouping needed
+      not_fit_for:
+      - Two-level account structures
+    default: LEAF(account)
+  design_decisions:
+  - 30-day wash sale window hardcoded (IRS rule is fixed; avoids configuration complexity
+    for US users) - fava_investor/modules/tlh/libtlh.py:209(sql)
+  - relativedelta for gain_term (Accounts for leap years since IRS defines long/short
+    as '> 1 year') - fava_investor/modules/tlh/libtlh.py:38(gain_term)
+  - GROUP BY cost_date,currency,cost_currency,cost_number (Ensures single-position
+    inventories enabling get_only_position() optimization) - fava_investor/modules/tlh/libtlh.py:84(sql)
+  - a__substidenticals metadata for wash detection (Commodity declarations drive wash
+    detection without code changes) - fava_investor/modules/tlh/libtlh.py:129(get_metavalue)
+  acceptance_hints:
+  - Lots with unrealized losses appear in harvestable_table when threshold met
+  - Wash sales correctly flagged when same/similar security purchased within 30 days
+  - Long-term vs short-term classification accurate across leap years
+  - 'Output tables return 4-tuple: (rtypes list, rrows list, reserved_None, footer_or_None)'
+- id: asset_allocation_class
+  name: Asset Allocation by Class
+  order: 2
+  responsibility: Maps portfolio positions to hierarchical asset classes using commodity
+    metadata prefixes, with optional tax adjustment scaling.
+  interface:
+    inputs:
+    - accapi
+    - config with accounts_patterns, skip_tax_adjustment flag
+    outputs:
+    - AssetClassNode tree with balance, percentage, percentage_children
+    - realacc account tree
+  required_methods:
+  - name: AssetClassNode
+    description: Tree node extending Node with serialization for Fava charts, storing
+      balance, percentage, percentage_children
+    evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:20(AssetClassNode)
+  - name: treeify
+    description: Builds hierarchical asset class tree from bucket map using underscore-separated
+      path encoding
+    evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:59(treeify)
+  - name: bucketize
+    description: Distributes position values into asset_buckets based on asset_allocation_*
+      metadata prefixes
+    evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:87(bucketize)
+  - name: tax_adjust
+    description: Scales inventory balances by account-level tax adjustment metadata,
+      preserving cost specs
+    evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:177(tax_adjust)
+  key_behaviors:
+  - behavior: Metadata-driven bucket assignment
+    description: Commodities are classified into asset classes based on asset_allocation_*
+      prefix metadata, enabling configuration without code changes
+    evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:93(meta_prefix)
+  - behavior: 100% sum validation
+    description: Asset bucket percentages must sum to 100 or 'unknown' bucket auto-created
+      with unallocated remainder
+    evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:127(unallocated)
+  - behavior: Bisect-based price conversion
+    description: Uses binary search to find nearest available price on either side
+      of end_date for position conversion
+    evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:106(convert_position)
+  replaceable_points:
+  - name: bucket_prefix
+    description: Metadata prefix for asset class labels
+    options:
+    - name: asset_allocation_
+      traits:
+      - Standard naming convention
+      fit_for:
+      - Users following naming convention
+      not_fit_for:
+      - Custom prefix requirements
+    default: asset_allocation_
+  - name: tax_adjustment
+    description: Account-level tax basis adjustment scaling factor
+    options:
+    - name: '100'
+      traits:
+      - Full value (no tax adjustment)
+      fit_for:
+      - Taxable accounts without gain tracking
+      not_fit_for:
+      - Accounts needing tax-adjusted values
+    - name: 0-100 range
+      traits:
+      - Partial adjustment percentage
+      fit_for:
+      - Accounts with mixed tax treatment
+      not_fit_for:
+      - Simple single-account portfolios
+    default: '100'
+  design_decisions:
+  - asset_allocation_* metadata prefix for bucket assignment (Allows flexible classification
+    without code changes; percentages must sum to 100) - fava_investor/modules/assetalloc_class/libassetalloc.py:93(meta_prefix)
+  - balance_children for rolled-up totals (Parent nodes need cumulative values for
+    correct percentage display in tree) - fava_investor/modules/assetalloc_class/libassetalloc.py:44(compute_child_balances)
+  - Base currency from operating_currencies[0] (Single-currency assumption simplifies
+    comparison; multi-currency needs via parameter) - fava_investor/modules/assetalloc_class/libassetalloc.py:69(root.currency)
+  - convert_position with bisect for closest-date conversion (Bisect finds nearest
+    available price on either side of end_date) - fava_investor/modules/assetalloc_class/libassetalloc.py:106(convert_position)
+  acceptance_hints:
+  - Tree structure renders correctly with percentages summing to 100%
+  - Tax adjustment applies correctly when configured per account
+  - Multi-currency positions convert using nearest available price
+  - Unknown bucket created only when metadata sum != 100%
+- id: gains_minimizer
+  name: Gains Minimizer
+  order: 3
+  responsibility: Determines optimal lot selection to minimize capital gains tax by
+    sorting by estimated tax percentage ascending.
+  interface:
+    inputs:
+    - accapi
+    - options with accounts_pattern, st_tax_rate, lt_tax_rate, account_field
+    outputs:
+    - tables with cumulative proceeds, taxes, avg/marginal rates per lot
+  required_methods:
+  - name: find_minimized_gains
+    description: Main function computing tax-burden-optimized sale order by sorting
+      lots by estimated tax percentage ascending
+    evidence: fava_investor/modules/minimizegains/libminimizegains.py:43(find_minimized_gains)
+  - name: find_tax_burden
+    description: Interpolation function for calculating specific sale amount tax given
+      progressive tax brackets
+    evidence: fava_investor/modules/minimizegains/libminimizegains.py:16(find_tax_burden)
+  key_behaviors:
+  - behavior: Ascending tax-burden sorting
+    description: Sells highest-tax-burden-per-dollar lots first to minimize total
+      tax across sale
+    evidence: fava_investor/modules/minimizegains/libminimizegains.py:98(sort)
+  - behavior: Progressive tax interpolation
+    description: Tax brackets are progressive; interpolation between data points calculates
+      exact tax burden
+    evidence: fava_investor/modules/minimizegains/libminimizegains.py:16(find_tax_burden)
+  - behavior: Separate ST/LT rate handling
+    description: US short-term (ordinary income rate) vs long-term (15-20%) rates
+      handled distinctly
+    evidence: fava_investor/modules/minimizegains/libminimizegains.py:46(tax_rate)
+  replaceable_points:
+  - name: st_tax_rate
+    description: Short-term capital gains tax rate (ordinary income)
+    options:
+    - name: 0.0-1.0
+      traits:
+      - User-configurable
+      - Must match actual tax bracket
+      fit_for:
+      - Users knowing their marginal rate
+      not_fit_for:
+      - Users unsure of their tax bracket
+    default: 0.01 (placeholder - must be configured)
+  - name: lt_tax_rate
+    description: Long-term capital gains tax rate
+    options:
+    - name: 0.0-1.0
+      traits:
+      - User-configurable
+      - Typically 0/15/20% in US
+      fit_for:
+      - Users knowing their LTCG bracket
+      not_fit_for:
+      - Users unsure of long-term rates
+    default: 0.01 (placeholder - must be configured)
+  design_decisions:
+  - Sort by est_tax_percent ascending (Sells highest-tax-burden-per-dollar lots first
+    to minimize total tax) - fava_investor/modules/minimizegains/libminimizegains.py:98(sort)
+  - Separate st_tax_rate and lt_tax_rate (US short-term (ordinary income) vs long-term
+    (15-20%) rates differ fundamentally) - fava_investor/modules/minimizegains/libminimizegains.py:46(tax_rate)
+  - Cumulative tax interpolation (Tax brackets are progressive; interpolation needed
+    between data points) - fava_investor/modules/minimizegains/libminimizegains.py:16(find_tax_burden)
+  acceptance_hints:
+  - Output table shows lots in tax-optimized selling order
+  - Cumulative tax burden increases monotonically as more lots sold
+  - Marginal rate correctly reflects bracket transitions
+  - Short-term and long-term lots handled with appropriate rates
+- id: cash_drag
+  name: Cash Drag Analyzer
+  order: 4
+  responsibility: Identifies uninvested cash positions across accounts that may be
+    experiencing opportunity cost.
+  interface:
+    inputs:
+    - accapi
+    - options with accounts_pattern, accounts_exclude_pattern, min_threshold, metadata_label_cash
+    outputs:
+    - Table of accounts with cash balances exceeding threshold
+  required_methods:
+  - name: find_loose_cash
+    description: Main function executing cash query across accounts, returning balances
+      above threshold
+    evidence: fava_investor/modules/cashdrag/libcashdrag.py:23(find_loose_cash)
+  - name: find_cash_commodities
+    description: Builds regex pattern for cash-like commodities based on Bond_Cash
+      metadata and operating currencies
+    evidence: fava_investor/modules/cashdrag/libcashdrag.py:7(find_cash_commodities)
+  key_behaviors:
+  - behavior: Bond_Cash metadata detection
+    description: Reuses asset_allocation_Bond_Cash to mark cash-like instruments (money
+      market funds) as cash
+    evidence: fava_investor/modules/cashdrag/libcashdrag.py:10(metadata_label_cash)
+  - behavior: Automatic operating currency inclusion
+    description: Base currencies (USD, EUR) automatically included as cash since they're
+      inherently liquid
+    evidence: fava_investor/modules/cashdrag/libcashdrag.py:16(cash_commodities)
+  replaceable_points:
+  - name: min_threshold
+    description: Minimum cash balance to report (ignores dust amounts)
+    options:
+    - name: 0+
+      traits:
+      - Any non-negative value
+      fit_for:
+      - Filtering micro-amounts
+      not_fit_for:
+      - Reporting each balances including dust
+    default: '0'
+  design_decisions:
+  - Bond_Cash metadata as cash indicator (Reuses asset_allocation_Bond_Cash to mark
+    cash-like instruments (money market funds)) - fava_investor/modules/cashdrag/libcashdrag.py:10(metadata_label_cash)
+  - Operating currencies automatically included (Base currencies (USD, EUR) are inherently
+    cash by definition) - fava_investor/modules/cashdrag/libcashdrag.py:16(cash_commodities)
+  acceptance_hints:
+  - Cash balances above threshold appear correctly in output table
+  - Operating currencies detected as cash automatically
+  - Money market funds marked with Bond_Cash metadata included
+  - Threshold filtering works correctly
+- id: summarizer
+  name: Metadata Summarizer
+  order: 5
+  responsibility: Extracts and displays arbitrary metadata from account or commodity
+    directives as configurable tables.
+  interface:
+    inputs:
+    - accapi
+    - configs array with directive_type, columns, acc_pattern/col_labels
+    outputs:
+    - Ordered, labeled, sorted tables with optional footers
+  required_methods:
+  - name: build_table
+    description: Main table builder with column ordering, labeling, and optional footer
+      calculation
+    evidence: fava_investor/modules/summarizer/libsummarizer.py:67(build_table)
+  - name: active_accounts_metadata
+    description: Extracts metadata from open accounts matching pattern
+    evidence: fava_investor/modules/summarizer/libsummarizer.py:131(active_accounts_metadata)
+  - name: commodities_metadata
+    description: Extracts metadata from commodity directives
+    evidence: fava_investor/modules/summarizer/libsummarizer.py:101(commodities_metadata)
+  key_behaviors:
+  - behavior: Ordered dict column preservation
+    description: Python 3.7+ guarantees dict insertion order; enables explicit column
+      sequencing and ordering
+    evidence: fava_investor/modules/summarizer/libsummarizer.py:39(order_and_rename)
+  - behavior: Commodity leaf parent check
+    description: Prevents double-counting when parent account is explicitly opened
+      alongside leaf accounts
+    evidence: fava_investor/modules/summarizer/libsummarizer.py:47(is_commodity_leaf_with_parent)
+  replaceable_points:
+  - name: directive_type
+    description: Source of metadata extraction
+    options:
+    - name: accounts
+      traits:
+      - Account directive metadata
+      fit_for:
+      - Account-level annotations
+      not_fit_for:
+      - Commodity-level data
+    - name: commodities
+      traits:
+      - Commodity directive metadata
+      fit_for:
+      - Ticker-level annotations
+      not_fit_for:
+      - Account-level data
+    default: accounts
+  - name: meta_prefix
+    description: Filter metadata keys by prefix for selective display
+    options:
+    - name: any string
+      traits:
+      - User-defined prefix filter
+      fit_for:
+      - Grouping related metadata
+      not_fit_for:
+      - Showing each metadata
+    default: '"" (no filter)'
+  design_decisions:
+  - Ordered dict for column preservation (Python 3.7+ guarantees dict insertion order;
+    enables explicit column sequencing) - fava_investor/modules/summarizer/libsummarizer.py:39(order_and_rename)
+  - Commodity leaf account parent check (Prevents double-counting when parent account
+    is explicitly opened) - fava_investor/modules/summarizer/libsummarizer.py:47(is_commodity_leaf_with_parent)
+  acceptance_hints:
+  - Account metadata tables display correct column ordering
+  - Commodity metadata extraction works for both types
+  - Prefix filtering correctly narrows displayed metadata
+  - Tables return standard 4-tuple format
+- id: ticker_relationships
+  name: Ticker Relationship Manager
+  order: 6
+  responsibility: Tracks substantially identical funds, equivalents, and TLH partners
+    from commodity declarations for wash sale detection.
+  interface:
+    inputs:
+    - beancount commodity declarations file
+    outputs:
+    - Equivalence groups, identical sets, TLH partner recommendations
+  required_methods:
+  - name: RelateTickers
+    description: Core class managing ticker equivalence relationships, precomputes
+      equivalents/identicals at init
+    evidence: fava_investor/util/relatetickers.py:12(RelateTickers)
+  - name: compute_tlh_groups
+    description: Infers complete TLH partner set from partial declarations using symmetric
+      closure
+    evidence: fava_investor/util/relatetickers.py:141(compute_tlh_groups)
+  - name: representative
+    description: Returns consistent canonical ticker for equivalent group
+    evidence: fava_investor/util/relatetickers.py:71(representative)
+  key_behaviors:
+  - behavior: Incomplete specification inference
+    description: Users specify minimal relationships; algorithm derives symmetric
+      closure for complete TLH pairs
+    evidence: fava_investor/util/relatetickers.py:141(compute_tlh_groups)
+  - behavior: Same-type filtering
+    description: Mutual funds should only TLH with other MFs, ETFs with ETFs based
+      on a__quoteType metadata
+    evidence: fava_investor/util/relatetickers.py:147(mf_to_etf_map)
+  - behavior: Static precomputation
+    description: Equivalents/identicals precomputed at __init__, cannot be updated
+      at runtime
+    evidence: fava_investor/util/relatetickers.py:21-24
+  replaceable_points:
+  - name: same_type_funds_only
+    description: Restrict TLH partners to same fund type (MF with MF, ETF with ETF)
+    options:
+    - name: 'true'
+      traits:
+      - Type-restricted pairs
+      fit_for:
+      - Conservative wash sale detection avoiding cross-type issues
+      not_fit_for:
+      - Users wanting each possible TLH partners regardless of type
+    - name: 'false'
+      traits:
+      - Every pairs allowed
+      fit_for:
+      - Maximum TLH opportunity discovery
+      not_fit_for:
+      - Strict type-matching requirements
+    default: 'false'
+  design_decisions:
+  - Infer complete TLH partners from incomplete specification (Users specify minimal
+    relationships; algorithm derives symmetric closure) - fava_investor/util/relatetickers.py:141(compute_tlh_groups)
+  - Symmetric TLH inference rule (If A→B is TLH pair, B→A is also TLH; mathematical
+    property of the relationship) - fava_investor/util/relatetickers.py:170-186
+  - a__quoteType for same-type filtering (Mutual funds should only TLH with other
+    MFs, ETFs with ETFs) - fava_investor/util/relatetickers.py:147(mf_to_etf_map)
+  acceptance_hints:
+  - Equivalence groups compute correctly with transitive closure
+  - TLH partner recommendations include each symmetric pairs
+  - Same-type filtering excludes cross-type partnerships when enabled
+  - RelateTickers loads file successfully on initialization
+data_flow:
+- from_stage: external
+  to_stage: Investor
+  data: Beancount ledger data via Fava context (g.ledger) or file loading
+- from_stage: Investor
+  to_stage: FavaInvestorAPI
+  data: Creates API instance per request; Fava context g.ledger provides each data
+- from_stage: FavaInvestorAPI
+  to_stage: Every modules
+  data: 'accapi provides: query_func, realize, root_tree, get_commodity_directives,
+    get_operating_currencies, cost_or_value'
+- from_stage: libtlh.find_harvestable_lots
+  to_stage: libtlh.harvestable_by_commodity
+  data: rtypes, rrows with lot-level loss data
+- from_stage: libassetalloc.build_interesting_realacc
+  to_stage: libassetalloc.bucketize
+  data: realacc tree filtered to included accounts
+- from_stage: bucketize
+  to_stage: treeify
+  data: asset_buckets dict mapping class names to Decimal values
+- from_stage: RelateTickers
+  to_stage: CachedTickerInfo
+  data: ticker list; Yahoo info cached locally as pickle
+- from_stage: ScaledNAV
+  to_stage: Price entries
+  data: Estimated MF NAVs appended to prices file
+- from_stage: ticker_relationships
+  to_stage: tax_loss_harvesting
+  data: Substantially identical tickers and TLH partner groups for wash sale detection
+global_contracts:
+- 'Every tables return 4-tuple: (rtypes list, rrows list, reserved_None, footer_or_None)
+  - fava_investor/common/libinvestor.py:81(build_table_footer)'
+- 'Namedtuple format: Row(*values) where types come from rtypes parallel list - fava_investor/modules/tlh/libtlh.py:110(RetRow)'
+- Metadata prefix 'asset_allocation_*' for allocation classification - fava_investor/modules/assetalloc_class/libassetalloc.py:93(meta_prefix_len)
+- Metadata prefix 'a__' for auto-generated ticker metadata - fava_investor/util/ticker_util.py:156(prefix)
+- Operating currency from ledger.options['operating_currency'][0] as base - fava_investor/common/favainvestorapi.py:58(get_operating_currencies)
+- Configuration via 'fava-extension' custom directives in beancount - fava_investor/common/beancountinvestorapi.py:79(get_custom_config)
+- Dual-API abstraction (FavaInvestorAPI/AccAPI) enables CLI-Fava code reuse - fava_investor/common/favainvestorapi.py:13(FavaInvestorAPI)
+- Account sortkey pattern '^[01]' enforces Assets/Liabilities as first digit - fava_investor/modules/tlh/libtlh.py:82
+business_decisions:
+- id: BD-001
+  type: B/DK
+  content: 30-day wash sale window hardcoded
+  rationale: IRS wash sale rule mandates a 30-day lookback/lookforward window; hardcoding
+    eliminates configuration complexity for US users while ensuring regulatory compliance.
+    This prevents users from accidentally misconfiguring the window and facing IRS
+    penalties.
+  evidence: fava_investor/modules/tlh/libtlh.py:209(sql)
+  stage: tax_loss_harvesting
+  alternative_considered: Configurable window was rejected to avoid user misconfiguration
+    risk
+  _evidence_issues:
+  - 'FN_NOT_FOUND: sql in fava_investor/modules/tlh/libtlh.py'
+- id: BD-002
+  type: BA
+  content: relativedelta for gain_term
+  rationale: IRS defines long-term vs short-term as 'greater than 1 year' which requires
+    precise date arithmetic accounting for leap years. Using relativedelta ensures
+    accurate boundary determination (366+ days for leap years vs 365+ for non-leap
+    years) preventing misclassification.
+  evidence: fava_investor/modules/tlh/libtlh.py:38(gain_term)
+  stage: tax_loss_harvesting
+  alternative_considered: Simple day-count division was rejected due to leap year
+    inaccuracy
+- id: BD-003
+  type: M
+  content: GROUP BY cost_date,currency,cost_currency,cost_number
+  rationale: Aggregating lots by cost_date, currency, cost_currency, and cost_number
+    ensures single-position inventories per unique cost basis. This enables the get_only_position()
+    optimization which reduces query complexity from O(n) to O(1) per position lookup.
+  evidence: fava_investor/modules/tlh/libtlh.py:84(sql)
+  stage: tax_loss_harvesting
+  alternative_considered: No grouping with post-processing was rejected due to performance
+    overhead
+  _evidence_issues:
+  - 'FN_NOT_FOUND: sql in fava_investor/modules/tlh/libtlh.py'
+- id: BD-004
+  type: M
+  content: a__substidenticals metadata for wash detection
+  rationale: Using a__substidenticals metadata commodity declarations drives wash
+    sale detection logic without requiring code changes. This declarative approach
+    allows users to define substitution relationships in their Beancount data while
+    the algorithm dynamically applies wash sale rules.
+  evidence: fava_investor/modules/tlh/libtlh.py:45(get_metavalue)
+  stage: tax_loss_harvesting
+  alternative_considered: Hardcoded substitution maps were rejected due to inflexibility
+- id: BD-005
+  type: M/BA
+  content: asset_allocation_* metadata prefix for bucket assignment
+  rationale: The asset_allocation_* prefix convention allows flexible security classification
+    without code changes. Users declare bucket assignments via metadata, and percentages
+    must sum to 100% ensuring valid portfolio allocation. This separation of data
+    and logic enables self-documenting configuration.
+  evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:93(meta_prefix)
+  stage: asset_allocation_class
+  alternative_considered: Database-driven classification was rejected due to complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: meta_prefix in fava_investor/modules/assetalloc_class/libassetalloc.py'
+- id: BD-006
+  type: BA
+  content: balance_children for rolled-up totals
+  rationale: Parent account nodes in the asset allocation tree require cumulative
+    child balances to calculate correct percentage allocations. Without balance_children,
+    percentage display would be incorrect because parent totals must include each
+    nested children at every level of the hierarchy.
+  evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:44(compute_child_balances)
+  stage: asset_allocation_class
+  alternative_considered: Flat calculation was rejected due to inability to show hierarchical
+    breakdown
+- id: BD-007
+  type: B/BA
+  content: Base currency from operating_currencies[0]
+  rationale: The system assumes single-base-currency portfolios by default, selecting
+    operating_currencies[0] as the base. This simplifies comparison and reporting;
+    multi-currency support is available via explicit parameter for users who need
+    it. This boundary prevents scope creep while meeting typical investor needs.
+  evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:69(root.currency)
+  stage: asset_allocation_class
+  alternative_considered: Automatic multi-currency conversion was rejected as too
+    complex for v1
+  _evidence_issues:
+  - 'FN_NOT_FOUND: root.currency in fava_investor/modules/assetalloc_class/libassetalloc.py'
+- id: BD-008
+  type: BA
+  content: convert_position with bisect for closest-date conversion
+  rationale: Using bisect for closest-date price conversion finds the nearest available
+    price on either side of end_date with O(log n) efficiency. This handles missing
+    price data gracefully while maintaining accuracy for allocation calculations on
+    any user-specified date.
+  evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:106(convert_position)
+  stage: asset_allocation_class
+  alternative_considered: Linear search was rejected due to O(n) performance on large
+    datasets
+  _evidence_issues:
+  - 'FN_NOT_FOUND: convert_position in fava_investor/modules/assetalloc_class/libassetalloc.py'
+- id: BD-009
+  type: B/RC
+  content: Sort by est_tax_percent ascending
+  rationale: Selling highest-tax-burden-per-dollar lots first minimizes total tax
+    liability because each dollar of gain is taxed at the highest marginal rate first.
+    This greedy optimization provides near-optimal tax minimization without expensive
+    combinatorial lot selection algorithms.
+  evidence: fava_investor/modules/minimizegains/libminimizegains.py:98(sort)
+  stage: gains_minimizer
+  alternative_considered: Exhaustive enumeration was rejected due to NP-hard complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: sort in fava_investor/modules/minimizegains/libminimizegains.py'
+- id: BD-010
+  type: B/RC
+  content: Separate st_tax_rate and lt_tax_rate
+  rationale: US tax law fundamentally separates short-term gains (taxed as ordinary
+    income up to 37%) from long-term gains (taxed at preferential 15-20% rates). Maintaining
+    separate rate fields ensures correct tax calculation and enables the optimizer
+    to prioritize lot selection based on differential tax treatment.
+  evidence: fava_investor/modules/minimizegains/libminimizegains.py:46(tax_rate)
+  stage: gains_minimizer
+  alternative_considered: Single blended rate was rejected due to legal inaccuracy
+  _evidence_issues:
+  - 'FN_NOT_FOUND: tax_rate in fava_investor/modules/minimizegains/libminimizegains.py'
+- id: BD-011
+  type: M
+  content: Cumulative tax interpolation
+  rationale: US tax brackets are progressive with marginal rates; interpolation between
+    data points provides continuous tax burden estimation. Without interpolation,
+    calculations would jump discretely at bracket boundaries causing step-function
+    errors in estimated tax liability.
+  evidence: fava_investor/modules/minimizegains/libminimizegains.py:16(find_tax_burden)
+  stage: gains_minimizer
+  alternative_considered: Bracket-step calculation was rejected due to estimation
+    inaccuracy
+- id: BD-012
+  type: B/BA
+  content: Bond_Cash metadata as cash indicator
+  rationale: Reusing asset_allocation_Bond_Cash metadata designation marks cash-like
+    instruments including money market funds as cash equivalents. This convention
+    avoids creating duplicate classification systems while ensuring consistent treatment
+    across modules for yield optimization analysis.
+  evidence: fava_investor/modules/cashdrag/libcashdrag.py:10(metadata_label_cash)
+  stage: cash_drag
+  alternative_considered: Separate cash_exempt metadata was rejected to avoid duplication
+  _evidence_issues:
+  - 'FN_NOT_FOUND: metadata_label_cash in fava_investor/modules/cashdrag/libcashdrag.py'
+- id: BD-013
+  type: B
+  content: Operating currencies automatically included
+  rationale: Base operating currencies (USD, EUR, etc.) are inherently cash by definition
+    and are automatically included in cash identification. This boundary avoids requiring
+    explicit cash declaration for native currencies while ensuring native currency
+    balances are never flagged as drag.
+  evidence: fava_investor/modules/cashdrag/libcashdrag.py:16(cash_commodities)
+  stage: cash_drag
+  alternative_considered: Explicit declaration requirement was rejected due to user
+    friction
+  _evidence_issues:
+  - 'FN_NOT_FOUND: cash_commodities in fava_investor/modules/cashdrag/libcashdrag.py'
+- id: BD-014
+  type: BA
+  content: Ordered dict for column preservation
+  rationale: Python 3.7+ guarantees dict insertion order, enabling explicit column
+    sequencing in output. This allows deterministic metadata report ordering rather
+    than arbitrary hash-based sequences, improving readability and enabling users
+    to predict column arrangement.
+  evidence: fava_investor/modules/summarizer/libsummarizer.py:29(order_and_rename)
+  stage: summarizer
+  alternative_considered: Alphabetical ordering was rejected due to loss of semantic
+    grouping
+- id: BD-015
+  type: M
+  content: Commodity leaf account parent check
+  rationale: Checking for parent account presence prevents double-counting when parent
+    accounts are explicitly opened alongside commodity leaf accounts. Without this
+    check, balances would be aggregated twice—once for children and again for the
+    parent—causing inflated totals.
+  evidence: fava_investor/modules/summarizer/libsummarizer.py:47(is_commodity_leaf_with_parent)
+  stage: summarizer
+  alternative_considered: Silent duplication was rejected as incorrect by design
+- id: BD-016
+  type: M/DK
+  content: Infer complete TLH partners from incomplete specification
+  rationale: Users specify minimal wash sale relationships; the algorithm derives
+    symmetric closure to infer complete partner sets. This reduces user configuration
+    burden by allowing one-directional declarations (A→B implies B→A) while ensuring
+    complete wash sale tracking.
+  evidence: fava_investor/util/relatetickers.py:141(compute_tlh_groups)
+  stage: ticker_relationships
+  alternative_considered: Explicit full declaration was rejected due to verbosity
+- id: BD-017
+  type: B/RC
+  content: Symmetric TLH inference rule
+  rationale: 'Wash sale relationships are symmetric by mathematical definition: if
+    security A cannot be sold to repurchase B within 30 days, then B cannot be repurchased
+    by selling A. Enforcing symmetry ensures consistent wash sale detection regardless
+    of which direction users declare the relationship.'
+  evidence: fava_investor/util/relatetickers.py:170-186(module)
+  stage: ticker_relationships
+  alternative_considered: Directional relationships were rejected as mathematically
+    incorrect
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/util/relatetickers.py'
+- id: BD-018
+  type: B
+  content: a__quoteType for same-type filtering
+  rationale: Mutual funds should only participate in wash sale pairs with other mutual
+    funds, and ETFs with ETFs, because IRS substantially identical rules consider
+    fund structure. Filtering by a__quoteType enforces this boundary preventing invalid
+    cross-type wash sale designations.
+  evidence: fava_investor/util/relatetickers.py:207(fund_type)
+  stage: ticker_relationships
+  alternative_considered: Cross-type pairs were rejected as potentially non-compliant
+  vague_rationale: true
+- id: BD-019
+  type: B/DK
+  content: 30-day wash sale window for both recent purchases and recent sales
+  rationale: The wash sale rule under IRS Publication 550 prohibits claiming a loss
+    if a substantially identical security is purchased within 30 days before or after
+    the sale. The code checks both recent_purchases and recent_sales against a 30-day
+    lookback window using DATE_ADD(TODAY(), -30), ensuring no losses are harvested
+    on positions that trigger wash sale disallowance. This prevents tax deduction
+    loss while maintaining regulatory compliance.
+  evidence: fava_investor/modules/tlh/libtlh.py:209(module)
+  stage: tax_loss_harvesting
+  alternative_considered: 35-day window was considered but rejected to align precisely
+    with IRS 30-day rule and avoid edge cases
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/tlh/libtlh.py'
+- id: BD-020
+  type: B/BA
+  content: 'Long-term gain threshold: >1 year using relativedelta accounting for leap
+    years'
+  rationale: US tax law classifies gains as long-term only when assets are held more
+    than one year from acquisition date. The relativedelta library correctly handles
+    varying month lengths and leap year days, ensuring the 365+ day boundary is precisely
+    calculated. This distinction determines whether gains are taxed at preferential
+    long-term rates (0-20%) versus ordinary income rates (up to 37%).
+  evidence: fava_investor/modules/tlh/libtlh.py:40(gain_term)
+  stage: tax_loss_harvesting
+  alternative_considered: Simple day-count arithmetic was rejected in favor of relativedelta
+    for accuracy across year boundaries
+- id: BD-021
+  type: B/BA
+  content: Default loss_threshold of 1 dollar
+  rationale: A minimum loss threshold of $1 prevents harvesting microscopic losses
+    that would generate disproportionate wash sale complications relative to tax benefit.
+    This default can be overridden via options, allowing users to tune for their portfolio
+    size. The threshold ensures administrative overhead doesn't exceed the tax savings
+    for small positions.
+  evidence: fava_investor/modules/tlh/libtlh.py:96(module)
+  stage: tax_loss_harvesting
+  alternative_considered: Zero threshold was rejected to prevent wash sale generation
+    for no material benefit
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/tlh/libtlh.py'
+- id: BD-022
+  type: B/RC
+  content: Uses a__substidenticals metadata to identify substantially identical securities
+  rationale: The IRS wash sale rule applies to 'substantially identical' securities,
+    which can include different share classes of the same fund or similar ETFs tracking
+    the same index. The custom 'a__substidenticals' metadata on Beancount commodities
+    allows users to explicitly declare which securities should be treated as interchangeable
+    for wash sale tracking, providing clarity that generic ticker matching cannot
+    achieve.
+  evidence: fava_investor/modules/tlh/libtlh.py:45(get_metavalue)
+  stage: tax_loss_harvesting
+  alternative_considered: Automatic ticker matching was rejected as insufficiently
+    precise for complex fund relationships
+- id: BD-023
+  type: B/BA
+  content: Filter accounts via account_sortkey matching ^[01] pattern
+  rationale: Beancount users prefix account sortkeys with digits to categorize accounts;
+    pattern ^[01] selects accounts starting with 0 or 1, typically taxable brokerage
+    accounts. Accounts starting with 2+ (401k, IRA, HSA) are tax-advantaged and exempt
+    from wash sale rules. This regex pattern provides a simple convention for distinguishing
+    which accounts participate in tax loss harvesting calculations.
+  evidence: fava_investor/modules/tlh/libtlh.py:30(order)
+  stage: tax_loss_harvesting
+  alternative_considered: Metadata-based filtering was considered but rejected in
+    favor of the simpler sortkey convention
+- id: BD-024
+  type: B/DK
+  content: Earliest safe sale date = acquisition_date + 31 days
+  rationale: After a loss sale, the wash sale window spans 30 days before and 30 days
+    after. The earliest safe date to repurchase a substantially identical security
+    is day 31 after acquisition, calculated as DATE_ADD(date, 31). This 31-day boundary
+    ensures no overlap with the 61-day wash sale window (30 days each direction) for
+    any lot sold on the same day.
+  evidence: fava_investor/modules/tlh/libtlh.py:204(module)
+  stage: tax_loss_harvesting
+  alternative_considered: 30-day calculation was rejected to maintain clear buffer
+    from wash sale window edges
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/tlh/libtlh.py'
+- id: BD-025
+  type: B/BA
+  content: Sort harvestable table by highest to lowest losses
+  rationale: When presenting harvest opportunities, sorting by loss magnitude descending
+    helps users prioritize the most impactful tax savings first. Higher losses generate
+    larger tax deductions when harvested, making them more valuable per unit of wash
+    sale risk and transaction cost. This default sort aids decision-making for portfolios
+    with many harvestable positions.
+  evidence: fava_investor/modules/tlh/libtlh.py:26-34(sort_harvestable_table)
+  stage: tax_loss_harvesting
+  alternative_considered: Alphabetical or date-based sorting was rejected as less
+    useful for tax optimization
+- id: BD-026
+  type: B/RC
+  content: Separate wash_pattern to distinguish taxable accounts from wash-sale accounts
+  rationale: Wash sale rules can cross accounts if the same taxpayer holds positions
+    in multiple accounts. The code uses separate wash_pattern variables at lines 76
+    and 196-198 to track which accounts are taxable (subject to wash sale rules) versus
+    wash-sale accounts (which can receive replacement shares without triggering disallowance).
+    This separation prevents incorrectly flagging tax-advantaged account activity
+    as wash sales.
+  evidence: fava_investor/modules/tlh/libtlh.py:76,196-198(module)
+  stage: tax_loss_harvesting
+  alternative_considered: Single pattern approach was rejected due to different treatment
+    requirements for account types
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/tlh/libtlh.py'
+- id: BD-027
+  type: B/DK
+  content: Deduplicate recent purchases by ticker across substantially identical funds
+  rationale: When multiple funds are designated as substantially identical (e.g.,
+    VTI and ITOT both tracking total stock market), purchasing shares in one fund
+    within the wash window of selling another could trigger wash sale rules. Lines
+    178-179 deduplicate purchases by ticker symbol, ensuring only one purchase per
+    ticker counts toward wash sale calculations across each substantially identical
+    funds.
+  evidence: fava_investor/modules/tlh/libtlh.py:178-179(module)
+  stage: tax_loss_harvesting
+  alternative_considered: Per-fund tracking was rejected as it would miss cross-fund
+    wash sale triggers
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/tlh/libtlh.py'
+- id: BD-028
+  type: B/BA
+  content: Tax adjustment enabled by default in asset allocation
+  rationale: Tax-adjusted asset allocation provides a more accurate picture of true
+    portfolio value by including unrealized gains and losses. The skip_tax_adjustment
+    function at line 202 allows users to disable this, but the default enables it
+    because most investors care about after-tax wealth when assessing allocation.
+    This ensures the allocation percentages reflect actual economic value.
+  evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:202(skip_tax_adjustment)
+  stage: asset_allocation_class
+  alternative_considered: Disabled by default was rejected as most users prefer tax-adjusted
+    figures
+  _evidence_issues:
+  - 'FN_NOT_FOUND: skip_tax_adjustment in fava_investor/modules/assetalloc_class/libassetalloc.py'
+- id: BD-029
+  type: B
+  content: Use first operating currency as base currency for each conversions
+  rationale: When a portfolio contains multiple currencies, a single base currency
+    is needed for consolidated allocation reporting. Using the first operating currency
+    from the Beancount file as base ensures consistent deterministic selection without
+    requiring additional configuration. Users can control this by ordering their currencies
+    appropriately in the operating_currencies directive.
+  evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:69,92(module)
+  stage: asset_allocation_class
+  alternative_considered: Random or hash-based selection was rejected in favor of
+    deterministic first-currency rule
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/assetalloc_class/libassetalloc.py'
+  vague_rationale: true
+- id: BD-030
+  type: B/BA
+  content: Bucket unallocated percentages into 'unknown' bucket when metadata < 100%
+  rationale: Asset allocation metadata should sum to 100% for complete classification,
+    but real-world metadata may be incomplete. Rather than silently ignoring unallocated
+    amounts or failing, the code creates an 'unknown' bucket to capture these residual
+    percentages. This transparency helps users identify gaps in their metadata configuration
+    rather than having allocation sum to less than expected.
+  evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:127-130(module)
+  stage: asset_allocation_class
+  alternative_considered: Error-throwing was rejected as too aggressive; ignoring
+    was rejected as silent failure
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/assetalloc_class/libassetalloc.py'
+- id: BD-031
+  type: B/DK
+  content: Skip negative balances (liabilities) in asset allocation
+  rationale: Asset allocation reports traditionally focus on asset composition, not
+    net worth. Negative balances (margin loans, shorts, borrowed amounts) are liabilities,
+    not assets, so they are skipped at lines 100-102. This ensures the allocation
+    percentages reflect how assets are distributed across categories, not how those
+    assets are financed.
+  evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:100-102(module)
+  stage: asset_allocation_class
+  alternative_considered: Including liabilities was rejected as it would muddy asset
+    allocation interpretation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/assetalloc_class/libassetalloc.py'
+- id: BD-032
+  type: B/BA
+  content: Remove empty accounts and zero-balance ancestor accounts
+  rationale: Beancount allows hierarchical account structures where intermediate parents
+    may have zero balance if only children have values. Lines 154-156 and 171-173
+    remove both empty accounts and their zero-balance ancestors from allocation reports,
+    preventing clutter from accounts that exist in the schema but hold no economic
+    value. This simplifies the output and focuses attention on meaningful positions.
+  evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:154-156,171-173(module)
+  stage: asset_allocation_class
+  alternative_considered: Preserving hierarchy was rejected as less useful for allocation
+    analysis
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/assetalloc_class/libassetalloc.py'
+- id: BD-033
+  type: B/BA
+  content: Use 'asset_allocation_' metadata prefix for bucket definitions
+  rationale: The 'asset_allocation_' prefix at lines 93-94 provides a clear namespace
+    for allocation-related metadata, distinguishing these settings from other commodity
+    metadata. This convention allows the code to programmatically discover allocation
+    definitions while avoiding conflicts with other metadata uses. Users can intuitively
+    predict metadata names following this pattern.
+  evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:93-94(module)
+  stage: asset_allocation_class
+  alternative_considered: No prefix was rejected due to namespace collision risk with
+    other metadata
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/assetalloc_class/libassetalloc.py'
+- id: BD-034
+  type: B/BA
+  content: Convert currencies via operating currencies when direct conversion unavailable
+  rationale: Beancount may not have direct exchange rates between each currency pairs
+    (e.g., CHF to JPY). Lines 112-113 implement a fallback that converts through operating
+    currencies (typically USD or EUR), establishing indirect rates. This ensures allocation
+    can still be calculated for portfolios with currencies lacking direct pair quotes.
+  evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:112-113(module)
+  stage: asset_allocation_class
+  alternative_considered: Failing on missing direct rate was rejected as too brittle
+    for real-world portfolios
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/assetalloc_class/libassetalloc.py'
+- id: BD-035
+  type: B/DK
+  content: Cash commodities detected via asset_allocation_Bond_Cash metadata = 100
+  rationale: Some securities like money market funds are classified as both bond and
+    cash depending on context. The code at lines 10-14 checks for asset_allocation_Bond_Cash=100
+    metadata to identify commodities that should be treated as cash equivalents rather
+    than bonds in allocation. This allows precise categorization of hybrid securities
+    for accurate asset class reporting.
+  evidence: fava_investor/modules/cashdrag/libcashdrag.py:10-14(module)
+  stage: cash_drag
+  alternative_considered: Automatic detection from security type was rejected as less
+    configurable
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/cashdrag/libcashdrag.py'
+- id: BD-036
+  type: B/BA
+  content: Include operating currencies as cash by default
+  rationale: Operating currencies (like USD held in checking accounts) represent cash
+    positions that should factor into cash drag calculations. Lines 16-17 include
+    these currencies as cash by default, ensuring that idle cash balances in the portfolio's
+    native currencies are properly counted toward the cash allocation rather than
+    being overlooked.
+  evidence: fava_investor/modules/cashdrag/libcashdrag.py:16-17(module)
+  stage: cash_drag
+  alternative_considered: Excluding currencies was rejected as it would understate
+    cash drag in native-currency portfolios
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/cashdrag/libcashdrag.py'
+- id: BD-037
+  type: B/BA
+  content: Default accounts pattern '^Assets' for cash drag detection
+  rationale: The regex pattern '^Assets' at line 36 selects each accounts under the
+    Assets top-level account, which is the standard Beancount convention for asset
+    accounts. This default scope captures bank accounts, brokerage cash, and other
+    asset holdings while excluding liabilities (Liabilities) and equity (Equity).
+    Users can override this pattern for custom account structures.
+  evidence: fava_investor/modules/cashdrag/libcashdrag.py:36(module)
+  stage: cash_drag
+  alternative_considered: More restrictive patterns were rejected as too limiting
+    for typical portfolios
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/cashdrag/libcashdrag.py'
+- id: BD-038
+  type: B/BA
+  content: Default short-term and long-term tax rates of 1%
+  rationale: Lines 46-47 set 1% as the default tax rate for both short-term and long-term
+    gains. This placeholder rate allows the module to function without explicit configuration
+    while producing reasonable estimates. Users should configure actual rates based
+    on their tax brackets, but 1% ensures calculations don't fail and gives approximate
+    results for low-bracket taxpayers.
+  evidence: fava_investor/modules/minimizegains/libminimizegains.py:46-47(module)
+  stage: gains_minimizer
+  alternative_considered: Requiring explicit rates was rejected as it would prevent
+    module usage without configuration
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/minimizegains/libminimizegains.py'
+- id: BD-039
+  type: B/RC
+  content: Sort lots by estimated tax percentage ascending
+  rationale: For tax-loss harvesting, selling lots with the highest tax impact first
+    maximizes tax savings per dollar of loss. Sorting by estimated tax percentage
+    ascending at line 98 ensures lots with the smallest tax consequence are harvested
+    last, prioritizing the most tax-efficient sales. This ordering supports the module's
+    goal of minimizing taxes through strategic lot selection.
+  evidence: fava_investor/modules/minimizegains/libminimizegains.py:98(module)
+  stage: gains_minimizer
+  alternative_considered: Random or FIFO ordering was rejected as suboptimal for tax
+    minimization
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/minimizegains/libminimizegains.py'
+- id: BD-040
+  type: B/RC
+  content: 'Add cumulative columns: cu_proceeds, cu_taxes, tax_avg, tax_marg'
+  rationale: Lines 101-103 add cumulative columns to help users understand the tax
+    impact of selling multiple lots in sequence. cu_proceeds and cu_taxes track running
+    totals, while tax_avg and tax_marg show average and marginal rates. These columns
+    help users decide how many lots to sell before hitting higher tax brackets.
+  evidence: fava_investor/modules/minimizegains/libminimizegains.py:101-103(module)
+  stage: gains_minimizer
+  alternative_considered: Cumulative tracking was deemed essential for understanding
+    bracket progression
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/minimizegains/libminimizegains.py'
+- id: BD-041
+  type: B/BA
+  content: Estimate tax = gain × tax_rate for each lot
+  rationale: Line 92 calculates estimated tax as gain multiplied by tax_rate using
+    Decimal arithmetic for precision. This simplified formula approximates tax liability
+    without复杂的 tax law details like carryforwards, AMT, or net investment income tax.
+    The approximation is sufficient for lot selection decisions while remaining computationally
+    simple.
+  evidence: fava_investor/modules/minimizegains/libminimizegains.py:92(module)
+  stage: gains_minimizer
+  alternative_considered: Full tax law modeling was rejected as too complex for this
+    module's scope
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/minimizegains/libminimizegains.py'
+- id: BD-042
+  type: B/RC
+  content: Separate 'a__equivalents' and 'a__substidenticals' metadata fields
+  rationale: 'Lines 21-22 define separate metadata fields for ''equivalents'' (securities
+    that can substitute for each other in allocation) versus ''substidenticals'' (securities
+    that trigger wash sale rules). While similar, the legal distinction matters: equivalents
+    allow allocation grouping while substidenticals affect tax loss harvesting calculations.
+    Separate fields prevent misuse of the wrong relationship type.'
+  evidence: fava_investor/util/relatetickers.py:21-22(module)
+  stage: ticker_relationships
+  alternative_considered: Single combined field was rejected due to different semantic
+    meanings
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/util/relatetickers.py'
+- id: BD-043
+  type: B/RC
+  content: Tickers with 'archive' metadata are excluded from TLH calculations
+  rationale: Lines 18 and 205 check for 'archive' metadata and exclude those tickers
+    from TLH calculations. Archived securities may be delisted, merged, or otherwise
+    no longer relevant for active tax management. Excluding them prevents errors from
+    missing price data and focuses TLH recommendations on currently tradeable positions.
+  evidence: fava_investor/util/relatetickers.py:18,205(module)
+  stage: ticker_relationships
+  alternative_considered: Including archived tickers was rejected due to price data
+    reliability concerns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/util/relatetickers.py'
+- id: BD-044
+  type: B/BA
+  content: 'TLH partners are made transitive: if A→B, then B→A inferred'
+  rationale: Lines 170-186 implement transitive closure for TLH partner relationships,
+    automatically inferring that if ticker A is a partner of B, then B is also a partner
+    of A. Users shouldn't need to declare both directions. This inference simplifies
+    metadata requirements while ensuring wash sale detection works symmetrically in
+    both directions.
+  evidence: fava_investor/util/relatetickers.py:170-186(module)
+  stage: ticker_relationships
+  alternative_considered: Requiring explicit bidirectional declarations was rejected
+    as tedious and error-prone
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/util/relatetickers.py'
+- id: BD-045
+  type: B
+  content: Option to filter TLH partners by fund type (ETF vs MUTUALFUND)
+  rationale: Lines 207-213 allow filtering TLH partners by Beancount fund type (ETF
+    versus MUTUALFUND). Some users may prefer ETF-to-ETF or mutual fund-to-mutual
+    fund replacements for simpler tracking. This filter allows targeting partner recommendations
+    to compatible fund types when explicitly desired.
+  evidence: fava_investor/util/relatetickers.py:207-213(module)
+  stage: ticker_relationships
+  alternative_considered: No type filtering was rejected as users may prefer same-type
+    replacements
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/util/relatetickers.py'
+- id: BD-046
+  type: B/DK
+  content: Representative ticker chosen from preferred set (idents_preferred)
+  rationale: Lines 71-91 implement selection logic for choosing a representative ticker
+    from a preferred set when multiple identifiers exist for the same security. This
+    ensures consistent display and reporting by selecting a canonical ticker (like
+    'VTI' instead of 'VANGUARD TOTAL STOCK MARKET ETF') based on user-defined preferences.
+  evidence: fava_investor/util/relatetickers.py:71-91(module)
+  stage: ticker_relationships
+  alternative_considered: First-found selection was rejected as potentially non-intuitive
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/util/relatetickers.py'
+- id: BD-047
+  type: B/DK
+  content: Use last 10 days of price data for MF/ETF ratio calculation
+  rationale: Lines 120-124 use a 10-day window to calculate the ratio between mutual
+    fund and equivalent ETF prices. This period balances noise reduction (longer window)
+    against responsiveness to price drift (shorter window). The 10-day choice provides
+    reasonable stability for estimating what a mutual fund's net asset value would
+    be based on ETF pricing.
+  evidence: fava_investor/util/experimental/scaled_navs.py:120-124(module)
+  stage: Scaled NAV
+  alternative_considered: 5-day window was considered but rejected for insufficient
+    smoothing; 30-day rejected for excessive lag
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/util/experimental/scaled_navs.py'
+- id: BD-048
+  type: B/BA
+  content: Use median ratio instead of mean to avoid extreme values
+  rationale: Line 126 uses median instead of mean to aggregate the 10-day price ratios.
+    The median is robust to outliers and extreme values, which can occur due to pricing
+    delays, dividend distributions, or market microstructure effects. Using median
+    ensures the estimated ratio reflects typical conditions rather than being skewed
+    by anomalous days.
+  evidence: fava_investor/util/experimental/scaled_navs.py:126(module)
+  stage: Scaled NAV
+  alternative_considered: Mean was rejected due to sensitivity to extreme values;
+    mode rejected as too noisy
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/util/experimental/scaled_navs.py'
+- id: BD-049
+  type: B
+  content: Warn but don't fail when ETF prices unavailable for MF estimation
+  rationale: Lines 132-134 log a warning but continue execution when ETF prices are
+    unavailable for mutual fund NAV estimation. Failing completely would prevent the
+    module from operating in edge cases with sparse price data. The warning alerts
+    users to potential accuracy issues while still providing available functionality.
+  evidence: fava_investor/util/experimental/scaled_navs.py:132-134(module)
+  stage: Scaled NAV
+  alternative_considered: Strict failure was rejected as too disruptive; silent continuation
+    was rejected as too opaque
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/util/experimental/scaled_navs.py'
+- id: BD-050
+  type: B/BA
+  content: CLI mode returns end_date=None (no date filtering)
+  rationale: Line 22 sets end_date=None when running in CLI mode, disabling date filtering.
+    CLI users typically want complete historical data rather than time-bounded reports.
+    This default ensures CLI output contains each available data, matching typical
+    command-line tool behavior of comprehensive output.
+  evidence: fava_investor/common/beancountinvestorapi.py:22(module)
+  stage: API Design
+  alternative_considered: Requiring explicit dates was rejected as inconvenient for
+    CLI usage patterns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/common/beancountinvestorapi.py'
+- id: BD-051
+  type: B
+  content: Config extracted from fava-extension custom directives in beancount file
+  rationale: Lines 79-92 parse configuration from fava-extension custom directives
+    embedded in the Beancount file. This approach keeps configuration alongside the
+    financial data in version control, ensuring consistent settings across machines
+    and environments. It avoids separate config files that could drift from the ledger.
+  evidence: fava_investor/common/beancountinvestorapi.py:79-92(module)
+  stage: API Design
+  alternative_considered: External config files were rejected as harder to synchronize
+    with ledger changes
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/common/beancountinvestorapi.py'
+- id: BD-052
+  type: B/DK
+  content: Version-specific query_func for Fava 1.22+ vs 1.30+ compatibility
+  rationale: Lines 42-54 implement version-specific query function selection to support
+    both Fava 1.22+ and 1.30+ API changes. The Fava API changed how queries are executed
+    between versions. This conditional logic ensures the module works with multiple
+    Fava versions rather than requiring users to upgrade or downgrade.
+  evidence: fava_investor/common/favainvestorapi.py:42-54(module)
+  stage: API Design
+  alternative_considered: Supporting only newer version was rejected as it would break
+    existing installations
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/common/favainvestorapi.py'
+- id: BD-053
+  type: B/DK
+  content: val() function returns 0 for empty Inventory, None for other cases
+  rationale: Lines 37-44 define val() to return 0 for empty Inventory objects and
+    None for other error cases. Empty Inventory (no positions) should naturally evaluate
+    to zero for arithmetic operations. Returning None for other cases signals errors
+    without silently propagating invalid values downstream.
+  evidence: fava_investor/common/libinvestor.py:37-44(module)
+  stage: Common Library
+  alternative_considered: Raising exceptions was rejected as too disruptive; returning
+    0 universally was rejected as silent failure
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/common/libinvestor.py'
+- id: BD-054
+  type: B
+  content: Decimal type used for each financial calculations
+  rationale: Line 4 mandates Decimal type for each financial calculations to avoid
+    floating-point rounding errors inherent in binary float representation. Financial
+    calculations require exact decimal arithmetic (e.g., 0.1 + 0.2 = 0.3 in Decimal,
+    not 0.30000000000000004 in float). This design ensures monetary precision throughout
+    the codebase.
+  evidence: fava_investor/common/libinvestor.py:4(module)
+  stage: Common Library
+  alternative_considered: Float was rejected due to well-known precision issues with
+    monetary calculations
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/common/libinvestor.py'
+- id: BD-055
+  type: B
+  content: Table footer sums Inventory columns via reduce with currency conversion
+  rationale: Lines 96-98 aggregate table footer values using reduce with currency
+    conversion, ensuring multi-currency inventories are properly totaled. This handles
+    the complexity of summing positions across different currencies by converting
+    to a common base currency during aggregation, providing accurate totals in consolidated
+    reports.
+  evidence: fava_investor/common/libinvestor.py:96-98(module)
+  stage: Common Library
+  alternative_considered: Simple sum was rejected as insufficient for multi-currency
+    portfolios
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/common/libinvestor.py'
+- id: BD-056
+  type: B
+  content: Commodity_leaf accounts only included if parent account has no Open directive
+  rationale: Lines 47-56 implement a rule that commodity_leaf accounts are only included
+    if their parent account lacks an Open directive. This prevents double-counting
+    when both parent and leaf accounts have balances. The rule ensures that accounts
+    with explicit Open directives are treated as boundaries, with balances aggregated
+    at the parent level only.
+  evidence: fava_investor/modules/summarizer/libsummarizer.py:47-56(module)
+  stage: summarizer
+  alternative_considered: Including both levels was rejected due to double-counting
+    risk
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/summarizer/libsummarizer.py'
+- id: BD-057
+  type: B/RC
+  content: Option to filter summarizer to active commodities only (has positions)
+  rationale: Lines 105-107 add an option to filter summarizer output to only commodities
+    with positions, excluding dormant securities. This reduces noise in reports by
+    hiding securities that exist in the ledger but hold no current value. Users can
+    toggle this behavior based on whether they want complete historical tracking or
+    focused active-position views.
+  evidence: fava_investor/modules/summarizer/libsummarizer.py:105-107(module)
+  stage: summarizer
+  alternative_considered: Active-only as default was rejected as some users prefer
+    complete historical views
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/summarizer/libsummarizer.py'
+- id: BD-058
+  type: B
+  content: Empty string used for missing column values in summarizer
+  rationale: Lines 82-85 use empty strings for missing column values in summarizer
+    output. This avoids 'None' or 'null' appearing in reports while clearly indicating
+    absence of data. Empty string is display-friendly and doesn't disrupt column alignment
+    in text-based table output.
+  evidence: fava_investor/modules/summarizer/libsummarizer.py:82-85(module)
+  stage: summarizer
+  alternative_considered: NA or null was rejected as less clean for text output; error
+    values rejected as misleading
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/summarizer/libsummarizer.py'
+- id: BD-059
+  type: B
+  content: Yahoo info cache stored as pickle file in BEAN_ROOT directory
+  rationale: Lines 14-18 store Yahoo Finance ticker info cache as a pickle file in
+    the BEAN_ROOT directory. This co-locates the cache with the financial data, making
+    it available on the same filesystem. Pickle format preserves Python objects efficiently,
+    reducing deserialization overhead compared to JSON while maintaining reasonable
+    portability.
+  evidence: fava_investor/util/cachedtickerinfo.py:14-18(module)
+  stage: ticker_relationships
+  alternative_considered: Memory-only cache was rejected due to persistence requirements;
+    database rejected as overkill
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/util/cachedtickerinfo.py'
+- id: BD-060
+  type: B/BA
+  content: Expense ratio converted from decimal to percentage (×100) on cache write
+  rationale: Lines 34-37 multiply expense ratios by 100 when writing to cache, converting
+    from decimal (0.0020) to percentage (0.20%) representation. This matches typical
+    financial industry conventions where expense ratios are quoted as percentages.
+    Storage in percentage form avoids display-time conversions and matches how users
+    expect to see the data.
+  evidence: fava_investor/util/cachedtickerinfo.py:34-37(module)
+  stage: ticker_relationships
+  alternative_considered: Storing as decimal was rejected as unintuitive for user
+    display
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/util/cachedtickerinfo.py'
+- id: BD-061
+  type: B/DK
+  content: Remove '-' ISIN values from cached ticker info
+  rationale: Lines 32-33 filter out '-' placeholder values from cached ISIN fields.
+    Yahoo Finance sometimes returns '-' for missing ISIN data rather than empty or
+    null. Removing these placeholders prevents downstream processing from treating
+    '-' as a valid security identifier.
+  evidence: fava_investor/util/cachedtickerinfo.py:32-33(module)
+  stage: ticker_relationships
+  alternative_considered: Keeping '-' was rejected as it would cause downstream identifier
+    validation failures
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/util/cachedtickerinfo.py'
+- id: BD-062
+  type: B
+  content: Account allocation uses optional include_children flag for balance rollup
+  rationale: Lines 25 and 71 implement an include_children flag controlling whether
+    child account balances roll up into parent totals. When True, parent accounts
+    show combined balances including children. When False, only the direct parent
+    balance is shown. This flexibility accommodates different reporting preferences
+    for hierarchical account structures.
+  evidence: fava_investor/modules/assetalloc_account/libaaacc.py:25,71(module)
+  stage: asset_allocation_class
+  alternative_considered: Mandatory rollup was rejected as inflexible; mandatory no-rollup
+    rejected as limiting
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/assetalloc_account/libaaacc.py'
+- id: BD-063
+  type: B
+  content: Dynamic dispatch to pattern_type function (by_account_name, by_account_open_metadata)
+  rationale: Line 13 implements dynamic dispatch to different pattern_type functions
+    based on configuration, supporting strategies like by_account_name and by_account_open_metadata.
+    This strategy pattern allows flexible account classification without hardcoding
+    logic. New strategies can be added without modifying the core allocation algorithm.
+  evidence: fava_investor/modules/assetalloc_account/libaaacc.py:13(module)
+  stage: asset_allocation_class
+  alternative_considered: Hardcoded strategies were rejected as less flexible for
+    custom account structures
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/assetalloc_account/libaaacc.py'
+- id: BD-064
+  type: B/DK
+  content: 10-period sliding window for ratio history in MF-to-ETF price conversion
+  rationale: We limit the ratio history to the most recent 10 data points to balance
+    responsiveness to recent market conditions against noise from stale data. This
+    boundary prevents dilution of current pricing signals while still providing sufficient
+    sample size for reliable median estimation. A larger window would slow adaptation;
+    a smaller window would increase volatility sensitivity.
+  evidence: fava_investor/util/experimental/scaled_navs.py:124(module)
+  stage: scaled_navs
+  alternative_considered: Larger windows (20, 30 periods) considered but rejected
+    due to slower adaptation; smaller windows (5 periods) rejected due to high variance
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/util/experimental/scaled_navs.py'
+- id: BD-065
+  type: B/BA
+  content: 1% loss threshold for tax loss harvesting eligibility
+  rationale: We require positions to be at least 1% below their purchase price before
+    harvesting, preventing excessive trading activity driven by minor price fluctuations.
+    This threshold balances the tax benefit opportunity against transaction costs
+    and the risk of missing a market recovery. Positions with smaller losses have
+    insufficient after-cost benefit to warrant the complexity of a wash sale analysis.
+  evidence: fava_investor/modules/tlh/libtlh.py:96(module)
+  stage: libtlh
+  alternative_considered: Lower thresholds (0.5%) considered but rejected due to excessive
+    trading; higher thresholds (2-3%) rejected due to missing harvestable opportunities
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/tlh/libtlh.py'
+- id: BD-066
+  type: B/RC
+  content: 30-day wash sale detection lookback period per IRC Section 1091
+  rationale: We enforce a 30-calendar-day window before and after a sale to detect
+    wash sales under IRS regulations. This hard boundary ensures compliance with IRC
+    Section 1091, which disallows loss recognition when substantially identical securities
+    are purchased within 61 total days surrounding the sale. The precise 30-day lookback
+    (rather than rounded to business days) aligns with IRS interpretation of calendar
+    days.
+  evidence: fava_investor/modules/tlh/libtlh.py:209(module)
+  stage: libtlh
+  alternative_considered: 31-day window considered to account for edge cases; rejected
+    to maintain exact regulatory alignment
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/tlh/libtlh.py'
+- id: BD-067
+  type: B/BA
+  content: 'Capital gain term classification: long-term requires >1 year holding period'
+  rationale: We classify positions as long-term capital gains only when held more
+    than one year plus one day, based on standard IRS holding period rules. A position
+    held exactly 1 year (365 days) remains short-term. The boundary uses precise date
+    arithmetic including months and days to ensure correct classification. Long-term
+    rates (0-20%) are significantly more favorable than short-term rates (up to 37%),
+    so classification accuracy directly impacts tax liability.
+  evidence: fava_investor/modules/tlh/libtlh.py:40(module)
+  stage: libtlh
+  alternative_considered: Alternative boundary at exactly 365 days rejected as it
+    would misclassify some long-term positions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/tlh/libtlh.py'
+- id: BD-068
+  type: BA/DK
+  content: Operating currency assumed to be first element of array [0]
+  rationale: The system assumes the first currency in the operating_currencies array
+    is the primary currency for each portfolio calculations. This is a convention-based
+    design where currency ordering carries semantic meaning. If the array is empty
+    or reordered, each downstream currency-dependent computations will produce incorrect
+    results without validation.
+  evidence: fava_investor/common/favainvestorapi.py:58(get_operating_currencies)
+  stage: invariant
+  alternative_considered: Named currency fields or explicit primary_currency attribute
+- id: BD-069
+  type: B/DK
+  content: 'TLH workflow requires specific call order: find_harvestable_lots → harvestable_by_commodity
+    → summarize_tlh, then recently_sold_at_loss separately'
+  rationale: Tax-loss harvesting depends on accurate identification of wash sale windows
+    and harvestable lots. The call order ensures that lot data is properly accumulated
+    before wash sale checks are applied. Skipping or reordering steps would cause
+    wash sale violations to be missed or gains to be incorrectly calculated because
+    the recently_sold_at_loss state must be queried independently to avoid circular
+    dependency.
+  evidence: fava_investor/modules/tlh/libtlh.py:15-23(get_tables)
+  stage: ordering_contract
+  alternative_considered: Encapsulate workflow in single orchestrator function with
+    internal state
+- id: BD-070
+  type: B/DK
+  content: Hardcoded 30-day wash sale lookback window and 31-day earliest sale date
+  rationale: US tax law specifies a 61-day window (30 days before and 30 days after)
+    for wash sale detection. The implementation uses 30-day lookback and 31-day forward
+    (totaling 61 days including sale day) to strictly comply with IRS wash sale rules.
+    These boundaries are regulatory requirements and changing them would result in
+    non-compliance with tax code Section 1091.
+  evidence: libtlh.py:209(30_days), libtlh.py:204(DATE_ADD_31), libtlh.py:235(-30_days)
+  stage: default_value
+  alternative_considered: Configurable parameters with validation against tax jurisdiction
+    rules
+  _evidence_issues:
+  - 'NOT_FOUND: libtlh.py'
+- id: BD-071
+  type: M/BA
+  content: Loss threshold default is 1 (dollar) - may miss smaller losses
+  rationale: A threshold of $1 means any loss of exactly $1.00 or more triggers tax-loss
+    harvesting analysis. Losses below this threshold are ignored to reduce computational
+    overhead and avoid microscopic wash sale complications. This is a performance/efficiency
+    tradeoff where small loss harvesting provides minimal tax benefit relative to
+    processing cost.
+  evidence: libtlh.py:96(loss_threshold default=1)
+  stage: default_value
+  alternative_considered: Configurable threshold with user risk tolerance input
+  _evidence_issues:
+  - 'NOT_FOUND: libtlh.py'
+- id: BD-072
+  type: BA
+  content: 'Dual-API strategy pattern: FavaInvestorAPI uses g.context, AccAPI loads
+    file directly'
+  rationale: Two distinct data access patterns support different use cases. FavaInvestorAPI
+    leverages the global context for integration with Fava web interface, while AccAPI
+    provides standalone file-based operation for batch processing. This pattern allows
+    the same business logic to work in both interactive and automated contexts without
+    conditional branching in core calculations.
+  evidence: fava_investor/common/favainvestorapi.py:14-75(beancountinvestorapi)
+  stage: pattern_choice
+  alternative_considered: Single adapter pattern with runtime configuration for data
+    source
+  _evidence_issues:
+  - 'FN_NOT_FOUND: beancountinvestorapi in fava_investor/common/favainvestorapi.py'
+- id: BD-073
+  type: BA/DK
+  content: Account sortkey pattern '^[01]' enforces Assets/Liabilities as first digit
+  rationale: Account numbering convention uses leading digit to categorize account
+    types (0=Assets, 1=Liabilities, 2=Income, 3=Expenses, etc.). This enables reliable
+    sorting and filtering of account types without parsing account names. The pattern
+    is inherited from double-entry bookkeeping conventions and ensures consistent
+    account hierarchy representation across each reports.
+  evidence: fava_investor/modules/tlh/libtlh.py:82(libtlh)
+  stage: invariant
+  alternative_considered: Explicit account type metadata fields instead of position-based
+    convention
+  _evidence_issues:
+  - 'FN_NOT_FOUND: libtlh in fava_investor/modules/tlh/libtlh.py'
+- id: BD-074
+  type: M
+  content: Asset allocation metadata MUST sum to 100%, unknown bucket auto-created
+    if not
+  rationale: Portfolio asset allocation must account for 100% of investable assets
+    to maintain accuracy in target vs actual comparisons. When metadata does not sum
+    to 100%, an 'unknown' bucket is automatically created to preserve accounting integrity.
+    This prevents misleading allocation percentages and alerts users to incomplete
+    metadata without blocking calculations.
+  evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:121-130(module)
+  stage: invariant
+  alternative_considered: Require explicit 100% sum validation before saving metadata
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/assetalloc_class/libassetalloc.py'
+- id: BD-075
+  type: B/BA
+  content: ScaledNAV initialization contract requires load_file() call during object
+    construction
+  rationale: ScaledNAV objects must have RelateTickers data loaded before they can
+    calculate scaled net asset values. The initialization contract enforces that load_file()
+    is called in __init__, ensuring each scaled NAV calculations have the required
+    ticker relationship data. Violating this contract by constructing without initialization
+    leads to AttributeError or incorrect calculations.
+  evidence: scaled_navs.py:51-71(ScaledNAV.__init__), relatetickers.py:26-33(load_file)
+  stage: inheritance
+  alternative_considered: Factory pattern with explicit initialization step before
+    use
+  _evidence_issues:
+  - 'NOT_FOUND: scaled_navs.py'
+- id: BD-076
+  type: BA
+  content: ScaledNAV extends RelateTickers for inheritance-based ticker relationship
+    access
+  rationale: Class inheritance is used to grant ScaledNAV direct access to RelateTickers
+    methods and cached data structures. This avoids composition overhead and duplicate
+    caching while keeping the API surface consistent. However, inheritance creates
+    tight coupling; changes to RelateTickers directly impact ScaledNAV behavior without
+    interface boundaries.
+  evidence: scaled_navs.py:51-71(ScaledNAV.__init__), relatetickers.py:26-33(load_file)
+  stage: inheritance
+  alternative_considered: Composition pattern with RelateTickers instance as member
+    variable
+  _evidence_issues:
+  - 'NOT_FOUND: scaled_navs.py'
+- id: BD-077
+  type: DK
+  content: 'TLH partner inference rule: if A→(B,C) then B→(A,C) and C→(A,B) - applied
+    once, no convergence'
+  rationale: When identifying substantially identical securities for tax-loss harvesting,
+    the system infers reciprocal relationships based on observed ticker groupings.
+    If securities B and C are TLH partners of A, then B and C are also TLH partners
+    of each other. This single-pass inference avoids infinite loops in complex multi-way
+    relationships but may not discover each implied partnerships that require multiple
+    inference steps.
+  evidence: relatetickers.py:170-189(compute_tlh_groups step 3)
+  stage: pattern_choice
+  alternative_considered: Iterative convergence algorithm until fixed point reached
+  _evidence_issues:
+  - 'NOT_FOUND: relatetickers.py'
+- id: BD-078
+  type: BA
+  content: RelateTickers precomputes equivalents/identicals at __init__, cannot be
+    updated
+  rationale: Ticker relationship data (equivalent and identical securities) is computed
+    once during object initialization and stored in immutable caches. This design
+    prioritizes read performance for frequent lookups during portfolio analysis. The
+    tradeoff is that if ticker relationships change (due to corporate actions, new
+    data, or corrections), the RelateTickers object must be reconstructed entirely
+    to pick up changes.
+  evidence: fava_investor/util/relatetickers.py:48(substidenticals)
+  stage: invariant
+  alternative_considered: Lazy computation with cache invalidation on external data
+    change
+- id: BD-079
+  type: B/BA
+  content: 'Gain term uses relativedelta: ''long'' only if >1 year AND 1+ month/day
+    past anniversary'
+  rationale: Long-term capital gains require holding period exceeding 1 year plus
+    at least one day beyond the anniversary date. Using relativedelta ensures accurate
+    calendar arithmetic including leap years and variable month lengths. A simple
+    365-day threshold would incorrectly classify gains near year boundaries. This
+    precise calculation ensures tax rate accuracy and compliance with holding period
+    requirements.
+  evidence: libtlh.py:37-42(gain_term)
+  stage: default_value
+  alternative_considered: 365-day threshold approximation for simpler but less accurate
+    calculation
+  _evidence_issues:
+  - 'NOT_FOUND: libtlh.py'
+- id: BD-080
+  type: M/DK
+  content: 'Tree node path encoding: underscore-separated hierarchy (equity_domestic
+    → equity → Total)'
+  rationale: Asset allocation hierarchy uses underscore-separated path segments to
+    encode tree structure as flat strings. This allows standard string sorting to
+    traverse the hierarchy and enables simple parent-child derivation from path prefixes.
+    The tradeoff is that underscore becomes a reserved character in category names,
+    and deeply nested hierarchies can produce unwieldy strings.
+  evidence: fava_investor/modules/assetalloc_class/libassetalloc.py:59-84(treeify)
+  stage: pattern_choice
+  alternative_considered: Explicit parent_id references or nested dictionary structure
+- id: BD-081
+  type: BA/DK
+  content: a__ metadata prefix convention enforced across each commodity attributes
+  rationale: Every custom commodity metadata attributes must be prefixed with 'a__'
+    to namespace user-defined fields separately from standard Beancount attributes.
+    This prevents naming collisions and makes it trivial to identify which attributes
+    are custom extensions. The convention is enforced by the system for each commodity
+    metadata access but relies on developer discipline for direct database access.
+  evidence: fava_investor/util/relatetickers.py:21-22(ticker_util)
+  stage: invariant
+  alternative_considered: Separate metadata table with explicit schema registration
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ticker_util in fava_investor/util/relatetickers.py'
+- id: BD-082
+  type: B/BA
+  content: Tax rates default to 1% for both short-term and long-term
+  rationale: Default tax rates of 1% serve as placeholders until user-specified rates
+    are provided. Realistic US rates would be 10-37% for short-term and 0-20% for
+    long-term depending on income bracket. The 1% default is intentionally unrealistic
+    to prevent accidental use of defaults in production while allowing the system
+    to function without explicit configuration. Using realistic defaults could lead
+    to significant miscalculation if users forget to configure.
+  evidence: libminimizegains.py:46-47(st_tax_rate=1, lt_tax_rate=1)
+  stage: default_value
+  alternative_considered: Prompt user for tax rates on first use or require explicit
+    zero-rate confirmation
+  _evidence_issues:
+  - 'NOT_FOUND: libminimizegains.py'
+- id: BD-083
+  type: B/RC
+  content: Substantially identical tickers must be queried before wash sale check
+    in same loop
+  rationale: Wash sale detection requires knowing each substantially identical securities
+    held before evaluating whether a loss can be harvested. By querying identical
+    tickers first within the same iteration, the system ensures wash sale state is
+    complete before applying the loss disallowance rule. Separating these steps or
+    reversing order would cause race conditions where some identical holdings are
+    missed, potentially creating incorrect wash sale adjustments.
+  evidence: fava_investor/modules/tlh/libtlh.py:118-142(module)
+  stage: ordering_contract
+  alternative_considered: Two-phase commit with explicit state snapshot between steps
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fava_investor/modules/tlh/libtlh.py'
+- id: BD-084
+  type: B/BA
+  content: 'INTERACTION: [BD-068] × [BD-007] × [BD-029] → Silent failure on empty
+    or single-element operating_currencies'
+  rationale: 'BD-068 assumes operating_currencies[0] exists as the base currency,
+    which BD-007 and BD-029 use for each conversions. If operating_currencies is empty
+    or contains only one currency not matching portfolio holdings, asset allocation
+    and cash drag calculations silently produce incorrect results. This hidden dependency
+    creates a silent failure mode where users receive plausible but wrong allocation
+    percentages without any warning. The problem manifests when: (1) user misorders
+    currencies in beancount file, (2) single-currency portfolio has no operating_currencies
+    directive, or (3) primary trading currency differs from operating_currencies[0].'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Explicit primary_currency metadata field with validation;
+    warn+fallback on single-currency portfolios
+- id: BD-085
+  type: BA
+  content: 'INTERACTION: [BD-076] × [BD-075] × [BD-078] → NAV estimation staleness
+    cascade on ticker relationship changes'
+  rationale: BD-076 uses inheritance to grant ScaledNAV direct access to RelateTickers
+    cached data, BD-075 enforces load_file() during construction, and BD-078 precomputes
+    equivalents/identicals once as immutable caches. When a user updates a__substidenticals
+    metadata in their beancount file (e.g., after discovering a new substantially
+    identical fund), the ScaledNAV instance retains stale ticker relationships until
+    explicitly reconstructed. This causes NAV estimation to use outdated wash sale
+    grouping, leading to incorrect scaled NAV calculations that silently propagate
+    until the user rebuilds the object. The inheritance pattern (BD-076) means ScaledNAV
+    has no interface boundary to detect staleness.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Composition pattern with cache invalidation callback; explicit
+    reload() method
+- id: BD-086
+  type: B/BA
+  content: 'INTERACTION: [BD-065] × [BD-071] × [BD-021] → Contradiction: 1% threshold
+    vs $1 default vs micro-loss exclusion'
+  rationale: 'BD-065 (1% loss threshold) and BD-071 ($1 minimum loss) create a contradiction
+    with BD-021 (default loss_threshold=1). BD-065''s percentage-based threshold could
+    harvest positions with sub-dollar losses in small portfolios (e.g., 1% of $50
+    = $0.50), violating BD-071''s intent to exclude micro-losses. Meanwhile, BD-021''s
+    dollar default of $1 means only losses ≥$1 qualify regardless of percentage. A
+    position with a $0.75 loss on a $75 holding would be: (a) harvested by BD-065
+    (1% threshold met), (b) excluded by BD-071 ($0.75 < $1), and (c) depends on BD-021
+    configuration. This inconsistency could cause wash sale generation for losses
+    below the intended minimum, or inconsistent behavior across portfolios of different
+    sizes. The conflict emerges most severely when portfolio values change—positions
+    that qualified for harvesting at one price level may not at another.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: 'Unified threshold: max(1%, $1 absolute); separate percentage
+    and absolute thresholds with AND logic'
+- id: BD-087
+  type: B/RC
+  content: 'INTERACTION: [BD-009] × [BD-039] × [BD-010] → Amplification: Tax rate
+    differentiation multiplies lot selection optimization'
+  rationale: 'BD-009 sorts by est_tax_percent ascending for tax-efficient lot selection,
+    BD-039 implements the same sort, and BD-010 maintains separate short-term and
+    long-term tax rates. These decisions amplify each other''s effect: BD-010''s differential
+    tax rates (10-37% ST vs 0-20% LT) create spread in est_tax_percent values, which
+    BD-009/039 then prioritize for selection. Without BD-010''s separate rates, each
+    lots would have similar effective rates and sorting would have minimal impact.
+    The amplification creates materially different outcomes—short-term losses in high
+    tax brackets get selected first, generating 37% tax savings per dollar versus
+    15% for long-term gains. A $10,000 short-term loss at 37% saves $3,700; at undifferentiated
+    10% rate, only $1,000. This multiplicative effect means BD-010 directly determines
+    the magnitude of BD-009''s optimization benefit.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Single blended rate approximation; bracket-aware marginal
+    rate selection
+- id: BD-088
+  type: BA
+  content: 'INTERACTION: [BD-006] × [BD-031] → Risk cascade: balance_children vs negative
+    balance exclusion creates understated allocations'
+  rationale: 'BD-006 requires balance_children for rolled-up totals in hierarchical
+    allocation, while BD-031 skips negative balances to focus on assets only. When
+    a parent account has both positive child balances (rolled up by BD-006) and negative
+    balances (margin loans, shorts), BD-031''s exclusion means the negative portion
+    isn''t subtracted from the aggregate, overstating total portfolio value. For example,
+    a margin loan of $10,000 under a stock position would not reduce the asset allocation
+    calculation if it''s in a separate child account. The risk cascade: (1) BD-006
+    aggregates children into parent, (2) BD-031 filters negatives, (3) asset allocation
+    percentages sum to >100% because liabilities aren''t netted, (4) rebalancing recommendations
+    suggest over-investing in asset classes. This is particularly dangerous when BD-030''s
+    unknown bucket absorbs the discrepancy rather than surfacing the error.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Net negative balances against positive within same asset
+    class; explicit liability allocation mode
+- id: BD-089
+  type: B/DK
+  content: 'INTERACTION: [BD-069] × [BD-083] → Hidden dependency: TLH workflow call
+    order required for wash sale accuracy'
+  rationale: 'BD-069 mandates specific call order (find_harvestable_lots → harvestable_by_commodity
+    → summarize_tlh, with recently_sold_at_loss separately), and BD-083 requires querying
+    substantially identical tickers before wash sale checks in the same loop iteration.
+    These create a hidden dependency: skipping steps or reordering calls causes incomplete
+    wash sale detection. Specifically, recently_sold_at_loss must be queried independently
+    to avoid circular dependency, but if called after harvesting logic rather than
+    before, the wash sale window calculation misses replacement share purchases that
+    occurred between workflow steps. The risk: automated scripts or alternative entry
+    points that bypass the documented workflow order will generate incorrect TLH recommendations,
+    potentially triggering IRS wash sale disallowance without user awareness. No runtime
+    validation exists to detect workflow violations.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Single atomic workflow function with internal state management;
+    workflow validation at entry points
+- id: BD-090
+  type: B
+  content: 'Missing gap: No as-of/reference date mechanism for time-sensitive calculations'
+  rationale: 'No ''as_of'', ''evaluation_date'', ''reference_date'', or ''snapshot_time''
+    mechanism exists in the codebase. This gap affects wash sale window calculations
+    (BD-066, BD-070), asset allocation dates, and gains minimization estimates. Without
+    an explicit as-of date, the system uses the current date at runtime, which means:
+    (1) historical analysis requires running with fake ''today'' dates, (2) report
+    reproducibility is compromised when data changes between runs, (3) audit trails
+    cannot reproduce exact calculations from a specific date. For tax calculations
+    with 30-day lookback windows, this means the same beancount file evaluated on
+    different dates produces different wash sale results without any version control
+    of the input state.'
+  evidence: N/A:0(see_rationale)
+  stage: universal
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Non-reproducible tax calculations; cannot generate point-in-time reports
+  alternative_considered: evaluation_date parameter on each report functions; snapshot
+    mode with immutable database
+- id: BD-091
+  type: B
+  content: 'Missing gap: Settlement and delivery time convention absent'
+  rationale: 'No T+N settlement date concepts exist in the codebase. US equities settle
+    T+1 (or T+2 for some), meaning cash from a sale isn''t available for reinvestment
+    until the settlement date. This affects: (1) BD-024 (earliest safe sale date)
+    which calculates from acquisition_date but doesn''t account for settlement-driven
+    reinvestment timing, (2) cash availability calculations in cash drag (BD-035,
+    BD-036, BD-037), (3) wash sale window calculations where replacement share purchase
+    timing matters. Without settlement awareness, the system may recommend selling
+    and repurchasing within a wash sale window because it doesn''t track when cash
+    actually becomes available for reinvestment.'
+  evidence: N/A:0(see_rationale)
+  stage: tax_loss_harvesting
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Wash sale recommendations that don't account for settlement timing
+  alternative_considered: T+1 settlement offset in each date calculations; configurable
+    settlement delay per security type
+- id: BD-GAP-001
+  content: 'Missing: as-of vs processing time'
+  type: DK
+  rationale: 'Audit finding: missing: as-of vs processing time. Identified by audit
+    checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: tax_loss_harvesting
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-002
+  content: 'Missing: Matrix ill-conditioning'
+  type: M
+  rationale: 'Audit finding: missing: matrix ill-conditioning. Identified by audit
+    checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: tax_loss_harvesting
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-003
+  content: 'Missing: Point-in-Time data availability'
+  type: DK
+  rationale: 'Audit finding: missing: point-in-time data availability. Identified
+    by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: tax_loss_harvesting
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-004
+  content: 'Missing: PnL conservation'
+  type: B
+  rationale: 'Audit finding: missing: pnl conservation. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: tax_loss_harvesting
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-005
+  content: 'Missing: Train/test time split'
+  type: B
+  rationale: 'Audit finding: missing: train/test time split. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: tax_loss_harvesting
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-006
+  content: 'Missing: Random seed full coverage'
+  type: DK
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit
+    checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: tax_loss_harvesting
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-007
+  content: 'Missing: Price and quantity precision'
+  type: RC
+  rationale: 'Audit finding: missing: price and quantity precision. Identified by
+    audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: tax_loss_harvesting
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-008
+  content: 'Missing: Return frequency annualization'
+  type: B
+  rationale: 'Audit finding: missing: return frequency annualization. Identified by
+    audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: tax_loss_harvesting
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-009
+  content: 'Missing: Optimization constraint completeness'
+  type: B
+  rationale: 'Audit finding: missing: optimization constraint completeness. Identified
+    by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: tax_loss_harvesting
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-010
+  content: 'Missing: Feature extraction time boundaries'
+  type: B
+  rationale: 'Audit finding: missing: feature extraction time boundaries. Identified
+    by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: tax_loss_harvesting
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+known_use_cases: []
+_enrich_meta:
+  evidence_coverage_ratio: 0.912
+  evidence_verified: 12
+  evidence_invalid: 67
+  evidence_auto_fixed: 4
+  evidence_verify_ratio: 0.14457831325301204
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - RSK
+  - DAT
+  finance_universal:
+    pass: 2
+    warn: 7
+    fail: 11
+  subdomain_totals:
+    pass: 0
+    warn: 6
+    fail: 7
+  coverage: 2/33 (6%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+resources:
+- id: res-slot-001
+  type: replaceable_component
+  name: ticker_metadata_source
+  path: null
+  description: Yahoo Finance is the default due to free access, comprehensive fund
+    metadata (expense ratios, ISIN), and good coverage of ETFs/mutual funds. Users
+    with API access needs or non-Yahoo securities should consider Alpha Vantage.
+  used_in_stages: []
+  options:
+  - name: yfinance (Yahoo Finance)
+    traits:
+    - free
+    - no_auth
+    - real_time_metadata
+    - fund_data
+    fit_for:
+    - Individual investors tracking personal portfolios with US/international securities
+    not_fit_for:
+    - Institutional use, non-Yahoo securities, guaranteed uptime requirements
+  - name: Alpha Vantage
+    traits:
+    - api_key_required
+    - fundamental_data
+    - historical_prices
+    fit_for:
+    - Professional use requiring comprehensive fundamental data
+    not_fit_for:
+    - Quick prototyping, users without API keys
+  - name: Manual CSV/SQLite database
+    traits:
+    - offline
+    - user_curated
+    - reliable
+    fit_for:
+    - Offline use, highly reliable data requirements, advanced users
+    not_fit_for:
+    - Dynamic fund data, initial population of data
+  default: yfinance (Yahoo Finance)
+  _source: worker_resource
+- id: res-slot-002
+  type: replaceable_component
+  name: accounting_ledger
+  path: null
+  description: Beancount is the only option currently implemented. This is a fundamental
+    dependency that would require a complete rewrite to replace.
+  used_in_stages: []
+  options:
+  - name: Beancount
+    traits:
+    - plain_text
+    - double_entry
+    - queryable
+    - fava_integration
+    fit_for:
+    - Plain text accounting enthusiasts, users who want Fava web UI integration
+    not_fit_for:
+    - Users preferring GUI accounting software, enterprise accounting systems
+  - name: Ledger CLI
+    traits:
+    - plain_text
+    - double_entry
+    fit_for:
+    - Users already invested in Ledger format
+    not_fit_for:
+    - Users needing Fava integration, beancount query features
+  - name: SQLite/PostgreSQL database
+    traits:
+    - relational
+    - concurrent_access
+    - reporting_tools
+    fit_for:
+    - Multi-user scenarios, complex reporting requirements
+    not_fit_for:
+    - Plain text purists, users wanting Fava integration
+  default: Beancount
+  _source: worker_resource
+- id: res-slot-003
+  type: replaceable_component
+  name: web_ui_framework
+  path: null
+  description: Fava provides native beancount integration with charts, filtering,
+    and extension support. CLI-only mode is available for users who only need command-line
+    tools (investor, ticker-util).
+  used_in_stages: []
+  options:
+  - name: Fava
+    traits:
+    - beancount_native
+    - charts
+    - extensions
+    - responsive
+    fit_for:
+    - Users wanting integrated web view of beancount data with extension support
+    not_fit_for:
+    - Users preferring command-line only, or non-beancount ledgers
+  - name: CLI-only (no web UI)
+    traits:
+    - offline
+    - scriptable
+    - no_dependencies
+    fit_for:
+    - Headless servers, scripted workflows, minimal dependencies
+    not_fit_for:
+    - Interactive exploration, visual charts
+  - name: Custom Flask/FastAPI frontend
+    traits:
+    - customizable
+    - integrated
+    fit_for:
+    - Users wanting custom web interfaces or integration with existing web apps
+    not_fit_for:
+    - Users wanting plug-and-play solution
+  default: Fava
+  _source: worker_resource
+- id: res-slot-004
+  type: replaceable_component
+  name: ticker_cache_storage
+  path: null
+  description: Pickle is the simplest option for single-user local caching. SQLite
+    provides better cross-tool compatibility. JSON offers human readability. Redis/memcached
+    suit multi-user deployments.
+  used_in_stages: []
+  options:
+  - name: Pickle file (current)
+    traits:
+    - simple
+    - fast
+    - python_native
+    fit_for:
+    - Single-user local setup, rapid prototyping
+    not_fit_for:
+    - Multi-user systems, non-Python consumers, security-sensitive environments
+  - name: SQLite database
+    traits:
+    - portable
+    - queryable
+    - cross_language
+    fit_for:
+    - Multi-user access, more complex queries, non-Python tools
+    not_fit_for:
+    - High concurrency, distributed systems
+  - name: JSON file
+    traits:
+    - human_readable
+    - version_control_friendly
+    - cross_language
+    fit_for:
+    - Users wanting human-readable cache, version control integration
+    not_fit_for:
+    - Large datasets, performance-critical scenarios
+  - name: Redis/memcached
+    traits:
+    - distributed
+    - fast
+    - multi_user
+    fit_for:
+    - Multi-user deployments, shared cache across machines
+    not_fit_for:
+    - Simple single-user setups, additional infrastructure overhead
+  default: Pickle file (~/.ticker_info.yahoo.cache)
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: Yahoo Finance
+  description: 'Security metadata and fund information. Coverage: Stocks, ETFs, mutual
+    funds, commodities with ticker symbols. Auth: None (public data)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: Beancount Ledger
+  description: 'Double-entry accounting transactions, commodity directives, account
+    metadata. Coverage: User''s complete financial history defined in beancount format.
+    Auth: File system access to beancount source files'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: Beancount Price Database
+  description: 'Historical commodity prices for currency conversion. Coverage: Prices
+    explicitly declared in beancount ledger. Auth: None (local file)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-008
+  type: external_service
+  name: Fava Web Server
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: external_service
+  name: Yahoo Finance API
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: external_service
+  name: Beancount Price Directives
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: python_package
+  name: beancount>=2.3.2
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: python_package
+  name: fava>=1.26
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: python_package
+  name: beanquery
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-014
+  type: python_package
+  name: click>=7.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-015
+  type: python_package
+  name: yfinance>=0.1.70
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: python_package
+  name: click_aliases>=1.0.1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-017
+  type: python_package
+  name: packaging>=20.3
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-018
+  type: python_package
+  name: python_dateutil>=2.8.1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-019
+  type: python_package
+  name: tabulate>=0.8.9
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-020
+  type: python_package
+  name: setuptools_scm
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
