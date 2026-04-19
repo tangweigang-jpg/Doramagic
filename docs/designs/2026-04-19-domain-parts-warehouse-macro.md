@@ -1,9 +1,9 @@
-# Doramagic 领域配件仓库 — 宏观架构讨论
+# Doramagic 领域配件仓库 — 宏观架构讨论 (v2.1)
 
 **Date**: 2026-04-19
-**Status**: Strategic Discussion / Pre-RFC
-**Author**: Session 28 主线程 Opus 4.7 (1M) + 用户驱动思考
-**Scope**: 回答三个宏观问题——框架能否融合、资源能否复用、约束能否复用——以及 Doramagic 从"项目晶体库"走向"领域配件仓库"的路径
+**Status**: Strategic Discussion / RFC (Incorporating Peer Review — GPT + Grok)
+**Author**: Session 28 主线程 Opus + 多方评审共识修正（v2.1 吸纳 Grok 独家 STRONG CHALLENGE）
+**Scope**: 回答三个宏观问题——框架能否融合、资源能否复用、约束能否复用——以及 Doramagic 从"项目晶体库"走向"领域配件仓库"的演进逻辑与修正路径
 
 ---
 
@@ -74,6 +74,18 @@
 - 两晶体的脚本、数据库、环境完全独立，互不干扰
 
 **这是 v5.3 已支持的场景**（OpenClaw 可同时装多个 skill），不需要新工具。Doramagic 的真正价值是**让这种共存不产生冲突**——每颗晶体自带 preconditions / host_adapter / namespace，host 天然隔离。
+
+### 2.5 how 层可提取的 pattern（v2.1 Grok 评审新增）
+
+v2.0 把 how 与 what 做了过严的二分，认为 how 层不可融合。Grok 指出此二分把**当前实现形态当成了本质**，忽略了行业先例：
+
+- **LLVM IR**：证明跨语言 how 层抽象可行——C/C++/Rust/Swift 的具体实现决策被规约到同一 IR 层，再 lowering 到不同 target
+- **Kubernetes CRD**：证明 how 层可以被声明式抽象而仍保留执行语义
+- **React component model**：证明组合式 how（props + children + lifecycle）可跨项目重用
+
+**对 Doramagic 的启示**：54 颗 finance 蓝图在 **time-series storage** 这一架构槽位上，很可能只存在 **~7 种稳定 pattern**（ORM / Parquet / HDF5 / Protocol Buffer / SQLite + JSON / Arrow / MessagePack）而非 54 种独立决策。LLM 2026 已具备**做 pattern mining 提取这 7 种骨架**的能力（非推导抽象本体，而是对具体决策做聚类）。
+
+**因此**：capability_ontology 不必等到 P3 "研究级" 才开始。**P2 阶段可先做 how-pattern 聚类预研**——在 finance 领域 3-5 个关键架构槽位上（time-series storage / factor computation / backtest engine / risk constraint / data source adapter）做 pattern mining，产出的 pattern 即可喂进 UC 级跨晶体路由作为**第二层路由依据**。这不推翻 §2.3 的结论（决策级直接融合仍不可行），但**把 P3 的研究性任务前压到 P2 的预研层**。
 
 ---
 
@@ -160,6 +172,7 @@ finance_domain_constraints.jsonl (~40 条 A 股/港股/美股共识)
 ```
 
 编译晶体时，final constraints = union(四层)。新蓝图只需抽取最底层（项目特有），上层自动继承。
+**冲突解决原则**：当下层与上层发生矛盾时，必须实施明确的 override（覆盖）机制和归咎记录，严禁无脑合并。
 
 ### 4.3 这是 Linux 发行版模型
 
@@ -188,14 +201,16 @@ Level 2：Domain Pool (finance / ml / web / infra)
 Level 3：Project Crystal                   (项目晶体，最具体实现)
 ```
 
-### 5.1 行动优先级
+### 5.1 行动优先级（评审修正版：先验证后抽象）
+
+原计划自下而上建设抽象池存在“需求错位”的致命风险，现调整为验证优先顺序：
 
 | 优先级 | 动作 | 依据 | 估时 | 风险 |
 |---|---|---|---|---|
-| **P0 立即可做** | 建 finance resource_pool（反扫 54 颗蓝图归档） | Q2 答案 | 1 周 | 零 |
-| **P1 下一步** | 建 finance constraints 四层继承链（分类现有 147+ 条） | Q3 答案 | 2 周 | 中 |
-| **P2 研究** | UC 级跨晶体路由 + capability_ontology 抽象 | Q1 短期答案 | 1 月 | 高 |
-| **P3 长期** | decision-level 框架融合（feature model + LLM 推导） | Q1 长期答案 | 1 季度+ | 研究级 |
+| **P0（原 P2）** | 完善 UC 级跨晶体路由与真实流量验证 | 在建池前，先收集真实流量，跑 4 周确认跨晶体组合需求。避免在无市场需求处修建基础设施。 | 1-2 周 | 低 |
+| **P1（原 P0）** | 蓝图门禁清洗与建设 finance resource_pool | 现有 54 颗蓝图存在脏数据，必须**先清洗去毒**再反扫进入共享池化层。 | 2 周 | 中 |
+| **P2（原 P1）** | 建 finance constraints 四层继承链 | 需同步确立领域约束的仲裁权与演化治理机制，防范继承腐烂。 | 3 周 | 高 |
+| **P3 长期** | 基于 Pattern Mining 的 decision-level 框架融合 | 解决 Token 成本爆炸与冲突降级问题后逐步平滑展开。 | 1 季度+ | 研究级 |
 
 ### 5.2 回应用户原始驱动
 
@@ -211,21 +226,76 @@ Level 3：Project Crystal                   (项目晶体，最具体实现)
 
 ---
 
-## 六、诚实 caveats
+## 六、领域治理与可观测性（评审新增）
 
-1. **四层池模型是业界成熟方案**（Linux distro / Maven BOM / Terraform modules 都是这个思路），不是我的发明。Doramagic 的独特点只在"LLM 可以做第 3/4 层的自动合成"，前两层仍需人工或半自动归档。
+四层池化后若失去控制，将导致系统性腐败。新增以下机制护栏：
 
-2. **Software Product Lines 的历史教训**：前期建模成本可以吞噬整个项目。Doramagic 要避免这陷阱，关键是**先从最具体层反扫归档**（Q2 的 resource_pool），而不是先设计抽象本体。
+1. **治理仲裁机制**：当 `domain_constraints` 出现冲突或需迭代时，必须设立明确的“主线程仲裁”或“领域理事会”流程，不能让 LLM 随机发牌导致劣币驱逐良币。
+2. **健康度追踪（可观测性）**：不只是一句话"监控冲突率"。**v2.1 Grok 评审补强 — 必须落到具体指标表**：
 
-3. **融合框架是最难的，短期不要追**。UC 级并列已能满足 80% 的用户"跨项目补缺口"需求。剩下 20% 需要真正的接口抽象，是研究课题。
+   | 指标 | 阈值告警 | 消费者 / 反馈回路 |
+   |---|---|---|
+   | `resource_pool.conflict_rate` | > 5% | resource_pool 维护者，触发人工裁决 |
+   | `inherited_constraints.override_ratio` | > 15% 说明上层约束过严 | 领域理事会，触发约束降级评审 |
+   | `capability_ontology.recall` | < 80% 不得入主仓 | ontology 维护者，回归 pattern mining |
+   | `capability_ontology.precision` | < 80% 不得入主仓 | 同上 |
+   | `cross_crystal_routing.user_coherence` | 用户反馈串台率 > 3% | 路由改进 backlog |
+   | `pool.hit_rate`（新蓝图引用 pool 的命中率）| < 60% 说明池抽象层失效 | pool 结构审视 |
 
-4. **P-07 暴露的 ZVT 硬编码问题是配件仓库的子问题**：build_resources 的 4 处硬编码实际就是**没有 resource_pool 的症状**。修 P-07 的正确姿势不是硬删默认，而是**让默认从 pool 派生**——资源池落地 P-07 自然消解。
+   **无指标 = 无演化闭环**。四层池上线后半年必然腐化，如果没有这层量化反馈。
+
+3. **规模成本防护**：当大型领域收纳 5000+ 条约束时，全量质量门禁的 Token 消耗将呈指数级爆炸。编译链中需增加向量截断检索或硬标签阻断过滤设计。同时**约束冲突 union 降级算法**需显式定义——当 domain-wide 与 project-specific 互斥时，规则是"下层覆盖上层 + 归咎记录"，不是"两者皆保留"。
 
 ---
 
-## 七、与现有工作的衔接
+## 七、诚实 caveats（v2.1 Grok 评审扩为显式四类失败模式）
 
-### 7.1 v5.3.1 / v5.4 路线图需要调整
+### 7.1 治理失败（Governance Failure）
+
+**症状**：`domain_constraints` 出现冲突时没有明确仲裁流程，LLM 随机发牌导致劣币驱逐良币。universal / cross-domain 由谁最终裁定缺失定义。
+
+**防护**：§6.1 治理仲裁机制必须落到**具名主线程或领域理事会**，不是"看情况而定"。每次仓库变更留 append-only 决策日志（who / when / why）。
+
+**判死条件**：半年内仓库腐化，核心约束被反复 override，回归到"54 颗独立晶体"形态。
+
+### 7.2 冷启动失败（Cold-Start Failure）
+
+**症状**：新项目第一颗晶体编译时 pool 尚未包含该项目的资源 / 约束模式，只能走"项目特有"路径。后续再把新项目的资源迁移进 pool 的重构成本高，团队选择"先不进 pool"，仓库变成**只有历史快照、无现在时的摆设**。
+
+**防护**：新晶体编译脚本默认**同时写入晶体 + 向 pool 提交候选项 PR**，由治理流程审核。不让迁移成为事后任务。
+
+**判死条件**：pool 的 `used_by` 列表停留在最初反扫的 54 颗蓝图，3 个月内无新项目加入。
+
+### 7.3 演化失败（Evolution Failure）
+
+**症状**：capability_ontology 上线后，旧晶体使用的 pattern 版本被废弃，**无平滑升级路径**。缺 versioned ontology 与 deprecation 策略，旧晶体要么失效要么被卡死在老版本。
+
+**防护**：引入 `ontology_version` + `min_supported_version` 字段。ontology 变更走**灰度**（先标 deprecated 2 个月，再移除）。旧晶体升级脚本化。
+
+**判死条件**：一次破坏性 ontology 变更让 30%+ 已部署晶体需要人工重编。
+
+### 7.4 用户感知失败（User Perception Failure）
+
+**症状**：用户装 ZVT + qlib + FinRL 后，host 菜单膨胀 3 倍，intent_router 偶尔串台（把"跑 MACD 回测"路由到 qlib 的 Alpha158 而非 ZVT 的 MACD）。用户认知负荷飙升，**更可能只装一颗最好的**——"跨项目组合"的价值不被感知。
+
+**防护**：intent_router 冲突解决需可解释（显示"为什么选这颗"），支持用户偏好锁定。UC 菜单超过阈值（如 50 条）自动折叠分层。
+
+**判死条件**：用户反馈串台率 > 3%（见 §6.2 指标表）；或多晶体安装率 < 20%（大多数用户还是单颗使用）。
+
+---
+
+### 7.5 其他警告
+
+- **四层分层模型（Linux / Terraform）的盲区**：类比需极为谨慎。Terraform 模块的跨团队复用率实质不佳（多为一次性胶水），Linux 靠的是巨大强权与维护者包网络，不要低估构建领域仓库后的重度运维和冷启动负荷。
+- **历史蓝图自带剧毒债**：当前提取的 54 颗蓝图并非纯净资产（诸如 P-07 中暴露出的深度硬编码）。**反扫前不做质量门禁清洗，仓库将变成结构化的毒药场**。
+- **融合框架短期不要追**：将重点前压至 P0 的业务侧路由验证，验证跨晶体交互存在用户真实拉动时，再铺展框架。v2.1 的 §2.5 pattern mining 是 P2 预研，**不改变 P0/P1/P2 的主顺序**。
+- **P-07 ZVT 硬编码问题是配件仓库子问题**：build_resources 的 4 处硬编码实际是**没有 resource_pool 的症状**。修 P-07 的正确姿势不是硬删默认，而是**让默认从 pool 派生**——资源池落地 P-07 自然消解。
+
+---
+
+## 八、与现有工作的衔接
+
+### 8.1 v5.3.1 / v5.4 路线图需要调整
 
 原路线图（见 Session 28 worklog §V）：
 1. compile 脚本按消费者分 build block 重构
@@ -237,13 +307,13 @@ Level 3：Project Crystal                   (项目晶体，最具体实现)
 - **v5.3.1 插入 P0**：建 `knowledge/resource_pool/finance.yaml`，修 P-07（build_resources 从 pool 派生）
 - **v5.4 插入 P1**：建约束四层继承链
 
-### 7.2 与蓝图 / 约束抽取工具链的关系
+### 8.2 与蓝图 / 约束抽取工具链的关系
 
 本文讨论的是**编译后的配件仓库**。但真正的反方向也成立：**抽取工具链也应意识到层次**——抽取约束时先问"这是 universal / cross-domain / domain-wide / project-specific 的哪一层"，避免重复抽取。
 
 这意味着 `sops/{domain}/constraint-extraction-sop.md`（如存在）需要同步更新分层规则。**延后到 P1 阶段一起做**。
 
-### 7.3 对晶体编译脚本的要求
+### 8.3 对晶体编译脚本的要求
 
 未来晶体编译脚本在 v5.4+ 应支持：
 - `--inherit-from finance_domain` 参数 → 编译时合并 domain constraints + pool resources
@@ -252,7 +322,7 @@ Level 3：Project Crystal                   (项目晶体，最具体实现)
 
 ---
 
-## 八、一句话总结
+## 九、一句话总结
 
 **Doramagic 不是"N 颗独立晶体"，而是"1 个领域配件仓库 + N 颗共享仓库的晶体"**。这不是未来愿景，是当下已经开始累积的既成事实——只是被单体项目的提取方式**掩盖**了。
 
@@ -273,3 +343,5 @@ Level 3：Project Crystal                   (项目晶体，最具体实现)
 ---
 
 *v1.0 | 2026-04-19 | Session 28 | 主线程 Opus 4.7 (1M) + 用户宏观驱动*
+*v2.0 | 2026-04-19 | GPT 评审吸纳（优先级倒置 + 治理观测章节 + caveat 升级）*
+*v2.1 | 2026-04-19 | Grok 评审吸纳（§2.5 how-pattern + §6.2 指标表 + §7 四类失败模式 + §2.3 LLM 推导置信区间 caveat）*
