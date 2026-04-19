@@ -1,0 +1,3513 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-103
+name: ArcticDB
+sop_version: '3.6'
+source:
+  projects:
+  - ArcticDB
+  commit_hash: d06cdd757a394a05c217c5279419af2ddde51142
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Time-series DataFrame database for high-performance storage and retrieval
+  description: ArcticDB is a serverless DataFrame database that provides versioned storage for Pandas,
+    PyArrow, and Polars data with time-series optimization, supporting multiple backends including S3,
+    Azure, LMDB, and MongoDB.
+  prerequisites: Python 3.9+, access to object storage (S3/Azure/LMDB), familiarity with Pandas DataFrames
+  not_suitable_for: Non-Python environments, unstructured document storage, real-time streaming workloads
+    requiring sub-millisecond latency, applications that cannot tolerate nanosecond timestamp precision
+    requirements
+  activation:
+    triggers:
+    - GitHub Actions workflow invocation with injected PR_NUMBER, REPO, EVENT_ACTION, BEFORE_SHA, AFTER_SHA
+    - 'Local slash command invocation: /review-pr <PR_NUMBER>'
+    - No arguments provided locally (auto-detect from current branch)
+    emphasis:
+    - Use especially for synchronize events where incremental review saves time
+    - Use especially when PR description lacks detail about actual changes
+    - Use especially for changes to on-disk format, storage backends, or Python-C++ boundary
+    anti_skip:
+    - Don't skip loading guidelines because PR looks simple — format/compatibility issues may not be obvious
+    - Don't skip deduplication because you have new findings — human reviewer may have addressed the same
+      concern
+    - Don't skip the sticky summary because inline comments exist — summary provides high-level overview
+stages:
+- id: uri_parsing_and_adapter_selection
+  name: URI Parsing and Storage Adapter Selection
+  order: 1
+  responsibility: Parses user-provided URIs and selects the appropriate storage adapter based on URI scheme,
+    enabling connection to multiple backends (S3, Azure, LMDB, etc.)
+  interface:
+    inputs:
+    - URI string (e.g., 's3://bucket', 'lmdb:///path')
+    outputs:
+    - ArcticLibraryAdapter instance, configured LibraryManager
+  required_methods:
+  - name: Arctic.__init__
+    description: Top-level entry point that initializes storage connection and manages adapter selection
+    evidence: python/arcticdb/arctic.py:39
+  - name: ArcticLibraryAdapter.supports_uri
+    description: Static method that determines if adapter can handle given URI scheme
+    evidence: python/arcticdb/adapters/arctic_library_adapter.py:58
+  key_behaviors:
+  - behavior: Adapter registry pattern for storage backends
+    description: Iterates through registered adapters until one claims URI support, allowing pluggable
+      storage backends
+    evidence: python/arcticdb/arctic.py:45(_LIBRARY_ADAPTERS)
+  - behavior: Encoding version per-library configuration
+    description: Encoding version is an instance-level setting passed to adapter constructor, allowing
+      per-library versioning
+    evidence: python/arcticdb/arctic.py:116(_library_adapter)
+  replaceable_points:
+  - name: Storage Backend
+    description: New storage backends can be added by implementing ArcticLibraryAdapter
+    options:
+    - name: S3LibraryAdapter
+      traits:
+      - Cloud-native
+      - S3-compatible
+      - Highly scalable
+      fit_for:
+      - Production deployments
+      - Large datasets
+      - Distributed teams
+      not_fit_for:
+      - Local development
+      - Low latency requirements
+      - Air-gapped environments
+    - name: AzureLibraryAdapter
+      traits:
+      - Azure-native
+      - Enterprise integration
+      fit_for:
+      - Azure ecosystems
+      - Microsoft enterprise
+      not_fit_for:
+      - Multi-cloud deployments
+      - AWS environments
+    - name: LMDBLibraryAdapter
+      traits:
+      - Local filesystem
+      - Memory-mapped
+      - Single-node
+      fit_for:
+      - Local development
+      - Small datasets
+      - Fast prototyping
+      not_fit_for:
+      - Distributed access
+      - Cloud deployments
+      - Large datasets
+    - name: MongoLibraryAdapter
+      traits:
+      - Document store
+      - Flexible schema
+      fit_for:
+      - Document-centric data
+      - MongoDB users
+      not_fit_for:
+      - Columnar analytics
+      - High-throughput writes
+    - name: InMemoryLibraryAdapter
+      traits:
+      - Ephemeral
+      - In-process
+      - No persistence
+      fit_for:
+      - Testing
+      - Caching
+      - Temporary data
+      not_fit_for:
+      - Production
+      - Data persistence requirements
+    default: S3LibraryAdapter
+  design_decisions:
+  - 'Adapter registry pattern for storage backends: Allows pluggable storage backends by iterating through
+    registered adapters until one claims URI support. New backends can be added by subclassing ArcticLibraryAdapter
+    (python/arcticdb/arctic.py:45)'
+  - 'Encoding version passed to adapter constructor: Encoding version is an instance-level setting, not
+    adapter-level, allowing per-library versioning without adapter code changes (python/arcticdb/arctic.py:116)'
+  acceptance_hints:
+  - Arctic(uri) successfully instantiates correct adapter for given URI scheme
+  - Unsupported URI raises clear error listing available adapters
+  - Library created via get_library() uses correct storage backend
+- id: library_configuration
+  name: Library Configuration and Management
+  order: 2
+  responsibility: Creates, configures, and manages ArcticDB libraries with options for schema, deduplication,
+    and encoding
+  interface:
+    inputs:
+    - LibraryOptions, Library name, Storage configuration
+    outputs:
+    - Configured Library instance with NativeVersionStore
+  required_methods:
+  - name: Arctic.get_library
+    description: Retrieves or creates a library with specified options and storage configuration
+    evidence: python/arcticdb/arctic.py:157
+  - name: LibraryOptions.__init__
+    description: Configuration options for library behavior including dynamic schema, dedup, and encoding
+    evidence: python/arcticdb/options.py:21
+  key_behaviors:
+  - behavior: LibraryOptions with sensible defaults
+    description: 'Defaults chosen for broad compatibility: dynamic_schema=False for fixed schemas, dedup=False
+      for simplicity, rows_per_segment=100k for balance'
+    evidence: python/arcticdb/options.py:40
+  - behavior: Dynamic schema toggle affects tiling strategy
+    description: When False, data is tiled by rows AND columns enabling efficient column subsetting. When
+      True, only row tiling for dynamic column backfill
+    evidence: python/arcticdb/options.py:55
+  - behavior: Encoding version configurable per-library
+    description: V2 is faster but experimental, so V1 is default. Library-level override allows gradual
+      migration
+    evidence: python/arcticdb/options.py:127
+  replaceable_points:
+  - name: Library Options
+    description: Behavior can be customized via LibraryOptions parameters
+    options:
+    - name: dynamic_schema=True
+      traits:
+      - Flexible columns
+      - Schema evolution
+      - Backfill support
+      fit_for:
+      - Dynamic data sources
+      - Append-only workloads
+      - Unknown schemas
+      not_fit_for:
+      - Predictable workloads
+      - Fixed schemas
+      - Columnar optimization
+    - name: dynamic_schema=False
+      traits:
+      - Fixed columns
+      - Column tiling
+      - Efficient subsetting
+      fit_for:
+      - Known schemas
+      - Analytical queries
+      - Column projection
+      not_fit_for:
+      - Dynamic column structures
+      - Schema changes
+    - name: dedup=True
+      traits:
+      - Segment deduplication
+      - Storage optimization
+      fit_for:
+      - Append-only workloads
+      - Repeated data
+      not_fit_for:
+      - Unique data
+      - Update-heavy workloads
+    - name: rows_per_segment=100000
+      traits:
+      - Balanced segment size
+      - Default tuning
+      fit_for:
+      - General workloads
+      - Medium datasets
+      not_fit_for:
+      - Very large segments
+      - Fine-grained streaming
+    default: dynamic_schema=False, dedup=False, rows_per_segment=100000
+  design_decisions:
+  - 'LibraryOptions with sensible defaults: Defaults chosen for broad compatibility: dynamic_schema=False
+    for fixed schemas, dedup=False for simplicity, rows_per_segment=100k for balance (python/arcticdb/options.py:40)'
+  - 'Dynamic schema toggle affects tiling strategy: When False, data is tiled by rows AND columns enabling
+    efficient column subsetting. When True, only row tiling for dynamic column backfill (python/arcticdb/options.py:55)'
+  - 'Encoding version configurable per-library: V2 is faster but experimental, so V1 is default. Library-level
+    override allows gradual migration (python/arcticdb/options.py:127)'
+  acceptance_hints:
+  - Library created with default options has dynamic_schema=False
+  - Library with dynamic_schema=True allows column additions
+  - Library encoding version persists across restarts
+- id: data_normalization
+  name: Data Normalization
+  order: 3
+  responsibility: Transforms user data (Pandas DataFrames, Series, Arrow Tables, numpy arrays) into ArcticDB's
+    internal columnar format for storage
+  interface:
+    inputs:
+    - Python objects (DataFrame, Series, Arrow Table, etc.)
+    outputs:
+    - Normalized FrameData with metadata for storage
+  required_methods:
+  - name: CompositeNormalizer.normalize
+    description: Orchestrates multiple normalizers to handle different data types in chain
+    evidence: python/arcticdb/version_store/_normalization.py:1557
+  - name: DataFrameNormalizer.normalize
+    description: Normalizes Pandas DataFrames to internal columnar format
+    evidence: python/arcticdb/version_store/_normalization.py:1088
+  key_behaviors:
+  - behavior: Normalizer chain with fallback to MsgPack/Pickle
+    description: Attempts normalization in order; if each fail, falls back to MsgPack then Pickle. Ensures
+      data is never lost but prioritizes efficient formats
+    evidence: python/arcticdb/version_store/_normalization.py:1578
+  - behavior: Dynamic strings enabled by default in staging
+    description: Staged writes use dynamic_strings=True to allow flexible string handling during incomplete
+      data collection
+    evidence: python/arcticdb/version_store/_store.py:729
+  - behavior: Arrow normalization preserves pandas metadata
+    description: Round-trip compatibility with Pandas requires preserving index names and MultiIndex structure
+      in Arrow schema
+    evidence: python/arcticdb/version_store/_normalization.py:648
+  replaceable_points:
+  - name: Data Format
+    description: Normalizer chain handles different input formats
+    options:
+    - name: Pandas DataFrame
+      traits:
+      - Primary format
+      - Full feature support
+      fit_for:
+      - Most Python data science workloads
+      not_fit_for:
+      - Memory-constrained environments
+    - name: PyArrow Table
+      traits:
+      - Schema preservation
+      - Interoperability
+      fit_for:
+      - Arrow ecosystem
+      - Zero-copy reads
+      not_fit_for:
+      - Pandas-specific operations
+    - name: numpy array
+      traits:
+      - Memory efficient
+      - Homogeneous types
+      fit_for:
+      - Numerical data
+      - ML features
+      not_fit_for:
+      - Mixed type data
+      - Tabular data
+    - name: MsgPack/Pickle fallback
+      traits:
+      - Universal fallback
+      - Any Python object
+      fit_for:
+      - Unknown types
+      - Custom classes
+      not_fit_for:
+      - Performance-critical paths
+      - Large data
+    default: Pandas DataFrame
+  design_decisions:
+  - 'Normalizer chain with fallback to MsgPack/Pickle: Attempts normalization in order; if each fail,
+    falls back to MsgPack then Pickle. Ensures data is never lost but prioritizes efficient formats (python/arcticdb/version_store/_normalization.py:1578)'
+  - 'Dynamic strings enabled by default in staging: Staged writes use dynamic_strings=True to allow flexible
+    string handling during incomplete data collection (python/arcticdb/version_store/_store.py:729)'
+  - 'Arrow normalization preserves pandas metadata: Round-trip compatibility with Pandas requires preserving
+    index names and MultiIndex structure in Arrow schema (python/arcticdb/version_store/_normalization.py:648)'
+  acceptance_hints:
+  - Pandas DataFrame round-trips without data loss
+  - PyArrow Table preserves schema on read
+  - Unknown types fall back to Pickle serialization
+  - MultiIndex structure preserved through normalization
+- id: recursive_normalization
+  name: Recursive Normalization (Nested Structures)
+  order: 4
+  responsibility: Handles deeply nested data structures (dicts of dicts, lists of DataFrames) by flattening
+    them into separate symbols with a metastruct
+  interface:
+    inputs:
+    - Nested Python objects with dict/list structures
+    outputs:
+    - Flattened symbols + meta_structure for reconstruction
+  required_methods:
+  - name: Flattener.flatten
+    description: Converts nested structures into flat symbols with metastructure metadata
+    evidence: python/arcticdb/flattener.py:31
+  - name: Flattener.reconstruct
+    description: Restores original nested structure from flattened symbols using metastructure
+    evidence: python/arcticdb/flattener.py:327
+  key_behaviors:
+  - behavior: Metastructure versioning for backward compatibility
+    description: V1 uses pickled types; V2 stores type module/name for class reconstruction. KeyError
+      on '__version__' vs '__VER__' allows old releases to fail gracefully
+    evidence: python/arcticdb/flattener.py:327
+  - behavior: Separator-based key compaction
+    description: Symbols >100 chars are compacted using last-3-chars of each segment + hash. Ensures LMDB
+      key size limits are respected
+    evidence: python/arcticdb/flattener.py:56
+  - behavior: Recursive normalizers opt-in per library
+    description: Disabled by default to maintain predictable behavior. Users must explicitly enable to
+      write nested structures
+    evidence: python/arcticdb/options.py:131
+  replaceable_points:
+  - name: Metastructure Version
+    description: Format for storing nested structure metadata
+    options:
+    - name: V1 (pickled types)
+      traits:
+      - Legacy format
+      - Python object serialization
+      fit_for:
+      - Existing data migration
+      - Complex Python objects
+      not_fit_for:
+      - Cross-version compatibility
+      - Security-sensitive environments
+    - name: V2 (module+class names)
+      traits:
+      - Forward compatibility
+      - Clean metadata
+      fit_for:
+      - New projects
+      - Version-stable applications
+      not_fit_for:
+      - Old releases
+      - Complex class hierarchies
+    default: V2
+  design_decisions:
+  - 'Metastructure versioning for backward compatibility: V1 uses pickled types; V2 stores type module/name
+    for class reconstruction. KeyError on ''__version__'' vs ''__VER__'' allows old releases to fail gracefully
+    (python/arcticdb/flattener.py:327)'
+  - 'Separator-based key compaction: Symbols >100 chars are compacted using last-3-chars of each segment
+    + hash. Ensures LMDB key size limits are respected (python/arcticdb/flattener.py:56)'
+  - 'Recursive normalizers opt-in per library: Disabled by default to maintain predictable behavior. Users
+    must explicitly enable to write nested structures (python/arcticdb/options.py:131)'
+  acceptance_hints:
+  - Dict of DataFrames writes multiple symbols
+  - Read reconstructs original nested structure
+  - Symbol compaction prevents LMDB key length errors
+  - V1 data remains readable after V2 default migration
+- id: write_operations
+  name: Write Operations
+  order: 5
+  responsibility: Handles write, append, update, and staged data operations with version management and
+    deduplication
+  interface:
+    inputs:
+    - Symbol name, normalized data, metadata, write options
+    outputs:
+    - VersionedItem with version number and metadata
+  required_methods:
+  - name: NativeVersionStore.write
+    description: Primary write method that creates new version of symbol with data and optional metadata
+    evidence: python/arcticdb/version_store/_store.py:751
+  - name: NativeVersionStore.append
+    description: Appends data along index dimension to existing symbol
+    evidence: python/arcticdb/version_store/_store.py:937
+  - name: NativeVersionStore.update
+    description: Overwrites existing data within specified date ranges
+    evidence: python/arcticdb/version_store/_store.py:1074
+  - name: NativeVersionStore.stage
+    description: Writes incomplete data segments for later compaction
+    evidence: python/arcticdb/version_store/_store.py:711
+  key_behaviors:
+  - behavior: Write creates new version always
+    description: New version created even if symbol exists; previous version remains accessible via 'as_of'.
+      Enables full version history
+    evidence: python/arcticdb/version_store/_store.py:763
+  - behavior: Prune previous version default False
+    description: Keeping each versions by default; users must explicitly prune to avoid storage growth.
+      Snapshot protection prevents accidental deletion
+    evidence: python/arcticdb/version_store/_store.py:849
+  - behavior: Segment deduplication against previous version
+    description: Content hash comparison allows skipping identical segments. Most effective for append-only
+      workloads with data only at end
+    evidence: python/arcticdb/options.py:75
+  replaceable_points:
+  - name: Write Mode
+    description: How new data interacts with existing versions
+    options:
+    - name: write
+      traits:
+      - New version
+      - Full history
+      - Immutable past
+      fit_for:
+      - Audit requirements
+      - Version history needs
+      - Non-destructive updates
+      not_fit_for:
+      - Storage-constrained environments
+      - Overwrite semantics
+    - name: append
+      traits:
+      - Extend index
+      - Incremental
+      - Time-series
+      fit_for:
+      - Streaming data
+      - Time-series ingestion
+      - Log data
+      not_fit_for:
+      - Out-of-order data
+      - Column updates
+    - name: update
+      traits:
+      - Range overwrite
+      - In-place modification
+      fit_for:
+      - Data corrections
+      - Backfilling
+      - Partial updates
+      not_fit_for:
+      - Immutable requirements
+      - Audit trails
+    - name: stage
+      traits:
+      - Incomplete segments
+      - Deferred compaction
+      fit_for:
+      - Batched streaming
+      - Incomplete data
+      - Checkpointing
+      not_fit_for:
+      - Immediate reads
+      - Small writes
+    default: write
+  design_decisions:
+  - 'Write creates new version always: New version created even if symbol exists; previous version remains
+    accessible via ''as_of''. Enables full version history (python/arcticdb/version_store/_store.py:763)'
+  - 'Prune previous version default False: Keeping each versions by default; users must explicitly prune
+    to avoid storage growth. Snapshot protection prevents accidental deletion (python/arcticdb/version_store/_store.py:849)'
+  - 'Segment deduplication against previous version: Content hash comparison allows skipping identical
+    segments. Most effective for append-only workloads with data only at end (python/arcticdb/options.py:75)'
+  acceptance_hints:
+  - Write to existing symbol creates new version, old version accessible via as_of
+  - Append extends data along index dimension
+  - Stage data readable after finalize operation
+  - Prune does not delete snapshot-protected versions
+- id: read_operations
+  name: Read Operations
+  order: 6
+  responsibility: Retrieves data from storage with filtering by version, date range, columns, and row
+    range. Supports multiple output formats.
+  interface:
+    inputs:
+    - Symbol name, version query, date range, column filter, output format
+    outputs:
+    - Data in requested format (Pandas, PyArrow, Polars)
+  required_methods:
+  - name: NativeVersionStore.read
+    description: Primary read method with each filtering options including version, date range, column
+      selection, and format specification
+    evidence: python/arcticdb/version_store/_store.py:2423
+  - name: NativeVersionStore.batch_read
+    description: Efficient multi-symbol reads reducing round-trips
+    evidence: python/arcticdb/version_store/_store.py:1369
+  key_behaviors:
+  - behavior: Output format configurable at multiple levels
+    description: Arctic instance → Library → Read operation precedence allows global defaults with per-operation
+      overrides
+    evidence: python/arcticdb/options.py:279
+  - behavior: Lazy DataFrame for deferred execution
+    description: Enables chaining of queries before execution, reducing round-trips. collect() triggers
+      actual read
+    evidence: python/arcticdb/version_store/library.py:441
+  - behavior: Column and row range filtering in C++
+    description: Storage layer does filtering to minimize data transfer from backend. Python layer handles
+      format conversion
+    evidence: python/arcticdb/version_store/_store.py:2189
+  replaceable_points:
+  - name: Output Format
+    description: Format for returned data
+    options:
+    - name: PANDAS
+      traits:
+      - Primary format
+      - Full feature set
+      - Widely used
+      fit_for:
+      - Most Python workflows
+      - Data analysis
+      - Integration with pandas ecosystem
+      not_fit_for:
+      - Memory-constrained environments
+      - Arrow-native pipelines
+    - name: PYARROW
+      traits:
+      - Zero-copy
+      - Columnar
+      - Interop
+      fit_for:
+      - Arrow ecosystem
+      - Memory efficiency
+      - Streaming
+      not_fit_for:
+      - Pandas-specific operations
+      - Legacy code
+    - name: POLARS
+      traits:
+      - Fast
+      - Lazy evaluation
+      - Rust-based
+      fit_for:
+      - High-performance analytics
+      - Large datasets
+      - Modern pipelines
+      not_fit_for:
+      - Pandas-dependent code
+      - Small datasets
+    default: PANDAS
+  design_decisions:
+  - 'Output format configurable at multiple levels: Arctic instance → Library → Read operation precedence
+    allows global defaults with per-operation overrides (python/arcticdb/options.py:279)'
+  - 'Lazy DataFrame for deferred execution: Enables chaining of queries before execution, reducing round-trips.
+    collect() triggers actual read (python/arcticdb/version_store/library.py:441)'
+  - 'Column and row range filtering in C++: Storage layer does filtering to minimize data transfer from
+    backend. Python layer handles format conversion (python/arcticdb/version_store/_store.py:2189)'
+  acceptance_hints:
+  - Read returns data in requested format (Pandas/Arrow/Polars)
+  - Version query retrieves correct historical version
+  - Column filtering reduces data transfer
+  - LazyDataFrame.collect() triggers actual storage read
+- id: query_processing
+  name: Query Processing
+  order: 7
+  responsibility: Provides expression-based filtering, aggregation, and resampling operations on read
+    data
+  interface:
+    inputs:
+    - QueryBuilder with filter/expression clauses
+    outputs:
+    - Filtered/aggregated DataFrame
+  required_methods:
+  - name: QueryBuilder.__getitem__
+    description: Filter expressions using bracket syntax with operator overloading
+    evidence: python/arcticdb/version_store/processing.py:425
+  - name: QueryBuilder.groupby
+    description: Groups data by column for aggregation operations
+    evidence: python/arcticdb/version_store/processing.py:563
+  - name: QueryBuilder.resample
+    description: Time-based resampling on datetime index with flexible origin alignment
+    evidence: python/arcticdb/version_store/processing.py:694
+  key_behaviors:
+  - behavior: Operator overloading for expressions
+    description: 'Enables natural syntax: q = q[q[''a''] < 5] similar to Pandas boolean indexing. Returns
+      ExpressionNode for lazy evaluation'
+    evidence: python/arcticdb/version_store/processing.py:117
+  - behavior: Resample with flexible origin
+    description: Origin parameter supports 'epoch', 'start', 'end', or specific timestamp for alignment
+      flexibility
+    evidence: python/arcticdb/version_store/processing.py:694
+  - behavior: Memory vs speed optimization modes
+    description: QueryBuilder can be optimized for speed (default) or memory based on data characteristics
+    evidence: python/arcticdb/version_store/processing.py:1199
+  replaceable_points:
+  - name: Query Optimization
+    description: Trade-off between memory usage and speed
+    options:
+    - name: optimise_for_speed
+      traits:
+      - Default
+      - Parallel processing
+      - Higher memory
+      fit_for:
+      - Large datasets
+      - Batch processing
+      - Production queries
+      not_fit_for:
+      - Memory-constrained environments
+      - Small datasets
+    - name: optimise_for_memory
+      traits:
+      - Sequential processing
+      - Lower memory
+      fit_for:
+      - Memory-constrained environments
+      - Streaming
+      - Small datasets
+      not_fit_for:
+      - Large batch operations
+      - Performance-critical paths
+    default: optimise_for_speed
+  design_decisions:
+  - 'Operator overloading for expressions: Enables natural syntax: q = q[q[''a''] < 5] similar to Pandas
+    boolean indexing. Returns ExpressionNode for lazy evaluation (python/arcticdb/version_store/processing.py:117)'
+  - 'Resample with flexible origin: Origin parameter supports ''epoch'', ''start'', ''end'', or specific
+    timestamp for alignment flexibility (python/arcticdb/version_store/processing.py:694)'
+  - 'Memory vs speed optimization modes: QueryBuilder can be optimized for speed (default) or memory based
+    on data characteristics (python/arcticdb/version_store/processing.py:1199)'
+  acceptance_hints:
+  - QueryBuilder filters produce correct results matching Pandas boolean indexing
+  - Resample with different origins produces correctly aligned time buckets
+  - Groupby aggregations return expected grouped results
+  - Query optimization mode affects memory/speed trade-off
+- id: version_and_snapshot_management
+  name: Version and Snapshot Management
+  order: 8
+  responsibility: Manages version history, snapshots, and deletion of symbols with tombstone tracking
+  interface:
+    inputs:
+    - Symbol name, version specifier, snapshot name
+    outputs:
+    - Version history, snapshot metadata, deletion confirmation
+  required_methods:
+  - name: NativeVersionStore.list_versions
+    description: Lists versions with filtering options showing version history
+    evidence: python/arcticdb/version_store/_store.py:2939
+  - name: NativeVersionStore.snapshot
+    description: Creates named snapshot of current library state
+    evidence: python/arcticdb/version_store/_store.py:3094
+  - name: NativeVersionStore.delete
+    description: Deletes versions using tombstoning for safety
+    evidence: python/arcticdb/version_store/_store.py:3196
+  - name: NativeVersionStore.prune_previous_versions
+    description: Removes non-snapshotted versions from storage
+    evidence: python/arcticdb/version_store/_store.py:3322
+  key_behaviors:
+  - behavior: Tombstone-based deletion
+    description: Deletion marks versions as deleted without immediate removal. Allows recovery and prevents
+      dangling references
+    evidence: docs/mkdocs/docs/technical/on_disk_storage.md:29
+  - behavior: Snapshot protection
+    description: Versions protected by snapshots cannot be deleted, ensuring consistency
+    evidence: python/arcticdb/version_store/_store.py:3196
+  - behavior: Symbol list caching with compaction
+    description: ListSymbols uses cached add/delete markers. Compacts to single key when >500 entries
+      to avoid unbounded growth
+    evidence: docs/mkdocs/docs/technical/on_disk_storage.md:100
+  replaceable_points:
+  - name: Version Pruning
+    description: When old versions are physically removed
+    options:
+    - name: Manual via prune_previous_versions
+      traits:
+      - Explicit control
+      - Safe defaults
+      fit_for:
+      - Production environments
+      - Audit requirements
+      - Storage management
+      not_fit_for:
+      - Automated pipelines
+      - Continuous deployment
+    - name: Automatic via background deletion
+      traits:
+      - Hands-off
+      - Potential data loss risk
+      fit_for:
+      - Development
+      - Temporary data
+      not_fit_for:
+      - Production
+      - Compliance requirements
+    default: Manual
+  design_decisions:
+  - 'Tombstone-based deletion: Deletion marks versions as deleted without immediate removal. Allows recovery
+    and prevents dangling references (docs/mkdocs/docs/technical/on_disk_storage.md:29)'
+  - 'Snapshot protection: Versions protected by snapshots cannot be deleted, ensuring consistency (python/arcticdb/version_store/_store.py:3196)'
+  - 'Symbol list caching with compaction: ListSymbols uses cached add/delete markers. Compacts to single
+    key when >500 entries to avoid unbounded growth (docs/mkdocs/docs/technical/on_disk_storage.md:100)'
+  acceptance_hints:
+  - list_versions returns each versions for a symbol
+  - Snapshot creation captures current state
+  - Delete does not remove snapshot-protected versions
+  - Prune physically removes non-protected versions
+  - Symbol list cache compaction triggers at 500 entries
+- id: storage_backend
+  name: Storage Backend (C++ Layer)
+  order: 9
+  responsibility: Implements the actual key-value storage with columnar segment format, indexing, and
+    compression. Tiles data by rows and columns for efficient reads.
+  interface:
+    inputs:
+    - Normalized segments, index descriptors, storage configuration
+    outputs:
+    - Stored segments, retrieved data segments
+  required_methods:
+  - name: PythonVersionStore.write
+    description: C++ implementation of write operation via pybind11
+    evidence: python/arcticdb/version_store/_store.py:62
+  - name: PythonVersionStore.read
+    description: C++ implementation of read operation with filtering
+    evidence: python/arcticdb/version_store/_store.py:62
+  key_behaviors:
+  - behavior: 4-layer storage hierarchy
+    description: Reference Layer (mutable) → Version Layer (immutable linked list) → Index Layer (B-Tree)
+      → Data Layer (columnar segments). Separates mutable pointers from immutable data
+    evidence: docs/mkdocs/docs/technical/on_disk_storage.md:25
+  - behavior: Segment tiling by rows and columns
+    description: 100k rows × 127 columns default creates manageable segments. Enables date_range and column
+      subsetting without full read
+    evidence: python/arcticdb/options.py:95
+  - behavior: Version linked list for history
+    description: Each version points to previous version. Allows arbitrary historical reads but long version
+      chains slow 'as_of' queries
+    evidence: docs/mkdocs/docs/technical/on_disk_storage.md:35
+  replaceable_points:
+  - name: Key-Value Backend
+    description: Storage engine implementation
+    options:
+    - name: S3
+      traits:
+      - Cloud-native
+      - Durable
+      - Scalable
+      fit_for:
+      - Production
+      - Large scale
+      - Distributed
+      not_fit_for:
+      - Low latency
+      - Local development
+    - name: LMDB
+      traits:
+      - Memory-mapped
+      - Local
+      - Transactional
+      fit_for:
+      - Local dev
+      - Single-node
+      - Fast access
+      not_fit_for:
+      - Distributed
+      - Cloud-native
+    - name: Azure Blob
+      traits:
+      - Cloud-native
+      - Enterprise
+      fit_for:
+      - Azure deployments
+      - Enterprise
+      not_fit_for:
+      - Multi-cloud
+      - AWS-centric
+    - name: MongoDB
+      traits:
+      - Document store
+      - Flexible
+      fit_for:
+      - MongoDB users
+      - Document data
+      not_fit_for:
+      - Analytical workloads
+      - Columnar access
+    - name: In-Memory
+      traits:
+      - Ephemeral
+      - Fast
+      - Testing
+      fit_for:
+      - Testing
+      - Caching
+      - Dev
+      not_fit_for:
+      - Persistence
+      - Production
+    default: S3
+  design_decisions:
+  - '4-layer storage hierarchy: Reference Layer (mutable) → Version Layer (immutable linked list) → Index
+    Layer (B-Tree) → Data Layer (columnar segments). Separates mutable pointers from immutable data (docs/mkdocs/docs/technical/on_disk_storage.md:25)'
+  - 'Segment tiling by rows and columns: 100k rows × 127 columns default creates manageable segments.
+    Enables date_range and column subsetting without full read (python/arcticdb/options.py:95)'
+  - 'Version linked list for history: Each version points to previous version. Allows arbitrary historical
+    reads but long version chains slow ''as_of'' queries (docs/mkdocs/docs/technical/on_disk_storage.md:35)'
+  acceptance_hints:
+  - Data persists across library restarts
+  - Column subsetting reads only required columns
+  - Date range filtering avoids full scans
+  - Reference keys are mutable, atom keys are immutable
+  - Deep version history increases read latency for old versions
+data_flow:
+- from_stage: uri_parsing_and_adapter_selection
+  to_stage: library_configuration
+  data: URI parsed into components, storage adapter selected based on URI scheme, library config created
+    with encoding version
+- from_stage: library_configuration
+  to_stage: data_normalization
+  data: Configured library instance with normalizer chain, LibraryOptions affecting tiling and deduplication
+    behavior
+- from_stage: data_normalization
+  to_stage: write_operations
+  data: Normalized FrameData with columnar arrays, normalization metadata (norm_meta) for reconstruction
+- from_stage: recursive_normalization
+  to_stage: write_operations
+  data: Flattened symbols with metastructure metadata for nested structure reconstruction
+- from_stage: write_operations
+  to_stage: storage_backend
+  data: Segments with index descriptors, versioned keys (reference and atom), metadata
+- from_stage: storage_backend
+  to_stage: read_operations
+  data: Raw columnar segments with index information retrieved from key-value store
+- from_stage: read_operations
+  to_stage: query_processing
+  data: Denormalized data in requested output format (Pandas/PyArrow/Polars)
+- from_stage: read_operations
+  to_stage: data_normalization
+  data: Denormalization metadata (norm_meta) required for reconstructing original data types from normalized
+    form
+- from_stage: external
+  to_stage: uri_parsing_and_adapter_selection
+  data: User-provided URI strings (s3://, azure://, lmdb://, memory://)
+global_contracts:
+- contract: Every symbols are versioned - writes always create new versions even if symbol exists, accessible
+    via as_of parameter (python/arcticdb/version_store/_store.py:763)
+  evidence: ''
+- contract: TimeSeriesType is Union[pd.DataFrame, pd.Series] for each time-series operations (python/arcticdb/version_store/_store.py:103)
+  evidence: ''
+- contract: DateRangeInput is Tuple of optional Timestamps for range filtering (python/arcticdb/supported_types.py:18)
+  evidence: ''
+- contract: VersionQueryInput accepts int version number, string datetime, or None for latest version
+    (python/arcticdb/version_store/_store.py:2160)
+  evidence: ''
+- contract: Dynamic schema defaults to False for predictable column ordering and efficient tiling (python/arcticdb/options.py:43)
+  evidence: ''
+- contract: Every internal timestamps use nanosecond precision datetime64[ns] (python/arcticdb/version_store/_common.py:29)
+  evidence: ''
+- contract: Reference Keys are mutable; Atom Keys are immutable - storage contract (docs/mkdocs/docs/technical/on_disk_storage.md:73)
+  evidence: ''
+- contract: TimeFrame index dtype hardcoded to datetime64[ns] resolution - Pandas 2.0+ non-nanosecond
+    timestamps may lose precision (python/arcticdb/version_store/_common.py:38)
+  evidence: ''
+- contract: 'Normalizer chain order: CustomNormalizer → CompositeNormalizer → DataFrameNormalizer (python/arcticdb/version_store/_store.py:571-587)'
+  evidence: ''
+- contract: Symbol List Cache compaction triggers at 500 keys threshold (docs/mkdocs/docs/technical/on_disk_storage.md:134)
+  evidence: ''
+business_decisions:
+- id: BD-001
+  type: B/BA
+  content: Adapter registry pattern for storage backends
+  rationale: 'Allows pluggable storage backends by iterating through registered adapters until one claims
+    URI support. New backends can be added by subclassing ArcticLibraryAdapter. Boundary: Only one adapter
+    claims a given URI scheme, and the registry is populated at module initialization time.'
+  evidence: python/arcticdb/arctic.py:45(_LIBRARY_ADAPTERS)
+  stage: uri_parsing_and_adapter_selection
+  alternative_considered: Single adapter per URI scheme or compile-time registration
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _LIBRARY_ADAPTERS in python/arcticdb/arctic.py'
+- id: BD-002
+  type: BA
+  content: Encoding version passed to adapter constructor as instance-level setting
+  rationale: 'Encoding version is an instance-level setting, not adapter-level, allowing per-library versioning
+    without adapter code changes. Boundary: Encoding version is determined at library creation and cannot
+    be changed after the fact.'
+  evidence: python/arcticdb/arctic.py:116(_library_adapter)
+  stage: uri_parsing_and_adapter_selection
+  alternative_considered: Adapter-level encoding version (would require adapter subclassing per version)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _library_adapter in python/arcticdb/arctic.py'
+- id: BD-003
+  type: B/BA
+  content: LibraryOptions with sensible defaults for broad compatibility
+  rationale: 'Defaults chosen for broad compatibility: dynamic_schema=False for fixed schemas, dedup=False
+    for simplicity, rows_per_segment=100k for balance. Boundary: Defaults represent the safest options;
+    advanced users can override specific settings.'
+  evidence: python/arcticdb/options.py:313(__init__)
+  stage: library_configuration
+  alternative_considered: No defaults (each options required) or aggressive defaults (higher performance
+    but lower safety)
+- id: BD-004
+  type: B
+  content: Dynamic schema toggle affects tiling strategy
+  rationale: 'When False, data is tiled by rows AND columns enabling efficient column subsetting. When
+    True, only row tiling for dynamic column backfill. Boundary: Dynamic schema incurs overhead for column
+    operations but allows schema evolution.'
+  evidence: python/arcticdb/options.py:55(dynamic_schema)
+  stage: library_configuration
+  alternative_considered: Automatic detection (too complex) or fixed tiling strategy (either read-optimized
+    or write-optimized)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: dynamic_schema in python/arcticdb/options.py'
+- id: BD-005
+  type: B/BA
+  content: Encoding version configurable per-library with V1 as default
+  rationale: 'V2 is faster but experimental, so V1 is default. Library-level override allows gradual migration.
+    Boundary: V1 and V2 are not interoperable; once a library uses V2, it cannot be downgraded.'
+  evidence: python/arcticdb/options.py:127(encoding_version)
+  stage: library_configuration
+  alternative_considered: V2 default (risky for existing deployments) or no versioning (prevents format
+    evolution)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: encoding_version in python/arcticdb/options.py'
+- id: BD-006
+  type: B
+  content: Normalizer chain with fallback to MsgPack/Pickle
+  rationale: 'Attempts normalization in order; if each fail, falls back to MsgPack then Pickle. Ensures
+    data is never lost but prioritizes efficient formats. Boundary: Fallback chain is fixed; users cannot
+    customize the order.'
+  evidence: python/arcticdb/version_store/_normalization.py:1578(_normalize)
+  stage: data_normalization
+  alternative_considered: Single fallback (may lose data) or no fallback (fails on complex objects)
+- id: BD-007
+  type: BA
+  content: Dynamic strings enabled by default in staging operations
+  rationale: 'Staged writes use dynamic_strings=True to allow flexible string handling during incomplete
+    data collection. Boundary: Dynamic strings affect storage format and cannot be changed after data
+    is written.'
+  evidence: python/arcticdb/version_store/_store.py:729(dynamic_strings)
+  stage: data_normalization
+  alternative_considered: Static strings in staging (more restrictive) or user-specified (more complex
+    API)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: dynamic_strings in python/arcticdb/version_store/_store.py'
+- id: BD-008
+  type: B
+  content: Arrow normalization preserves pandas metadata
+  rationale: 'Round-trip compatibility with Pandas requires preserving index names and MultiIndex structure
+    in Arrow schema. Boundary: Metadata is stored in Arrow schema; incompatible Pandas versions may not
+    preserve each metadata.'
+  evidence: python/arcticdb/version_store/_normalization.py:648(construct_pandas_metadata)
+  stage: data_normalization
+  alternative_considered: Pandas-native storage (breaks Arrow interoperability) or no metadata preservation
+    (loses index information)
+- id: BD-009
+  type: B
+  content: Metastructure versioning for backward compatibility with V1/V2
+  rationale: 'V1 uses pickled types; V2 stores type module/name for class reconstruction. KeyError on
+    ''__version__'' vs ''__VER__'' allows old releases to fail gracefully. Boundary: V1 libraries remain
+    readable but V2 types require module availability.'
+  evidence: python/arcticdb/flattener.py:327(create_original_obj_from_metastruct)
+  stage: recursive_normalization
+  alternative_considered: Single metastructure version (breaks old data) or complex migration system (too
+    heavyweight)
+- id: BD-010
+  type: B
+  content: Separator-based key compaction for long symbols
+  rationale: 'Symbols >100 chars are compacted using last-3-chars of each segment + hash. Ensures LMDB
+    key size limits are respected. Boundary: Compaction is deterministic but not reversible; original
+    symbol cannot be recovered from key.'
+  evidence: python/arcticdb/flattener.py:56(compact_v1)
+  stage: recursive_normalization
+  alternative_considered: Reject long symbols (user experience) or truncate keys (collision risk)
+- id: BD-011
+  type: B/BA
+  content: Recursive normalizers opt-in per library
+  rationale: 'Disabled by default to maintain predictable behavior. Users must explicitly enable to write
+    nested structures. Boundary: Once enabled, nested structures are stored with flattened keys; disabling
+    after write has no effect on existing data.'
+  evidence: python/arcticdb/options.py:131(recursive_normalizers)
+  stage: recursive_normalization
+  alternative_considered: Enabled by default (confusing for simple use cases) or per-write option (API
+    complexity)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: recursive_normalizers in python/arcticdb/options.py'
+- id: BD-012
+  type: B
+  content: Write operations always create new version
+  rationale: 'New version created even if symbol exists; previous version remains accessible via ''as_of''.
+    Enables full version history. Boundary: Version is created regardless of data content; identical writes
+    create distinct versions.'
+  evidence: python/arcticdb/version_store/_store.py:751(write)
+  stage: write_operations
+  alternative_considered: Update-in-place (loses history) or conditional versioning (complex semantics)
+- id: BD-013
+  type: B/BA
+  content: Prune previous version default False for safety
+  rationale: 'Keeping each versions by default; users must explicitly prune to avoid storage growth. Snapshot
+    protection prevents accidental deletion. Boundary: Prune only affects non-snapshot-protected versions;
+    explicit as_of is required to read specific versions.'
+  evidence: python/arcticdb/version_store/_store.py:849(prune_previous_version)
+  stage: write_operations
+  alternative_considered: Default True (storage efficiency but risky) or manual-only pruning (too burdensome)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: prune_previous_version in python/arcticdb/version_store/_store.py'
+- id: BD-014
+  type: B
+  content: Segment deduplication against previous version using content hash
+  rationale: 'Content hash comparison allows skipping identical segments. Most effective for append-only
+    workloads with data only at end. Boundary: Deduplication only compares adjacent versions; non-adjacent
+    duplicates are not detected.'
+  evidence: python/arcticdb/options.py:75(dedup)
+  stage: write_operations
+  alternative_considered: No deduplication (simpler) or full-block deduplication (higher memory usage)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: dedup in python/arcticdb/options.py'
+- id: BD-015
+  type: B/BA
+  content: Output format configurable at multiple precedence levels
+  rationale: 'Arctic instance → Library → Read operation precedence allows global defaults with per-operation
+    overrides. Boundary: Operation-level settings override library-level; library-level overrides instance-level;
+    precedence is left-to-right.'
+  evidence: python/arcticdb/options.py:279(RuntimeOptions)
+  stage: read_operations
+  alternative_considered: Single configuration level (less flexible) or runtime-only configuration (loses
+    persistence)
+- id: BD-016
+  type: B/RC
+  content: Lazy DataFrame for deferred query execution
+  rationale: 'Enables chaining of queries before execution, reducing round-trips. collect() triggers actual
+    read. Boundary: Query is executed on first materialization; side effects (read timestamps) occur at
+    collect time.'
+  evidence: python/arcticdb/version_store/library.py:441(LazyDataFrame)
+  stage: read_operations
+  alternative_considered: Eager execution (simpler but less efficient) or separate query compilation (more
+    complex API)
+- id: BD-017
+  type: B/DK
+  content: Column and row range filtering in C++ storage layer
+  rationale: 'Storage layer does filtering to minimize data transfer from backend. Python layer handles
+    format conversion. Boundary: Filter pushdown is attempted but may not succeed for complex expressions;
+    fallback to full read.'
+  evidence: python/arcticdb/version_store/_store.py:2189(_get_read_query)
+  stage: read_operations
+  alternative_considered: Python-only filtering (higher transfer costs) or mandatory filter pushdown (complex
+    optimizer)
+- id: BD-018
+  type: B/RC
+  content: Operator overloading for expression building
+  rationale: 'Enables natural syntax: q = q[q[''a''] < 5] similar to Pandas boolean indexing. Returns
+    ExpressionNode for lazy evaluation. Boundary: Operators create expression trees; actual computation
+    happens during query execution.'
+  evidence: python/arcticdb/version_store/processing.py:117(__add__)
+  stage: query_processing
+  alternative_considered: Functional API only (steeper learning curve) or method chaining (different paradigm)
+- id: BD-019
+  type: B/RC
+  content: Resample with flexible origin parameter
+  rationale: 'Origin parameter supports ''epoch'', ''start'', ''end'', or specific timestamp for alignment
+    flexibility. Boundary: Origin affects bucket boundaries which can significantly change results; users
+    must understand implications.'
+  evidence: python/arcticdb/version_store/processing.py:694(resample)
+  stage: query_processing
+  alternative_considered: Fixed origin (simpler but less flexible) or auto-detection (ambiguous for some
+    data)
+- id: BD-020
+  type: B/BA
+  content: Memory vs speed optimization modes for query builder
+  rationale: 'QueryBuilder can be optimized for speed (default) or memory based on data characteristics.
+    Boundary: Memory optimization may increase latency due to chunked processing; speed optimization may
+    exceed available RAM on large datasets.'
+  evidence: python/arcticdb/version_store/processing.py:1199(optimise_for_speed)
+  stage: query_processing
+  alternative_considered: Single optimization target (must choose) or automatic selection (hard to predict
+    resource availability)
+- id: BD-021
+  type: B
+  content: Tombstone-based deletion for soft version removal
+  rationale: 'Deletion marks versions as deleted without immediate removal. Allows recovery and prevents
+    dangling references. Boundary: Tombstones persist until compaction; soft-deleted data remains until
+    garbage collection runs.'
+  evidence: docs/mkdocs/docs/technical/on_disk_storage.md:29(Reference Layer)
+  stage: version_and_snapshot_management
+  alternative_considered: Hard delete (faster but irreversible) or versioning without tombstones (dangling
+    references)
+- id: BD-022
+  type: B
+  content: Snapshot protection prevents version deletion
+  rationale: 'Versions protected by snapshots cannot be deleted, ensuring consistency. Boundary: Snapshot
+    must be explicitly deleted to allow version pruning; snapshots are namespace-scoped.'
+  evidence: python/arcticdb/version_store/_store.py:3196(delete)
+  stage: version_and_snapshot_management
+  alternative_considered: No protection (simpler but risky) or soft references (complex GC semantics)
+- id: BD-023
+  type: B/BA
+  content: Symbol list caching with compaction at 500 entries threshold
+  rationale: 'ListSymbols uses cached add/delete markers. Compacts to single key when >500 entries to
+    avoid unbounded growth. Boundary: Compact operation incurs write overhead; threshold is fixed at 500
+    entries.'
+  evidence: docs/mkdocs/docs/technical/on_disk_storage.md:100(Symbol List Caching)
+  stage: version_and_snapshot_management
+  alternative_considered: No caching (slower reads) or unlimited cache (unbounded storage growth)
+- id: BD-024
+  type: B
+  content: 4-layer storage hierarchy separating mutability concerns
+  rationale: 'Reference Layer (mutable) → Version Layer (immutable linked list) → Index Layer (B-Tree)
+    → Data Layer (columnar segments). Separates mutable pointers from immutable data. Boundary: Each layer
+    has distinct consistency guarantees; cross-layer operations require careful ordering.'
+  evidence: docs/mkdocs/docs/technical/on_disk_storage.md:25(Structural overview)
+  stage: storage_backend
+  alternative_considered: Flat storage (simpler but loses versioning) or more granular layers (complexity)
+- id: BD-025
+  type: B/BA
+  content: Segment tiling by rows and columns with configurable defaults
+  rationale: '100k rows × 127 columns default creates manageable segments. Enables date_range and column
+    subsetting without full read. Boundary: Tile size affects both read performance (small = selective)
+    and compression efficiency (large = better ratios).'
+  evidence: python/arcticdb/options.py:95(rows_per_segment)
+  stage: storage_backend
+  alternative_considered: Single segment (simple but inefficient) or auto-tuning (requires profiling overhead)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: rows_per_segment in python/arcticdb/options.py'
+- id: BD-026
+  type: B
+  content: Version linked list for immutable version history
+  rationale: 'Each version points to previous version. Allows arbitrary historical reads but long version
+    chains slow ''as_of'' queries. Boundary: Version traversal is O(n) in chain length; no indexing of
+    historical versions.'
+  evidence: docs/mkdocs/docs/technical/on_disk_storage.md:35(Version Layer)
+  stage: storage_backend
+  alternative_considered: Version index (faster reads but more complex consistency) or no history (simplest)
+- id: BD-027
+  type: B/BA
+  content: Default rows per segment is 100,000 for data storage segmentation
+  rationale: The 100,000-row segment size default prevents excessive memory consumption while maintaining
+    efficient I/O throughput during storage operations. This boundary ensures segments remain small enough
+    to fit in memory but large enough to avoid excessive overhead from metadata and system calls. Values
+    outside this range could cause OOM errors or performance degradation.
+  evidence: python/arcticdb/util/append_and_defrag.py:54(_append_and_defrag_idempotent)
+  stage: write_operations
+  alternative_considered: Smaller segments (10K rows) for memory-constrained environments or larger segments
+    (1M rows) for high-throughput batch writes were considered but rejected for general-purpose use.
+- id: BD-028
+  type: B/BA
+  content: Prune previous versions defaults to False, preserving each historical versions
+  rationale: Disabling version pruning by default protects against accidental data loss and enables full
+    audit trails and time-travel queries. This boundary means users must explicitly opt into pruning to
+    reduce storage costs, ensuring they understand the irreversible nature of version deletion before
+    proceeding.
+  evidence: python/arcticdb/version_store/_store.py:2060(_batch_append_to_versioned_items)
+  stage: write_operations
+  alternative_considered: Auto-pruning based on count or age was considered but rejected to avoid silent
+    data loss in production systems.
+- id: BD-029
+  type: B/BA
+  content: Dynamic schema defaults to False, requiring fixed column structure
+  rationale: Fixed schema by default ensures predictable data layouts, efficient compression, and better
+    query optimization. This boundary enforces data consistency for analytics workloads where schema evolution
+    could break downstream processing. Users must explicitly enable dynamic schema when they need to handle
+    variable column sets.
+  evidence: python/arcticdb/version_store/_store.py:2286(_get_read_options_and_output_format)
+  stage: read/write
+  alternative_considered: Dynamic schema as default was considered for schema-on-write flexibility but
+    rejected due to performance overhead and consistency guarantees required for time-series data.
+- id: BD-030
+  type: B/BA
+  content: Output format defaults to PANDAS for read operations
+  rationale: Pandas DataFrame as the default output format maximizes compatibility with existing Python
+    data science ecosystems. This boundary ensures most users receive immediately-usable data structures
+    while allowing Arrow or native formats for performance-sensitive or interop scenarios.
+  evidence: python/arcticdb/version_store/_store.py:2286(_get_read_options_and_output_format)
+  stage: read_operations
+  alternative_considered: Arrow as default was considered for modern data stack compatibility but rejected
+    due to pandas' wider adoption in existing codebases.
+- id: BD-031
+  type: B/BA
+  content: Arrow string format defaults to LARGE_STRING for Arrow output
+  rationale: LARGE_STRING encoding handles long string values without truncation while maintaining reasonable
+    compression ratios. This boundary prevents data loss when reading Arrow output with string columns
+    that may exceed standard 2GB limits, ensuring data fidelity across the wire.
+  evidence: python/arcticdb/version_store/_store.py:2286(_get_read_options_and_output_format)
+  stage: read_operations
+  alternative_considered: SMALL_STRING encoding for memory efficiency was considered but rejected due
+    to potential truncation risks for user data.
+- id: BD-032
+  type: B/BA
+  content: Validate index defaults to False for append operations
+  rationale: Disabling index validation by default optimizes append performance for high-throughput scenarios.
+    This boundary trades validation overhead for speed, allowing users who trust their data's index integrity
+    to achieve maximum write throughput while enabling validation when data quality is uncertain.
+  evidence: python/arcticdb/version_store/_store.py:1989(batch_append)
+  stage: append
+  alternative_considered: Validation enabled by default was considered for data safety but rejected due
+    to significant performance impact on append-heavy workloads.
+- id: BD-033
+  type: B/BA
+  content: Write if missing defaults to True for batch append operations
+  rationale: Defaulting to create missing symbols enables flexible pipelines where symbols may or may
+    not already exist. This boundary simplifies initial data loading workflows while allowing users to
+    set this to False when they expect symbols to pre-exist and want to catch configuration errors.
+  evidence: python/arcticdb/version_store/_store.py:2060(_batch_append_to_versioned_items)
+  stage: append
+  alternative_considered: write_if_missing=False as default was considered for strict pipeline enforcement
+    but rejected due to friction in exploration and initial data loading.
+- id: BD-034
+  type: B/BA
+  content: Sparsify defaults to False for compact_incomplete operations
+  rationale: Disabling sparsification preserves data locality and prevents potential query performance
+    degradation from scattered sparse columns. This boundary ensures predictable query performance after
+    compaction while allowing users to opt into sparsification for specific storage optimization scenarios.
+  evidence: python/arcticdb/version_store/_store.py:2770(compact_incomplete)
+  stage: compact
+  alternative_considered: Sparsification enabled by default was considered for storage efficiency but
+    rejected due to query performance trade-offs.
+- id: BD-035
+  type: B/BA
+  content: Via iteration defaults to True for compact_incomplete
+  rationale: Iterative compaction handles large symbols without memory exhaustion during the compaction
+    process. This boundary ensures symbols of any size can be compacted by processing in chunks, trading
+    some speed for guaranteed completion without OOM failures.
+  evidence: python/arcticdb/version_store/_store.py:2775(compact_incomplete)
+  stage: compact
+  alternative_considered: Snapshot-based compaction as default was considered for speed but rejected due
+    to memory constraints for large symbols.
+- id: BD-036
+  type: B/BA
+  content: Delete staged data on failure defaults to False
+  rationale: Preserving failed staging data enables debugging and manual recovery of interrupted compaction
+    operations. This boundary prevents automatic deletion of potentially valuable intermediate state,
+    allowing operators to inspect failures before cleanup.
+  evidence: python/arcticdb/version_store/_store.py:2770(compact_incomplete)
+  stage: compact
+  alternative_considered: Auto-cleanup on failure was considered for storage management but rejected to
+    preserve debugging evidence.
+- id: BD-037
+  type: B/BA
+  content: Defragmentation threshold defaults to 0.9 (90% of target)
+  rationale: A 90% threshold triggers defragmentation when segments are nearly full, balancing storage
+    efficiency against defragmentation overhead. This boundary ensures segments are efficiently utilized
+    before incurring defragmentation costs while preventing excessive fragmentation from under-filled
+    segments.
+  evidence: python/arcticdb/util/append_and_defrag.py:58(_append_and_defrag_idempotent)
+  stage: defrag
+  alternative_considered: Lower thresholds (70-80%) were considered for better space efficiency but rejected
+    due to increased defragmentation frequency and CPU overhead.
+- id: BD-038
+  type: B
+  content: Defragmentation factor must be greater than 1
+  rationale: Requiring defragmentation factor > 1 ensures compaction actually reduces segment count and
+    storage usage. This boundary prevents no-op defragmentation that would waste resources, enforcing
+    that any defragmentation operation must produce tangible storage improvements.
+  evidence: python/arcticdb/util/append_and_defrag.py:54(_append_and_defrag_idempotent)
+  stage: defrag
+  alternative_considered: Allowing factor=1 for identity operations was considered but rejected to prevent
+    meaningless defragmentation calls.
+- id: BD-039
+  type: B/BA
+  content: Head and tail operations default to 5 rows
+  rationale: The 5-row default provides a quick data preview without loading large result sets. This boundary
+    balances information density against response time, allowing users to quickly inspect data structure
+    and content before committing to full reads.
+  evidence: python/arcticdb/version_store/library.py:2920(head)
+  stage: read_operations
+  alternative_considered: Larger defaults (10-20 rows) were considered but rejected as they may delay
+    initial responses for exploratory queries.
+- id: BD-040
+  type: B/BA
+  content: Force strings to object defaults to False
+  rationale: Disabling forced string-to-object conversion preserves Arrow-native string types for better
+    performance. This boundary allows Arrow consumers to leverage type-specific optimizations while users
+    needing pandas object types can explicitly request conversion.
+  evidence: python/arcticdb/version_store/_store.py:2291(_get_read_options_and_output_format)
+  stage: read_operations
+  alternative_considered: Forcing object conversion as default was considered for pandas compatibility
+    but rejected due to performance impact for Arrow-native consumers.
+- id: BD-041
+  type: B/BA
+  content: Optimise string memory defaults to False
+  rationale: Disabling string memory optimization by default preserves data in its original encoding for
+    faster reads. This boundary prevents unexpected behavior changes when users expect literal data representation,
+    while allowing memory-conscious users to enable dictionary encoding when needed.
+  evidence: python/arcticdb/version_store/_store.py:2286(_get_read_options_and_output_format)
+  stage: read_operations
+  alternative_considered: Memory optimization by default was considered for efficiency but rejected due
+    to potential behavioral differences from source data.
+- id: BD-042
+  type: B/BA
+  content: Set timezone defaults to False for read operations
+  rationale: Disabling timezone conversion preserves data in its stored timezone, avoiding unexpected
+    datetime shifts. This boundary ensures consistent data representation for local-time analysis while
+    allowing UTC conversion when explicitly requested for cross-timezone operations.
+  evidence: python/arcticdb/version_store/_store.py:2286(_get_read_options_and_output_format)
+  stage: read_operations
+  alternative_considered: UTC conversion by default was considered for consistency but rejected due to
+    potential datetime shifts affecting existing analyses.
+- id: BD-043
+  type: B/BA
+  content: Allow sparse defaults to False for read operations
+  rationale: Disabling sparse reads ensures complete data is always returned, guaranteeing query accuracy.
+    This boundary prevents subtle bugs from sparse column handling where missing values might be misinterpreted
+    as explicit zeros or nulls.
+  evidence: python/arcticdb/version_store/_store.py:2286(_get_read_options_and_output_format)
+  stage: read_operations
+  alternative_considered: Sparse-aware reads by default were considered for memory efficiency but rejected
+    due to potential accuracy issues with sparse data.
+- id: BD-044
+  type: B/BA
+  content: Incomplete data reading defaults to False
+  rationale: Rejecting incomplete data by default prevents partial results from propagating through analytical
+    pipelines. This boundary ensures data integrity by failing fast when segments are missing rather than
+    returning misleading partial datasets.
+  evidence: python/arcticdb/version_store/_store.py:2286(_get_read_options_and_output_format)
+  stage: read_operations
+  alternative_considered: Partial reads by default were considered for resilience but rejected due to
+    risk of silent data loss in production analytics.
+- id: BD-045
+  type: B/BA
+  content: Empty types defaults to False in normalization
+  rationale: Disabling empty types enforces strict schema requirements that improve downstream predictability.
+    This boundary ensures each columns have defined types before storage, preventing null-type columns
+    that could cause serialization or query issues.
+  evidence: python/arcticdb/toolbox/library_tool.py:167(normalize_dataframe_with_nvs_defaults)
+  stage: write_operations
+  alternative_considered: Allowing empty types was considered for schema-on-read flexibility but rejected
+    due to potential type inference ambiguities.
+- id: BD-046
+  type: B/BA
+  content: AWS authentication method defaults to DISABLED
+  rationale: AWS authentication disabled by default follows the principle of least privilege and prevents
+    accidental credential exposure. This boundary ensures explicit authentication configuration is required
+    for AWS access, reducing attack surface in misconfigured deployments.
+  evidence: python/arcticdb/adapters/s3_library_adapter.py:38(ParsedQuery)
+  stage: storage_backend
+  alternative_considered: Auto-detection of environment credentials was considered for convenience but
+    rejected to enforce explicit security configuration.
+- id: BD-047
+  type: B/BA
+  content: SSL defaults to False for S3 connections
+  rationale: SSL disabled by default reduces connection overhead for local or trusted network S3-compatible
+    storage. This boundary allows performance tuning for non-production environments while strongly encouraging
+    HTTPS for production S3 access to AWS.
+  evidence: python/arcticdb/adapters/s3_library_adapter.py:38(ParsedQuery)
+  stage: storage_backend
+  alternative_considered: SSL required by default was considered for security but rejected due to compatibility
+    issues with some S3-compatible storage systems.
+- id: BD-048
+  type: B/BA
+  content: Use virtual addressing defaults to False for S3
+  rationale: Path-style addressing disabled by default ensures compatibility with modern S3 implementations
+    and bucket naming restrictions. This boundary uses virtual-hosted style by default, which aligns with
+    AWS best practices and avoids issues with dots in bucket names.
+  evidence: python/arcticdb/adapters/s3_library_adapter.py:42(ParsedQuery)
+  stage: storage_backend
+  alternative_considered: Path-style as default was considered for broad compatibility but rejected due
+    to AWS deprecation of this style.
+- id: BD-049
+  type: B/BA
+  content: CA certificate path uses system defaults on Linux
+  rationale: Using system CA certificates leverages the OS-maintained trust store, reducing certificate
+    management overhead. This boundary ensures secure HTTPS connections work out-of-the-box on properly-configured
+    Linux systems while allowing custom certificates when needed.
+  evidence: python/arcticdb/adapters/s3_library_adapter.py:71(S3LibraryAdapter.__init__)
+  stage: storage_backend
+  alternative_considered: Bundled certificates were considered for portability but rejected in favor of
+    system trust stores for easier certificate rotation.
+- id: BD-050
+  type: B/DK
+  content: CA certificate settings only supported on Linux
+  rationale: Limiting custom CA certificate support to Linux reduces implementation complexity and leverages
+    established security practices. This boundary acknowledges that cross-platform certificate handling
+    varies significantly, with Windows and macOS requiring different approaches.
+  evidence: python/arcticdb/adapters/s3_library_adapter.py:71(S3LibraryAdapter.__init__)
+  stage: storage_backend
+  alternative_considered: Cross-platform CA support was considered but rejected due to significant complexity
+    and maintenance burden.
+- id: BD-051
+  type: B/RC
+  content: Force URI lib config deprecated due to security concerns
+  rationale: Embedding credentials in URIs creates security risks through logging, shell history, and
+    unintended credential exposure. This deprecation boundary encourages secure credential management
+    practices by directing users toward explicit configuration rather than URI-embedded secrets.
+  evidence: python/arcticdb/adapters/s3_library_adapter.py:71(S3LibraryAdapter.__init__)
+  stage: storage_backend
+  alternative_considered: Continued support with warnings was considered but rejected to drive security
+    improvements across the user base.
+- id: BD-052
+  type: B
+  content: Batch throw on error configurable per batch operation
+  rationale: Making batch error handling configurable allows pipelines to balance failure modes between
+    fail-fast and best-effort approaches. This boundary enables graceful degradation in ETL scenarios
+    while supporting strict requirements in data quality validation workflows.
+  evidence: python/arcticdb/version_store/_store.py:2323(_get_batch_read_options)
+  stage: read_operations
+  alternative_considered: Fixed error handling was considered but rejected due to varying requirements
+    across different use cases.
+- id: BD-053
+  type: B/RC
+  content: Date range nanosecond precision is True for get_description
+  rationale: Nanosecond precision ensures time range queries match the stored data granularity exactly.
+    This boundary prevents off-by-one errors in time-based filtering, critical for financial and scientific
+    time-series data where microsecond differences matter.
+  evidence: python/arcticdb/version_store/library.py:3124(get_description_batch)
+  stage: metadata
+  alternative_considered: Second-level precision as default was considered for simplicity but rejected
+    due to precision loss in high-frequency data.
+- id: BD-054
+  type: B/BA
+  content: Iterate snapshots if tombstoned defaults to False for head/tail
+  rationale: Skipping tombstoned snapshots by default prevents access to deleted data versions. This boundary
+    ensures head/tail operations respect deletion boundaries while allowing explicit iteration when recovery
+    or audit of deleted snapshots is needed.
+  evidence: python/arcticdb/version_store/library.py:2917(head)
+  stage: read_operations
+  alternative_considered: Including tombstoned data by default was considered for recovery scenarios but
+    rejected due to potential confusion about data state.
+- id: BD-055
+  type: B/BA
+  content: Implement read index defaults to False
+  rationale: Disabling index-only reads ensures complete data is returned by default, preventing unexpected
+    partial results. This boundary protects users from accidentally reading only metadata when they expect
+    full data, with index optimization available for specific use cases.
+  evidence: python/arcticdb/version_store/_store.py:2423(read)
+  stage: read_operations
+  alternative_considered: Index-only reads as default were considered for memory efficiency but rejected
+    due to risk of silent data omission.
+- id: BD-056
+  type: B/BA
+  content: Lazy dataframe defaults to False for read operations
+  rationale: Eager evaluation by default ensures queries complete before returning, providing immediate
+    feedback and error detection. This boundary simplifies debugging and ensures downstream code receives
+    ready-to-use data, with lazy evaluation available for streaming scenarios.
+  evidence: python/arcticdb/version_store/library.py:2917(head)
+  stage: read_operations
+  alternative_considered: Lazy evaluation by default was considered for memory efficiency but rejected
+    due to debugging complexity with deferred execution.
+- id: BD-057
+  type: B/BA
+  content: Upsert defaults to True for update_batch in defrag operations
+  rationale: Upsert mode in defragmentation ensures updated data overwrites existing versions rather than
+    creating duplicates. This boundary maintains data integrity during compaction by ensuring only one
+    version exists per symbol, preventing version proliferation during defragmentation.
+  evidence: python/arcticdb/util/append_and_defrag.py:54(_append_and_defrag_idempotent)
+  stage: update
+  alternative_considered: Append mode during defrag was considered for version preservation but rejected
+    to prevent duplicate data accumulation.
+- id: BD-058
+  type: B/BA
+  content: Index name defaults to 'index' when unnamed
+  rationale: Defaulting to 'index' as the index name provides a predictable, user-friendly default for
+    unnamed indexes. This boundary ensures consistent serialization and display of index metadata while
+    allowing users to specify meaningful names when index semantics matter.
+  evidence: python/arcticdb/version_store/_normalization.py:404(_normalize_index)
+  stage: data_normalization
+  alternative_considered: Using the DataFrame's actual index name attribute was considered but rejected
+    due to pandas index name handling inconsistencies.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _normalize_index in python/arcticdb/version_store/_normalization.py'
+- id: BD-059
+  type: B
+  content: ZoneInfo timezones converted to string for compatibility
+  rationale: Converting ZoneInfo timezones to strings ensures compatibility across different Python versions
+    and serialization formats. This boundary prevents ZoneInfo-specific objects from leaking into storage,
+    ensuring data portability and consistent behavior across environments.
+  evidence: python/arcticdb/version_store/_normalization.py:434(_ensure_str_timezone)
+  stage: data_normalization
+  alternative_considered: Preserving ZoneInfo objects was considered for modern Python compatibility but
+    rejected due to serialization challenges across versions.
+- id: BD-060
+  type: B
+  content: UTC timezone coerced to string 'UTC'
+  rationale: Coercing UTC to the string 'UTC' normalizes timezone representation for consistent storage
+    and comparison. This boundary prevents multiple UTC representations (pytz.UTC, datetime.timezone.utc,
+    ZoneInfo('UTC')) from creating inconsistent data despite representing the same instant.
+  evidence: python/arcticdb/version_store/_normalization.py:433(_ensure_str_timezone)
+  stage: data_normalization
+  alternative_considered: Preserving original UTC type was considered but rejected for consistent serialization
+    behavior.
+- id: BD-061
+  type: B
+  content: Column and index names must be str or int type
+  rationale: Restricting column and index names to str or int types ensures consistent serialization and
+    compatibility. This boundary prevents complex object types from causing serialization failures or
+    storage format issues, maintaining predictable data access patterns.
+  evidence: python/arcticdb/version_store/_normalization.py:518(_check_valid_name)
+  stage: data_normalization
+  alternative_considered: Support for additional types (tuples, floats) was considered but rejected due
+    to serialization complexity and potential query issues.
+- id: BD-062
+  type: B
+  content: Multiple None columns not allowed in dynamic_schema
+  rationale: Rejecting multiple None columns in dynamic_schema prevents ambiguous column identification.
+    This boundary ensures each column has a unique, identifiable name, which is essential for schema evolution
+    and data retrieval in dynamic schema mode.
+  evidence: python/arcticdb/version_store/_normalization.py:531(_normalize_columns_names)
+  stage: data_normalization
+  alternative_considered: Auto-renaming None columns was considered but rejected for explicit error handling
+    that forces data quality improvements.
+- id: BD-063
+  type: B
+  content: Empty string columns renamed to __empty__ prefix
+  rationale: Renaming empty string columns to __empty__ prefix ensures valid column names while preserving
+    data. This boundary prevents empty string column names from causing storage or query issues while
+    making the transformation explicit and reversible.
+  evidence: python/arcticdb/version_store/_normalization.py:526(_normalize_columns_names)
+  stage: data_normalization
+  alternative_considered: Rejecting empty string names was considered but rejected in favor of data preservation
+    through renaming.
+- id: BD-064
+  type: B
+  content: Duplicate column names disallowed in dynamic_schema
+  rationale: Rejecting duplicate column names maintains data integrity and predictable column access.
+    This boundary prevents ambiguous column references that could lead to unpredictable data retrieval,
+    essential for reproducible analytical results.
+  evidence: python/arcticdb/version_store/_normalization.py:526(_normalize_columns_names)
+  stage: data_normalization
+  alternative_considered: Case-insensitive deduplication was considered but rejected for explicit error
+    handling of data quality issues.
+- id: BD-065
+  type: B
+  content: Integer column names preserved with is_int flag
+  rationale: Preserving integer column names with metadata allows exact reconstruction of original DataFrames.
+    This boundary ensures pandas compatibility for integer-indexed columns, preventing data loss or transformation
+    issues when round-tripping through storage.
+  evidence: python/arcticdb/version_store/_normalization.py:526(_normalize_columns_names)
+  stage: data_normalization
+  alternative_considered: Converting integer names to strings was considered but rejected for full pandas
+    compatibility.
+- id: BD-066
+  type: B/BA
+  content: Amazon AWS endpoints trigger automatic AWS configuration
+  rationale: Auto-configuring AWS credentials when connecting to AWS endpoints simplifies initial setup
+    for new users. This boundary reduces friction for AWS users while maintaining explicit configuration
+    options for production environments requiring specific credential handling.
+  evidence: python/arcticdb/adapters/s3_library_adapter.py:71(S3LibraryAdapter.__init__)
+  stage: storage_backend
+  alternative_considered: Requiring explicit credentials for each S3 operations was considered but rejected
+    for usability on AWS infrastructure.
+- id: BD-067
+  type: B
+  content: Query builder deep copied before modification
+  rationale: Deep copying the query builder before modification prevents accidental mutation of original
+    query objects. This boundary ensures callers retain their original query state, enabling safe query
+    reuse and preventing subtle bugs from shared mutable state.
+  evidence: python/arcticdb/version_store/_store.py:2423(read)
+  stage: read_operations
+  alternative_considered: Shallow copying was considered for performance but rejected due to risk of unintended
+    mutation side effects.
+- id: BD-068
+  type: B/BA
+  content: Date range and row range cannot both be specified
+  rationale: Mutually exclusive date and row range filtering prevents ambiguous query semantics. This
+    boundary ensures predictable query behavior by requiring users to choose one filtering paradigm, preventing
+    edge cases where both filters might produce unexpected results.
+  evidence: python/arcticdb/version_store/_store.py:2189(_get_read_query)
+  stage: read_operations
+  alternative_considered: Supporting both filters was considered for flexibility but rejected due to semantic
+    ambiguity in combined filtering.
+- id: BD-069
+  type: B
+  content: Symbol list compaction requires storage lock
+  rationale: Requiring storage locks for symbol list compaction prevents race conditions during concurrent
+    modifications. This boundary ensures atomic updates to the symbol list, preventing corruption from
+    simultaneous compaction and symbol registration operations.
+  evidence: python/arcticdb/version_store/library.py:3170(compact_symbol_list)
+  stage: maintenance
+  alternative_considered: Lock-free operations were considered but rejected due to complexity and potential
+    consistency issues.
+- id: BD-070
+  type: B/BA
+  content: Symbol fragmentation check uses default segment count threshold of 100
+  rationale: A 100-segment threshold identifies fragmented symbols that would benefit from compaction.
+    This boundary balances sensitivity to fragmentation against false positives from naturally partitioned
+    data, ensuring compaction is triggered only when meaningful space savings are likely.
+  evidence: python/arcticdb/version_store/library.py:3188(is_symbol_fragmented)
+  stage: maintenance
+  alternative_considered: Adaptive thresholds based on data size were considered but rejected for simplicity
+    and predictability.
+- id: BD-071
+  type: B
+  content: Pandas 2.0+ uses pytz.UTC for timezone consistency
+  rationale: Using pytz.UTC for Pandas 2.0+ ensures consistent timezone handling across different Pandas
+    versions. This boundary normalizes timezone representation for storage, preventing incompatibilities
+    when data is read by different Pandas versions.
+  evidence: python/arcticdb/version_store/library.py:3052(_info_to_desc)
+  stage: denormalization
+  alternative_considered: Preserving original timezone types was considered but rejected for cross-version
+    compatibility.
+- id: BD-072
+  type: B
+  content: Batch append not atomic across symbols
+  rationale: Non-atomic batch appends across symbols prevent head-of-line blocking when one symbol fails.
+    This boundary allows partial success, enabling error handling strategies like retry-only-failed-symbols
+    while acknowledging that full atomicity requires transaction management.
+  evidence: python/arcticdb/version_store/_store.py:1989(batch_append)
+  stage: write_operations
+  alternative_considered: Full atomic transactions were considered but rejected due to complexity and
+    performance overhead for large batches.
+- id: BD-073
+  type: B
+  content: Empty dataframe append warns if write_if_missing and new version created
+  rationale: Warning on empty dataframe append prevents accidental version creation without data. This
+    boundary alerts users to potentially unintended behavior while allowing the operation to proceed,
+    enabling pipeline continuity with user awareness.
+  evidence: python/arcticdb/version_store/_store.py:2060(_batch_append_to_versioned_items)
+  stage: append
+  alternative_considered: Blocking empty appends was considered but rejected to allow legitimate use cases
+    like schema initialization.
+- id: BD-074
+  type: B/BA
+  content: Throw on error defaults to True for single append
+  rationale: Fail-fast error handling by default ensures data integrity for single operations where partial
+    success is rarely desirable. This boundary prevents silent failures in append operations, surfacing
+    errors immediately for corrective action rather than allowing inconsistent state.
+  evidence: python/arcticdb/version_store/_store.py:1989(batch_append)
+  stage: append
+  alternative_considered: Graceful degradation by default was considered for resilience but rejected for
+    single operations where failure visibility is critical.
+- id: BD-075
+  type: B
+  content: NFS layout only for testing, not production
+  rationale: Limiting NFS layout to testing acknowledges its lack of durability guarantees for production
+    workloads. This boundary prevents users from inadvertently deploying to unreliable storage, guiding
+    them toward S3 or Azure for production use cases requiring data durability.
+  evidence: python/arcticdb/adapters/s3_library_adapter.py:38(ParsedQuery)
+  stage: storage_backend
+  alternative_considered: Production NFS support was considered but rejected due to fundamental durability
+    limitations of NFS protocol.
+- id: BD-076
+  type: B
+  content: Library tool overwrite operations require extreme caution
+  rationale: Flagging overwrite operations as dangerous prevents accidental data destruction during maintenance
+    operations. This boundary ensures operators consciously acknowledge the destructive nature of overwrite
+    operations, reducing risk of data loss from script errors or misconfiguration.
+  evidence: python/arcticdb/toolbox/library_tool.py:186(overwrite_append_data_with_dataframe)
+  stage: maintenance
+  alternative_considered: Adding confirmation prompts was considered but rejected to avoid blocking automation
+    scenarios where manual confirmation is not possible.
+- id: BD-077
+  type: B
+  content: Power-sequence pseudo-random float generation for thorough numeric testing
+  rationale: Power-sequence based float generation ensures deterministic yet varied numeric distributions
+    across test runs, providing boundary condition coverage that pure random cannot guarantee. The seed-based
+    approach (implied by test context) ensures reproducibility while the power-sequence transformation
+    tests non-linear numeric operations, aggregation pipelines, and comparison logic with values spanning
+    multiple magnitudes.
+  evidence: python/arcticdb/util/test_utils.py:75(generate_random_float_array)
+  stage: arcticdb.util.test_utils
+  alternative_considered: Standard np.random with uniform distribution would miss power-law edge cases
+    in overflow/underflow scenarios
+- id: BD-078
+  type: B/RC
+  content: Last-X-percent date range computation via TimestampNumber arithmetic
+  rationale: Computing date ranges via percentage boundaries tests time-series query edge cases where
+    the result set size depends on the input data distribution. TimestampNumber arithmetic ensures consistent
+    results across timezone configurations and pre/post-epoch boundaries, critical for financial time-series
+    use cases.
+  evidence: python/arcticdb/util/test_utils.py:913(get_last_x_percent_date_range)
+  stage: arcticdb.util.test_utils
+  alternative_considered: Fixed date ranges would not cover percentile-based query semantics
+- id: BD-079
+  type: B/RC
+  content: Timestamp-as-integer period counting with floor rounding via TimestampNumber
+  rationale: Period counting with floor semantics ensures deterministic behavior when timestamps fall
+    exactly on period boundaries. This is essential for trading systems where EOD calculations must be
+    consistent regardless of millisecond precision, preventing off-by-one errors in daily/monthly/yearly
+    aggregation.
+  evidence: python/arcticdb/util/test_utils.py:246(calculate_timestamp_after_n_periods)
+  stage: arcticdb.util.test_utils
+  alternative_considered: Ceiling rounding would cause double-counting at exact period boundaries
+- id: BD-080
+  type: B
+  content: Pseudo-random dataframe with value sum ≈ N for verifiable aggregation testing
+  rationale: Constraining the sum of generated values enables automated verification of sum/count aggregations
+    without manual result inspection. This supports continuous integration testing where aggregation correctness
+    must be proven programmatically, catching regressions in numeric computation pipelines.
+  evidence: python/benchmarks/common.py:27(generate_pseudo_random_dataframe)
+  stage: benchmarks.common
+  alternative_considered: Unconstrained random sums would require manual verification or external golden
+    datasets
+- id: BD-081
+  type: B
+  content: DuckDB-style groupby benchmark data with controlled categorical cardinality
+  rationale: Controlled cardinality ensures groupby benchmarks test specific aggregation performance profiles
+    rather than accidentally testing one particular data distribution. This enables meaningful comparison
+    between query engines by fixing the group cardinality-to-row count ratio, isolating algorithmic differences
+    from data shape artifacts.
+  evidence: python/benchmarks/common.py:63(generate_benchmark_df)
+  stage: benchmarks.common
+  alternative_considered: Real-world data would introduce uncontrolled variance between benchmark runs
+- id: BD-082
+  type: B/BA
+  content: Default RNG with explicit seed for reproducible benchmark data generation
+  rationale: Explicit RNG seeding eliminates benchmark variance caused by random initialization, ensuring
+    performance measurements reflect algorithmic changes rather than data generation differences. This
+    is critical for ASV (airspeed velocity) regression detection where false positives from data variance
+    would mask real improvements.
+  evidence: python/benchmarks/common.py:44(generate_random_floats_dataframe)
+  stage: benchmarks.common
+  alternative_considered: Timestamp-seeded randomness would cause unreproducible benchmark results
+- id: BD-083
+  type: B/RC
+  content: Timestamp normalized to nanoseconds since UTC epoch for universal time representation
+  rationale: Nanosecond-resolution UTC epoch timestamps provide a canonical time format that avoids timezone
+    ambiguity and preserves microsecond precision. This design decision ensures time-series queries return
+    consistent results regardless of client timezone configuration, critical for global financial data
+    systems where 23:59:59.999 vs 00:00:00.000 determines trading day attribution.
+  evidence: python/arcticdb/version_store/processing.py:350(nanoseconds_from_utc)
+  stage: arcticdb.version_store.processing
+  alternative_considered: Millisecond precision would lose data in high-frequency trading scenarios
+- id: BD-084
+  type: B/BA
+  content: Resample origin default='epoch' (1970-01-01) matching pandas for reproducibility
+  rationale: Matching pandas resample origin semantics ensures ArcticDB behaves identically to pandas
+    for equivalent queries, preventing subtle behavioral differences that would require user code changes.
+    The epoch-based origin provides deterministic bucket boundaries independent of input data, critical
+    for reproducible report generation.
+  evidence: python/arcticdb/version_store/processing.py:700(origin_param)
+  stage: arcticdb.version_store.processing
+  alternative_considered: Custom origin defaults would break pandas parity and require migration effort
+  _evidence_issues:
+  - 'FN_NOT_FOUND: origin_param in python/arcticdb/version_store/processing.py'
+- id: BD-085
+  type: B/RC
+  content: Value list deduplication with integer overflow detection for isin/isnotin
+  rationale: Integer overflow detection in isin operations prevents silent data corruption when large
+    value lists are used. This boundary enforcement ensures filter predicates either succeed deterministically
+    or raise clear errors rather than returning incorrect membership results, critical for data integrity
+    in compliance-sensitive applications.
+  evidence: python/arcticdb/version_store/processing.py:370(value_set)
+  stage: arcticdb.version_store.processing
+  alternative_considered: Silent truncation would cause incorrect filter results without error indication
+  _evidence_issues:
+  - 'FN_NOT_FOUND: value_set in python/arcticdb/version_store/processing.py'
+- id: BD-086
+  type: B
+  content: Expression AST with C++ operator dispatch for filter/projection/aggregation pipeline
+  rationale: Expression-based AST enables query optimization through operator reordering and constant
+    folding before execution, improving performance for complex filter/projection/aggregation chains.
+    C++ dispatch ensures type-safe operations without Python overhead, critical for high-throughput streaming
+    scenarios.
+  evidence: python/arcticdb/version_store/processing.py:72(__array_priority__)
+  stage: arcticdb.version_store.processing
+  alternative_considered: Row-by-row Python iteration would introduce 100-1000x performance overhead
+  _evidence_issues:
+  - 'FN_NOT_FOUND: __array_priority__ in python/arcticdb/version_store/processing.py'
+- id: BD-087
+  type: B
+  content: Query optimization modes SPEED vs MEMORY controlling pipeline resource trade-offs
+  rationale: Explicit SPEED vs MEMORY optimization modes allow users to control the memory-compute tradeoff
+    based on their deployment constraints. This design enables ArcticDB to serve both memory-constrained
+    edge devices and high-memory server deployments with the same codebase, critical for IoT and cloud
+    convergence scenarios.
+  evidence: python/arcticdb/version_store/processing.py:1199(optimise_for_speed)
+  stage: arcticdb.version_store.processing
+  alternative_considered: Fixed single mode would force users to accept unsuitable defaults for their
+    environment
+- id: BD-088
+  type: B
+  content: Integer scalar type minimization for query value constants
+  rationale: Minimizing integer types to the smallest sufficient width reduces memory footprint during
+    query execution, particularly for filter predicates with many integer constants. This optimization
+    is critical for high-cardinality isin queries where storage savings multiply across millions of rows.
+  evidence: python/arcticdb/version_store/processing.py:1233(min_scalar_type)
+  stage: arcticdb.version_store.processing
+  alternative_considered: Using 64-bit for each integers would waste 50-75% memory in common cases
+  _evidence_issues:
+  - 'FN_NOT_FOUND: min_scalar_type in python/arcticdb/version_store/processing.py'
+- id: BD-089
+  type: B/RC
+  content: datetime64[ns] as canonical time representation for cross-version compatibility
+  rationale: Enforcing datetime64[ns] as the canonical format ensures consistent timestamp semantics across
+    schema versions and Python/pandas version upgrades. This prevents silent precision loss when data
+    migrates between versions, critical for financial audit trails where timestamp precision has legal
+    implications.
+  evidence: python/arcticdb/version_store/_normalization.py:167(DTN64_DTYPE)
+  stage: data_normalization
+  alternative_considered: Variable precision by pandas version would cause silent data degradation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DTN64_DTYPE in python/arcticdb/version_store/_normalization.py'
+- id: BD-090
+  type: B/BA
+  content: Sentinel NA values by dtype for dynamic schema column padding (INT/FLOAT/BOOL/STRING/TIMESTAMP)
+  rationale: Type-specific sentinel values (min_int for integers, NaN for floats) ensure null representation
+    matches the natural missing value semantics of each dtype. This prevents incorrect null comparisons
+    and enables type-safe missing value handling, critical for analytics queries where null propagation
+    must follow dtype conventions.
+  evidence: python/arcticdb/util/arctic_simulator.py:37(empty_column_of_type)
+  stage: arcticdb.util.arctic_simulator
+  alternative_considered: Generic sentinel would break type-specific null comparisons (e.g., NaN != NaN)
+- id: BD-091
+  type: B/RC
+  content: Fixed-length string coercion with max-length truncation for cross-platform safety
+  rationale: Truncating strings exceeding max length prevents storage schema violations while providing
+    clear feedback via logging. This prevents silent data loss from overly-long strings, critical for
+    data governance scenarios where column widths are enforced for compliance.
+  evidence: python/arcticdb/version_store/_normalization.py:207(coerce_string_column_to_fixed_length_array)
+  stage: data_normalization
+  alternative_considered: Exception-throwing would fail entire write operations for minor length violations
+- id: BD-092
+  type: B/BA
+  content: Column name sanitization with __col_<name>__ and __index__ prefixes for clash resolution
+  rationale: Prefix-based sanitization resolves conflicts between user column names and internal metadata
+    columns without data loss. The __col_ and __index_ prefixes prevent user data corruption when column
+    names collide with reserved identifiers, critical for multi-tenant scenarios where users cannot coordinate
+    naming conventions.
+  evidence: python/arcticdb/version_store/_normalization.py:526(_normalize_columns_names)
+  stage: data_normalization
+  alternative_considered: Rejection of conflicting names would break valid user workflows
+- id: BD-093
+  type: B
+  content: math.isnan() for float NaN detection in normalization
+  rationale: Using math.isnan() explicitly documents the null detection approach and avoids potential
+    pd.isna() inconsistencies with different NA types. This ensures float NaN values are consistently
+    recognized as nulls during normalization, preventing subtle data integrity issues in numeric columns.
+  evidence: python/arcticdb/version_store/_normalization.py:182(_is_nan)
+  stage: data_normalization
+  alternative_considered: pd.isna() might handle non-float NA types differently in edge cases
+- id: BD-094
+  type: B
+  content: Sparse data generation via Bernoulli mask with configurable sparsity probability
+  rationale: Bernoulli-mask sparsity generation enables realistic sparse data testing without pre-computed
+    sparse datasets. Configurable probability allows benchmarking across sparsity levels (1%, 10%, 50%),
+    essential for validating compression effectiveness and sparse-read optimizations in storage backends.
+  evidence: python/benchmarks/arrow.py:112(module)
+  stage: benchmarks.arrow
+  alternative_considered: Fixed sparse patterns would not test varying sparsity levels
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in python/benchmarks/arrow.py'
+- id: BD-095
+  type: B/DK
+  content: Resample aggregation at microsecond resolution with 100,000-row segments
+  rationale: Microsecond resolution with 100k row segments tests high-frequency resampling performance
+    and segment boundary handling. This configuration simulates real-time market data scenarios where
+    microsecond bins contain statistically meaningful sample counts, validating both accuracy and throughput.
+  evidence: python/benchmarks/resample.py:24(resample:)
+  stage: benchmarks.resample
+  alternative_considered: Larger segments would miss segment-boundary resampling edge cases
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: resample: in python/benchmarks/resample.py'
+- id: BD-096
+  type: B/RC
+  content: Resample datetime index from pd.Timestamp(0, unit='us') with us frequency
+  rationale: Starting from Unix epoch microseconds ensures resample benchmarks begin at a known UTC boundary,
+    making time-zone sensitivity testing deterministic. The microsecond unit matches high-frequency trading
+    data resolutions while remaining computationally tractable for repeated benchmark runs.
+  evidence: python/benchmarks/resample.py:74(module)
+  stage: benchmarks.resample
+  alternative_considered: Random start times would prevent timezone boundary testing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in python/benchmarks/resample.py'
+- id: BD-097
+  type: B
+  content: Resample frequency 64-bit signed integer bounds check
+  rationale: Validating that frequency values fit in 64-bit signed integers prevents integer overflow
+    in timedelta calculations during resampling. This boundary check is essential for preventing silent
+    incorrect results or crashes when users specify extremely large frequency values.
+  evidence: python/tests/hypothesis/arcticdb/test_resample.py:50(freq_fits_in_64_bits)
+  stage: tests.hypothesis.arcticdb.test_resample
+  alternative_considered: Implicit overflow would cause silent incorrect results
+- id: BD-098
+  type: B
+  content: Dense row count prediction via integer division of timedelta
+  rationale: Predicting dense row counts before resampling enables hypothesis testing to validate algorithm
+    correctness without materializing full result sets. Integer division semantics (floor) ensure consistent
+    dense row count predictions at period boundaries, critical for testing resampling correctness across
+    edge cases.
+  evidence: python/tests/hypothesis/arcticdb/test_resample.py:26(dense_row_count_in_resampled_dataframe)
+  stage: tests.hypothesis.arcticdb.test_resample
+  alternative_considered: Manual counting would not scale to property-based test generation
+- id: BD-099
+  type: B/RC
+  content: ASV benchmark timestamps converted to milliseconds via integer division for storage
+  rationale: Storing ASV results with millisecond timestamps balances precision with storage efficiency,
+    as nanosecond timestamps provide unnecessary resolution for benchmark data. Integer division prevents
+    floating-point artifacts in timestamp comparisons during trend analysis.
+  evidence: build_tooling/transform_asv_results.py:31(df_to_asv_json)
+  stage: build_tooling.transform_asv_results
+  alternative_considered: Nanosecond precision would increase storage without practical benefit
+- id: BD-100
+  type: B
+  content: ASV results analysis using eval() for heterogeneous result strings containing nan/inf
+  rationale: Using eval() for result parsing handles the heterogeneous string format that ASV produces,
+    including nan/inf values that cannot be parsed by standard numeric converters. This enables correct
+    trend analysis even when benchmarks fail or produce non-numeric results.
+  evidence: build_tooling/transform_asv_results.py:62(module)
+  stage: build_tooling.transform_asv_results
+  alternative_considered: Strict numeric parsing would fail on nan/inf benchmark results
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in build_tooling/transform_asv_results.py'
+- id: BD-101
+  type: B
+  content: TimeFrame sorted check via vectorized pairwise comparison
+  rationale: Vectorized sorted checking provides O(n) complexity for sort validation without Python loop
+    overhead. This enables fast sort-order verification in query paths that require sorted inputs, preventing
+    incorrect results from unsorted data fed to binary search operations.
+  evidence: python/arcticdb/version_store/_common.py:126(issorted)
+  stage: arcticdb.version_store._common
+  alternative_considered: O(n log n) sorting would be wasteful when only checking sortedness
+- id: BD-102
+  type: B/DK
+  content: Symbol concatenation with outer/inner join semantics for column alignment
+  rationale: Supporting outer and inner join semantics in symbol concatenation enables different column
+    alignment strategies for multi-symbol queries. Outer join preserves each columns while inner join
+    only keeps shared columns, allowing users to control result schema based on their downstream processing
+    requirements.
+  evidence: python/arcticdb/version_store/processing.py:1038(module)
+  stage: arcticdb.version_store.processing
+  alternative_considered: Fixed single alignment mode would force users into inconvenient data handling
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in python/arcticdb/version_store/processing.py'
+- id: BD-103
+  type: DK
+  content: Visitor Pattern for Expression Tree Traversal in QueryBuilder
+  rationale: QueryBuilder uses the Visitor pattern to traverse expression trees for query filtering. The
+    visit_expression method at line 1264 processes expression nodes in a decoupled manner, allowing new
+    expression types to be added without modifying the visitor interface.
+  evidence: python/arcticdb/version_store/processing.py:1264(visit_expression)
+  stage: pattern_choice
+  alternative_considered: Double dispatch or type-based branching were rejected due to coupling concerns
+- id: BD-104
+  type: B/BA
+  content: DEFAULT_ENCODING_VERSION=V2 with V1 still fully tested
+  rationale: ArcticDB defaults to encoding version 2 while maintaining full backward compatibility testing
+    for V1. This allows gradual migration while ensuring existing data written in V1 format remains readable.
+    The boundary is that any new write can opt into V1 explicitly but defaults to V2.
+  evidence: python/arcticdb/encoding_version.py:8(V2)
+  stage: default_value
+  alternative_considered: Forcing V2 migration was rejected to avoid breaking existing workflows
+  _evidence_issues:
+  - 'FN_NOT_FOUND: V2 in python/arcticdb/encoding_version.py'
+- id: BD-105
+  type: DK
+  content: Version Layer Linked-List traversal required for as_of queries
+  rationale: Time-travel queries (as_of) must traverse the version chain sequentially because versions
+    are stored as a linked list. This creates O(n) lookup time for historical versions where n is the
+    number of versions since the target timestamp.
+  evidence: N/A:0(see_rationale)
+  stage: ordering_contract
+  alternative_considered: Random access indexing was considered but rejected due to write amplification
+- id: BD-106
+  type: B/BA
+  content: 'Normalizer Chain: CustomNormalizer → CompositeNormalizer → DataFrameNormalizer'
+  rationale: ArcticDB implements a three-tier normalizer chain where CustomNormalizer handles user-defined
+    types, CompositeNormalizer aggregates multiple normalizers, and DataFrameNormalizer handles pandas
+    DataFrames as the default. This chain is evaluated in order, with each tier responsible for a specific
+    data category.
+  evidence: python/arcticdb/version_store/_store.py:571-587(module)
+  stage: pattern_choice
+  alternative_considered: Single dispatcher was rejected due to complexity in handling multiple normalizer
+    priorities
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in python/arcticdb/version_store/_store.py'
+- id: BD-107
+  type: DK
+  content: Symbol List Cache compaction triggers at 500 keys threshold
+  rationale: Symbol list caching performs automatic compaction when the number of symbol entries exceeds
+    500. This threshold balances memory usage against CPU overhead from frequent compaction operations.
+    Compaction consolidates fragmented symbol references into a more compact representation.
+  evidence: N/A:0(see_rationale)
+  stage: invariant
+  alternative_considered: Dynamic threshold based on memory pressure was considered but adds complexity
+- id: BD-108
+  type: B/RC
+  content: TimeFrame index dtype hardcoded to datetime64[ns] resolution
+  rationale: TimeFrame indexes are constrained to datetime64 with nanosecond resolution as defined by
+    _NS_DTYPE. This hardcoding ensures consistent timestamp handling across each operations but prevents
+    use of lower-resolution time indexes. The boundary is that any index must be convertible to nanosecond
+    precision.
+  evidence: python/arcticdb/version_store/_common.py:29(_NS_DTYPE)
+  stage: default_value
+  alternative_considered: Supporting multiple resolutions was rejected due to storage format complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _NS_DTYPE in python/arcticdb/version_store/_common.py'
+- id: BD-109
+  type: DK/B
+  content: Abstract Base Class hierarchy for Library Adapters (ArcticConfig)
+  rationale: Library adapters inherit from an Abstract Base Class hierarchy rooted at ArcticConfig. This
+    enforces a contract that each adapter implementations must provide specific methods for storage operations.
+    The ABC pattern ensures consistent interfaces across different storage backends.
+  evidence: python/arcticdb/version_store/helper.py:61(ArcticConfig)
+  stage: pattern_choice
+  alternative_considered: Protocol-based duck typing was considered but ABC provides better IDE support
+- id: BD-110
+  type: B
+  content: LibraryTool extends C++ LibraryToolImpl for Python/C++ bridging
+  rationale: LibraryTool provides a Python interface that wraps C++ LibraryToolImpl through inheritance.
+    This bridge allows Python applications to access low-level storage operations implemented in C++ for
+    performance. The boundary is that each Python calls ultimately delegate to the C++ implementation.
+  evidence: python/arcticdb/toolbox/library_tool.py:36(LibraryTool)
+  stage: inheritance
+  alternative_considered: ctypes/cffi binding was rejected in favor of native inheritance pattern
+- id: BD-111
+  type: B/BA
+  content: resolve_defaults() pattern for write_options with False defaults
+  rationale: Write options follow a resolve_defaults() pattern where unspecified options default to False.
+    This explicit False default ensures no ambiguous behavior where options might be None or unset. The
+    boundary is that callers must explicitly opt into behaviors rather than opting out.
+  evidence: python/arcticdb/version_store/_store.py:565-568(module)
+  stage: default_value
+  alternative_considered: None as default was rejected to prevent ambiguous state handling
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in python/arcticdb/version_store/_store.py'
+- id: BD-112
+  type: B
+  content: Stage→Finalize pipeline for streaming data with APPEND_DATA→APPEND_REF transition
+  rationale: 'Streaming data follows a two-phase commit pattern: Stage accumulates data, then Finalize
+    transitions from APPEND_DATA to APPEND_REF state. This ensures data integrity by preventing reads
+    of incomplete streams. The boundary is that no reads can occur until finalize() completes successfully.'
+  evidence: python/arcticdb/version_store/library.py:949(finalize)
+  stage: ordering_contract
+  alternative_considered: Automatic finalization was rejected due to uncertainty about write completion
+  _evidence_issues:
+  - 'FN_NOT_FOUND: finalize in python/arcticdb/version_store/library.py'
+- id: BD-113
+  type: B
+  content: Reference Keys are mutable; Atom Keys are immutable - storage contract
+  rationale: ArcticDB distinguishes between Reference keys (mutable, point to other keys) and Atom keys
+    (immutable, contain actual data). This separation enables efficient versioning while maintaining data
+    integrity. The boundary is that Atom keys can never be modified after creation.
+  evidence: N/A:0(see_rationale)
+  stage: invariant
+  alternative_considered: Mutable atoms were rejected due to consistency concerns with concurrent readers
+- id: BD-114
+  type: B/BA
+  content: Flattener metastructure v1 vs v2 encoding with v2 becoming default
+  rationale: The flattener module supports two metastructure encodings where v2 is now the default. V2
+    provides improved handling of nested structures but maintains backward compatibility with v1 reads.
+    The boundary is that data flattened with v1 can still be read by v2.
+  evidence: python/arcticdb/flattener.py:38(meta_structure_v2)
+  stage: pattern_choice
+  alternative_considered: Forcing v2 migration was rejected to prevent read failures for legacy data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: meta_structure_v2 in python/arcticdb/flattener.py'
+- id: BD-115
+  type: B/BA
+  content: _DEFAULT_ENV='environment' hardcoded across each library adapters
+  rationale: Every library adapters default to 'environment' as the environment name. This hardcoded default
+    provides a consistent baseline configuration across storage backends. The boundary is that any adapter
+    can override this default through configuration.
+  evidence: python/arcticdb/adapters/arctic_library_adapter.py:12(module)
+  stage: default_value
+  alternative_considered: No default was rejected to prevent configuration errors from missing required
+    parameters
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in python/arcticdb/adapters/arctic_library_adapter.py'
+- id: BD-116
+  type: BA/DK
+  content: _DEFAULT_ENV='environment' hardcoded across each library adapters - API contract
+  rationale: The 'environment' naming convention establishes a standard API contract for how ArcticDB
+    libraries reference storage environments. This convention is documented and expected by API consumers.
+    The boundary is that each official adapters must follow this convention.
+  evidence: python/arcticdb/adapters/arctic_library_adapter.py:12(module)
+  stage: default_value
+  alternative_considered: Adapter-specific defaults were rejected to maintain cross-platform consistency
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in python/arcticdb/adapters/arctic_library_adapter.py'
+- id: BD-117
+  type: DK/B
+  content: QueryBuilder with __getitem__ overloading for filter syntax
+  rationale: QueryBuilder implements __getitem__ to provide a filter syntax using bracket notation. This
+    allows query expressions like builder[builder['column'] > 5]. The design choice uses operator overloading
+    to create an intuitive DSL for filtering.
+  evidence: python/arcticdb/version_store/processing.py:425(QueryBuilder)
+  stage: pattern_choice
+  alternative_considered: Method chaining (builder.filter(...)) was rejected for brevity
+- id: BD-118
+  type: M/BA
+  content: Toolbox library_tool provides low-level storage access bypassing normalizer
+  rationale: The library_tool module provides a toolbox for low-level storage operations that bypass the
+    normalizer pipeline. This enables performance-critical operations and direct data manipulation. The
+    boundary is that bypassed data may not be portable across different normalizer configurations.
+  evidence: python/arcticdb/toolbox/library_tool.py:167(normalize_dataframe_with_nvs_defaults)
+  stage: subdirectory
+  alternative_considered: Forcing normalization was rejected to support expert users and testing scenarios
+- id: BD-119
+  type: DK
+  content: util/append_and_defrag.py contains manual data layer fragmentation management
+  rationale: ArcticDB includes manual defragmentation utilities for managing storage fragmentation. This
+    indicates that automated garbage collection may not fully address fragmentation issues. The boundary
+    is that users can manually trigger defragmentation when performance degrades.
+  evidence: python/arcticdb/util/append_and_defrag.py:54(_append_and_defrag_idempotent)
+  stage: subdirectory
+  alternative_considered: Automatic defragmentation was considered but could interrupt active workloads
+- id: BD-120
+  type: B/RC
+  content: pickle_on_failure parameter controls normalizer fallback behavior
+  rationale: The pickle_on_failure parameter determines whether ArcticDB falls back to pickle serialization
+    when normalizer-based serialization fails. This provides a safety net for unknown data types. The
+    boundary is that pickle fallback may have security implications.
+  evidence: python/arcticdb/version_store/_store.py:579(pickle_on_failure)
+  stage: ordering_contract
+  alternative_considered: Strict rejection of unknown types was rejected to support polymorphic data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: pickle_on_failure in python/arcticdb/version_store/_store.py'
+- id: BD-121
+  type: B/RC
+  content: TimeFrame requires datetime64[ns] dtype; other resolutions rejected at construction
+  rationale: TimeFrame enforces datetime64[ns] dtype at construction time, rejecting any other timestamp
+    resolution. This strict enforcement ensures consistent storage format but can fail on input data with
+    different resolutions. The boundary is construction-time validation only.
+  evidence: python/arcticdb/version_store/_common.py:38(__new__)
+  stage: invariant
+  alternative_considered: Silent conversion was rejected to prevent precision loss without user awareness
+- id: BD-122
+  type: DK/B
+  content: LazyDataFrame/LazyDataFrameCollection proxy pattern for deferred evaluation
+  rationale: LazyDataFrame and LazyDataFrameCollection implement a proxy pattern that defers computation
+    until data is actually needed. This enables efficient handling of large datasets by avoiding unnecessary
+    materialization. The boundary is that operations return proxies, not results.
+  evidence: python/arcticdb/version_store/library.py:441(LazyDataFrame)
+  stage: pattern_choice
+  alternative_considered: Eager evaluation was rejected due to memory constraints with large datasets
+- id: BD-123
+  type: M
+  content: Library._nvs wraps NativeVersionStore; each operations proxied through
+  rationale: Library wraps NativeVersionStore through composition, proxying each operations through the
+    _nvs member. This design isolates the native implementation from the public API. The boundary is that
+    each library operations ultimately delegate to the native store.
+  evidence: python/arcticdb/version_store/library.py:200(module)
+  stage: inheritance
+  alternative_considered: Direct native store exposure was rejected to maintain API stability
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in python/arcticdb/version_store/library.py'
+- id: BD-124
+  type: BA/M
+  content: 'INTERACTION: [BD-107] × [BD-005] → Contradictory encoding version defaults across configuration
+    layers'
+  rationale: BD-107 declares DEFAULT_ENCODING_VERSION=V2 in the core encoding module while BD-005 shows
+    encoding_version=V1 as the default in LibraryOptions. This creates contradictory defaults where the
+    same library-level setting has two different baseline values depending on which code path initializes
+    it. The contradiction manifests during library creation when the normalizer chain must choose an encoding
+    version—the discrepancy could lead to unexpected V1 vs V2 behavior depending on import order or configuration
+    source.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Unified encoding version default in single configuration point
+- id: BD-125
+  type: B/BA
+  content: 'INTERACTION: [BD-012] × [BD-028] → Unbounded storage growth risk from version accumulation'
+  rationale: BD-012 mandates that every write operation creates a new version regardless of data content,
+    while BD-028 defaults prune_previous_version to False. Together, these decisions guarantee that storage
+    will grow monotonically with each write operation. For write-heavy workloads (high-frequency data
+    ingestion, intraday updates), this combination creates a systemic storage exhaustion risk. The risk
+    is compounded by the fact that identical writes still create distinct versions, meaning even no-op
+    writes consume storage.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Conditional versioning or automatic pruning thresholds to prevent storage exhaustion
+- id: BD-126
+  type: B/BA
+  content: 'INTERACTION: [BD-004] × [BD-064] → Dynamic schema enables stricter validation that amplifies
+    append failures'
+  rationale: When dynamic_schema=True (BD-004 enables schema evolution), the system still enforces BD-064's
+    strict duplicate column name rejection. This combination means dynamic schema allows adding new columns
+    freely but forbids any duplicate column names—a restrictive form of schema evolution that may surprise
+    users expecting full flexibility. The amplification occurs because users enabling dynamic schema for
+    flexibility encounter strict validation when their data has duplicate column names from external sources.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Allow duplicate columns in dynamic schema mode with positional disambiguation
+- id: BD-127
+  type: B/BA
+  content: 'INTERACTION: [BD-046] × [BD-047] → S3 security defaults create unencrypted, unauthenticated
+    storage access path'
+  rationale: BD-046 defaults AWS authentication to DISABLED while BD-047 defaults SSL to False for S3
+    connections. Together, these create a configuration path where S3 storage operates without encryption
+    in transit and without authentication. While SSL disabled may be intentional for local/trusted networks,
+    the combination with disabled authentication creates a security posture where production S3 buckets
+    could be accessed without credentials if SSL is disabled in error. The amplification is the security
+    gap being multiplicative rather than additive.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Conditional SSL enforcement when authentication is enabled
+- id: BD-128
+  type: B
+  content: 'INTERACTION: [BD-013] × [BD-022] → Snapshot protection prevents pruning even when explicitly
+    requested'
+  rationale: Even when prune_previous_version=True is explicitly set (BD-013), versions protected by snapshots
+    (BD-022) cannot be deleted. This creates a scenario where users who believe they have configured automatic
+    pruning may still accumulate storage because snapshot protection blocks deletion. The cascade risk
+    occurs in multi-tenant systems where one user's snapshots protect versions that another user's pruning
+    policy would otherwise clean up. Storage continues growing despite explicit pruning configuration.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Snapshot-level pruning controls or namespace-scoped snapshot isolation
+- id: BD-129
+  type: BA
+  content: 'INTERACTION: [BD-026] × [BD-108] → Version linked list creates O(n) performance degradation
+    for deep history'
+  rationale: BD-026 describes versions as an immutable linked list where each version points to the previous
+    version, while BD-108 explicitly states that as_of queries require O(n) traversal where n is the version
+    count. For libraries with extensive version history (thousands of versions from frequent writes),
+    this creates a performance cascade where time-travel queries become increasingly slow. The hidden
+    dependency is that users expecting efficient historical access may not realize the linked-list structure
+    makes deep history expensive to query.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Version index structure for O(log n) historical access at cost of write amplification
+- id: BD-130
+  type: BA
+  content: 'INTERACTION: [BD-021] × [BD-023] → Tombstone accumulation interacts with symbol list cache
+    compaction threshold'
+  rationale: Soft-deleted versions create tombstones (BD-021) that persist until garbage collection, while
+    symbol list caching (BD-023) only compacts at the 500-entry threshold. The interaction creates a scenario
+    where rapid delete operations accumulate tombstones in the symbol list cache, causing cache bloat
+    until compaction triggers. During the accumulation period, list_symbols operations must process each
+    tombstone markers, potentially degrading performance. The cascade occurs because high-frequency deletion
+    workloads outpace the compaction threshold timing.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Dynamic compaction triggering based on tombstone density rather than fixed entry
+    count
+- id: BD-131
+  type: B
+  content: 'INTERACTION: [BD-024] × [BD-116] → Four-layer storage hierarchy enables mutable reference
+    atoms separation'
+  rationale: The 4-layer storage hierarchy (BD-024) separates mutable Reference Layer pointers from immutable
+    Data Layer atoms (BD-116). This design enables versioning without data duplication—the Reference Layer
+    can point to new atoms while historical references remain valid. The amplification occurs because
+    this separation is foundational to the entire versioning system, meaning any corruption or inconsistency
+    in the Reference Layer (the only mutable layer) can affect each historical versions simultaneously.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Immutable reference pointers for stronger consistency at cost of write performance
+- id: BD-132
+  type: BA
+  content: 'INTERACTION: [BD-015] × [BD-114] → Multi-level configuration precedence may conflict with
+    conservative False defaults'
+  rationale: 'Output format has 4 precedence levels (BD-015: Arctic instance → Library → Read operation),
+    yet BD-114 establishes that write options default to False with resolve_defaults(). When users configure
+    format at instance level expecting propagation to each operations, they may be surprised when operation-level
+    resolve_defaults() resets to conservative False values. The tension creates scenarios where explicit
+    high-level configuration is silently overridden by low-level conservative defaults.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Unified precedence where higher levels always override without default reset
+- id: BD-133
+  type: BA
+  content: 'INTERACTION: [BD-051] × [BD-066] → Deprecated URI credentials conflicts with auto-AWS configuration'
+  rationale: BD-051 deprecates URI-embedded credentials for security reasons, yet BD-066 auto-discovers
+    AWS credentials when connecting to AWS endpoints. Users migrating away from deprecated URI credentials
+    may expect credentials to require explicit configuration but instead encounter automatic discovery
+    behavior. The contradiction is between the security posture of requiring explicit configuration (deprecation
+    message) and the usability posture of silent auto-discovery.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Align auto-discovery with explicit opt-in requirement matching URI deprecation
+    intent
+- id: BD-GAP-001
+  type: T
+  content: Each storage fixture is backed by its own isolated database/container to enable deterministic
+    cleanup without cross-test contamination
+  rationale: Isolation per fixture ensures test parallelism safety and prevents cleanup failures in one
+    test from affecting others; breaks when storage backends have hard limits on database/container count
+  evidence: python/arcticdb/storage_fixtures/mongo.py:46(MongoDatabase.__init__)
+  stage: test_infrastructure
+  alternative_considered: Shared databases with namespacing would reduce isolation
+- id: BD-GAP-002
+  type: B/BA
+  content: MongoDB fixture validates URI must start with 'mongodb://' and database name must not contain
+    '?' to prevent connection string injection attacks
+  rationale: Prevents malformed URIs from reaching the MongoDB driver with unexpected behavior; breaks
+    if MongoDB adds new URI schemes
+  evidence: python/arcticdb/storage_fixtures/mongo.py:49(MongoDatabase.__init__)
+  stage: input_validation
+  alternative_considered: Let driver validate would produce less clear errors
+- id: BD-GAP-003
+  type: T
+  content: 'Storage fixture factory supports dual modes: externally managed servers (via URI) and self-managed
+    servers started on ephemeral ports'
+  rationale: Enables CI environments to provide pre-existing servers while still supporting local development
+    without external dependencies; breaks when external servers are unavailable in CI
+  evidence: python/arcticdb/storage_fixtures/mongo.py:103(ExternalMongoDBServer)
+  stage: deployment
+  alternative_considered: Require external servers always would complicate local dev
+- id: BD-GAP-004
+  type: B
+  content: 'Auto-detection fallback chain: CI_MONGO_HOST env var → localhost → spawn dedicated instance
+    on random port'
+  rationale: Prioritizes CI-provided infrastructure before attempting local resources, minimizing test
+    runtime; breaks when localhost MongoDB conflicts with existing installations
+  evidence: python/arcticdb/storage_fixtures/mongo.py:165(auto_detect_server)
+  stage: test_infrastructure
+  alternative_considered: Skip localhost check would waste resources
+- id: BD-GAP-005
+  type: B/DK
+  content: Graceful process termination uses CTRL_BREAK_EVENT on Windows to handle multiprocess servers
+    (unlike SIGTERM which only kills the leader)
+  rationale: Ensures MongoDB/Moto processes with multiple workers are fully terminated on Windows; breaks
+    if subprocess doesn't use start() method or on non-Windows platforms
+  evidence: python/arcticdb/storage_fixtures/utils.py:101(GracefulProcessUtils.terminate)
+  stage: platform_support
+  alternative_considered: Taskkill would be less portable
+- id: BD-GAP-006
+  type: B/BA
+  content: Azurite mock defaults to SSL enabled (use_ssl=True) for production parity, with ssl_test_support
+    flag to disable when certs unavailable
+  rationale: Catches SSL configuration issues early rather than discovering them only in production; breaks
+    when test environment lacks SSL support
+  evidence: python/arcticdb/storage_fixtures/azure.py:182(AzuriteStorageFixtureFactory.__init__)
+  stage: security
+  alternative_considered: Disable SSL by default would miss SSL-specific bugs
+- id: BD-GAP-007
+  type: B
+  content: GCP S3 implementation requires separate host dispatcher because GCP's S3-compatible API lacks
+    batch delete operations
+  rationale: Enables testing against GCP's actual S3-compatible API which has different semantics; breaks
+    if GCP adds batch delete support making the distinction unnecessary
+  evidence: python/arcticdb/storage_fixtures/s3.py:743(GcpHostDispatcherApplication)
+  stage: cloud_compatibility
+  alternative_considered: Emulate GCP quirks in mock would hide real behavior
+- id: BD-GAP-008
+  type: B/BA
+  content: Service startup retries with configurable timeout (default 20s) and polling interval (default
+    0.2s) to account for cold-start variance
+  rationale: Avoids false test failures on slow CI runners while bounding worst-case startup wait; breaks
+    on systems where services take longer than timeout
+  evidence: python/arcticdb/storage_fixtures/utils.py:120(wait_for_server_to_come_up)
+  stage: reliability
+  alternative_considered: Infinite wait would hang tests indefinitely
+- id: BD-GAP-009
+  type: B/RC
+  content: CA certificates for SSL are copied to system temp with chmod 666 (readable by each users) to
+    support Azure tests in multi-user environments
+  rationale: Ensures SSL tests work regardless of which user runs pytest while avoiding permission errors;
+    breaks security policies requiring stricter cert permissions
+  evidence: python/arcticdb/storage_fixtures/azure.py:281(copy_ca_certs)
+  stage: security
+  alternative_considered: Per-user certs would require more complex lifecycle management
+- id: BD-GAP-010
+  type: B/BA
+  content: 'Storage fixture library name reuse contract: same lib_name returns same underlying storage
+    to support library caching'
+  rationale: Enables test efficiency by reusing expensive storage initialization; breaks if tests assume
+    lib_name changes result in fresh storage
+  evidence: python/arcticdb/storage_fixtures/api.py:77(StorageFixture.create_test_cfg)
+  stage: test_infrastructure
+  alternative_considered: Always fresh would be slower but safer
+- id: BD-GAP-011
+  type: B/RC
+  content: Optional permission enforcement with context manager allows tests to verify permission behavior
+    without making it mandatory for each fixtures
+  rationale: Enables granular permission testing while supporting backends that don't implement permissions;
+    breaks when backend claims support but implements incorrectly
+  evidence: python/arcticdb/storage_fixtures/api.py:139(StorageFixture.set_permission)
+  stage: test_infrastructure
+  alternative_considered: Require uniform permissions would exclude simpler backends
+- id: BD-GAP-012
+  type: B/BA
+  content: Mock S3 supports error simulation based on symbol names, distinct from general mock fixtures
+    for storage failure injection testing
+  rationale: Enables targeted storage failure testing without external fault injection infrastructure;
+    breaks when error patterns don't match symbol naming conventions
+  evidence: python/arcticdb/storage_fixtures/s3.py:661(mock_s3_with_error_simulation)
+  stage: testing
+  alternative_considered: Chaos engineering with real failures would be more comprehensive
+- id: BD-GAP-013
+  type: B
+  content: Real cloud storage detection exclusively from environment variables, never from config files
+    or interactive prompts in test context
+  rationale: Ensures tests run deterministically based on CI configuration; breaks if credentials expire
+    and no env refresh mechanism exists
+  evidence: python/arcticdb/storage_fixtures/s3.py:373(real_s3_from_environment_variables)
+  stage: security
+  alternative_considered: Interactive prompts would block CI automation
+- id: BD-GAP-014
+  type: B/BA
+  content: STS-based S3 authentication uses assumed roles with policy-controlled access for test isolation
+    from production resources
+  rationale: Minimizes blast radius of test errors by restricting what test code can access; breaks when
+    IAM roles lack necessary permissions
+  evidence: python/arcticdb/storage_fixtures/s3.py:440(real_s3_sts_from_environment_variables)
+  stage: security
+  alternative_considered: Dedicated test account would be simpler but require more infrastructure
+- id: BD-GAP-015
+  type: B
+  content: Installation tests validate deduplicated batch writes, parallel writes with appends, and stage/finalize
+    patterns with chunking
+  rationale: These are core ArcticDB features that must work across each storage backends; breaks when
+    concurrent access patterns expose storage-specific bugs
+  evidence: python/installation_tests/test_installation.py:52(test_write_batch_dedup)
+  stage: validation
+  alternative_considered: Unit tests alone would miss cloud-specific behaviors
+- id: BD-GAP-016
+  type: B
+  content: Log sanitization in GitHub CI context strips sensitive values from test output to prevent credential
+    leakage in logs
+  rationale: Prevents accidental credential exposure when tests fail and dump request/response data; breaks
+    when sanitization regex doesn't cover each sensitive patterns
+  evidence: python/installation_tests/logger.py:27(GitHubSanitizingHandler.sanitize_message)
+  stage: security
+  alternative_considered: Redact each logging would make debugging harder
+- id: BD-GAP-017
+  type: B/BA
+  content: Lazy singleton pattern for boto3 bucket access in S3 fixtures with explicit thread-safety warning
+  rationale: Reduces connection overhead for tests that don't need bucket operations; breaks if multiple
+    threads access fixture concurrently before initialization completes
+  evidence: python/arcticdb/storage_fixtures/s3.py:171(S3Bucket.get_boto_bucket)
+  stage: performance
+  alternative_considered: Eager initialization would be slower but safer
+- id: BD-GAP-018
+  type: B
+  content: Client factory pattern in installation tests decouples storage creation from test code to support
+    storage-type parameterized testing
+  rationale: Enables same test code to run against multiple storage backends without modification; breaks
+    when storage-specific features are inadvertently used
+  evidence: python/installation_tests/client_utils.py:210(create_arctic_client)
+  stage: test_infrastructure
+  alternative_considered: Separate tests per backend would be more explicit but more code
+- id: BD-GAP-019
+  type: B
+  content: Temporary path cleanup warns (not fails) on rmtree errors to distinguish test bugs from external
+    interference
+  rationale: Avoids masking real test failures when cleanup fails due to concurrent processes; breaks
+    when cleanup failures indicate actual bugs
+  evidence: python/arcticdb/storage_fixtures/utils.py:160(safer_rmtree)
+  stage: reliability
+  alternative_considered: Fail-fast would expose issues earlier but cause CI noise
+- id: BD-GAP-020
+  type: BA
+  content: _safe_enter separates resource allocation that needs __exit__ cleanup from initialization that
+    can safely fail, enabling cleaner error propagation
+  rationale: Prevents partial initialization states where __exit__ runs on uninitialized resources; breaks
+    when subclasses override incorrectly
+  evidence: python/arcticdb/storage_fixtures/api.py:50(_SaferContextManager._safe_enter)
+  stage: reliability
+  alternative_considered: Single-phase init would be simpler but less safe
+known_use_cases:
+- id: UC-101
+  name: AWS S3 Configuration for Public Blockchain Data Access
+  source: docs/mkdocs/docs/notebooks/ArcticDB_aws_public_blockchain.ipynb
+  type: data_pipeline
+  business_problem: Setting up AWS credentials to enable secure access to public blockchain data stored
+    in S3, allowing integration with ArcticDB for time-series storage.
+  intent_keywords:
+  - aws
+  - s3
+  - credentials
+  - blockchain
+  - configuration
+  stage: data_collection
+  negative_keywords:
+  - lmdb
+  - local storage
+  - parquet
+  - write data
+  - local
+  disambiguation: Are you trying to configure AWS S3 credentials for cloud storage access, or working
+    with local ArcticDB storage?
+  data_domain: market_data
+- id: UC-102
+  name: Billion Row Challenge - Large Scale Data Performance
+  source: docs/mkdocs/docs/notebooks/ArcticDB_billion_row_challenge.ipynb
+  type: data_pipeline
+  business_problem: Demonstrates ArcticDB's ability to handle massive datasets (1 billion rows of temperature
+    data) with efficient aggregation, serving as a performance benchmark for large-scale data operations.
+  intent_keywords:
+  - billion rows
+  - large scale
+  - performance
+  - aggregation
+  - temperature
+  stage: data_collection
+  negative_keywords:
+  - small dataset
+  - real-time
+  - trading
+  - options
+  - streaming
+  disambiguation: Are you benchmarking ArcticDB performance with very large datasets, or working with
+    typical financial market data volumes?
+  data_domain: mixed
+- id: UC-103
+  name: Batch DataFrame Concatenation with Lazy Loading
+  source: docs/mkdocs/docs/notebooks/ArcticDB_demo_concat.ipynb
+  type: data_pipeline
+  business_problem: Demonstrates efficient concatenation of multiple DataFrames stored in ArcticDB using
+    lazy loading to minimize memory consumption during batch operations.
+  intent_keywords:
+  - concat
+  - batch
+  - lazy
+  - combine
+  - merge
+  stage: data_processing
+  negative_keywords:
+  - single dataframe
+  - real-time
+  - streaming
+  - append-only
+  disambiguation: Are you combining multiple data sources into one unified dataset, or working with a
+    single continuous data stream?
+  data_domain: mixed
+- id: UC-104
+  name: Equity Market Data Historical Analytics
+  source: docs/mkdocs/docs/notebooks/ArcticDB_demo_equity_analytics.ipynb
+  type: data_pipeline
+  business_problem: Demonstrates downloading historical equity market data from yfinance and storing it
+    in ArcticDB for analytics, enabling time-series analysis of stock prices and volumes across multiple
+    symbols.
+  intent_keywords:
+  - equity
+  - stock
+  - historical
+  - yfinance
+  - analytics
+  stage: data_collection
+  negative_keywords:
+  - options
+  - futures
+  - crypto
+  - real-time
+  - streaming
+  disambiguation: Are you analyzing historical stock prices and returns, or looking at derivatives like
+    options and futures?
+  data_domain: financial_data
+- id: UC-105
+  name: Equity Options Market Data Analysis
+  source: docs/mkdocs/docs/notebooks/ArcticDB_demo_equity_options.ipynb
+  type: data_pipeline
+  business_problem: Demonstrates storing and querying equity options data including expiry analysis and
+    option Greeks, supporting options strategy research and analysis workflows.
+  intent_keywords:
+  - options
+  - expiry
+  - greeks
+  - underlying
+  - options data
+  stage: data_collection
+  negative_keywords:
+  - stock prices
+  - bonds
+  - crypto
+  - futures
+  - equity
+  disambiguation: Are you working with equity options contracts, or looking at underlying stock prices?
+  data_domain: financial_data
+- id: UC-106
+  name: Lazy DataFrame Operations for Large Datasets
+  source: docs/mkdocs/docs/notebooks/ArcticDB_demo_lazydataframe.ipynb
+  type: data_pipeline
+  business_problem: Demonstrates reading large datasets (10M-1B rows) efficiently using ArcticDB's lazy
+    loading to reduce memory usage while selecting specific columns.
+  intent_keywords:
+  - lazy
+  - large dataset
+  - memory efficient
+  - column selection
+  - performance
+  stage: data_collection
+  negative_keywords:
+  - write
+  - update
+  - streaming
+  - real-time
+  - small data
+  disambiguation: Are you optimizing memory usage when reading large datasets, or doing writes and updates?
+  data_domain: mixed
+- id: UC-107
+  name: LMDB Storage Operations - Basic CRUD
+  source: docs/mkdocs/docs/notebooks/ArcticDB_demo_lmdb.ipynb
+  type: data_pipeline
+  business_problem: Demonstrates basic storage operations (write, read, append, update) with ArcticDB
+    using LMDB backend, including version management and subframe reading capabilities.
+  intent_keywords:
+  - lmdb
+  - write
+  - read
+  - append
+  - update
+  - version
+  stage: data_collection
+  negative_keywords:
+  - s3
+  - aws
+  - cloud
+  - remote storage
+  - streaming
+  disambiguation: Are you performing basic read/write operations on local storage, or working with cloud-based
+    S3 storage?
+  data_domain: mixed
+- id: UC-108
+  name: Query Builder with Column Selection
+  source: docs/mkdocs/docs/notebooks/ArcticDB_demo_querybuilder.ipynb
+  type: data_pipeline
+  business_problem: Demonstrates efficient querying of large datasets (up to 1B rows) with specific column
+    selection, optimizing read performance by avoiding unnecessary data loading.
+  intent_keywords:
+  - query
+  - column
+  - select
+  - filter
+  - performance
+  stage: data_processing
+  negative_keywords:
+  - write
+  - update
+  - full scan
+  - streaming
+  disambiguation: Are you querying and selecting specific columns from data, or writing and updating data?
+  data_domain: mixed
+- id: UC-109
+  name: Data Export to Arrow and Polars Formats
+  source: docs/mkdocs/docs/notebooks/ArcticDB_demo_read_as_arrow.ipynb
+  type: data_pipeline
+  business_problem: Demonstrates reading ArcticDB data into Arrow and Polars formats for interoperability
+    with modern data science tooling, enabling seamless integration with downstream processing pipelines.
+  intent_keywords:
+  - arrow
+  - polars
+  - export
+  - convert
+  - interoperability
+  stage: data_processing
+  negative_keywords:
+  - write
+  - update
+  - streaming
+  - pandas
+  disambiguation: Are you converting ArcticDB data to Arrow or Polars for analysis, or working with pandas?
+  data_domain: mixed
+- id: UC-110
+  name: Nested Data Structure Storage
+  source: docs/mkdocs/docs/notebooks/ArcticDB_demo_recursive_normalizers.ipynb
+  type: data_pipeline
+  business_problem: Demonstrates storing complex nested data structures including DataFrames within dictionaries
+    using recursive normalizers, enabling preservation of hierarchical data relationships.
+  intent_keywords:
+  - nested
+  - recursive
+  - complex structure
+  - dict
+  - normalizer
+  stage: data_collection
+  negative_keywords:
+  - flat
+  - simple
+  - single dataframe
+  - streaming
+  disambiguation: Are you storing complex nested data structures, or working with simple flat data?
+  data_domain: mixed
+- id: UC-111
+  name: Time-Series Data Resampling and Aggregation
+  source: docs/mkdocs/docs/notebooks/ArcticDB_demo_resample.ipynb
+  type: data_pipeline
+  business_problem: Demonstrates resampling high-frequency time-series data (12M rows at second frequency)
+    to lower frequencies (1-minute) using built-in aggregation, optimizing storage and query performance.
+  intent_keywords:
+  - resample
+  - time series
+  - aggregate
+  - frequency
+  - OHLCV
+  stage: data_processing
+  negative_keywords:
+  - cross-sectional
+  - snapshot
+  - static data
+  - flat data
+  disambiguation: Are you converting time-series data between different frequencies, or analyzing cross-sectional
+    snapshots?
+  data_domain: market_data
+- id: UC-112
+  name: Data Versioning with Snapshots
+  source: docs/mkdocs/docs/notebooks/ArcticDB_demo_snapshots.ipynb
+  type: data_pipeline
+  business_problem: Demonstrates creating and managing data snapshots for point-in-time recovery, enabling
+    reproducibility and audit trails for time-series data in ArcticDB.
+  intent_keywords:
+  - snapshot
+  - version
+  - restore
+  - point-in-time
+  - reproducibility
+  stage: data_processing
+  negative_keywords:
+  - live
+  - current
+  - streaming
+  - real-time
+  - append-only
+  disambiguation: Are you creating point-in-time snapshots for recovery or reproducibility, or working
+    with live streaming data?
+  data_domain: mixed
+- id: UC-113
+  name: Data Merge and Update Operations
+  source: docs/mkdocs/docs/notebooks/ArcticDB_merge.ipynb
+  type: data_pipeline
+  business_problem: Demonstrates merging new data with existing datasets using merge strategies (update,
+    do_nothing) for handling price corrections and data synchronization in financial applications.
+  intent_keywords:
+  - merge
+  - update
+  - combine
+  - correct
+  - synchronize
+  stage: data_processing
+  negative_keywords:
+  - append
+  - concat
+  - snapshot
+  - version
+  - new data only
+  disambiguation: Are you merging and updating existing records, or appending/concatenating new records?
+  data_domain: market_data
+- id: UC-114
+  name: Sports Analytics with Statistical Modeling
+  source: docs/mkdocs/docs/notebooks/ArcticDB_pythagorean_won_loss_formula_notebook.ipynb
+  type: research_analysis
+  business_problem: Demonstrates sports data analytics using the Pythagorean expectation formula to analyze
+    team performance, including data storage, visualization, and OLS statistical modeling.
+  intent_keywords:
+  - sports
+  - analytics
+  - statistics
+  - pythagorean
+  - team performance
+  stage: research_analysis
+  negative_keywords:
+  - financial
+  - market
+  - trading
+  - real-time
+  - production
+  disambiguation: Are you analyzing sports/athletic performance data, or financial market data?
+  data_domain: mixed
+- id: UC-115
+  name: Multi-Process Data Staging with Token Management
+  source: docs/mkdocs/docs/notebooks/ArcticDB_staged_data_with_tokens.ipynb
+  type: data_pipeline
+  business_problem: Demonstrates staging data from multiple concurrent writers before finalizing with
+    tokens, enabling distributed data ingestion workflows with proper synchronization.
+  intent_keywords:
+  - stage
+  - token
+  - multi-process
+  - concurrent
+  - write
+  stage: data_collection
+  negative_keywords:
+  - single process
+  - read-only
+  - snapshot
+  - append-only
+  disambiguation: Are you coordinating writes from multiple concurrent processes, or working with single-process
+    data operations?
+  data_domain: mixed
+- id: UC-116
+  name: Data Visualization Styling Utilities
+  source: docs/mkdocs/docs/notebooks/styling.py
+  type: reporting
+  business_problem: Provides styling functions for DataFrame visualization with custom themes, color schemes,
+    and export capabilities for creating professional data presentations.
+  intent_keywords:
+  - style
+  - visualization
+  - theme
+  - color
+  - table formatting
+  stage: reporting
+  negative_keywords:
+  - data storage
+  - processing
+  - analysis
+  - pipeline
+  disambiguation: Are you styling and formatting data for presentation, or processing and storing data?
+  data_domain: mixed
+- id: UC-117
+  name: ArcticDB Release Validation Tests
+  source: docs/mkdocs/docs/technical/release_checks.py
+  type: builtin_factor
+  business_problem: Provides automated release validation tests that verify basic ArcticDB functionality
+    including library creation, data write/read operations, and library deletion.
+  intent_keywords:
+  - release
+  - test
+  - validation
+  - assert
+  - verify
+  stage: builtin_factor
+  negative_keywords:
+  - production
+  - analysis
+  - real data
+  - trading
+  disambiguation: Are you running automated tests for release validation, or working with production data?
+  data_domain: mixed
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 110
+  evidence_invalid: 30
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.7857142857142857
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+- type: depends_on
+  target: docs/claude/PR_REVIEW_GUIDELINES.md
+  description: review-pr skill requires the PR review guidelines document to apply correct code quality
+    checks and generate summary checklist
+  evidence: .claude/skills/review-pr/SKILL.md:§Step 6
+- type: complementary
+  target: CLAUDE.md
+  description: CLAUDE.md provides the root configuration and references code review guidelines, complementing
+    the review-pr skill's detailed workflow
+  evidence: CLAUDE.md:§Code Review Guidelines
+- type: contains
+  target: docs/claude/cpp/
+  description: C++ documentation subtree contains sub-documents for specific modules referenced during
+    review (caching, versioning, storage, etc.)
+  evidence: CLAUDE.md:§Documentation Index
+- type: contains
+  target: docs/claude/python/
+  description: Python documentation subtree contains sub-documents for specific modules referenced during
+    review
+  evidence: CLAUDE.md:§Documentation Index
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 0
+    warn: 0
+    fail: 0
+  subdomain_totals:
+    pass: 6
+    warn: 14
+    fail: 19
+  coverage: 39/39 (100%)
+  pass_rate: 6/39 (15%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: cloud_storage_backend
+  description: Choose based on cloud provider, deployment model (cloud vs on-prem), latency requirements,
+    and existing infrastructure
+  used_in_stages: []
+  options:
+  - name: AWS S3
+    traits:
+    - S3-compatible
+    - IAM roles
+    - STS support
+    - Multi-part upload
+    fit_for:
+    - Production cloud workloads, AWS-native deployments
+    not_fit_for:
+    - On-premises without S3 compatibility
+  - name: Azure Blob Storage
+    traits:
+    - Azure-native
+    - AD authentication
+    - Hierarchical namespaces
+    fit_for:
+    - Azure-native deployments, enterprise Microsoft environments
+    not_fit_for:
+    - Multi-cloud or AWS-focused setups
+  - name: Google Cloud Storage (XML API)
+    traits:
+    - S3-compatible API
+    - GCS-native
+    - Credential chain
+    fit_for:
+    - GCP deployments with S3-compatible access
+    not_fit_for:
+    - Native GCS APIs (not yet implemented)
+  - name: Ceph RGW / MinIO
+    traits:
+    - S3-compatible
+    - Self-hosted
+    - On-premises
+    fit_for:
+    - On-premises deployments, private cloud
+    not_fit_for:
+    - Managed cloud services
+  - name: MongoDB
+    traits:
+    - Document store
+    - Sharding
+    - Replica sets
+    fit_for:
+    - Document-centric workloads, MongoDB shops
+    not_fit_for:
+    - High-performance time-series (use S3/LMDB)
+  - name: LMDB (Local Disk)
+    traits:
+    - Embedded
+    - ACID
+    - MMAP
+    - Single-node
+    fit_for:
+    - Development, single-node deployments, low-latency local storage
+    not_fit_for:
+    - Distributed deployments, cloud storage
+  default: AWS S3
+  _source: worker_resource
+- id: slot-002
+  name: dataframe_format
+  description: Choose based on existing codebase, performance requirements, and ecosystem integration
+  used_in_stages: []
+  options:
+  - name: Pandas
+    traits:
+    - Default
+    - NumPy-backed
+    - Wide ecosystem
+    fit_for:
+    - General use, existing Python data science workflows
+    not_fit_for:
+    - Large datasets needing memory optimization
+  - name: PyArrow Tables
+    traits:
+    - Columnar memory
+    - Zero-copy
+    - Interoperable
+    fit_for:
+    - Performance-critical, Arrow ecosystem integration
+    not_fit_for:
+    - Legacy Pandas-only workflows
+  - name: Polars DataFrames
+    traits:
+    - Lazy evaluation
+    - Multi-threaded
+    - Arrow-native
+    fit_for:
+    - High-performance analytics, Polars-first workflows
+    not_fit_for:
+    - Pandas-dependent code
+  default: Pandas
+  _source: worker_resource
+- id: slot-003
+  name: metrics_monitoring
+  description: Enable based on observability requirements; Prometheus recommended for production
+  used_in_stages: []
+  options:
+  - name: Prometheus Push
+    traits:
+    - Push model
+    - Short-lived processes
+    - Gateway-based
+    fit_for:
+    - Batch jobs, short-lived processes
+    not_fit_for:
+    - Long-running services preferred by Pull
+  - name: Prometheus Pull
+    traits:
+    - Pull model
+    - Long-running services
+    - Exposer endpoint
+    fit_for:
+    - Long-running services, containerized deployments
+    not_fit_for:
+    - Short-lived batch jobs
+  - name: No Metrics
+    traits:
+    - Disabled by default
+    - Zero overhead
+    fit_for:
+    - Development, minimal overhead requirements
+    not_fit_for:
+    - Production monitoring
+  default: No Metrics
+  _source: worker_resource
+- id: slot-004
+  name: authentication_method
+  description: Prefer managed identities/IAM roles in production; explicit credentials for development/testing
+  used_in_stages: []
+  options:
+  - name: Explicit Credentials
+    traits:
+    - Access key/secret in URI
+    - Direct
+    fit_for:
+    - Simple deployments, testing
+    not_fit_for:
+    - Production (credential rotation)
+  - name: AWS Default Credential Chain
+    traits:
+    - IAM roles
+    - Environment vars
+    - Config files
+    - EC2 metadata
+    fit_for:
+    - AWS deployments, production
+    not_fit_for:
+    - Non-AWS or multi-cloud
+  - name: AWS STS Profile Credentials
+    traits:
+    - Assume role
+    - Temporary credentials
+    - Cross-account
+    fit_for:
+    - Enterprise AWS, cross-account access
+    not_fit_for:
+    - Simple single-account setups
+  - name: Azure Managed Identity
+    traits:
+    - Azure-native
+    - No secrets in code
+    fit_for:
+    - Azure deployments, production
+    not_fit_for:
+    - Multi-cloud
+  default: Explicit Credentials
+  _source: worker_resource
+- id: slot-005
+  name: compression_codec
+  description: zstd for balanced workloads; LZ4 for speed-critical; no compression for pre-compressed
+    data
+  used_in_stages: []
+  options:
+  - name: Zstandard (zstd)
+    traits:
+    - Default
+    - High compression ratio
+    - Fast decompression
+    fit_for:
+    - General use, balanced speed/ratio
+    not_fit_for:
+    - Maximum speed (use LZ4)
+  - name: LZ4
+    traits:
+    - Fastest decompression
+    - Lower compression ratio
+    fit_for:
+    - Write-heavy workloads, latency-sensitive
+    not_fit_for:
+    - Storage-constrained environments
+  - name: No Compression
+    traits:
+    - Passthrough
+    - Maximum speed
+    - Maximum storage
+    fit_for:
+    - Already compressed data, in-memory storage
+    not_fit_for:
+    - General use
+  default: Zstandard (zstd)
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: AWS S3
+  description: 'Time-series DataFrames (Pandas/Polars/Arrow). Coverage: N/A. Auth: Access key/secret OR
+    AWS SDK credential chain (IAM roles, STS, profiles)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: Google Cloud Storage (via S3-compatible API)
+  description: 'Time-series DataFrames. Coverage: N/A. Auth: Access key/secret OR Google Cloud credential
+    chain'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: Azure Blob Storage
+  description: 'Time-series DataFrames. Coverage: N/A. Auth: Account name/key OR Azure Identity (managed
+    identities, service principals)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: MongoDB
+  description: 'Time-series DataFrames (document storage). Coverage: N/A. Auth: MongoDB connection string
+    with optional auth'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: LMDB (Local Disk)
+  description: 'Time-series DataFrames (embedded). Coverage: N/A. Auth: None (local filesystem access)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: In-Memory Storage
+  description: 'Time-series DataFrames. Coverage: N/A. Auth: None'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: NFS-backed S3
+  description: 'Time-series DataFrames with NFS semantics. Coverage: N/A. Auth: S3 credentials + NFS mount'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-008
+  type: external_service
+  name: Prometheus Push Gateway
+  description: Push/pull metrics from ArcticDB (counters, gauges, histograms, summaries)
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: external_service
+  name: Prometheus Exposer (Pull)
+  description: Expose metrics for Prometheus scraping
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: external_service
+  name: AWS STS (Security Token Service)
+  description: STS-based authentication for S3 with IAM roles
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: external_service
+  name: Azure Active Directory
+  description: Managed identity and service principal authentication for Azure Blob
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: external_service
+  name: MongoDB Server
+  description: Metadata storage for ArcticDB library configuration
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: python_package
+  name: pandas
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-014
+  type: python_package
+  name: numpy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-015
+  type: python_package
+  name: attrs
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: python_package
+  name: protobuf
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-017
+  type: python_package
+  name: msgpack
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-018
+  type: python_package
+  name: pyyaml
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-019
+  type: python_package
+  name: packaging
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-020
+  type: python_package
+  name: pytz
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-021
+  type: python_package
+  name: pyarrow
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-022
+  type: python_package
+  name: polars
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-023
+  type: code_example
+  name: AWS S3 Configuration for Public Blockchain Data Access
+  path: docs/mkdocs/docs/notebooks/ArcticDB_aws_public_blockchain.ipynb
+  description: Setting up AWS credentials to enable secure access to public blockchain data stored in
+    S3, allowing integration with ArcticDB for time-series storage.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-024
+  type: code_example
+  name: Billion Row Challenge - Large Scale Data Performance
+  path: docs/mkdocs/docs/notebooks/ArcticDB_billion_row_challenge.ipynb
+  description: Demonstrates ArcticDB's ability to handle massive datasets (1 billion rows of temperature
+    data) with efficient aggregation, serving as a performance benchmark for large-scale data operations.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-025
+  type: code_example
+  name: Batch DataFrame Concatenation with Lazy Loading
+  path: docs/mkdocs/docs/notebooks/ArcticDB_demo_concat.ipynb
+  description: Demonstrates efficient concatenation of multiple DataFrames stored in ArcticDB using lazy
+    loading to minimize memory consumption during batch operations.
+  used_in_stages:
+  - data_processing
+  _source: uc_list
+- id: res-026
+  type: code_example
+  name: Equity Market Data Historical Analytics
+  path: docs/mkdocs/docs/notebooks/ArcticDB_demo_equity_analytics.ipynb
+  description: Demonstrates downloading historical equity market data from yfinance and storing it in
+    ArcticDB for analytics, enabling time-series analysis of stock prices and volumes across multiple
+    symbols.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-027
+  type: code_example
+  name: Equity Options Market Data Analysis
+  path: docs/mkdocs/docs/notebooks/ArcticDB_demo_equity_options.ipynb
+  description: Demonstrates storing and querying equity options data including expiry analysis and option
+    Greeks, supporting options strategy research and analysis workflows.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-028
+  type: code_example
+  name: Lazy DataFrame Operations for Large Datasets
+  path: docs/mkdocs/docs/notebooks/ArcticDB_demo_lazydataframe.ipynb
+  description: Demonstrates reading large datasets (10M-1B rows) efficiently using ArcticDB's lazy loading
+    to reduce memory usage while selecting specific columns.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-029
+  type: code_example
+  name: LMDB Storage Operations - Basic CRUD
+  path: docs/mkdocs/docs/notebooks/ArcticDB_demo_lmdb.ipynb
+  description: Demonstrates basic storage operations (write, read, append, update) with ArcticDB using
+    LMDB backend, including version management and subframe reading capabilities.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-030
+  type: code_example
+  name: Query Builder with Column Selection
+  path: docs/mkdocs/docs/notebooks/ArcticDB_demo_querybuilder.ipynb
+  description: Demonstrates efficient querying of large datasets (up to 1B rows) with specific column
+    selection, optimizing read performance by avoiding unnecessary data loading.
+  used_in_stages:
+  - data_processing
+  _source: uc_list
+- id: res-031
+  type: code_example
+  name: Data Export to Arrow and Polars Formats
+  path: docs/mkdocs/docs/notebooks/ArcticDB_demo_read_as_arrow.ipynb
+  description: Demonstrates reading ArcticDB data into Arrow and Polars formats for interoperability with
+    modern data science tooling, enabling seamless integration with downstream processing pipelines.
+  used_in_stages:
+  - data_processing
+  _source: uc_list
+- id: res-032
+  type: code_example
+  name: Nested Data Structure Storage
+  path: docs/mkdocs/docs/notebooks/ArcticDB_demo_recursive_normalizers.ipynb
+  description: Demonstrates storing complex nested data structures including DataFrames within dictionaries
+    using recursive normalizers, enabling preservation of hierarchical data relationships.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-033
+  type: code_example
+  name: Time-Series Data Resampling and Aggregation
+  path: docs/mkdocs/docs/notebooks/ArcticDB_demo_resample.ipynb
+  description: Demonstrates resampling high-frequency time-series data (12M rows at second frequency)
+    to lower frequencies (1-minute) using built-in aggregation, optimizing storage and query performance.
+  used_in_stages:
+  - data_processing
+  _source: uc_list
+- id: res-034
+  type: code_example
+  name: Data Versioning with Snapshots
+  path: docs/mkdocs/docs/notebooks/ArcticDB_demo_snapshots.ipynb
+  description: Demonstrates creating and managing data snapshots for point-in-time recovery, enabling
+    reproducibility and audit trails for time-series data in ArcticDB.
+  used_in_stages:
+  - data_processing
+  _source: uc_list
+- id: res-035
+  type: code_example
+  name: Data Merge and Update Operations
+  path: docs/mkdocs/docs/notebooks/ArcticDB_merge.ipynb
+  description: Demonstrates merging new data with existing datasets using merge strategies (update, do_nothing)
+    for handling price corrections and data synchronization in financial applications.
+  used_in_stages:
+  - data_processing
+  _source: uc_list
+- id: res-036
+  type: code_example
+  name: Sports Analytics with Statistical Modeling
+  path: docs/mkdocs/docs/notebooks/ArcticDB_pythagorean_won_loss_formula_notebook.ipynb
+  description: Demonstrates sports data analytics using the Pythagorean expectation formula to analyze
+    team performance, including data storage, visualization, and OLS statistical modeling.
+  used_in_stages:
+  - research_analysis
+  _source: uc_list
+- id: res-037
+  type: code_example
+  name: Multi-Process Data Staging with Token Management
+  path: docs/mkdocs/docs/notebooks/ArcticDB_staged_data_with_tokens.ipynb
+  description: Demonstrates staging data from multiple concurrent writers before finalizing with tokens,
+    enabling distributed data ingestion workflows with proper synchronization.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-038
+  type: code_example
+  name: Data Visualization Styling Utilities
+  path: docs/mkdocs/docs/notebooks/styling.py
+  description: Provides styling functions for DataFrame visualization with custom themes, color schemes,
+    and export capabilities for creating professional data presentations.
+  used_in_stages:
+  - reporting
+  _source: uc_list
+- id: res-039
+  type: code_example
+  name: ArcticDB Release Validation Tests
+  path: docs/mkdocs/docs/technical/release_checks.py
+  description: Provides automated release validation tests that verify basic ArcticDB functionality including
+    library creation, data write/read operations, and library deletion.
+  used_in_stages:
+  - builtin_factor
+  _source: uc_list
