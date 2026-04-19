@@ -1116,10 +1116,32 @@ def _patch_execution_paradigm(bp: dict[str, Any]) -> int:
 # Shared helpers for reading evidence refs out of
 # step2c_business_decisions.md. Used both by P5.3 (post-hoc backfill) and
 # by bp_synthesis_v5's L3 recovery (upstream root-cause fix).
-_STEP2C_ROW_RE = re.compile(
-    r"^\|\s*\d+\s*\|(.+?)\|(.+?)\|(.+?)\|(.+?)\|(.+?)\|$",
-    re.MULTILINE,
-)
+
+# Sentinel / placeholder values that the pipeline itself emits when a BD's
+# evidence is effectively missing. Anything in this set should be treated
+# as missing and eligible for recovery from step2c.md / worker candidates.
+_MISSING_EVIDENCE_LITERALS = {"", "-", "—", "n/a", "none", "null"}
+
+
+def is_missing_evidence(ev: Any) -> bool:
+    """Return True when an evidence value is semantically missing.
+
+    Handles None, whitespace-only strings, dashes, and any value that
+    starts with the ``N/A`` sentinel (e.g. ``N/A:0(see_rationale)``,
+    ``N/A:0(coverage_gap)``). The comparison is case-insensitive so
+    legacy variants like ``n/a`` are caught too.
+    """
+    if ev is None:
+        return True
+    if not isinstance(ev, str):
+        return False
+    s = ev.strip()
+    if not s:
+        return True
+    low = s.lower()
+    if low.startswith("n/a"):
+        return True
+    return low in _MISSING_EVIDENCE_LITERALS
 
 
 def _step2c_content_key(content: str) -> str:
@@ -1127,12 +1149,49 @@ def _step2c_content_key(content: str) -> str:
     return " ".join((content or "")[:60].lower().split())
 
 
+def _split_md_row(line: str) -> list[str] | None:
+    """Split a GFM-style row into cells, honoring backslash-escaped pipes.
+
+    ``_bd_to_markdown`` emits rows where ``|`` inside content or rationale
+    is written as ``\\|`` so the column structure stays intact. The naive
+    regex splitter treated every ``|`` as a delimiter, corrupting cell
+    alignment for formula-heavy BDs (``|rho|``, ``Loss Rate\\|Closed``).
+
+    Returns the list of cell strings with the escapes resolved, or ``None``
+    when the line is not a data row (header, separator, empty).
+    """
+    s = line.strip()
+    if not s.startswith("|") or not s.endswith("|"):
+        return None
+    # Strip leading/trailing pipe so we only see cell boundaries
+    s = s[1:-1]
+    cells: list[str] = []
+    buf: list[str] = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s) and s[i + 1] == "|":
+            buf.append("|")
+            i += 2
+            continue
+        if ch == "|":
+            cells.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    cells.append("".join(buf).strip())
+    return cells
+
+
 def load_step2c_evidence_map(artifacts_dir: Path) -> dict[str, str]:
     """Parse step2c_business_decisions.md table into {content_key: evidence}.
 
-    Excludes rows where the evidence column is missing, a dash, or starts
-    with the N/A sentinel. First occurrence wins (table has row numbers
-    but we key by content, and duplicates are extremely rare).
+    Skips header, separator, and any row whose evidence column is
+    semantically missing (empty, dash, or N/A sentinel — see
+    ``is_missing_evidence``). Honors backslash-escaped pipes inside cells.
+    First occurrence wins (dups are rare).
 
     Returns an empty dict if the file is missing or malformed.
     """
@@ -1145,16 +1204,83 @@ def load_step2c_evidence_map(artifacts_dir: Path) -> dict[str, str]:
         return {}
 
     result: dict[str, str] = {}
-    for m in _STEP2C_ROW_RE.finditer(text):
-        content = m.group(1).strip()
-        evidence = m.group(4).strip()
-        if not content or not evidence:
+    for raw_line in text.splitlines():
+        cells = _split_md_row(raw_line)
+        # Data rows have 6 cells: # | Content | Type | Rationale | Evidence | Stage
+        if cells is None or len(cells) < 6:
             continue
-        if evidence.startswith("N/A") or evidence in ("-", "—", "N/A"):
+        row_num, content, _bd_type, _rationale, evidence, _stage = cells[:6]
+        # Header row begins with '#'; separator row is just dashes
+        if not row_num.isdigit():
+            continue
+        if not content or is_missing_evidence(evidence):
             continue
         key = _step2c_content_key(content)
         if key and key not in result:
             result[key] = evidence
+    return result
+
+
+def load_worker_candidate_evidence_map(artifacts_dir: Path) -> dict[str, str]:
+    """Build {content_key: evidence_str} from worker_*.json BDCandidates.
+
+    Workers emit BDCandidate objects whose ``evidence`` field is bound at
+    exploration time. These files exist BEFORE any synthesis phase runs,
+    so this map is safe to use as an L3 recovery source in v9 pipelines
+    where ``step2c_business_decisions.md`` has not been written yet.
+
+    Reads every ``worker_*.json`` file in ``artifacts_dir`` and flattens
+    their candidates. Unknown schema keys are tolerated (we only look at
+    ``content`` + ``evidence``). Returns an empty dict if no worker files
+    are present or nothing parses.
+    """
+    import json as _json
+
+    result: dict[str, str] = {}
+    if not artifacts_dir.is_dir():
+        return result
+
+    for worker_path in sorted(artifacts_dir.glob("worker_*.json")):
+        try:
+            raw = worker_path.read_text(encoding="utf-8", errors="ignore")
+            data = _json.loads(raw)
+        except (OSError, ValueError):
+            continue
+
+        # worker_*.json top-level varies — candidates may live under
+        # 'candidates' or the root may be a list. Handle both shapes.
+        candidates: list[Any] = []
+        if isinstance(data, dict):
+            if isinstance(data.get("candidates"), list):
+                candidates = data["candidates"]
+            elif isinstance(data.get("business_decisions"), list):
+                candidates = data["business_decisions"]
+        elif isinstance(data, list):
+            candidates = data
+
+        for cand in candidates:
+            if not isinstance(cand, dict):
+                continue
+            content = cand.get("content") or ""
+            ev = cand.get("evidence")
+            ev_str = ""
+            if isinstance(ev, dict):
+                file_ = (ev.get("file") or "").strip()
+                line_ = ev.get("line") or 0
+                fn_ = (ev.get("function") or "").strip()
+                if file_ and fn_:
+                    ev_str = f"{file_}:{line_}({fn_})"
+                elif file_ and line_:
+                    ev_str = f"{file_}:{line_}"
+                elif file_:
+                    ev_str = file_
+            elif isinstance(ev, str):
+                ev_str = ev.strip()
+            if not content or is_missing_evidence(ev_str):
+                continue
+            key = _step2c_content_key(content)
+            if key and key not in result:
+                result[key] = ev_str
     return result
 
 
@@ -1179,8 +1305,7 @@ def _patch_evidence_backfill_from_md(bp: dict[str, Any], artifacts_dir: Path) ->
 
     backfilled = 0
     for bd in bp.get("business_decisions", []):
-        ev = bd.get("evidence", "") or ""
-        if not ev.startswith("N/A"):
+        if not is_missing_evidence(bd.get("evidence")):
             continue
         key = _step2c_content_key(bd.get("content", "") or "")
         if key in md_by_key:

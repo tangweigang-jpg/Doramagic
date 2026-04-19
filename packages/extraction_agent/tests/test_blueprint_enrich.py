@@ -30,7 +30,11 @@ from doramagic_extraction_agent.sop.blueprint_enrich import (
     _patch_uc_merge,
     _patch_uc_normalize,
     _patch_vague_words,
+    _split_md_row,
     enrich_blueprint,
+    is_missing_evidence,
+    load_step2c_evidence_map,
+    load_worker_candidate_evidence_map,
 )
 from doramagic_extraction_agent.sop.schemas_v5 import BDExtractionResult, BusinessDecision
 from doramagic_extraction_agent.state.schema import AgentState
@@ -1055,6 +1059,180 @@ class TestPatchRelations:
         )
         count = _patch_relations(bp, state=state)
         assert count >= 1
+
+
+# ---------------------------------------------------------------------------
+# is_missing_evidence — sentinel detection
+# ---------------------------------------------------------------------------
+
+
+class TestIsMissingEvidence:
+    """Finding #3: placeholders like 'N/A:0(see_rationale)' must be treated
+    as missing so recovery can overwrite them."""
+
+    def test_empty_values_are_missing(self) -> None:
+        assert is_missing_evidence(None)
+        assert is_missing_evidence("")
+        assert is_missing_evidence("   ")
+        assert is_missing_evidence("\t")
+
+    def test_na_sentinels_are_missing(self) -> None:
+        assert is_missing_evidence("N/A:0(see_rationale)")
+        assert is_missing_evidence("N/A:0(coverage_gap)")
+        assert is_missing_evidence("N/A")
+        assert is_missing_evidence("n/a")
+
+    def test_dash_placeholders_are_missing(self) -> None:
+        assert is_missing_evidence("-")
+        assert is_missing_evidence("—")
+        assert is_missing_evidence("None")
+
+    def test_real_refs_are_present(self) -> None:
+        assert not is_missing_evidence("akshare/stock.py:42(fetch)")
+        assert not is_missing_evidence("README.md:21-26")
+        assert not is_missing_evidence("PD/vasicek.ipynb")
+
+    def test_non_string_is_not_missing(self) -> None:
+        # Ints / objects are technically "present" — downstream schema
+        # validation will catch them. Don't coerce here.
+        assert not is_missing_evidence(42)
+
+
+# ---------------------------------------------------------------------------
+# _split_md_row — backslash-escaped pipe parsing
+# ---------------------------------------------------------------------------
+
+
+class TestSplitMdRow:
+    """Finding #2: the original _STEP2C_ROW_RE split every '|' as a
+    delimiter, corrupting cells with formula pipes like '|rho|' or
+    'Loss Rate\\|Closed'."""
+
+    def test_plain_row_splits_into_six_cells(self) -> None:
+        row = "| 1 | Some BD | B | rationale text | a/b.py:10(f) | stage |"
+        cells = _split_md_row(row)
+        assert cells == ["1", "Some BD", "B", "rationale text", "a/b.py:10(f)", "stage"]
+
+    def test_escaped_pipe_preserved_inside_content(self) -> None:
+        row = r"| 45 | Loss Rate\|Closed × Expected | M | rat | PD/x.py:12 | stage |"
+        cells = _split_md_row(row)
+        assert cells is not None
+        assert len(cells) == 6
+        assert cells[1] == "Loss Rate|Closed × Expected"
+        assert cells[4] == "PD/x.py:12"
+
+    def test_escaped_pipe_in_rationale(self) -> None:
+        row = r"| 9 | BD | M/BA | Uses \|rho\| correlation | a/b.go:5(R) | s |"
+        cells = _split_md_row(row)
+        assert cells is not None
+        assert cells[3] == "Uses |rho| correlation"
+        assert cells[4] == "a/b.go:5(R)"
+
+    def test_header_line_returns_six_cells_but_not_digit(self) -> None:
+        row = "| # | Content | Type | Rationale | Evidence | Stage |"
+        cells = _split_md_row(row)
+        assert cells is not None
+        assert cells[0] == "#"  # caller (load_step2c_evidence_map) filters
+
+    def test_non_row_returns_none(self) -> None:
+        assert _split_md_row("") is None
+        assert _split_md_row("just text") is None
+        assert _split_md_row("|---|") is not None  # separator — caller filters
+
+
+class TestLoadStep2cEvidenceMapEscaped:
+    """Integration: load_step2c_evidence_map on content with escaped pipes."""
+
+    def test_formula_row_preserves_evidence(self, tmp_path: Path) -> None:
+        md = (
+            "## Business Decision Report\n\n"
+            "### Business Decision Table\n\n"
+            "| # | Content | Type | Rationale | Evidence | Stage |\n"
+            "|---|---------|------|-----------|----------|-------|\n"
+            r"| 1 | LGD formula uses \|rho\| correlation | M | rat text | PD/lgd.py:42(compute) | s |"
+            "\n"
+        )
+        (tmp_path / "step2c_business_decisions.md").write_text(md)
+        m = load_step2c_evidence_map(tmp_path)
+        # content-key is first-60-chars lower; "lgd formula uses |rho| correlation"
+        assert any("lgd formula" in k for k in m), m
+        assert next(iter(m.values())) == "PD/lgd.py:42(compute)"
+
+
+# ---------------------------------------------------------------------------
+# load_worker_candidate_evidence_map — v9 upstream source (Finding #1)
+# ---------------------------------------------------------------------------
+
+
+class TestLoadWorkerCandidateEvidenceMap:
+    def test_dict_evidence_is_flattened(self, tmp_path: Path) -> None:
+        import json as _json
+
+        (tmp_path / "worker_arch.json").write_text(
+            _json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "content": "VM uses opcode-based bytecode",
+                            "evidence": {
+                                "file": "internal/machine/vm/machine.go",
+                                "line": 197,
+                                "function": "opcodes",
+                            },
+                        },
+                        {
+                            "content": "Store interface decouples VM from storage",
+                            "evidence": {
+                                "file": "internal/machine/vm/store.go",
+                                "line": 18,
+                                "function": "Store",
+                            },
+                        },
+                    ]
+                }
+            )
+        )
+        m = load_worker_candidate_evidence_map(tmp_path)
+        assert len(m) == 2
+        assert any(v == "internal/machine/vm/machine.go:197(opcodes)" for v in m.values())
+        assert any(v == "internal/machine/vm/store.go:18(Store)" for v in m.values())
+
+    def test_string_evidence_is_kept_verbatim(self, tmp_path: Path) -> None:
+        import json as _json
+
+        (tmp_path / "worker_workflow.json").write_text(
+            _json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "content": "Balance computed as Input minus Output",
+                            "evidence": "internal/volumes.go:86(Balance)",
+                        }
+                    ]
+                }
+            )
+        )
+        m = load_worker_candidate_evidence_map(tmp_path)
+        assert list(m.values()) == ["internal/volumes.go:86(Balance)"]
+
+    def test_missing_evidence_rows_are_skipped(self, tmp_path: Path) -> None:
+        import json as _json
+
+        (tmp_path / "worker_math.json").write_text(
+            _json.dumps(
+                {
+                    "candidates": [
+                        {"content": "NoEvidenceBD", "evidence": "N/A:0(see_rationale)"},
+                        {"content": "EmptyFile", "evidence": {"file": "", "line": 0}},
+                    ]
+                }
+            )
+        )
+        m = load_worker_candidate_evidence_map(tmp_path)
+        assert m == {}
+
+    def test_no_worker_files_returns_empty(self, tmp_path: Path) -> None:
+        assert load_worker_candidate_evidence_map(tmp_path) == {}
 
 
 # ---------------------------------------------------------------------------

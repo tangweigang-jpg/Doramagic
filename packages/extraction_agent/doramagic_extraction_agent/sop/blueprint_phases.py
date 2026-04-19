@@ -33,7 +33,9 @@ from . import prompts, prompts_v4, prompts_v5, prompts_v6, prompts_v7
 from .blueprint_enrich import (
     _step2c_content_key,
     enrich_blueprint,
+    is_missing_evidence,
     load_step2c_evidence_map,
+    load_worker_candidate_evidence_map,
 )
 from .schemas_v5 import (
     BDExtractionResult,
@@ -1569,18 +1571,21 @@ def _recover_bd_evidence(
     """Pick the best available evidence string for a raw BD dict.
 
     Priority:
-      1. bd_raw['evidence'] if non-empty (LLM provided it directly)
-      2. step2c_business_decisions.md map by content-prefix match
-         (LLM wrote it earlier via write_artifact with lenient markdown)
+      1. bd_raw['evidence'] if present AND not a missing-sentinel
+         (LLM provided something meaningful — see ``is_missing_evidence``)
+      2. ``md_evidence_map`` by content-prefix — the caller is expected
+         to have merged step2c.md entries with worker-candidate entries
+         when operating in v9 (where step2c.md may not exist yet at
+         L3 recovery time)
       3. N/A sentinel (last resort — verifier and gates treat as missing)
 
     This helper exists to root-cause the bp-062 style mass-N/A regression
     where L3 recovery used to default evidence straight to the sentinel,
-    silently discarding real refs already sitting in step2c.md on disk.
+    silently discarding real refs already sitting on disk.
     """
-    existing = (bd_raw.get("evidence") or "").strip()
-    if existing:
-        return existing
+    existing = bd_raw.get("evidence")
+    if not is_missing_evidence(existing):
+        return str(existing).strip()
     key = _step2c_content_key(bd_raw.get("content", "") or "")
     if key and key in md_evidence_map:
         return md_evidence_map[key]
@@ -1870,13 +1875,18 @@ def build_blueprint_phases_v5(
         """Three-step Instructor synthesis: Extract+Classify → Enhance → Interactions."""
         artifacts_dir = Path(state.run_dir) / "artifacts"
         total_tokens = 0
-        # Load step2c.md evidence map once for all L3 recovery sites below.
-        # When the structured LLM call fails and we fall through to lenient
-        # JSON/YAML parsing, the recovered BDs often arrive without evidence.
-        # We used to default to N/A here — but the LLM already wrote real
-        # refs into step2c_business_decisions.md in an earlier phase, so we
-        # look there first and only fall back to N/A if no row matches.
+        # Build a single recovery map for every L3 fallback site below.
+        # Two sources, merged in priority order:
+        #  - step2c_business_decisions.md (written by bp_bd_r4_evidence;
+        #    classified + adversarial-reviewed refs — prefer when available)
+        #  - worker_*.json candidates (raw BDCandidate.evidence bound at
+        #    exploration time; always present before synthesis runs, so
+        #    this covers v9 schedules where step2c.md is still in flight
+        #    as well as fresh runs where it has not been written yet)
         md_evidence_map = load_step2c_evidence_map(artifacts_dir)
+        worker_evidence_map = load_worker_candidate_evidence_map(artifacts_dir)
+        # step2c.md wins on conflicts; worker map fills the gaps.
+        md_evidence_map = {**worker_evidence_map, **md_evidence_map}
 
         # Read worker artifacts (tolerant of missing non-blocking workers)
         worker_arch = _safe_read(artifacts_dir / "worker_arch.json")
@@ -2021,8 +2031,11 @@ def build_blueprint_phases_v5(
                         if len(rat) < 40:
                             rat = rat + " " * (40 - len(rat))
                         bd_raw["rationale"] = rat
-                        if not bd_raw.get("evidence"):
-                            bd_raw["evidence"] = _recover_bd_evidence(bd_raw, md_evidence_map)
+                        # Unconditional: _recover_bd_evidence returns the
+                        # existing value when it is not a missing-sentinel,
+                        # so real refs are preserved while N/A placeholders
+                        # get a chance to be replaced from the md_evidence_map.
+                        bd_raw["evidence"] = _recover_bd_evidence(bd_raw, md_evidence_map)
                         try:
                             bd = BusinessDecision.model_validate(bd_raw)
                             all_decisions.append(bd)
@@ -2100,8 +2113,7 @@ def build_blueprint_phases_v5(
                     if len(rat) < 40:
                         rat = rat + " " * (40 - len(rat))
                     bd_raw["rationale"] = rat
-                    if not bd_raw.get("evidence"):
-                        bd_raw["evidence"] = _recover_bd_evidence(bd_raw, md_evidence_map)
+                    bd_raw["evidence"] = _recover_bd_evidence(bd_raw, md_evidence_map)
                     # Dedup against existing code-extracted BDs
                     key = bd_raw["content"][:50].lower().strip()
                     if key not in seen_content:
@@ -2204,9 +2216,10 @@ def build_blueprint_phases_v5(
                     if len(rat) < 40:
                         rat = rat + " " * (40 - len(rat))
                     bd_raw["rationale"] = rat
-                    # Ensure evidence is non-empty — prefer step2c.md over sentinel
-                    if not bd_raw.get("evidence"):
-                        bd_raw["evidence"] = _recover_bd_evidence(bd_raw, md_evidence_map)
+                    # Prefer recovered evidence from md_evidence_map over the
+                    # N/A sentinel; _recover_bd_evidence keeps meaningful
+                    # existing values and only swaps missing-sentinels.
+                    bd_raw["evidence"] = _recover_bd_evidence(bd_raw, md_evidence_map)
                     try:
                         valid_bds.append(BusinessDecision.model_validate(bd_raw))
                     except Exception:

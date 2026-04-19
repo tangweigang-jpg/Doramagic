@@ -27,7 +27,9 @@ from typing import Any
 from doramagic_extraction_agent.core.agent_loop import ExtractionAgent, PhaseResult
 from doramagic_extraction_agent.sop.blueprint_enrich import (
     _step2c_content_key,
+    is_missing_evidence,
     load_step2c_evidence_map,
+    load_worker_candidate_evidence_map,
 )
 from doramagic_extraction_agent.sop.schemas_v5 import (
     BDExtractionResult,
@@ -236,12 +238,14 @@ def _coerce_bd_dict(
 
     Returns None if the dict is unusable (no content).
 
-    When ``md_evidence_map`` is provided and ``bd_raw`` lacks an
-    ``evidence`` field, we look up the BD by content-prefix in the
-    step2c_business_decisions.md table first. Only when the map has no
-    matching row do we fall back to the N/A sentinel. This roots out the
-    bp-062 regression where L3 recovery unconditionally defaulted to N/A
-    even when real refs were sitting on disk.
+    When ``md_evidence_map`` is provided AND the raw BD's evidence is
+    semantically missing (empty, dash, or an ``N/A`` sentinel — see
+    ``is_missing_evidence``), look up a real ref by content prefix.
+    Only when no row matches do we fall back to the N/A sentinel.
+
+    This roots out the bp-062 regression where L3 recovery unconditionally
+    defaulted to N/A even when real refs were sitting on disk, and
+    extends the repair to existing N/A placeholders the LLM itself emits.
     """
     if not isinstance(bd_raw, dict) or not bd_raw.get("content"):
         return None
@@ -253,7 +257,7 @@ def _coerce_bd_dict(
     if len(rat) < 40:
         rat = rat + " — decision extracted from worker candidate"
     bd_raw["rationale"] = rat[:500]
-    if not bd_raw.get("evidence"):
+    if is_missing_evidence(bd_raw.get("evidence")):
         recovered = ""
         if md_evidence_map:
             key = _step2c_content_key(bd_raw.get("content", "") or "")
@@ -263,12 +267,15 @@ def _coerce_bd_dict(
         return BusinessDecision.model_validate(bd_raw)
     except Exception:
         try:
+            ev = bd_raw.get("evidence")
+            if is_missing_evidence(ev):
+                ev = "N/A:0(see_rationale)"
             return BusinessDecision(
                 id=bd_raw["id"],
                 content=str(bd_raw["content"]),
                 type=bd_raw.get("type", "B"),
                 rationale=rat,
-                evidence=bd_raw.get("evidence") or "N/A:0(see_rationale)",
+                evidence=str(ev),
                 stage=bd_raw.get("stage", "unknown"),
             )
         except Exception:
@@ -409,7 +416,15 @@ def build_local_synthesis_handler(agent: ExtractionAgent) -> Callable:
         artifacts_dir = Path(state.run_dir) / "artifacts"
         # Load once so every _coerce_bd_dict call can recover evidence
         # from step2c_business_decisions.md instead of defaulting to N/A.
-        md_evidence_map = load_step2c_evidence_map(artifacts_dir)
+        # Merge step2c.md refs with worker_*.json candidate refs. Worker
+        # candidates are produced at exploration time, so they are already
+        # on disk when local/global synthesis fires — unlike step2c.md,
+        # which is written later by bp_bd_r4_evidence and may be missing
+        # on fresh v9 runs that schedule synthesis in parallel.
+        _md = load_step2c_evidence_map(artifacts_dir)
+        _worker = load_worker_candidate_evidence_map(artifacts_dir)
+        # step2c wins on conflicts; worker fills the rest.
+        md_evidence_map = {**_worker, **_md}
         total_tokens = 0
         local_results: dict[str, list[BusinessDecision]] = {}
 
@@ -566,7 +581,15 @@ def build_global_synthesis_handler(agent: ExtractionAgent) -> Callable:
 
     async def _handler(state: AgentState, repo_path: Path) -> PhaseResult:
         artifacts_dir = Path(state.run_dir) / "artifacts"
-        md_evidence_map = load_step2c_evidence_map(artifacts_dir)
+        # Merge step2c.md refs with worker_*.json candidate refs. Worker
+        # candidates are produced at exploration time, so they are already
+        # on disk when local/global synthesis fires — unlike step2c.md,
+        # which is written later by bp_bd_r4_evidence and may be missing
+        # on fresh v9 runs that schedule synthesis in parallel.
+        _md = load_step2c_evidence_map(artifacts_dir)
+        _worker = load_worker_candidate_evidence_map(artifacts_dir)
+        # step2c wins on conflicts; worker fills the rest.
+        md_evidence_map = {**_worker, **_md}
         total_tokens = 0
 
         # --- Collect all locally-synthesized BDs ---
@@ -741,7 +764,15 @@ def build_fixer_handler(agent: ExtractionAgent) -> Callable:
 
     async def _handler(state: AgentState, repo_path: Path) -> PhaseResult:
         artifacts_dir = Path(state.run_dir) / "artifacts"
-        md_evidence_map = load_step2c_evidence_map(artifacts_dir)
+        # Merge step2c.md refs with worker_*.json candidate refs. Worker
+        # candidates are produced at exploration time, so they are already
+        # on disk when local/global synthesis fires — unlike step2c.md,
+        # which is written later by bp_bd_r4_evidence and may be missing
+        # on fresh v9 runs that schedule synthesis in parallel.
+        _md = load_step2c_evidence_map(artifacts_dir)
+        _worker = load_worker_candidate_evidence_map(artifacts_dir)
+        # step2c wins on conflicts; worker fills the rest.
+        md_evidence_map = {**_worker, **_md}
         total_tokens = 0
 
         # --- Load current BD list ---
