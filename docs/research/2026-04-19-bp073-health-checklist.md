@@ -114,19 +114,48 @@ bp-073: 47/47 verified、0 invalid；bp-098 nautilus: 41 verified、**62 invalid
 
 1. **Prompt 硬约束**：worker prompt 加一条"如果找不到 `path:line(symbol)`，直接跳过该 BD，不要写 `N/A`"
 2. **Gate 阻断**：`blueprint_quality_gate.py` 加一条：`evidence_verify_ratio < 0.5` 或 `evidence_invalid > 20` 时 blueprint 不能进 LATEST.yaml
-3. **分批抽取**：99 条 BD 太多，一次 30 条 × 3 轮比一次 99 条质量高（类似 bp-073 vs bp-062 的分水岭）
+3. **分批抽取**：99 条 BD 太多，一次 30 条 × 3 轮比一次 99 条质量高
 4. **非 Python 项目白名单**：Go/Rust 项目跳过 repo_index 依赖，直接让 verifier 做 basename rglob
-5. **回溯 bp-073 抽取流程**：该项目用的是 `extraction_methods: ['semi_auto']`（见 `source` 字段），**手动介入过一步** —— 需要还原该介入点并评估能否自动化
+5. **verifier 语义对齐**：目前 verifier 对 `.py` 文件做严格 AST 检查，对非 Python 只查 file+line。这造成 Go/Rust 项目"免检通过"的假象。应该补 Go/Rust 的轻量 AST 或至少做 `(symbol)` grep 验证
 
 ---
 
-## 7. 未来跟踪
+## 7. Semi-auto 追溯结果（2026-04-19 补充）
 
-- [ ] 追溯 bp-073 的 semi_auto 介入点（哪一步是人工的？）
-- [ ] 对 bottom-5 的 bp 做"强约束重抽"验证处方 1 有效
-- [ ] Gate 阻断上线后，统计通过率（< 50% 的会被拦多少个）
+之前假设 bp-073 `extraction_methods: ['semi_auto']` 暗示人工介入。**实测证明该假设错误**：
+
+- 全部 73 个 finance 蓝图的 `extraction_methods` 都是 `['semi_auto']`
+- `blueprint_enrich.py:208` 把 **默认值** 硬编码为 `['semi_auto']`：任何没写 extraction_methods 的 bp 都会被填这个值
+- 该字段对 bp 间差异毫无信息量，不能当健康信号用
+
+**bp-073 真正"健康"的机制（修正理解）**：
+
+1. bp-073 是 Go 项目 (`ledger`)
+2. LLM 给出的 evidence 大多形如 `internal/machine/vm/machine.go:197(opcodes)`
+3. verifier P5.5 (`_patch_evidence_verify`) 对 `.py` 之外的文件**不做 symbol 验证**（见 L1183 `if fn_name and file_path.endswith(".py")`）
+4. 结果：Go 文件只要 file 存在 + line 在范围内就自动 `verified++`，符号名 `(opcodes)` 是否真的在那行**根本没检查**
+5. bp-073 verified=47、invalid=0 是验证器**结构性宽松**造成的，不是 BD 质量真的比其他高
+
+**对比 bp-062 为什么输**：
+- bp-062 是 Python 项目（含 `.ipynb` 和 `.py`）
+- 但 bd_list.json 里 117/117 都是 `N/A:0(see_rationale)` —— 连最终 JSON 阶段都丢了证据
+- 奇怪现象：`step2c_business_decisions.md` 里还有真实 refs 如 `PD/README.md:21-26` —— md 时间戳 10:09 早于 bd_list.json 10:18，说明 `bp_synthesis_v5` 应该要重写 md（见 `blueprint_phases.py:2412`），但 md 没被更新
+- 结论：bp-062 的 LLM 原始 md 有证据，但进入 `BDExtractionResult` 的路径上 evidence 全丢了。真正的 bug 在 step2c.md → BDExtractionResult 的解析/批处理链路，**不是 LLM 质量问题**
+
+---
+
+## 8. 未来跟踪（修订后）
+
+- [x] 追溯 bp-073 的 semi_auto 介入点 —— **已结论：无介入，是默认值**
+- [ ] 修 P5.5 verifier：Go/Rust 文件也做 `(symbol)` grep（grep symbol in line ±5 window），避免非 Python 项目免检
+- [ ] 修 bp-062 类丢失：查 `bd_list.json` 构建路径为何丢 evidence。怀疑 `_synthesize_bd_types_*` prompt 或 batching 把 evidence 字段 reset 成 N/A
+- [ ] Gate 阻断上线后，重跑 bottom-5，看 73 个蓝图 verify_ratio 是否能提升
+- [ ] 对比"真 Python 严格检查"下的 bp-050 (0.79) vs "Go 宽松免检"的 bp-073 (1.00) —— 实际质量差距可能被 verify_ratio 夸大
 
 **相关文件**:
-- `packages/extraction_agent/doramagic_extraction_agent/sop/blueprint_enrich.py`（P5.5 verifier）
+- `packages/extraction_agent/doramagic_extraction_agent/sop/blueprint_enrich.py:1116`（P5.5 verifier，L1183 是语义分叉点）
+- `packages/extraction_agent/doramagic_extraction_agent/sop/blueprint_enrich.py:208`（semi_auto 默认值来源）
+- `packages/extraction_agent/doramagic_extraction_agent/sop/blueprint_phases.py:2412`（synthesis 覆盖 md）
 - `knowledge/sources/finance/finance-bp-073--ledger/blueprint.v1.yaml`（对照样本）
-- `_runs/finance-bp-073/artifacts/`（artifacts 已存）
+- `_runs/finance-bp-073/artifacts/step2c_business_decisions.md`（LLM 原始 BD 表）
+- `_runs/finance-bp-062/artifacts/step2c_business_decisions.md`（证据丢失现场）
