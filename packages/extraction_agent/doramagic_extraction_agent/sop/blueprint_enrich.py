@@ -1113,6 +1113,51 @@ def _patch_execution_paradigm(bp: dict[str, Any]) -> int:
     return 0
 
 
+# Shared helpers for reading evidence refs out of
+# step2c_business_decisions.md. Used both by P5.3 (post-hoc backfill) and
+# by bp_synthesis_v5's L3 recovery (upstream root-cause fix).
+_STEP2C_ROW_RE = re.compile(
+    r"^\|\s*\d+\s*\|(.+?)\|(.+?)\|(.+?)\|(.+?)\|(.+?)\|$",
+    re.MULTILINE,
+)
+
+
+def _step2c_content_key(content: str) -> str:
+    """Normalize BD content into the lookup key used by the md map."""
+    return " ".join((content or "")[:60].lower().split())
+
+
+def load_step2c_evidence_map(artifacts_dir: Path) -> dict[str, str]:
+    """Parse step2c_business_decisions.md table into {content_key: evidence}.
+
+    Excludes rows where the evidence column is missing, a dash, or starts
+    with the N/A sentinel. First occurrence wins (table has row numbers
+    but we key by content, and duplicates are extremely rare).
+
+    Returns an empty dict if the file is missing or malformed.
+    """
+    md_path = artifacts_dir / "step2c_business_decisions.md"
+    if not md_path.exists():
+        return {}
+    try:
+        text = md_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return {}
+
+    result: dict[str, str] = {}
+    for m in _STEP2C_ROW_RE.finditer(text):
+        content = m.group(1).strip()
+        evidence = m.group(4).strip()
+        if not content or not evidence:
+            continue
+        if evidence.startswith("N/A") or evidence in ("-", "—", "N/A"):
+            continue
+        key = _step2c_content_key(content)
+        if key and key not in result:
+            result[key] = evidence
+    return result
+
+
 def _patch_evidence_backfill_from_md(bp: dict[str, Any], artifacts_dir: Path) -> int:
     """P5.3: recover evidence refs from step2c_business_decisions.md.
 
@@ -1128,30 +1173,7 @@ def _patch_evidence_backfill_from_md(bp: dict[str, Any], artifacts_dir: Path) ->
     by content prefix (first 60 chars, case-insensitive, whitespace
     normalized). Returns the number of BDs backfilled. Zero LLM calls.
     """
-    md_path = artifacts_dir / "step2c_business_decisions.md"
-    if not md_path.exists():
-        return 0
-    try:
-        text = md_path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return 0
-
-    row_re = re.compile(
-        r"^\|\s*\d+\s*\|(.+?)\|(.+?)\|(.+?)\|(.+?)\|(.+?)\|$",
-        re.MULTILINE,
-    )
-    md_by_key: dict[str, str] = {}
-    for m in row_re.finditer(text):
-        content = m.group(1).strip()
-        evidence = m.group(4).strip()
-        if not content or not evidence:
-            continue
-        if evidence.startswith("N/A") or evidence in ("-", "—", "N/A"):
-            continue
-        key = " ".join(content[:60].lower().split())
-        if key and key not in md_by_key:
-            md_by_key[key] = evidence
-
+    md_by_key = load_step2c_evidence_map(artifacts_dir)
     if not md_by_key:
         return 0
 
@@ -1160,8 +1182,7 @@ def _patch_evidence_backfill_from_md(bp: dict[str, Any], artifacts_dir: Path) ->
         ev = bd.get("evidence", "") or ""
         if not ev.startswith("N/A"):
             continue
-        content = bd.get("content", "") or ""
-        key = " ".join(content[:60].lower().split())
+        key = _step2c_content_key(bd.get("content", "") or "")
         if key in md_by_key:
             bd["evidence"] = md_by_key[key]
             bd.setdefault("_evidence_issues", []).append(

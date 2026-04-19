@@ -30,7 +30,11 @@ from ..tools.indexer import (
 )
 from ..tools.sources import mine_source_context
 from . import prompts, prompts_v4, prompts_v5, prompts_v6, prompts_v7
-from .blueprint_enrich import enrich_blueprint
+from .blueprint_enrich import (
+    _step2c_content_key,
+    enrich_blueprint,
+    load_step2c_evidence_map,
+)
 from .schemas_v5 import (
     BDExtractionResult,
     BusinessDecision,
@@ -1555,6 +1559,34 @@ def _safe_read(path: Path, default: str = "") -> str:
         return default
 
 
+_NA_EVIDENCE_SENTINEL = "N/A:0(see_rationale)"
+
+
+def _recover_bd_evidence(
+    bd_raw: dict[str, Any],
+    md_evidence_map: dict[str, str],
+) -> str:
+    """Pick the best available evidence string for a raw BD dict.
+
+    Priority:
+      1. bd_raw['evidence'] if non-empty (LLM provided it directly)
+      2. step2c_business_decisions.md map by content-prefix match
+         (LLM wrote it earlier via write_artifact with lenient markdown)
+      3. N/A sentinel (last resort — verifier and gates treat as missing)
+
+    This helper exists to root-cause the bp-062 style mass-N/A regression
+    where L3 recovery used to default evidence straight to the sentinel,
+    silently discarding real refs already sitting in step2c.md on disk.
+    """
+    existing = (bd_raw.get("evidence") or "").strip()
+    if existing:
+        return existing
+    key = _step2c_content_key(bd_raw.get("content", "") or "")
+    if key and key in md_evidence_map:
+        return md_evidence_map[key]
+    return _NA_EVIDENCE_SENTINEL
+
+
 def _bd_to_markdown(result: BDExtractionResult) -> str:
     """Convert a BDExtractionResult to Markdown for backward compatibility.
 
@@ -1838,6 +1870,13 @@ def build_blueprint_phases_v5(
         """Three-step Instructor synthesis: Extract+Classify → Enhance → Interactions."""
         artifacts_dir = Path(state.run_dir) / "artifacts"
         total_tokens = 0
+        # Load step2c.md evidence map once for all L3 recovery sites below.
+        # When the structured LLM call fails and we fall through to lenient
+        # JSON/YAML parsing, the recovered BDs often arrive without evidence.
+        # We used to default to N/A here — but the LLM already wrote real
+        # refs into step2c_business_decisions.md in an earlier phase, so we
+        # look there first and only fall back to N/A if no row matches.
+        md_evidence_map = load_step2c_evidence_map(artifacts_dir)
 
         # Read worker artifacts (tolerant of missing non-blocking workers)
         worker_arch = _safe_read(artifacts_dir / "worker_arch.json")
@@ -1983,7 +2022,7 @@ def build_blueprint_phases_v5(
                             rat = rat + " " * (40 - len(rat))
                         bd_raw["rationale"] = rat
                         if not bd_raw.get("evidence"):
-                            bd_raw["evidence"] = "N/A:0(see_rationale)"
+                            bd_raw["evidence"] = _recover_bd_evidence(bd_raw, md_evidence_map)
                         try:
                             bd = BusinessDecision.model_validate(bd_raw)
                             all_decisions.append(bd)
@@ -1996,7 +2035,7 @@ def build_blueprint_phases_v5(
                                     content=str(bd_raw.get("content", "")),
                                     type=bd_raw.get("type", "B"),
                                     rationale=rat,
-                                    evidence=bd_raw.get("evidence", "N/A:0(see_rationale)"),
+                                    evidence=_recover_bd_evidence(bd_raw, md_evidence_map),
                                     stage=bd_raw.get("stage", "unknown"),
                                 )
                                 all_decisions.append(bd)
@@ -2062,7 +2101,7 @@ def build_blueprint_phases_v5(
                         rat = rat + " " * (40 - len(rat))
                     bd_raw["rationale"] = rat
                     if not bd_raw.get("evidence"):
-                        bd_raw["evidence"] = "N/A:0(see_rationale)"
+                        bd_raw["evidence"] = _recover_bd_evidence(bd_raw, md_evidence_map)
                     # Dedup against existing code-extracted BDs
                     key = bd_raw["content"][:50].lower().strip()
                     if key not in seen_content:
@@ -2165,9 +2204,9 @@ def build_blueprint_phases_v5(
                     if len(rat) < 40:
                         rat = rat + " " * (40 - len(rat))
                     bd_raw["rationale"] = rat
-                    # Ensure evidence is non-empty
+                    # Ensure evidence is non-empty — prefer step2c.md over sentinel
                     if not bd_raw.get("evidence"):
-                        bd_raw["evidence"] = "N/A:0(see_rationale)"
+                        bd_raw["evidence"] = _recover_bd_evidence(bd_raw, md_evidence_map)
                     try:
                         valid_bds.append(BusinessDecision.model_validate(bd_raw))
                     except Exception:
@@ -2177,7 +2216,7 @@ def build_blueprint_phases_v5(
                                 content=str(bd_raw.get("content", "")),
                                 type=bd_raw.get("type", "B"),
                                 rationale=rat,
-                                evidence=bd_raw.get("evidence", "N/A:0(see_rationale)"),
+                                evidence=_recover_bd_evidence(bd_raw, md_evidence_map),
                                 stage=bd_raw.get("stage", "unknown"),
                             )
                         )

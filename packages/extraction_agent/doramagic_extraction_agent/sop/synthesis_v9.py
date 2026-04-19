@@ -25,6 +25,10 @@ from pathlib import Path
 from typing import Any
 
 from doramagic_extraction_agent.core.agent_loop import ExtractionAgent, PhaseResult
+from doramagic_extraction_agent.sop.blueprint_enrich import (
+    _step2c_content_key,
+    load_step2c_evidence_map,
+)
 from doramagic_extraction_agent.sop.schemas_v5 import (
     BDExtractionResult,
     BusinessDecision,
@@ -226,10 +230,18 @@ def _safe_read(path: Path, default: str = "") -> str:
 def _coerce_bd_dict(
     bd_raw: dict[str, Any],
     idx: int,
+    md_evidence_map: dict[str, str] | None = None,
 ) -> BusinessDecision | None:
     """Leniently coerce a raw dict to BusinessDecision.
 
     Returns None if the dict is unusable (no content).
+
+    When ``md_evidence_map`` is provided and ``bd_raw`` lacks an
+    ``evidence`` field, we look up the BD by content-prefix in the
+    step2c_business_decisions.md table first. Only when the map has no
+    matching row do we fall back to the N/A sentinel. This roots out the
+    bp-062 regression where L3 recovery unconditionally defaulted to N/A
+    even when real refs were sitting on disk.
     """
     if not isinstance(bd_raw, dict) or not bd_raw.get("content"):
         return None
@@ -242,7 +254,11 @@ def _coerce_bd_dict(
         rat = rat + " — decision extracted from worker candidate"
     bd_raw["rationale"] = rat[:500]
     if not bd_raw.get("evidence"):
-        bd_raw["evidence"] = "N/A:0(see_rationale)"
+        recovered = ""
+        if md_evidence_map:
+            key = _step2c_content_key(bd_raw.get("content", "") or "")
+            recovered = md_evidence_map.get(key, "")
+        bd_raw["evidence"] = recovered or "N/A:0(see_rationale)"
     try:
         return BusinessDecision.model_validate(bd_raw)
     except Exception:
@@ -252,7 +268,7 @@ def _coerce_bd_dict(
                 content=str(bd_raw["content"]),
                 type=bd_raw.get("type", "B"),
                 rationale=rat,
-                evidence=bd_raw.get("evidence", "N/A:0(see_rationale)"),
+                evidence=bd_raw.get("evidence") or "N/A:0(see_rationale)",
                 stage=bd_raw.get("stage", "unknown"),
             )
         except Exception:
@@ -391,6 +407,9 @@ def build_local_synthesis_handler(agent: ExtractionAgent) -> Callable:
 
     async def _handler(state: AgentState, repo_path: Path) -> PhaseResult:
         artifacts_dir = Path(state.run_dir) / "artifacts"
+        # Load once so every _coerce_bd_dict call can recover evidence
+        # from step2c_business_decisions.md instead of defaulting to N/A.
+        md_evidence_map = load_step2c_evidence_map(artifacts_dir)
         total_tokens = 0
         local_results: dict[str, list[BusinessDecision]] = {}
 
@@ -482,7 +501,7 @@ def build_local_synthesis_handler(agent: ExtractionAgent) -> Callable:
                 )
                 bds: list[BusinessDecision] = []
                 for i, bd_raw in enumerate(raw_decisions):
-                    bd = _coerce_bd_dict(bd_raw, i)
+                    bd = _coerce_bd_dict(bd_raw, i, md_evidence_map)
                     if bd is not None:
                         bds.append(bd)
                 logger.info(
@@ -547,6 +566,7 @@ def build_global_synthesis_handler(agent: ExtractionAgent) -> Callable:
 
     async def _handler(state: AgentState, repo_path: Path) -> PhaseResult:
         artifacts_dir = Path(state.run_dir) / "artifacts"
+        md_evidence_map = load_step2c_evidence_map(artifacts_dir)
         total_tokens = 0
 
         # --- Collect all locally-synthesized BDs ---
@@ -563,7 +583,7 @@ def build_global_synthesis_handler(agent: ExtractionAgent) -> Callable:
                 local_data = json.loads(local_path.read_text(encoding="utf-8"))
                 validated = local_data.get("validated", [])
                 for i, bd_raw in enumerate(validated):
-                    bd = _coerce_bd_dict(bd_raw, len(all_bds) + i)
+                    bd = _coerce_bd_dict(bd_raw, len(all_bds) + i, md_evidence_map)
                     if bd is not None:
                         all_bds.append(bd)
             except Exception as load_exc:
@@ -631,7 +651,7 @@ def build_global_synthesis_handler(agent: ExtractionAgent) -> Callable:
             )
             interaction_bds: list[BusinessDecision] = []
             for i, bd_raw in enumerate(interaction_raw):
-                bd = _coerce_bd_dict(bd_raw, len(deduped) + i)
+                bd = _coerce_bd_dict(bd_raw, len(deduped) + i, md_evidence_map)
                 if bd is not None:
                     interaction_bds.append(bd)
             logger.info(
@@ -721,6 +741,7 @@ def build_fixer_handler(agent: ExtractionAgent) -> Callable:
 
     async def _handler(state: AgentState, repo_path: Path) -> PhaseResult:
         artifacts_dir = Path(state.run_dir) / "artifacts"
+        md_evidence_map = load_step2c_evidence_map(artifacts_dir)
         total_tokens = 0
 
         # --- Load current BD list ---
@@ -887,7 +908,7 @@ def build_fixer_handler(agent: ExtractionAgent) -> Callable:
                 continue
             if bd.id in fixed_by_id:
                 fixed_raw = fixed_by_id[bd.id]
-                repaired = _coerce_bd_dict(fixed_raw, 0)
+                repaired = _coerce_bd_dict(fixed_raw, 0, md_evidence_map)
                 if repaired is not None:
                     repaired.id = bd.id  # preserve original ID
                     updated_decisions.append(repaired)
