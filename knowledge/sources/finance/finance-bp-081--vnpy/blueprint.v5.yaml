@@ -1,0 +1,3813 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-081
+name: VeighNa
+sop_version: '3.6'
+source:
+  projects:
+  - vnpy
+  commit_hash: 3d00af96832366c2343ff23c592a2f744ca6672a
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Multi-factor machine learning quantitative trading strategy development, research, and live
+    trading
+  description: VeighNa is a Python open-source quantitative trading development framework providing AI-powered
+    multi-factor ML strategy development, backtesting, and live trading capabilities for Chinese financial
+    markets including stocks, futures, and options.
+  prerequisites: Users need Python 3.10+ proficiency, basic understanding of quantitative trading concepts
+    (factors, backtesting, order management), Chinese futures/stock market knowledge (SHFE position modes,
+    trading hours), and familiarity with machine learning workflows for financial prediction tasks.
+  not_suitable_for: International markets outside China (hardcoded trading hours, Chinese character display,
+    240-day calendar), high-frequency trading requiring sub-millisecond latency (single-threaded event
+    loop), pure classification strategies (LgbModel defaults to MSE regression), and users seeking automated
+    strategy generation without factor research.
+stages:
+- id: event_driven_core
+  name: Event-Driven Core
+  order: 1
+  responsibility: Provides asynchronous event distribution for the entire platform, enabling loose coupling
+    between gateways, engines, and UI components. This stage is the nervous system of the entire framework,
+    routing typed events to registered handlers without direct component dependencies.
+  interface:
+    inputs:
+    - Event objects with type string and data payload
+    outputs:
+    - Dispatched events to registered handlers based on event type
+  required_methods:
+  - name: EventEngine.register
+    description: Registers event handler callback for specific event type, allowing components to subscribe
+      to market data, order updates, and other system events
+    evidence: vnpy/event/engine.py:80(register)
+  - name: EventEngine.unregister
+    description: Removes previously registered handler to prevent memory leaks and unwanted callbacks
+      during component shutdown
+    evidence: vnpy/event/engine.py:91(unregister)
+  - name: EventEngine.put
+    description: Enqueues an event into the processing queue, triggering async dispatch to each registered
+      handlers for that event type
+    evidence: vnpy/event/engine.py:66(put)
+  - name: MainEngine.add_gateway
+    description: Dynamically loads trading interface implementations (CTP, IB, etc.) into the platform
+      at runtime
+    evidence: vnpy/trader/engine.py:102(add_gateway)
+  - name: MainEngine.add_app
+    description: Dynamically loads application modules (CtaStrategy, PortfolioStrategy, etc.) into the
+      platform
+    evidence: vnpy/trader/engine.py:120(add_app)
+  key_behaviors:
+  - behavior: Single-threaded FIFO event processing
+    description: Events are processed in strict first-in-first-out order within their type-specific queues.
+      A dedicated worker thread dequeues events and dispatches to registered handlers synchronously, which
+      prevents race conditions but means slow handlers block subsequent events of the same type.
+    evidence: vnpy/event/engine.py:68-74(process),35-36(queues)
+  - behavior: Timer-driven periodic task execution
+    description: EventEngine starts an interval timer (default 1 second) that generates EVENT_TIMER events,
+      allowing components to register time-based callbacks without OS-level timer dependencies. This enables
+      polling-based strategies and periodic system checks.
+    evidence: 'vnpy/event/engine.py:42(interval: int=1)'
+  - behavior: General handlers for cross-cutting concerns
+    description: _handlers list receives ALL events regardless of type, enabling logging, performance
+      monitoring, and debugging without per-event-type registration. Essential for system-wide observability.
+    evidence: 'vnpy/event/engine.py:53(_general_handlers: list)'
+  - behavior: Plugin architecture via dynamic import
+    description: Gateways and apps are loaded via add_gateway/add_app using import_module, supporting
+      vnpy_<name> package convention. New exchanges or strategies can be added without modifying core
+      framework code.
+    evidence: vnpy/trader/engine.py:102(add_gateway),120(add_app)
+  replaceable_points:
+  - name: Event processing loop
+    description: The _run/_process loop implementation determines threading model for event dispatch
+    options:
+    - name: single-threaded queue
+      traits:
+      - Thread-based
+      - Synchronous dispatch
+      - GIL-bound
+      fit_for:
+      - Standard trading strategies
+      - UI integration
+      - Low-to-medium event frequency
+      not_fit_for:
+      - High-frequency trading
+      - CPU-intensive event processing
+    - name: multiprocess queue
+      traits:
+      - Process-based
+      - True parallelism
+      - Higher overhead
+      fit_for:
+      - CPU-intensive backtesting
+      - Isolated strategy execution
+      not_fit_for:
+      - UI applications
+      - Memory-constrained environments
+    - name: asyncio
+      traits:
+      - Coroutine-based
+      - Single-threaded async
+      - High concurrency
+      fit_for:
+      - Network-heavy operations
+      - I/O-bound event processing
+      not_fit_for:
+      - CPU-bound tasks
+      - Existing sync codebases
+    default: single-threaded queue
+  design_decisions:
+  - 'Single-threaded event queue with worker thread (evidence: vnpy/event/engine.py:48(_queue: Queue))
+    — Avoids race conditions in handler dispatch; simpler than multiprocessing for most trading use cases'
+  - 'Timer events every 1 second for polling (evidence: vnpy/event/engine.py:42(interval: int=1)) — Supports
+    periodic tasks without OS timer dependencies; default 1s is adequate for trading'
+  - 'General handlers for all-event listeners (evidence: vnpy/event/engine.py:53(_general_handlers: list))
+    — Allows cross-cutting concerns like logging without per-type registration'
+  - 'Plugin architecture via add_gateway/add_app dynamic loading (evidence: vnpy/trader/engine.py:102(add_gateway),120(add_app))
+    — New exchanges/strategies added without core changes; requires vnpy_<name> package convention'
+  - 'App engine class linked via BaseApp.engine_class attribute (evidence: vnpy/trader/app.py:19(engine_class:
+    type["BaseEngine"])) — Enables MainEngine to auto-create engine when app is added; tight coupling
+    via naming convention'
+  acceptance_hints:
+  - Events dispatched within 1ms of put() call under normal load
+  - Timer events fire exactly every interval second without drift
+  - Every registered handlers receive events for their subscribed types
+  - General handlers receive every event regardless of type
+  - add_gateway successfully loads vnpy_ctp and connects without errors
+  - add_app correctly instantiates engine via engine_class attribute
+- id: market_data_gateway
+  name: Market Data Gateway
+  order: 2
+  responsibility: ' Abstracts connectivity to different trading systems (CTP, IB, ESunny, etc.) providing
+    unified TickData and BarData streams. This stage isolates the platform from exchange-specific protocols,
+    enabling seamless switching between brokers and markets.'
+  interface:
+    inputs:
+    - SubscribeRequest objects specifying symbols/exchanges
+    outputs:
+    - TickData, BarData, TradeData, OrderData events pushed via EventEngine
+  required_methods:
+  - name: BaseGateway.subscribe
+    description: Subscribes to real-time market data for specified symbols and exchanges, initiating connection
+      to exchange backend
+    evidence: vnpy/trader/gateway.py:52(subscribe)
+  - name: BaseGateway.query_account
+    description: Queries current account balance and margin information from the trading backend
+    evidence: vnpy/trader/gateway.py:58(query_account)
+  - name: BaseGateway.query_position
+    description: Queries current position holdings across each subscribed contracts
+    evidence: vnpy/trader/gateway.py:61(query_position)
+  key_behaviors:
+  - behavior: vt_symbol composite key for contract identification
+    description: Every contracts use symbol.exchange format (e.g., 'rb2401.SHF') as unique identifier
+      across different exchanges. This prevents symbol collisions when trading similar symbols on multiple
+      exchanges (e.g., same symbol listed on both DCE and SHFE).
+    evidence: 'vnpy/trader/object.py:84(self.vt_symbol: str = f"{self.symbol}.{self.exchange.value}")'
+  - behavior: Full orderbook depth with 5-level bid/ask
+    description: TickData contains complete market depth snapshot with 5 price levels on each side, enabling
+      level-based analysis without additional market depth subscriptions. Critical for market impact estimation
+      and liquidity analysis.
+    evidence: vnpy/trader/object.py:56-78
+  - behavior: Gateway-agnostic data with origin tracing
+    description: Every data objects inherit BaseData and carry gateway_name field, enabling debugging
+      and audit trails in multi-gateway setups. Users can trace every tick to its source exchange/connection.
+    evidence: vnpy/trader/object.py:18(BaseData)
+  replaceable_points:
+  - name: Gateway implementation
+    description: Trading system connectivity layer for different brokers and protocols
+    options:
+    - name: vnpy_ctp
+      traits:
+      - CTP protocol
+      - Chinese futures
+      - Commercial license
+      fit_for:
+      - Chinese futures markets (SHFE, DCE, CZCE, CFFEX)
+      - Production trading
+      not_fit_for:
+      - Stocks
+      - International markets
+    - name: vnpy_ib
+      traits:
+      - IB API
+      - Global markets
+      - Stocks/Forex/Options
+      fit_for:
+      - International markets
+      - Multi-asset trading
+      not_fit_for:
+      - Chinese futures
+      - High-frequency (IB throttling)
+    - name: vnpy_esunny
+      traits:
+      - ESunny protocol
+      - Chinese futures
+      - Alternative to CTP
+      fit_for:
+      - Chinese futures markets
+      - Broker-specific features
+      not_fit_for:
+      - Stocks
+      - International markets
+    - name: custom
+      traits:
+      - User-defined
+      - Protocol-specific
+      fit_for:
+      - Proprietary exchanges
+      - Custom protocols
+      not_fit_for:
+      - Standard markets
+      - Production without testing
+    default: vnpy_ctp
+  design_decisions:
+  - 'vt_symbol composite key (symbol.exchange) (evidence: vnpy/trader/object.py:84(self.vt_symbol)) —
+    Uniquely identifies contracts across different exchanges; avoids symbol collisions'
+  - 'Every data objects inherit BaseData with gateway_name (evidence: vnpy/trader/object.py:18(BaseData))
+    — Traces data origin for debugging multi-gateway setups; each objects are gateway-agnostic'
+  - 'TickData contains full orderbook (5 levels) (evidence: vnpy/trader/object.py:56-78) — Supports level-based
+    analysis without additional market depth subscriptions'
+  acceptance_hints:
+  - Ticks arrive within 100ms of exchange dissemination
+  - vt_symbol uniquely identifies each contract across exchanges
+  - TickData contains each 5 bid/ask levels
+  - gateway_name correctly traces data origin
+  - SubscribeRequest successfully initiates data flow for specified symbols
+- id: order_management
+  name: Order Management System
+  order: 3
+  responsibility: Tracks orders, trades, positions, and accounts; handles position conversion for exchanges
+    with open/close distinction (SHFE net position mode). This stage provides the authoritative source
+    of truth for portfolio state, essential for risk management and execution.
+  interface:
+    inputs:
+    - OrderData, TradeData, PositionData events from gateways
+    outputs:
+    - OrderRequest, CancelRequest to gateways; position summaries to strategies
+  required_methods:
+  - name: OmsEngine.send_order
+    description: Sends order request through configured gateway, tracking order lifecycle from SUBMITTING
+      through to terminal states (ALLTRADED, CANCELLED, REJECTED)
+    evidence: vnpy/trader/engine.py:339(OmsEngine)
+  - name: OmsEngine.cancel_order
+    description: Cancels active (pending) orders identified by vt_orderid, updating order status and releasing
+      frozen amounts
+    evidence: vnpy/trader/engine.py:375(cancel_order)
+  - name: OffsetConverter.convert_order_request
+    description: Converts user intent (OPEN/CLOSE) into exchange-compliant offset for SHFE gross position
+      mode
+    evidence: vnpy/trader/converter.py:310(convert_order_request)
+  key_behaviors:
+  - behavior: Three offset modes for Chinese futures
+    description: NONE (non-futures), OPEN, CLOSE (and CLOSETODAY, CLOSEYESTERDAY) modes handle Chinese
+      futures requirements where same symbol can have separate today/yesterday position tracking. CLOSETODAY
+      vs CLOSEYESTERDAY is critical for day-session rules on SHFE.
+    evidence: vnpy/trader/constant.py:23-27
+  - behavior: Frozen volume tracking prevents over-trading
+    description: calculate_frozen() tracks pending order volume that hasn't filled yet, preventing strategies
+      from exceeding available margin. Essential for futures margin calculations and position limit compliance.
+    evidence: vnpy/trader/converter.py:112(calculate_frozen)
+  - behavior: SHFE lock mode for hedgers
+    description: convert_order_request_lock enables bidirectional positions without self-liquidating,
+      allowing large hedgers to maintain both long and short positions simultaneously in gross mode.
+    evidence: vnpy/trader/converter.py:202(convert_order_request_lock)
+  - behavior: Active order status tracking
+    description: ACTIVE_STATUSES set (SUBMITTING, NOTTRADED, PARTTRADED) defines orders eligible for cancellation.
+      Cancellation logic relies on this set; adding new statuses must update ACTIVE_STATUSES.
+    evidence: vnpy/trader/object.py:14(ACTIVE_STATUSES)
+  replaceable_points:
+  - name: Position mode
+    description: How positions are aggregated and tracked across trading sessions
+    options:
+    - name: gross (long/short separate)
+      traits:
+      - Separate tracking
+      - SHFE compliance
+      - Lock mode available
+      fit_for:
+      - Chinese futures
+      - Hedging strategies
+      - Large trader position limits
+      not_fit_for:
+      - Simple single-direction strategies
+      - Stock portfolios
+    - name: net (offset)
+      traits:
+      - Offset long/short
+      - Simpler tracking
+      fit_for:
+      - Stock long-only
+      - Simple pair trading
+      not_fit_for:
+      - Futures requiring gross tracking
+      - Hedging
+    - name: lock (bidirectional)
+      traits:
+      - Independent long/short
+      - No offset
+      fit_for:
+      - Market makers
+      - Statistical arbitrage
+      not_fit_for:
+      - Position limit-constrained accounts
+    default: gross
+  design_decisions:
+  - 'Three offset modes: NONE, OPEN, CLOSE (and CLOSETODAY/CLOSEYESTERDAY) (evidence: vnpy/trader/constant.py:23-27)
+    — Chinese futures require open/close distinction; CLOSETODAY vs CLOSEYESTERDAY handles day-session
+    rules'
+  - 'Frozen volume tracking per position (evidence: vnpy/trader/converter.py:112(calculate_frozen)) —
+    Prevents over-trading when orders are pending; essential for futures margin calculations'
+  - 'SHFE lock mode for hedgers (evidence: vnpy/trader/converter.py:202(convert_order_request_lock)) —
+    Large traders need bidirectional positions without self-liquidating'
+  acceptance_hints:
+  - 'Order status transitions follow legal path: SUBMITTING -> NOTTRADED/PARTTRADED -> ALLTRADED/CANCELLED/REJECTED'
+  - Frozen amounts correctly release upon order fill or cancellation
+  - Position calculations match exchange-provided position data within tolerance
+  - SHFE CLOSETODAY vs CLOSEYESTERDAY correctly handles day-session boundaries
+- id: alpha_research_data
+  name: Alpha Research Data Pipeline
+  order: 4
+  responsibility: Prepares, filters, and processes financial time-series data for machine learning factor
+    research. This stage transforms raw market data into feature-label pairs using expression-based factor
+    definitions, enabling rapid factor iteration without code changes.
+  interface:
+    inputs:
+    - Raw BarData loaded from database via AlphaLab
+    outputs:
+    - Processed DataFrames with features (alpha_101/alpha_158) and labels for model training
+  required_methods:
+  - name: AlphaDataset.add_feature
+    description: Defines factor expression (e.g., 'ts_delay(close, 5)') that maps to polars operations,
+      enabling rapid feature iteration
+    evidence: vnpy/alpha/dataset/datasets/alpha_101.py:27(add_feature)
+  - name: AlphaDataset.process_data
+    description: Applies feature expressions and label calculations to produce training-ready DataFrame
+    evidence: vnpy/alpha/dataset/template.py:23(AlphaDataset)
+  - name: DataProxy operators
+    description: Operator overloading (__gt__, __lt__, etc.) enables pandas-like expressions that compile
+      to polars operations
+    evidence: vnpy/alpha/dataset/utility.py:70(__gt__)
+  key_behaviors:
+  - behavior: Expression-based feature definitions
+    description: Factor expressions (ts_*, cs_*) are defined as strings that map to polars operations,
+      enabling rapid factor iteration without code changes. DataProxy wraps column references to enable
+      operator overloading in factor expressions.
+    evidence: vnpy/alpha/dataset/datasets/alpha_101.py:27(add_feature)
+  - behavior: Ternary operators for conditional logic
+    description: WorldQuant-style conditional factors require branching logic (quesval/quesval2) implemented
+      via DataProxy comparison operators returning polars Int32 expressions instead of Boolean for if_else
+      branching.
+    evidence: vnpy/alpha/dataset/utility.py:70(__gt__)
+  - behavior: Cross-sectional vs time-series operator separation
+    description: ts_* operators use rolling window calculations with polars; cs_* operators use groupby
+      for cross-sectional rankings and normalizations. Mixing cs_ and ts_ in wrong contexts produces incorrect
+      factor values.
+    evidence: vnpy/alpha/dataset/ts_function.py:12(ts_delay)
+  - behavior: AlphaDataset column structure contract
+    description: AlphaDataset requires datetime and vt_symbol as first two columns, features in columns[2:-1],
+      and label as last column. Every AlphaModel implementations assume this column structure, so adding/removing/reordering
+      columns breaks each models.
+    evidence: 'vnpy/alpha/dataset/utility.py:13(self.name: str = df.columns[-1])'
+  replaceable_points:
+  - name: Factor library
+    description: Pre-defined factor definitions for feature engineering
+    options:
+    - name: Alpha101
+      traits:
+      - 101 WorldQuant factors
+      - Expression-based
+      - OHLCV-based
+      fit_for:
+      - Alpha research prototyping
+      - WorldQuant-style factors
+      not_fit_for:
+      - Non-price data (fundamentals, sentiment)
+      - Custom factor formulas
+    - name: Alpha158
+      traits:
+      - 158 Qlib factors
+      - Broader feature set
+      - Multi-dimensional
+      fit_for:
+      - Stock market factors
+      - Broader feature coverage
+      not_fit_for:
+      - Futures-specific factors
+      - Custom expressions
+    - name: custom
+      traits:
+      - User-defined
+      - Flexible
+      fit_for:
+      - Proprietary factors
+      - Non-standard data
+      not_fit_for:
+      - Rapid prototyping
+      - Standard factor libraries
+    default: Alpha101
+  design_decisions:
+  - 'Expression-based feature definitions (evidence: vnpy/alpha/dataset/datasets/alpha_101.py:27(add_feature))
+    — Enables rapid factor iteration without code changes; expressions map to polars operations'
+  - 'Ternary operators (quesval/quesval2) for conditional logic (evidence: vnpy/alpha/dataset/utility.py:70(__gt__))
+    — WorldQuant-style conditional factors require branching logic on DataProxy'
+  - 'Cross-sectional vs time-series operators (evidence: vnpy/alpha/dataset/ts_function.py:12(ts_delay))
+    — ts_* operators use scipy for rolling window calculations; cs_* operators use polars groupby'
+  acceptance_hints:
+  - Factor expressions compile without syntax errors
+  - ts_* and cs_* operators produce correct results for their respective contexts
+  - AlphaDataset DataFrame has correct column structure (datetime, vt_symbol, features..., label)
+  - No NaN values in processed features (proper handling of missing data)
+  - quesval/quesval2 ternary logic correctly branches on conditions
+- id: alpha_modeling
+  name: Alpha Modeling
+  order: 5
+  responsibility: Trains and evaluates machine learning models (LightGBM, MLP, Lasso) on prepared alpha
+    factors. This stage provides standardized model interfaces for comparative analysis of different ML
+    algorithms on the same feature set.
+  interface:
+    inputs:
+    - AlphaDataset with features and labels
+    outputs:
+    - Trained model with predict() method; feature importance plots
+  required_methods:
+  - name: AlphaModel.fit
+    description: Trains model on train/valid split with early stopping support, producing internal weights
+      for prediction
+    evidence: vnpy/alpha/model/template.py:9(AlphaModel)
+  - name: AlphaModel.predict
+    description: Generates prediction signals (returns) for test/holdout dataset using trained model weights
+    evidence: vnpy/alpha/model/template.py:9(AlphaModel)
+  - name: AlphaModel.detail
+    description: Produces feature importance analysis and model-specific metrics for interpretability
+    evidence: vnpy/alpha/model/template.py:9(AlphaModel)
+  key_behaviors:
+  - behavior: Separate train/valid DataFrames for early stopping
+    description: LgbModel trains on TRAIN segment while using VALID segment for early_stopping_rounds,
+      preventing overfitting. This is critical for preventing the model from memorizing training data
+      patterns.
+    evidence: vnpy/alpha/model/models/lgb_model.py:70(Segment.TRAIN, Segment.VALID)
+  - behavior: MSE objective for regression
+    description: LgbModel defaults to objective='mse', forcing regression mode for predicting returns
+      as continuous values. Classification strategies must manually override self.params after __init__.
+    evidence: 'vnpy/alpha/model/models/lgb_model.py:41(objective: mse)'
+  - behavior: LassoModel merges TRAIN+VALID before training
+    description: Unlike LgbModel, LassoModel concatenates TRAIN and VALID segments (deduplicating by datetime+vt_symbol)
+      before training. This creates inconsistent fitting semantics across models, making performance comparisons
+      misleading.
+    evidence: vnpy/alpha/model/models/lasso_model.py:50-56(concat+unique)
+  - behavior: Inconsistent feature importance methods
+    description: LassoModel uses coef-based importance while MlpModel uses perturbation method (std of
+      prediction diff under noise). Comparing importance across models is invalid since they use completely
+      different metrics.
+    evidence: vnpy/alpha/model/models/mlp_model.py:458-490(_calculate_feature_importance)
+  replaceable_points:
+  - name: ML algorithm
+    description: Model architecture choice for alpha prediction
+    options:
+    - name: LightGBM
+      traits:
+      - Gradient boosting
+      - Early stopping
+      - Handles missing values
+      fit_for:
+      - Large feature sets
+      - Non-linear relationships
+      - Production
+      not_fit_for:
+      - Linear relationships only
+      - Interpretability requirements
+    - name: MLP (PyTorch)
+      traits:
+      - Neural network
+      - Non-linear
+      - Learning rate scheduler
+      fit_for:
+      - Complex patterns
+      - Deep features
+      not_fit_for:
+      - Small datasets
+      - Training time constraints
+    - name: Lasso
+      traits:
+      - Linear
+      - L1 regularization
+      - Feature selection
+      fit_for:
+      - Interpretability
+      - Sparse solutions
+      - Feature selection
+      not_fit_for:
+      - Non-linear patterns
+      - High-cardinality features
+    default: LightGBM
+  design_decisions:
+  - 'Separate train/valid DataFrames for early stopping (evidence: vnpy/alpha/model/models/lgb_model.py:70(Segment.TRAIN,
+    Segment.VALID)) — Prevents overfitting; valid set controls early_stopping_rounds'
+  - 'MSE objective for regression (evidence: vnpy/alpha/model/models/lgb_model.py:41(objective: mse))
+    — Predicting returns as continuous values; not classification'
+  - 'Early stopping rounds as hyperparameter (evidence: vnpy/alpha/model/models/lgb_model.py:48(early_stopping_rounds:
+    int=50)) — Balances training time vs generalization; 50 rounds is conservative'
+  - 'MLP learning_rate=0.001 with ReduceLROnPlateau (evidence: vnpy/alpha/model/models/mlp_model.py:39,125-135(scheduler))
+    — MLP may converge to suboptimal local minima; no warmup schedule unlike LgbModel early_stopping'
+  acceptance_hints:
+  - Model trains without errors on valid train/valid split
+  - Early stopping triggers at reasonable epoch (not 0, not max rounds)
+  - Predictions are generated for test dataset
+  - Feature importance values are non-zero for meaningful features
+  - Model detail() produces interpretable output for the specific algorithm
+- id: alpha_backtesting
+  name: Alpha Strategy Backtesting
+  order: 6
+  responsibility: Simulates strategy execution with realistic fill modeling, commission, and slippage
+    for alpha research. This stage bridges the gap between model predictions and trading performance,
+    providing statistical analysis of strategy viability.
+  interface:
+    inputs:
+    - AlphaStrategy with signals, historical BarData, contract settings (size, pricetick, rates)
+    outputs:
+    - Daily P&L DataFrame, performance statistics, equity curve plots
+  required_methods:
+  - name: BacktestingEngine.set_parameters
+    description: Configures backtest capital, annual_days, commission rates, slippage before strategy
+      loading
+    evidence: vnpy/alpha/strategy/backtesting.py:70-227(set_parameters)
+  - name: BacktestingEngine.add_strategy
+    description: Registers AlphaStrategy instance with its parameters for execution
+    evidence: vnpy/alpha/strategy/backtesting.py:104-110(add_strategy)
+  - name: BacktestingEngine.load_data
+    description: Loads historical BarData from database for backtest period
+    evidence: vnpy/alpha/strategy/backtesting.py:112-148(load_data)
+  - name: BacktestingEngine.run_backtesting
+    description: Executes strategy on loaded data with signal-driven bar processing
+    evidence: vnpy/alpha/strategy/backtesting.py:150-168(run_backtesting)
+  - name: BacktestingEngine.calculate_statistics
+    description: Computes performance metrics (Sharpe, max drawdown, annual return) from daily results
+    evidence: vnpy/alpha/strategy/backtesting.py:228-393(calculate_statistics)
+  key_behaviors:
+  - behavior: Mandatory 5-step pipeline execution order
+    description: 'BacktestingEngine mandates strict ordering: set_parameters→add_strategy→load_data→run_backtesting→calculate_result→calculate_statistics.
+      Calling run_backtesting before load_data crashes; calculate_statistics needs daily_df from calculate_result.'
+    evidence: vnpy/alpha/strategy/backtesting.py:70-227(set_parameters),104-110(add_strategy),112-148(load_data),150-168(run_backtesting),170-226(calculate_result),228-393(calculate_statistics)
+  - behavior: Signal-driven bar processing for ML strategies
+    description: Strategy receives dict of bars keyed by vt_symbol, enabling ML signals that may not align
+      with bar boundaries. This differs from traditional bar-driven strategies that process each bar sequentially.
+    evidence: vnpy/alpha/strategy/backtesting.py:150(on_bars)
+  - behavior: Limit order matching with cross_order
+    description: Simulates exchange limit order book; fills when price crosses limit price, providing
+      realistic fill modeling for limit-only strategies. Immediate fill for market orders.
+    evidence: vnpy/alpha/strategy/backtesting.py:619(cross_order)
+  - behavior: Stateful PortfolioDailyResult P&L calculation
+    description: calculate_pnl() requires pre_closes and start_poses to flow from previous day to next
+      in date-ascending order. Iterating daily_results in wrong order breaks each P&L calculations for
+      subsequent days.
+    evidence: vnpy/alpha/strategy/backtesting.py:189-199,186-198(pre_closes/start_poses chain)
+  - behavior: Chinese market calendar assumption (240 days)
+    description: annual_days=240 is hardcoded for Sharpe ratio and annualized return calculations. Using
+      same engine for US equities (252) or crypto (365) produces wrong risk-adjusted returns.
+    evidence: 'vnpy/alpha/strategy/backtesting.py:78(annual_days: int=240),328-329(Sharpe formula uses
+      annual_days)'
+  - behavior: Bankruptcy detection zeros each statistics
+    description: positive_balance check in calculate_statistics() sets each metrics to zero if any daily
+      balance ≤0. A single bad trading day zeros out each return/sharpe metrics instead of flagging bankruptcy.
+    evidence: vnpy/alpha/strategy/backtesting.py:258-282(positive_balance check),396-400(nan_to_num)
+  replaceable_points:
+  - name: Order type
+    description: Fill simulation method for backtesting
+    options:
+    - name: limit (cross_order)
+      traits:
+      - Realistic fill modeling
+      - Price-contingent execution
+      fit_for:
+      - Low-frequency strategies
+      - Order book simulation
+      not_fit_for:
+      - High-frequency
+      - Market-on-close
+    - name: market (immediate fill)
+      traits:
+      - Instant execution
+      - No price contingency
+      fit_for:
+      - High-frequency
+      - Equity strategies
+      not_fit_for:
+      - Limit-heavy strategies
+      - Slippage analysis
+    - name: VWAP
+      traits:
+      - Volume-weighted average
+      - Realistic for large orders
+      fit_for:
+      - Institutional strategies
+      - Execution analysis
+      not_fit_for:
+      - Small orders
+      - Exact fill price needs
+    default: limit
+  design_decisions:
+  - 'Signal-driven (not bars-driven) for ML strategies (evidence: vnpy/alpha/strategy/backtesting.py:150(on_bars))
+    — ML signals may not align with bar boundaries; strategy receives dict of bars'
+  - 'Limit order matching with cross_order() (evidence: vnpy/alpha/strategy/backtesting.py:619(cross_order))
+    — Simulates exchange limit order book; fills when price crosses limit'
+  - 'Commission and slippage per trade (evidence: vnpy/alpha/strategy/strategies/equity_demo_strategy.py:84(turnover
+    * self.close_rate)) — Realistic cost modeling; min_commission prevents tiny-order abuse'
+  - 'annual_days=240 for Chinese market (evidence: vnpy/alpha/strategy/backtesting.py:78(annual_days:
+    int=240)) — Calculates annualized returns assuming 240 trading days; wrong for other markets'
+  - 'Default capital 1,000,000 CNY (evidence: vnpy/alpha/strategy/backtesting.py:76(capital: int=1_000_000))
+    — Business assumption encoded as default; may not suit each portfolio sizes'
+  acceptance_hints:
+  - Pipeline executes in correct order without crashes
+  - Daily P&L matches manual calculation for sample day
+  - Statistics (Sharpe, max drawdown) are mathematically correct
+  - Equity curve is monotonically increasing only when profitable
+  - Limit order fills only occur when price crosses limit
+  - PositionConverter.pre_closes correctly flow across trading days
+- id: persistence_layer
+  name: Persistence Layer
+  order: 7
+  responsibility: Stores and retrieves historical market data (bars, ticks) using pluggable database backends.
+    This stage ensures data reproducibility for backtesting and provides the foundation for alpha research
+    data access.
+  interface:
+    inputs:
+    - BarData/TickData lists, symbol/exchange/interval queries
+    outputs:
+    - BarData/TickData lists filtered by time range; BarOverview/TickOverview metadata
+  required_methods:
+  - name: BaseDatabase.save_bar_data
+    description: Persists BarData list to storage with timezone conversion to DB_TZ
+    evidence: vnpy/trader/database.py:52(BaseDatabase)
+  - name: BaseDatabase.load_bar_data
+    description: Retrieves BarData filtered by symbol, exchange, interval, and time range
+    evidence: vnpy/trader/database.py:52(BaseDatabase)
+  - name: AlphaLab.get_bar_data
+    description: Alpha research data access with shelve metadata and polars DataFrame storage
+    evidence: vnpy/alpha/lab.py:20(AlphaLab)
+  key_behaviors:
+  - behavior: Lazy database initialization via import_module
+    description: Database driver selected by settings configuration; imports driver module at runtime.
+      Default falls back to SQLite if specified driver not found, providing graceful degradation.
+    evidence: 'vnpy/trader/database.py:152(module: import_module)'
+  - behavior: Timezone conversion to DB_TZ on save
+    description: Every timestamps converted to DB_TZ before storage, ensuring consistent timestamps across
+      distributed systems with different local timezones.
+    evidence: vnpy/trader/database.py:17(convert_tz)
+  - behavior: AlphaLab hybrid storage (shelve + polars)
+    description: Shelve handles key-value metadata (bar overviews, dataset info) while polars DataFrames
+      store the actual numerical data. Shelve is simple for metadata; polars is efficient for large numerical
+      operations.
+    evidence: vnpy/alpha/lab.py:51(save_bar_data)
+  - behavior: BarOverview metadata for data discovery
+    description: BarOverview provides count, start, end timestamps for available data, enabling efficient
+      data discovery without loading full datasets.
+    evidence: vnpy/trader/database.py:26(BarOverview)
+  replaceable_points:
+  - name: Database backend
+    description: Storage engine for market data persistence
+    options:
+    - name: SQLite (default)
+      traits:
+      - File-based
+      - Zero configuration
+      - Single-user
+      fit_for:
+      - Development
+      - Small datasets
+      - Single-machine backtesting
+      not_fit_for:
+      - Production
+      - Multi-user
+      - High-volume tick data
+    - name: MongoDB
+      traits:
+      - Document store
+      - Flexible schema
+      - Horizontal scaling
+      fit_for:
+      - Tick data
+      - Schema evolution
+      - Distributed setups
+      not_fit_for:
+      - Complex joins
+      - ACID requirements
+    - name: PostgreSQL
+      traits:
+      - Relational
+      - ACID
+      - SQL queries
+      fit_for:
+      - Production
+      - Complex queries
+      - Time-series extensions
+      not_fit_for:
+      - Simple deployments
+      - Document workloads
+    default: SQLite
+  design_decisions:
+  - 'Lazy database initialization via import_module (evidence: vnpy/trader/database.py:152(module: import_module))
+    — Database driver selected by settings; default to SQLite if not found'
+  - 'Timezone conversion to DB_TZ on save (evidence: vnpy/trader/database.py:17(convert_tz)) — Ensures
+    consistent timestamps across distributed systems'
+  - 'AlphaLab uses shelve for metadata, polars for data (evidence: vnpy/alpha/lab.py:51(save_bar_data))
+    — Shelve is simple for key-value metadata; polars is efficient for large numerical DataFrames'
+  acceptance_hints:
+  - BarData loads correctly for specified symbol/exchange/interval/time_range
+  - Timestamps preserved correctly across save/load cycle
+  - BarOverview metadata matches actual stored data counts
+  - Different database backends produce identical query results
+  - AlphaLab correctly manages both metadata and data storage
+- id: rpc_communication
+  name: RPC Communication
+  order: 8
+  responsibility: Enables distributed deployment where client and server run in separate processes with
+    async pub/sub. This stage supports scaling trading systems across machines for remote execution and
+    monitoring.
+  interface:
+    inputs:
+    - Function calls on client; publish data on server
+    outputs:
+    - Remote function results on client; subscription callbacks with topic+data
+  required_methods:
+  - name: RpcServer.register
+    description: Registers callable functions to be exposed to remote clients
+    evidence: vnpy/rpc/server.py:123-127(register)
+  - name: RpcServer.start
+    description: Starts ZMQ REP/PUB server with heartbeat monitoring (BLOCKING)
+    evidence: vnpy/rpc/server.py:42-62(start)
+  - name: RpcClient.start
+    description: Starts ZMQ REQ/SUB client and connects to server (must be called before proxy calls)
+    evidence: vnpy/rpc/client.py:88-110(start)
+  - name: RpcClient.callback
+    description: Abstract handler for pushed data from server; must be subclassed
+    evidence: vnpy/rpc/client.py:152-156(callback)
+  key_behaviors:
+  - behavior: Dual-socket architecture (REP/PUB)
+    description: RpcServer uses REP socket for synchronous request-reply (RPC calls) paired with PUB socket
+      for asynchronous data pushes. RpcClient uses REQ socket for calls and SUB socket for subscriptions.
+      Mixing causes ZMQ errors.
+    evidence: vnpy/rpc/server.py:24-28(sockets),client.py:37-41(sockets)
+  - behavior: __getattr__ transparent RPC proxy
+    description: Dynamic method proxying via __getattr__ with lru_cache caches proxy methods before connection.
+      RpcClient.start() MUST be called before any proxy method calls, otherwise calls fail silently or
+      timeout.
+    evidence: vnpy/rpc/client.py:56(__getattr__ with lru_cache),88-110(start)
+  - behavior: RpcServer.register must precede start
+    description: register() must be called before start() which enters blocking run loop. Registering
+      after start() adds to dict but run loop never dispatches to new functions.
+    evidence: vnpy/rpc/server.py:42-62(start),123-127(register)
+  - behavior: Heartbeat detection for cleanup
+    description: Separate heartbeat checking detects client disconnections for resource cleanup, preventing
+      zombie subscriptions in long-running servers.
+    evidence: vnpy/rpc/server.py:129(check_heartbeat)
+  - behavior: RpcClient.callback is abstract
+    description: callback() raises NotImplementedError; must be subclassed to handle pushed data. Using
+      RpcClient directly without subclassing causes on_disconnected to only print (not raise).
+    evidence: vnpy/rpc/client.py:152-156(callback)
+  replaceable_points:
+  - name: Transport protocol
+    description: Network communication mechanism for distributed deployment
+    options:
+    - name: ZMQ (default)
+      traits:
+      - Low-latency
+      - Pub/sub
+      - Multiple patterns
+      fit_for:
+      - Real-time market data
+      - High-frequency
+      - Local network
+      not_fit_for:
+      - Cross-datacenter
+      - Firewall traversal
+    - name: WebSocket
+      traits:
+      - HTTP-compatible
+      - Firewall-friendly
+      - Browser support
+      fit_for:
+      - Web clients
+      - Cloud deployments
+      - Firewall constraints
+      not_fit_for:
+      - Low-latency
+      - High-frequency
+    - name: gRPC
+      traits:
+      - Protocol buffers
+      - HTTP/2
+      - Strong typing
+      fit_for:
+      - Cross-language
+      - Contract-first APIs
+      not_fit_for:
+      - Real-time streaming
+      - Simple deployments
+    default: ZMQ
+  design_decisions:
+  - 'ZMQ for transport (not HTTP/grpc) (evidence: vnpy/rpc/server.py:1(zmq)) — Low-latency pub/sub for
+    real-time market data; REQ/REP for RPC calls'
+  - '__getattr__ for transparent RPC (evidence: vnpy/rpc/client.py:56(__getattr__)) — Dynamic method proxying;
+    client.call_server_method() feels like local call'
+  - 'Separate heartbeat detection (evidence: vnpy/rpc/server.py:129(check_heartbeat)) — Detects client
+    disconnections for cleanup; prevents zombie subscriptions'
+  acceptance_hints:
+  - RpcServer.register() called before start() without errors
+  - RpcClient.start() called before any proxy method calls
+  - Remote function calls return correct results
+  - Pushed data received in callback override
+  - Heartbeat detection correctly identifies disconnected clients
+- id: charting_visualization
+  name: Charting & Visualization
+  order: 9
+  responsibility: Renders interactive candlestick charts with volume and cursor overlays using PyQtGraph.
+    This stage provides visual analysis tools for real-time market monitoring and strategy signal visualization.
+  interface:
+    inputs:
+    - BarData lists; ChartWidget with plots and items
+    outputs:
+    - Rendered Qt widget with keyboard navigation and mouse tracking
+  required_methods:
+  - name: ChartWidget.add_plot
+    description: Adds independent plot area with shared x-axis for candle, volume, or indicator display
+    evidence: vnpy/chart/widget.py:62(add_plot)
+  - name: ChartWidget.update_history
+    description: Updates chart with historical BarData list, triggering QPicture cache invalidation
+    evidence: vnpy/chart/widget.py:20(ChartWidget)
+  - name: CandleItem.load_data
+    description: Loads OHLC data for rendering with QPicture caching optimization
+    evidence: vnpy/chart/item.py:120(CandleItem)
+  key_behaviors:
+  - behavior: QPicture caching for bar rendering
+    description: _draw_bar_picture() pre-renders bars to QPicture, avoiding full repaint on every paintEvent.
+      Redraw only occurs on data update, providing smooth 60fps scrolling.
+    evidence: vnpy/chart/item.py:44(_draw_bar_picture)
+  - behavior: Multiple independent plots with shared x-axis
+    description: Candle and volume rendered as separate plots sharing x-axis for alignment. ChartCursor
+      crosshair syncs across each plots, providing consistent cursor info.
+    evidence: vnpy/chart/widget.py:62(add_plot)
+  - behavior: Keyboard navigation (arrows, +/-)
+    description: 'Desktop UX convention: left/right arrows scroll through history, up/down zoom in/out.
+      Familiar patterns for traders used to Bloomberg/MT4.'
+    evidence: vnpy/chart/widget.py:237(keyPressEvent)
+  - behavior: ChartCursor crosshair with info labels
+    description: Crosshair displays OHLCV values and strategy signals at cursor position, synced across
+      each plots. Essential for precise entry/exit analysis.
+    evidence: vnpy/chart/widget.py:324(ChartCursor)
+  replaceable_points:
+  - name: Chart item types
+    description: Visual elements rendered on chart
+    options:
+    - name: CandleItem
+      traits:
+      - OHLC rendering
+      - QPicture cached
+      fit_for:
+      - Price analysis
+      - Candlestick patterns
+      not_fit_for:
+      - Line charts
+      - Point plots
+    - name: VolumeItem
+      traits:
+      - Volume bars
+      - Color-coded
+      fit_for:
+      - Liquidity analysis
+      - Volume-price confirmation
+      not_fit_for:
+      - Low-liquidity assets
+    - name: LineItem
+      traits:
+      - Simple line
+      - Indicator overlay
+      fit_for:
+      - Moving averages
+      - Custom indicators
+      not_fit_for:
+      - Discrete data
+      - Multi-series
+    - name: custom
+      traits:
+      - User-defined
+      - Flexible
+      fit_for:
+      - Special visualizations
+      - Custom indicators
+      not_fit_for:
+      - Standard candlestick analysis
+    default: CandleItem + VolumeItem
+  design_decisions:
+  - 'QPicture caching for bar rendering (evidence: vnpy/chart/item.py:44(_draw_bar_picture)) — Redraw
+    only on data update; avoids full repaint on every paintEvent'
+  - 'Multiple independent plots with shared x-axis (evidence: vnpy/chart/widget.py:62(add_plot)) — Candle
+    and volume as separate plots; cursor syncs across each plots'
+  - 'Keyboard navigation (arrows, +/-) (evidence: vnpy/chart/widget.py:237(keyPressEvent)) — Desktop UX
+    convention; left/right scrolls, up/down zooms'
+  acceptance_hints:
+  - Candlestick chart renders without visual artifacts
+  - Scrolling is smooth (60fps) during history navigation
+  - Volume bars align correctly with candle timestamps
+  - Crosshair syncs across each plots at same x position
+  - Keyboard navigation (arrows, +/-) works as expected
+- id: ui_application
+  name: UI Application Layer
+  order: 10
+  responsibility: Provides Qt-based trading interface with monitors, dialogs, and order entry widgets.
+    This stage delivers the primary user-facing interface for manual trading, strategy monitoring, and
+    system configuration.
+  interface:
+    inputs:
+    - User actions (clicks, keyboard); EventEngine updates
+    outputs:
+    - OrderRequest/CancelRequest to MainEngine; display updates via Qt signals
+  required_methods:
+  - name: MainWindow.createDockWidget
+    description: Creates dockable panel for strategy controls, market data, or position monitoring
+    evidence: vnpy/trader/ui/mainwindow.py:1(MainWindow)
+  - name: BaseMonitor.process_event
+    description: Event-driven handler for Tick/Trade/Order updates, inserting or updating table rows
+    evidence: vnpy/trader/ui/widget.py:214(insert_new_row)
+  - name: OrderMonitor.cancel_all
+    description: Batch cancellation of each active orders by iterating active_status set
+    evidence: vnpy/trader/ui/widget.py:375(OrderMonitor)
+  key_behaviors:
+  - behavior: Dock-based layout for modular panels
+    description: Users can rearrange, minimize, and float panels for multi-monitor setups. Essential for
+      traders with multiple screens requiring simultaneous visibility of different data streams.
+    evidence: vnpy/trader/ui/mainwindow.py:1(MainWindow)
+  - behavior: Event-driven row insertion/update
+    description: Monitors subscribe to EventEngine updates and dynamically insert/update table rows. Monitors
+      stay in sync with live data without polling, ensuring low-latency display updates.
+    evidence: vnpy/trader/ui/widget.py:214(insert_new_row)
+  - behavior: Color-coded direction (red=long, green=short)
+    description: 'Trading convention: long positions/orders displayed in red, short in green. Immediate
+      visual feedback on position direction without reading text labels.'
+    evidence: vnpy/trader/ui/widget.py:41(COLOR_LONG = red)
+  - behavior: Direction enum uses Chinese characters (多/空)
+    description: Direction enum uses Chinese characters as display values for Chinese market convention.
+      Requires locale override for international use.
+    evidence: vnpy/trader/constant.py:14(LONG = _("多"))
+  replaceable_points:
+  - name: Display theme
+    description: Color scheme and visual style
+    options:
+    - name: default (red/green)
+      traits:
+      - Red long
+      - Green short
+      - Chinese convention
+      fit_for:
+      - Chinese markets
+      - Standard trading
+      not_fit_for:
+      - International markets
+      - Color-blind users
+    - name: custom
+      traits:
+      - User-defined
+      - Accessible colors
+      fit_for:
+      - Branding
+      - Accessibility
+      - International markets
+      not_fit_for:
+      - Default Chinese convention
+    default: default
+  design_decisions:
+  - 'Dock-based layout for modular panels (evidence: vnpy/trader/ui/mainwindow.py:1(MainWindow)) — Users
+    rearrange panels; essential for multi-monitor setups'
+  - 'Event-driven row insertion/update (evidence: vnpy/trader/ui/widget.py:214(insert_new_row)) — Monitors
+    stay in sync with live data without polling'
+  - 'Color-coded direction (red=long, green=short) (evidence: vnpy/trader/ui/widget.py:41(COLOR_LONG =
+    red)) — Trading convention; immediate visual feedback on position direction'
+  acceptance_hints:
+  - Every dock widgets render correctly without overlap
+  - Monitor tables update within 100ms of event
+  - Order cancellation propagates to OMS and gateway
+  - Direction colors match Chinese trading convention
+  - Keyboard shortcuts functional across each widgets
+data_flow:
+- from_stage: market_data_gateway
+  to_stage: order_management
+  data: TickData, TradeData, OrderData events via EventEngine
+- from_stage: market_data_gateway
+  to_stage: charting_visualization
+  data: BarData updates for chart refresh
+- from_stage: order_management
+  to_stage: market_data_gateway
+  data: OrderRequest, CancelRequest
+- from_stage: persistence_layer
+  to_stage: alpha_research_data
+  data: Historical BarData via AlphaLab
+- from_stage: alpha_research_data
+  to_stage: alpha_modeling
+  data: Processed AlphaDataset with features (DataFrame with datetime, vt_symbol, features, label columns)
+- from_stage: alpha_modeling
+  to_stage: alpha_backtesting
+  data: Prediction signals (pl.DataFrame with vt_symbol/datetime/signal)
+- from_stage: alpha_backtesting
+  to_stage: ui_application
+  data: Performance statistics (Sharpe, max drawdown, annual return) for display
+- from_stage: event_driven_core
+  to_stage: ui_application
+  data: EVENT_TICK, EVENT_TRADE, EVENT_ORDER for monitor updates
+- from_stage: rpc_communication
+  to_stage: order_management
+  data: Remote order requests via RpcClient/RpcServer proxy
+- from_stage: persistence_layer
+  to_stage: charting_visualization
+  data: Historical bars loaded from database for display
+- from_stage: event_driven_core
+  to_stage: order_management
+  data: Timer events for position settlement and risk checks
+- from_stage: event_driven_core
+  to_stage: market_data_gateway
+  data: Timer events for connection health checks
+global_contracts:
+- contract: Every market data objects use vt_symbol (symbol.exchange.value) as composite key
+  evidence: 'vnpy/trader/object.py:84(self.vt_symbol: str = f"{self.symbol}.{self.exchange.value}")'
+- contract: Every BaseData subclasses require gateway_name for source tracing
+  evidence: 'vnpy/trader/object.py:24(gateway_name: str)'
+- contract: BarData interval must be one of Interval enum values (1min, 5min, 15min, 30min, 1hour, daily,
+    weekly)
+  evidence: vnpy/trader/constant.py:142(Interval enum)
+- contract: AlphaDataset requires datetime and vt_symbol as first two columns, features in columns[2:-1],
+    and label as last column
+  evidence: 'vnpy/alpha/dataset/utility.py:13(self.name: str = df.columns[-1])'
+- contract: Offset.NONE used for non-futures products; OPEN/CLOSE for futures (CLOSETODAY/CLOSEYESTERDAY
+    for SHFE)
+  evidence: vnpy/trader/constant.py:23(NONE = ""),24(OPEN),25(CLOSE)
+- contract: 'Order status transitions: SUBMITTING -> NOTTRADED/PARTTRADED -> ALLTRADED/CANCELLED/REJECTED'
+  evidence: vnpy/trader/object.py:14(ACTIVE_STATUSES = set([Status.SUBMITTING, Status.NOTTRADED, Status.PARTTRADED]))
+- contract: 'BacktestingEngine pipeline order: set_parameters → add_strategy → load_data → run_backtesting
+    → calculate_result → calculate_statistics'
+  evidence: vnpy/alpha/strategy/backtesting.py:70-227(set_parameters),104-110(add_strategy),112-148(load_data),150-168(run_backtesting),170-226(calculate_result),228-393(calculate_statistics)
+- contract: RpcServer.register() must be called before start(); RpcClient.start() must be called before
+    proxy method calls
+  evidence: vnpy/rpc/server.py:42-62(start),123-127(register); vnpy/rpc/client.py:55-86(__getattr__ with
+    lru_cache),88-110(start)
+- contract: PortfolioDailyResult.calculate_pnl() requires date-ascending iteration for pre_closes/start_poses
+    chain
+  evidence: vnpy/alpha/strategy/backtesting.py:189-199,186-198(pre_closes/start_poses chain)
+- contract: EventEngine processes events in strict FIFO per type queue with synchronous listener dispatch
+  evidence: vnpy/event/engine.py:68-74(process),35-36(queues)
+- contract: BacktestingEngine annual_days=240 for Chinese market calendar in Sharpe/annualized calculations
+  evidence: 'vnpy/alpha/strategy/backtesting.py:78(annual_days: int=240),328-329(Sharpe formula)'
+- contract: 'Direction enum values: LONG=多 (Chinese), SHORT=空 for trading convention display'
+  evidence: vnpy/trader/constant.py:14(LONG = _("多"))
+business_decisions:
+- id: BD-001
+  type: B/BA
+  content: Use SQLite as default database when specified driver not found
+  rationale: Provides graceful degradation when database drivers are unavailable, ensuring the trading
+    system can still operate with local SQLite storage without crashing or requiring manual configuration.
+    Fallback boundary is the entire application lifecycle when primary database connection fails.
+  evidence: vnpy/trader/database.py:155(module)
+  stage: market_data_gateway
+  alternative_considered: Fail fast with explicit error message requiring manual driver installation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/database.py'
+- id: BD-002
+  type: B
+  content: Use multiprocessing.Process for server processes in no_ui trading
+  rationale: Ensures complete process isolation between main trading engine and child server processes,
+    preventing shared state corruption. Boundary is the no_ui trading mode execution scope where GUI components
+    are unavailable.
+  evidence: examples/no_ui/run.py:111(module)
+  stage: execution_mode
+  alternative_considered: Threading for lower memory overhead but risking GIL contention
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in examples/no_ui/run.py'
+- id: BD-003
+  type: B/DK
+  content: 'Chinese futures trading period: day 8:45-15:00, night 20:45-02:45'
+  rationale: Defines official trading windows for Chinese futures markets including pre-open and after-hours
+    sessions. Boundary covers each Chinese exchange products traded through CtpGateway, ensuring orders
+    only execute within valid market hours.
+  evidence: examples/no_ui/run.py:34-38(module)
+  stage: market_data_gateway
+  alternative_considered: Per-exchange configurable hours for flexibility with other markets
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in examples/no_ui/run.py'
+- id: BD-004
+  type: B/DK
+  content: Start child process only during trading periods
+  rationale: Conserves system resources by only running trading processes when markets are active. Boundary
+    is the trading period window defined by exchange hours, preventing unnecessary process overhead during
+    off-hours.
+  evidence: examples/no_ui/run.py:109-113(module)
+  stage: execution_control
+  alternative_considered: Always-on process with passive monitoring for pre-market setups
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in examples/no_ui/run.py'
+- id: BD-005
+  type: B/BA
+  content: Use CtpGateway as primary gateway in veighna_trader example
+  rationale: CtpGateway provides access to CTP protocol exchanges which dominate Chinese futures trading.
+    Boundary is the example configuration scope, establishing a sensible default for new users entering
+    Chinese markets.
+  evidence: examples/veighna_trader/run.py:6(module)
+  stage: market_data_gateway
+  alternative_considered: IB gateway for global markets or empty gateway requiring manual selection
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in examples/veighna_trader/run.py'
+- id: BD-006
+  type: B/BA
+  content: Use CtaStrategyApp and CtaBacktesterApp as default apps
+  rationale: CTA strategy and backtesting are the primary use cases for the platform. Boundary covers
+    the standard veighna_trader installation, ensuring users have essential tools for algorithmic trading
+    immediately after setup.
+  evidence: examples/veighna_trader/run.py:22-23(module)
+  stage: app_selection
+  alternative_considered: Modular installation allowing users to select specific apps
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in examples/veighna_trader/run.py'
+- id: BD-007
+  type: B/BA
+  content: Use 1 million RMB default capital for backtesting
+  rationale: Provides sufficient capital for meaningful backtest results while being realistic for retail
+    traders in Chinese markets. Boundary is the initial capital setting before strategy optimization,
+    ensuring consistent baseline across tests.
+  evidence: vnpy/alpha/strategy/backtesting.py:76(module)
+  stage: capital_setup
+  alternative_considered: Zero or infinite capital for edge case testing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/strategy/backtesting.py'
+- id: BD-008
+  type: B/DK
+  content: Use 240 trading days for annualization
+  rationale: 240 days is the standard trading day count for Chinese stock and futures markets excluding
+    weekends and holidays. Boundary is the annualization calculation in performance metrics, enabling
+    accurate yearly return projections.
+  evidence: vnpy/alpha/strategy/backtesting.py:78(module)
+  stage: performance_calculation
+  alternative_considered: 252 days (US market standard) or 365 days (calendar days)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/strategy/backtesting.py'
+- id: BD-009
+  type: B/BA
+  content: Default risk-free rate is 0 for Sharpe ratio calculation
+  rationale: Zero risk-free rate simplifies Sharpe ratio calculation and is reasonable for short-term
+    futures trading where margin requirements make cash alternatives irrelevant. Boundary is the Sharpe
+    ratio calculation during backtest analysis.
+  evidence: vnpy/alpha/strategy/backtesting.py:77(module)
+  stage: performance_calculation
+  alternative_considered: Bank deposit rates or bond yields as risk-free benchmark
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/strategy/backtesting.py'
+- id: BD-010
+  type: B/DK
+  content: Use NetPnL + commission as final daily return
+  rationale: Including commission in daily returns ensures realistic profitability assessment accounting
+    for transaction costs. Boundary is the daily return calculation at market close, providing accurate
+    net performance figures.
+  evidence: vnpy/alpha/strategy/backtesting.py:221-222(module)
+  stage: performance_calculation
+  alternative_considered: Gross PnL without commission for theoretical performance comparison
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/strategy/backtesting.py'
+- id: BD-011
+  type: B
+  content: Reject backtest if balance <= 0 (bankruptcy detection)
+  rationale: Prevents meaningless backtest continuation when account is wiped out, flagging strategies
+    that violate risk controls. Boundary is the daily balance check in backtest loop, stopping simulation
+    at account depletion.
+  evidence: vnpy/alpha/strategy/backtesting.py:280-282(module)
+  stage: risk_control
+  alternative_considered: Allow negative balance simulation for max drawdown analysis
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/strategy/backtesting.py'
+- id: BD-012
+  type: B
+  content: Use plotly for performance chart visualization
+  rationale: Plotly provides interactive, web-based charts suitable for performance dashboards and HTML
+    reports. Boundary is the visualization layer of backtest results, enabling detailed analysis of equity
+    curves and metrics.
+  evidence: vnpy/alpha/strategy/backtesting.py:9(module)
+  stage: charting_visualization
+  alternative_considered: Matplotlib for static images or bokeh for alternative interactivity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/strategy/backtesting.py'
+- id: BD-013
+  type: B/BA
+  content: Use polars for DataFrame operations in alpha module
+  rationale: Polars offers significant performance advantages over pandas for large-scale financial data
+    processing with lazy evaluation. Boundary is the data processing layer in alpha module for factor
+    calculation and analysis.
+  evidence: vnpy/alpha/dataset/template.py:8(module)
+  stage: market_data_gateway
+  alternative_considered: Pandas for broader ecosystem compatibility or dask for distributed processing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/dataset/template.py'
+- id: BD-014
+  type: B/BA
+  content: Use spawn context for multiprocessing (not fork)
+  rationale: Spawn context ensures consistent behavior across platforms and avoids issues with forked
+    processes accessing parent resources. Boundary is the multiprocessing initialization in data processing
+    pipelines, preventing resource sharing issues.
+  evidence: vnpy/alpha/dataset/template.py:108(module)
+  stage: parallelization
+  alternative_considered: Fork for Linux-specific performance or threading for shared memory
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/dataset/template.py'
+- id: BD-015
+  type: B
+  content: Store bar data in parquet format under daily/minute folders
+  rationale: Parquet provides efficient columnar storage with compression, while time-based folders enable
+    quick date range queries. Boundary is the data persistence layer, organizing historical bars for efficient
+    retrieval.
+  evidence: vnpy/alpha/lab.py:59-62(module)
+  stage: market_data_gateway
+  alternative_considered: SQLite database or HDF5 for binary storage
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/lab.py'
+- id: BD-016
+  type: B/DK
+  content: Merge duplicate bars by datetime, keeping unique entries
+  rationale: Prevents duplicate bars from causing double-counting in calculations and ensures clean backtest
+    data. Boundary is the data ingestion pipeline, filtering out redundant market data entries.
+  evidence: vnpy/alpha/lab.py:89(module)
+  stage: market_data_gateway
+  alternative_considered: Keep each bars with timestamp and aggregate or take last
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/lab.py'
+- id: BD-017
+  type: B/BA
+  content: Normalize prices by first close price for multi-symbol comparison
+  rationale: Enables fair comparison of multiple symbols on the same chart by starting from common baseline.
+    Boundary is the multi-symbol visualization and analysis, preventing price scale bias.
+  evidence: vnpy/alpha/lab.py:217-224(module)
+  stage: market_data_gateway
+  alternative_considered: Z-score normalization or percentage returns from initial price
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/lab.py'
+- id: BD-018
+  type: B
+  content: Convert zero-sum rows to NaN (suspended trading days)
+  rationale: Zero-sum rows indicate non-trading days or data anomalies that should not influence factor
+    calculations. Boundary is the feature calculation pipeline, ensuring suspended periods don't create
+    misleading signals.
+  evidence: vnpy/alpha/lab.py:229-232(module)
+  stage: market_data_gateway
+  alternative_considered: Fill with previous value or exclude entire day from analysis
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/lab.py'
+- id: BD-019
+  type: B
+  content: Use timedelta(extended_days) to extend start for lookback
+  rationale: Ensures technical indicators have sufficient historical data for calculation before analysis
+    period begins. Boundary is the data fetch start date, adding buffer days for indicator warmup requirements.
+  evidence: vnpy/alpha/lab.py:172(module)
+  stage: market_data_gateway
+  alternative_considered: Fixed buffer of 100 bars regardless of indicator requirements
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/lab.py'
+- id: BD-020
+  type: B
+  content: Use ZMQ REP/REQ pattern for RPC request-reply
+  rationale: REP/REQ provides reliable request-response semantics with guaranteed message pairing. Boundary
+    is the RPC method invocation layer, ensuring ordered request-response execution.
+  evidence: vnpy/rpc/server.py:24-25(module)
+  stage: rpc_communication
+  alternative_considered: DEALER/ROUTER for asynchronous or non-paired communication
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/rpc/server.py'
+- id: BD-021
+  type: B
+  content: Use ZMQ PUB/SUB pattern for RPC data push
+  rationale: PUB/SUB enables one-way data streaming to multiple subscribers without blocking. Boundary
+    is the event and data push layer, allowing real-time updates without request overhead.
+  evidence: vnpy/rpc/server.py:27-28(module)
+  stage: rpc_communication
+  alternative_considered: PUSH/PULL for load balancing or direct socket connections
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/rpc/server.py'
+- id: BD-022
+  type: B/RC
+  content: 10-second heartbeat interval for RPC connection monitoring
+  rationale: 10-second interval balances detection speed with network overhead for connection monitoring.
+    Boundary is the RPC connection health check loop, determining how quickly disconnections are detected.
+  evidence: vnpy/rpc/common.py:9(module)
+  stage: rpc_communication
+  alternative_considered: 5-second for faster detection or 30-second for lower overhead
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/rpc/common.py'
+- id: BD-023
+  type: B/BA
+  content: 30-second tolerance for heartbeat loss detection
+  rationale: 30-second tolerance allows for occasional network delays while detecting true connection
+    failures. Boundary is the heartbeat monitoring threshold, defining when a connection is considered
+    dead.
+  evidence: vnpy/rpc/common.py:10(module)
+  stage: rpc_communication
+  alternative_considered: 3 missed heartbeats (30s with 10s interval) or adaptive timeout
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/rpc/common.py'
+  vague_rationale: true
+- id: BD-024
+  type: B/BA
+  content: 30-second default RPC timeout
+  rationale: 30 seconds accommodates typical network latency and server processing time for most RPC operations.
+    Boundary is the client-side request timeout, preventing indefinite blocking on unresponsive servers.
+  evidence: vnpy/rpc/client.py:63(module)
+  stage: rpc_communication
+  alternative_considered: Infinite timeout for critical operations or shorter timeout with automatic retry
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/rpc/client.py'
+- id: BD-025
+  type: B/RC
+  content: 1-second poll timeout for RPC server event loop
+  rationale: 1-second poll interval balances CPU usage with responsiveness to new events and connections.
+    Boundary is the server event loop iteration, affecting both latency and resource consumption.
+  evidence: vnpy/rpc/server.py:89(module)
+  stage: rpc_communication
+  alternative_considered: Blocking poll for lowest CPU or shorter interval for lower latency
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/rpc/server.py'
+- id: BD-026
+  type: B/BA
+  content: 1-second default timer interval for EventEngine
+  rationale: 1-second interval is sufficient for most trading event processing while minimizing CPU overhead.
+    Boundary is the EventEngine timer loop, determining frequency of timer-based event processing.
+  evidence: vnpy/event/engine.py:42(module)
+  stage: event_driven_core
+  alternative_considered: Sub-second intervals for high-frequency events or longer intervals for lower
+    overhead
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/event/engine.py'
+- id: BD-027
+  type: B
+  content: Store temp files in .vntrader under home directory
+  rationale: Using .vntrader in home directory provides consistent, discoverable storage across platforms.
+    Boundary is the temp file persistence layer, enabling log and cache storage in standard locations.
+  evidence: vnpy/trader/utility.py:61(module)
+  stage: file_storage
+  alternative_considered: System temp directory or application install directory
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/utility.py'
+- id: BD-028
+  type: B
+  content: Separate long/short positions with today/yesterday tracking
+  rationale: Chinese futures rules require tracking whether positions were opened today or held overnight
+    for closing sequence. Boundary is the position tracking layer, ensuring correct order routing based
+    on position age.
+  evidence: vnpy/trader/converter.py:27-33(module)
+  stage: order_management
+  alternative_considered: Aggregate position tracking without today/yesterday distinction
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/converter.py'
+- id: BD-029
+  type: B/DK
+  content: Close today first, then yesterday for non-SHFE/INE exchanges
+  rationale: Most Chinese exchanges prioritize closing today positions before yesterday positions. Boundary
+    is the close order generation for non-SHFE/INE futures, establishing standard closing sequence.
+  evidence: vnpy/trader/converter.py:96-104(module)
+  stage: order_management
+  alternative_considered: FIFO or close yesterday first for different strategies
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/converter.py'
+- id: BD-030
+  type: B/DK
+  content: Exchange-specific close order conversion for SHFE/INE
+  rationale: SHFE and INE have unique close sequence requirements that differ from other Chinese exchanges.
+    Boundary is the order conversion layer for these specific exchanges, ensuring compliance with their
+    rules.
+  evidence: vnpy/trader/converter.py:81-84(module)
+  stage: order_management
+  alternative_considered: Standard close sequence for each exchanges or exchange-specific gateways
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/converter.py'
+- id: BD-031
+  type: B
+  content: Use genetic algorithm (DEAP) with NSGA-II selection for optimization
+  rationale: NSGA-II enables multi-objective optimization suitable for trading strategies with competing
+    metrics. Boundary is the strategy parameter optimization layer, finding Pareto-optimal parameter sets.
+  evidence: vnpy/trader/optimize.py:176(module)
+  stage: optimization
+  alternative_considered: Single-objective GA or grid search for simpler optimization
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/optimize.py'
+- id: BD-032
+  type: B
+  content: Population size 100, 30 generations for GA optimization
+  rationale: 100 individuals with 30 generations provides good balance between exploration and computation
+    time. Boundary is the GA evolution loop, defining search depth and population diversity.
+  evidence: vnpy/trader/optimize.py:137-138(module)
+  stage: optimization
+  alternative_considered: Larger population for better exploration or fewer generations for faster results
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/optimize.py'
+- id: BD-033
+  type: B
+  content: Crossover probability 0.95, mutation = 1-crossover
+  rationale: High crossover with low mutation follows standard GA practice for exploiting good solutions.
+    Boundary is the GA reproduction operators, controlling balance between exploration and exploitation.
+  evidence: vnpy/trader/optimize.py:141-142(module)
+  stage: optimization
+  alternative_considered: Adaptive mutation rates or uniform crossover for different behavior
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/optimize.py'
+- id: BD-034
+  type: B
+  content: Use Adam optimizer with ReduceLROnPlateau scheduler for MLP
+  rationale: Adam provides robust adaptive learning for neural networks while ReduceLROnPlateau enables
+    dynamic rate adjustment. Boundary is the MLP training loop, controlling weight update behavior.
+  evidence: vnpy/alpha/model/models/mlp_model.py:109-125(module)
+  stage: model_training
+  alternative_considered: SGD with momentum or other adaptive optimizers like RMSprop
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/model/models/mlp_model.py'
+- id: BD-035
+  type: B/BA
+  content: Default 256 hidden units, 300 epochs, batch size 2000 for MLP
+  rationale: 256 hidden units provides sufficient capacity for financial factor relationships while batch
+    size 2000 suits time-series data structure. Boundary is the MLP model initialization and training
+    configuration.
+  evidence: vnpy/alpha/model/models/mlp_model.py:38-42(module)
+  stage: model_hyperparameters
+  alternative_considered: Deeper networks or different batch sizes for different data scales
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/model/models/mlp_model.py'
+- id: BD-036
+  type: B
+  content: Early stopping after 50 rounds without improvement
+  rationale: 50-epoch patience prevents premature stopping while avoiding excessive overfitting. Boundary
+    is the training validation loop, determining when to halt training based on validation performance.
+  evidence: vnpy/alpha/model/models/mlp_model.py:42(module)
+  stage: model_training
+  alternative_considered: Longer patience for slower convergence or shorter for faster training
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/model/models/mlp_model.py'
+- id: BD-037
+  type: B/DK
+  content: Filter out order book ticks with 0 last_price
+  rationale: Zero price ticks represent invalid or stale market data that should not influence calculations.
+    Boundary is the tick preprocessing layer, ensuring only valid price data enters the system.
+  evidence: vnpy/trader/utility.py:211-212(module)
+  stage: market_data_gateway
+  alternative_considered: Replace with last valid price or forward-fill
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/utility.py'
+- id: BD-038
+  type: B/DK
+  content: Round order prices to nearest price_tick using Decimal
+  rationale: Decimal arithmetic ensures precise rounding without floating-point errors, matching exchange
+    price tick requirements. Boundary is the order price validation layer, ensuring prices meet exchange
+    granularity rules.
+  evidence: vnpy/trader/utility.py:120-127(module)
+  stage: order_management
+  alternative_considered: Standard floating-point rounding or truncation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/utility.py'
+- id: BD-039
+  type: B/BA
+  content: Use ArrayManager with size=100 default for indicator calculation
+  rationale: 100-bar buffer accommodates most technical indicators including long-term ones like 200-day
+    moving average. Boundary is the price series management for indicator calculation, ensuring sufficient
+    historical data.
+  evidence: vnpy/trader/utility.py:495(module)
+  stage: indicator_calculation
+  alternative_considered: Configurable size per indicator or unlimited buffer
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/utility.py'
+- id: BD-040
+  type: B/DK
+  content: 'Active order statuses: SUBMITTING, NOTTRADED, PARTTRADED'
+  rationale: These three states cover each scenarios where orders may still be executable in the market.
+    Boundary is the order status tracking layer, determining which orders require monitoring.
+  evidence: vnpy/trader/object.py:14(module)
+  stage: order_management
+  alternative_considered: Single 'active' status or more granular sub-states
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/object.py'
+- id: BD-041
+  type: B/DK
+  content: Generate tick events with both generic and symbol-specific types
+  rationale: Generic events enable global handlers while symbol-specific events enable targeted processing.
+    Boundary is the market data event distribution layer, supporting both broad and specific event handling.
+  evidence: vnpy/trader/gateway.py:97-99(module)
+  stage: event_driven_core
+  alternative_considered: Generic only with filtering or symbol-only with iteration
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/gateway.py'
+- id: BD-042
+  type: B/BA
+  content: DataProxy supports arithmetic operators (+,-,*,/,comparison) for expressions
+  rationale: Full operator support enables complex factor formulas without custom functions. Boundary
+    is the factor expression parsing layer, defining what calculations users can express.
+  evidence: vnpy/alpha/dataset/utility.py:25-108(module)
+  stage: factor_expression
+  alternative_considered: Function-based API or limited operator set
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/dataset/utility.py'
+- id: BD-043
+  type: B/BA
+  content: Execute feature expressions via eval() with local DataProxy objects
+  rationale: eval() enables flexible user-defined expressions while local scope ensures controlled access
+    to data. Boundary is the expression execution layer, enabling runtime factor calculation.
+  evidence: vnpy/alpha/dataset/utility.py:159(module)
+  stage: factor_calculation
+  alternative_considered: Pre-compiled expressions or sandboxed execution
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/dataset/utility.py'
+- id: BD-044
+  type: B
+  content: Use 10 quantile buckets for factor performance analysis
+  rationale: Deciles provide sufficient granularity to detect non-linear factor relationships while remaining
+    interpretable. Boundary is the factor performance analysis layer, defining how to group factor values.
+  evidence: vnpy/alpha/dataset/template.py:237(module)
+  stage: factor_analysis
+  alternative_considered: Quintiles, tertiles, or continuous correlation analysis
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/dataset/template.py'
+- id: BD-045
+  type: B
+  content: 'Data segments: TRAIN, VALID, TEST with user-defined date ranges'
+  rationale: Temporal split prevents look-ahead bias while separate validation set enables hyperparameter
+    tuning. Boundary is the data preparation layer, ensuring proper temporal ordering for model training.
+  evidence: vnpy/alpha/dataset/utility.py:187-192(module)
+  stage: model_validation
+  alternative_considered: Random split or fixed date ranges
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/dataset/utility.py'
+- id: BD-046
+  type: B/BA
+  content: Default 1-hour initialization delay in data recorder example
+  rationale: 1-hour delay allows gateways to establish connections and begin receiving data before recording
+    starts. Boundary is the data recorder initialization, preventing early data loss during connection
+    setup.
+  evidence: examples/data_recorder/data_recorder.py:135(module)
+  stage: connection_timing
+  alternative_considered: Immediate start or event-triggered initialization
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in examples/data_recorder/data_recorder.py'
+- id: BD-047
+  type: B
+  content: Log trading events with gateway_name for source identification
+  rationale: Including gateway name in logs enables debugging when multiple gateways are active. Boundary
+    is the trading event logging layer, enabling source identification in logs.
+  evidence: vnpy/trader/engine.py:164(module)
+  stage: logging
+  alternative_considered: Generic logging without source identification
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/engine.py'
+- id: BD-048
+  type: B/BA
+  content: Auto-create .vntrader folder in home directory if not exists
+  rationale: Automatic folder creation prevents startup failures and simplifies first-run experience.
+    Boundary is the configuration initialization, ensuring storage location exists before writing.
+  evidence: vnpy/trader/utility.py:55-56(module)
+  stage: initialization
+  alternative_considered: Require manual folder creation or use system temp directory
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/utility.py'
+- id: BD-049
+  type: B/DK
+  content: Use vt_symbol format (symbol.exchange) as universal identifier
+  rationale: Composite identifier prevents symbol collisions across exchanges and provides clear context.
+    Boundary is the symbol resolution layer, enabling unique identification of any tradable instrument.
+  evidence: vnpy/trader/object.py:84(module)
+  stage: symbol_naming
+  alternative_considered: Exchange-prefixed symbols or numeric instrument IDs
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/object.py'
+- id: BD-050
+  type: B
+  content: PositionConverter tracks long/short frozen separately by today/yesterday
+  rationale: Separate tracking of frozen quantities by position age ensures correct close order generation.
+    Boundary is the position freeze tracking layer, enabling accurate close sequence determination.
+  evidence: vnpy/trader/converter.py:112-152(module)
+  stage: order_management
+  alternative_considered: Aggregate frozen tracking without age distinction
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/trader/converter.py'
+- id: BD-051
+  type: B/DK
+  content: Cross-sectional robust normalization using MAD with scaling factor
+  rationale: MAD-based normalization is chosen over standard deviation for its robustness to outliers
+    in cross-sectional factor distributions. This decision is critical for ensuring factor values from
+    different assets remain comparable even when extreme price movements occur. The scaling factor aligns
+    the output variance with standard z-scores for downstream model compatibility. Alternative robust
+    methods (trimmed mean, winsorization) were considered but MAD provides superior statistical efficiency
+    while mai
+  evidence: vnpy/alpha/dataset/processor.py:43-59(robust_normalize_mad)
+  stage: vnpy.alpha.dataset.processor
+  alternative_considered: Trimmed mean normalization, Huber estimator-based scaling
+  _evidence_issues:
+  - 'FN_NOT_FOUND: robust_normalize_mad in vnpy/alpha/dataset/processor.py'
+  vague_rationale: true
+- id: BD-052
+  type: B/BA
+  content: Cross-sectional Z-score normalization
+  rationale: 'Z-score normalization enables direct comparison of heterogeneous factor values by standardizing
+    to mean=0 and std=1 within each cross-sectional snapshot. This decision is fundamental for ML models
+    that assume features are on similar scales. The cross-sectional approach ensures factors are ranked
+    relative to peers on the same day, capturing relative value rather than absolute magnitude. Boundary:
+    assumes factors follow approximately normal distributions within the cross-section.'
+  evidence: vnpy/alpha/dataset/processor.py:77(process_robust_zscore_norm)
+  stage: vnpy.alpha.dataset.processor
+  alternative_considered: Quantile transformation to uniform/normal distribution
+- id: BD-053
+  type: B/DK
+  content: Global robust z-score normalization with time-windowed fitting
+  rationale: Global z-score differs from cross-sectional by computing statistics across time rather than
+    across assets on each day. The time-windowed fitting (rolling window) prevents look-ahead bias while
+    capturing evolving factor characteristics. This is essential for factors whose distributions drift
+    over time due to market regime changes. The window size defines the memory of the normalization—too
+    short loses stability, too long introduces stale statistics.
+  evidence: vnpy/alpha/dataset/processor.py:77-109(global_robust_zscore)
+  stage: vnpy.alpha.dataset.processor
+  alternative_considered: Exponentially weighted windows, full historical fitting
+  _evidence_issues:
+  - 'FN_NOT_FOUND: global_robust_zscore in vnpy/alpha/dataset/processor.py'
+- id: BD-054
+  type: B/BA
+  content: Cross-sectional rank normalization transforming to approximate N(0,1)
+  rationale: 'Rank normalization converts factor values to their percentile rank within each cross-section,
+    making the distribution uniform by design. The subsequent transformation to approximate N(0,1) preserves
+    ordinal information while restoring familiar statistical properties for model training. This approach
+    is robust to outliers and non-linear transformations, making it suitable for highly skewed factor
+    distributions. Boundary: loses information about absolute factor magnitude.'
+  evidence: vnpy/alpha/dataset/processor.py:112-125(rank_normalize)
+  stage: vnpy.alpha.dataset.processor
+  alternative_considered: Direct percentile output without N(0,1) transformation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: rank_normalize in vnpy/alpha/dataset/processor.py'
+- id: BD-055
+  type: B/BA
+  content: Sharpe Ratio calculation for strategy evaluation
+  rationale: 'Sharpe Ratio is the primary business metric for evaluating strategy performance, computed
+    as mean excess return divided by standard deviation. This decision establishes the core risk-adjusted
+    return measure used for strategy selection, parameter tuning, and performance attribution. The calculation
+    enables direct comparison across different strategies and time periods. Boundary: assumes returns
+    are normally distributed and independently and identically distributed.'
+  evidence: vnpy/alpha/strategy/backtesting.py:328-329(calculate_sharpe_ratio)
+  stage: vnpy.alpha.strategy.backtesting
+  alternative_considered: Sortino Ratio (downside deviation), Calmar Ratio (max drawdown)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: calculate_sharpe_ratio in vnpy/alpha/strategy/backtesting.py'
+- id: BD-056
+  type: B/BA
+  content: Drawdown calculation as current balance minus running maximum
+  rationale: 'Drawdown measurement using running maximum establishes the peak-to-trough decline for the
+    portfolio at any point in time. This is the primary risk measure for understanding worst-case historical
+    losses and setting stop-loss thresholds. The business decision to use running maximum (not rolling
+    window) ensures drawdowns persist until new highs are achieved. Boundary: drawdown calculation is
+    path-dependent and cannot be decomposed additively.'
+  evidence: vnpy/alpha/strategy/backtesting.py:22(BacktestingEngine)
+  stage: vnpy.alpha.strategy.backtesting
+  alternative_considered: Rolling window drawdown, relative drawdown from initial capital
+- id: BD-057
+  type: B/BA
+  content: Annualization factor of 240 trading days
+  rationale: 'The 240-day annualization factor converts daily/per-period returns to annualized equivalents
+    for standardized performance comparison. This assumes approximately 240 trading days per year (excluding
+    weekends and holidays), which is standard practice for equity markets. The decision enables fair comparison
+    between strategies with different trading frequencies and creates a consistent basis for Sharpe Ratio,
+    volatility, and other metrics. Boundary: may under/overestimate for markets with different '
+  evidence: vnpy/alpha/strategy/backtesting.py:78,323(ANNUALIZATION_FACTOR)
+  stage: vnpy.alpha.strategy.backtesting
+  alternative_considered: 252 days (calendar days), market-specific holiday calendars
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ANNUALIZATION_FACTOR in vnpy/alpha/strategy/backtesting.py'
+- id: BD-058
+  type: B/BA
+  content: Balance calculation as cumulative sum of net_pnl plus initial capital
+  rationale: 'Balance tracking establishes the running portfolio value necessary for each downstream calculations
+    (Sharpe, drawdown, returns). The decision to initialize from known starting capital and accumulate
+    net PnL ensures accounting consistency and enables proper return series construction. This forms the
+    basis for equity curve analysis and real-time NAV reporting. Boundary: does not account for intraday
+    cash flows, dividends, or funding costs.'
+  evidence: vnpy/alpha/strategy/backtesting.py:22(BacktestingEngine)
+  stage: vnpy.alpha.strategy.backtesting
+  alternative_considered: Mark-to-market valuation with real-time price updates
+- id: BD-059
+  type: B/BA
+  content: RSI technical indicator calculation via Talib
+  rationale: 'RSI (Relative Strength Index) is selected as a canonical momentum oscillator for factor
+    construction. Using Talib ensures standardized calculation consistent with industry practice and enables
+    reproducible research. RSI captures overbought/oversold conditions that can predict mean reversion.
+    The 14-period default aligns with common technical analysis conventions. Boundary: assumes price data
+    is adjusted for splits/dividends.'
+  evidence: vnpy/alpha/dataset/ta_function.py:23-30(calculate_rsi)
+  stage: vnpy.alpha.dataset.ta_function
+  alternative_considered: Stochastic oscillator, MACD, Williams %R
+  _evidence_issues:
+  - 'FN_NOT_FOUND: calculate_rsi in vnpy/alpha/dataset/ta_function.py'
+- id: BD-060
+  type: B
+  content: ATR technical indicator calculation via Talib
+  rationale: 'ATR (Average True Range) provides a volatility-adjusted measure of price movement essential
+    for position sizing and stop-loss determination. The True Range calculation captures gaps and limit
+    moves, not just intra-day ranges. Using Talib ensures consistency with standard volatility proxies.
+    Boundary: ATR measures historical volatility and may lag during sudden regime changes.'
+  evidence: vnpy/alpha/dataset/ta_function.py:33(ta_atr)
+  stage: vnpy.alpha.dataset.ta_function
+  alternative_considered: Garman-Klass volatility, Parkinson range estimator
+- id: BD-061
+  type: B/BA
+  content: Rolling linear regression slope calculation using pre-computed formulas
+  rationale: 'Rolling regression slope captures the trend component of price series over a rolling window,
+    enabling momentum factor construction. Pre-computed formulas provide computational efficiency over
+    iterative approaches, critical for processing large datasets. The slope coefficient represents the
+    expected return per unit time, distinguishing it from simple return calculations. Boundary: assumes
+    linear relationship within window; sensitive to window length choice.'
+  evidence: vnpy/alpha/dataset/ts_function.py:102(ts_slope)
+  stage: vnpy.alpha.dataset.ts_function
+  alternative_considered: Exponential moving average slope, Theil-Sen estimator for robustness
+- id: BD-062
+  type: B
+  content: Rolling R-squared calculation from regression statistics
+  rationale: 'Rolling R-squared measures the goodness-of-fit for rolling regressions, providing a confidence
+    signal for factor predictions. High R-squared indicates stable relationships that may persist, while
+    low R-squared signals regime changes or noise. This decision enables adaptive factor weighting based
+    on relationship strength. Boundary: R-squared is sensitive to the variance of dependent variable.'
+  evidence: vnpy/alpha/dataset/ts_function.py:140-183(rolling_r_squared)
+  stage: vnpy.alpha.dataset.ts_function
+  alternative_considered: Adjusted R-squared, information coefficient, cross-validated R-squared
+  _evidence_issues:
+  - 'FN_NOT_FOUND: rolling_r_squared in vnpy/alpha/dataset/ts_function.py'
+- id: BD-063
+  type: B
+  content: Rolling percentile rank using scipy percentileofscore
+  rationale: 'Rolling percentile rank normalizes time-series values relative to their historical distribution,
+    enabling cross-factor comparison and mean-reversion signals. Percentile ranks are robust to outliers
+    and non-normal distributions, making them suitable for heterogeneous factor values. This transforms
+    absolute values to bounded [0,1] signals suitable for machine learning models. Boundary: requires
+    sufficient historical data for meaningful percentiles.'
+  evidence: vnpy/alpha/dataset/ts_function.py:62(ts_rank)
+  stage: vnpy.alpha.dataset.ts_function
+  alternative_considered: Exponential moving percentile, expanding window percentile
+- id: BD-064
+  type: B/DK
+  content: Rolling correlation using Polars rolling_corr
+  rationale: 'Rolling correlation measures the time-varying relationship between two time series, critical
+    for pair trading, factor correlation analysis, and risk management. The Polars implementation provides
+    computational efficiency for large datasets. Correlation regimes indicate market states: high correlation
+    during stress, low correlation during dispersion. Boundary: rolling window may introduce autocorrelation
+    in the correlation estimate.'
+  evidence: vnpy/alpha/dataset/ts_function.py:226-240(rolling_correlation)
+  stage: vnpy.alpha.dataset.ts_function
+  alternative_considered: Exponential weighted correlation, realized correlation from high-frequency data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: rolling_correlation in vnpy/alpha/dataset/ts_function.py'
+- id: BD-065
+  type: B/DK
+  content: Linear decay weighted average for rolling window
+  rationale: 'Linear decay weighting applies greater importance to recent observations in rolling calculations
+    while retaining memory of older data. This balances responsiveness to new information with stability
+    from historical context. The linear decay contrasts with equal weighting (each observations same)
+    and exponential decay (faster decay). Boundary: requires normalized weights; may be sensitive to decay
+    rate.'
+  evidence: vnpy/alpha/dataset/ts_function.py:306-318(linear_decay_weighted_avg)
+  stage: vnpy.alpha.dataset.ts_function
+  alternative_considered: Exponential decay, cubic decay, half-life weighting
+  _evidence_issues:
+  - 'FN_NOT_FOUND: linear_decay_weighted_avg in vnpy/alpha/dataset/ts_function.py'
+- id: BD-066
+  type: B/DK
+  content: Rolling standard deviation with population ddof=0
+  rationale: 'Population standard deviation (ddof=0) uses N in the denominator rather than N-1, providing
+    the true population variance for the rolling window. This decision is appropriate when the window
+    represents the complete relevant population rather than a sample from a larger distribution. The choice
+    affects volatility estimates and therefore each risk calculations. Boundary: underestimates uncertainty
+    for small windows if true population is larger.'
+  evidence: vnpy/alpha/dataset/ts_function.py:92-99(rolling_std)
+  stage: vnpy.alpha.dataset.ts_function
+  alternative_considered: Sample standard deviation (ddof=1), exponentially weighted volatility
+  _evidence_issues:
+  - 'FN_NOT_FOUND: rolling_std in vnpy/alpha/dataset/ts_function.py'
+  vague_rationale: true
+- id: BD-067
+  type: B/RC
+  content: Dynamic expression evaluation for factor calculations
+  rationale: 'Dynamic expression evaluation enables on-the-fly construction of complex factor formulas
+    without code changes, critical for rapid research iteration. This decision supports the business need
+    for flexible factor composition, allowing researchers to combine base factors through arithmetic operations,
+    functions, and constants. The implementation provides a domain-specific language for quantitative
+    research. Boundary: introduces computational overhead and potential security considerations.'
+  evidence: vnpy/alpha/dataset/utility.py:111-162(evaluate_expression)
+  stage: vnpy.alpha.dataset.utility
+  alternative_considered: Pre-compiled factor functions, SQL-based factor expression
+  _evidence_issues:
+  - 'FN_NOT_FOUND: evaluate_expression in vnpy/alpha/dataset/utility.py'
+  vague_rationale: true
+- id: BD-068
+  type: B/BA
+  content: LASSO regression for alpha factor prediction with L1 regularization
+  rationale: 'LASSO regression is selected for alpha factor prediction due to its built-in feature selection
+    property from L1 regularization, which promotes sparsity in coefficient estimates. This is particularly
+    valuable when predicting from a large universe of candidate factors, as it automatically identifies
+    the most predictive subset while reducing overfitting. The L1 penalty also provides interpretability
+    by zeroing out irrelevant features. Boundary: L1 assumes many features are truly irrelevant rather
+    t'
+  evidence: vnpy/alpha/model/models/lasso_model.py:13(LassoModel)
+  stage: vnpy.alpha.model.models
+  alternative_considered: Elastic Net (L1+L2), Ridge regression, Random Forest for feature importance
+- id: BD-069
+  type: B/BA
+  content: Disable intercept fitting in LASSO model
+  rationale: 'Disabling the intercept in LASSO regression forces the model through the origin, assuming
+    that zero factor exposure should predict zero expected return. This decision is appropriate for factor
+    models where residuals should be mean-zero by construction and the intercept represents only idiosyncratic
+    alpha not captured by factors. The business assumption is that the factor space is complete for explaining
+    systematic returns. Boundary: may introduce bias if factors are not perfectly centered.'
+  evidence: vnpy/alpha/model/models/lasso_model.py:70(fit_intercept=False)
+  stage: vnpy.alpha.model.models
+  alternative_considered: Fit intercept and test for significance, center factors before modeling
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: fit_intercept=False in vnpy/alpha/model/models/lasso_model.py'
+  vague_rationale: true
+- id: BD-070
+  type: B/BA
+  content: MLP neural network architecture for alpha factor prediction
+  rationale: 'MLP (Multi-Layer Perceptron) is selected to capture non-linear relationships between alpha
+    factors and expected returns. Unlike linear models, MLP can learn complex feature interactions and
+    threshold effects that may exist in factor return dynamics. The architecture decision (layer depths,
+    widths) represents a balance between model capacity and overfitting risk. Boundary: requires careful
+    regularization and may be sensitive to hyperparameter choices.'
+  evidence: vnpy/alpha/model/models/mlp_model.py:22-33,99-102,620-664(MLPAlphaModel)
+  stage: vnpy.alpha.model.models
+  alternative_considered: Gradient Boosted Trees, Transformer-based architectures, Attention mechanisms
+  _evidence_issues:
+  - 'FN_NOT_FOUND: MLPAlphaModel in vnpy/alpha/model/models/mlp_model.py'
+- id: BD-071
+  type: B/BA
+  content: Adam optimizer with learning rate 0.001
+  rationale: 'Adam optimizer combines momentum and RMSprop concepts for adaptive learning rates, making
+    it robust to hyperparameter choices for most deep learning applications. The 0.001 learning rate is
+    the widely-accepted default from empirical studies, providing a reasonable starting point for convergence
+    speed versus stability tradeoff. This is a business decision affecting model training reliability
+    and final prediction quality. Boundary: may require reduction for fine-tuning or transfer learning
+    scenari'
+  evidence: vnpy/alpha/model/models/mlp_model.py:566(__init__)
+  stage: vnpy.alpha.model.models
+  alternative_considered: SGD with momentum, AdamW with decoupled weight decay, LAMB optimizer
+- id: BD-072
+  type: B/BA
+  content: ReduceLROnPlateau learning rate scheduler
+  rationale: 'ReduceLROnPlateau automatically reduces learning rate when validation loss plateaus, enabling
+    coarse-to-fine optimization. This is a business decision that balances training efficiency (high LR
+    initially) with convergence precision (low LR later). The scheduler adapts to the loss landscape without
+    manual intervention, improving reproducibility. Boundary: plateau detection threshold and reduction
+    factor are hyperparameters requiring tuning.'
+  evidence: vnpy/alpha/model/models/mlp_model.py:125-135(ReduceLROnPlateau)
+  stage: vnpy.alpha.model.models
+  alternative_considered: Step decay, cosine annealing, warmup + decay schedules
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ReduceLROnPlateau in vnpy/alpha/model/models/mlp_model.py'
+- id: BD-073
+  type: B/BA
+  content: MSE loss function for regression
+  rationale: 'Mean Squared Error is selected as the primary loss function for return prediction, penalizing
+    large errors quadratically. This business decision aligns with standard portfolio optimization which
+    typically assumes quadratic utility, where MSE is the appropriate risk measure. MSE also provides
+    convenient mathematical properties for optimization. Boundary: MSE is sensitive to outliers, potentially
+    over-weighting extreme predictions.'
+  evidence: vnpy/alpha/model/models/mlp_model.py:329(_loss_fn)
+  stage: vnpy.alpha.model.models
+  alternative_considered: Huber loss, quantile loss, asymmetric loss for over/under-prediction
+  vague_rationale: true
+- id: BD-074
+  type: B
+  content: Early stopping with 50 rounds patience
+  rationale: 'Early stopping prevents overfitting by halting training when validation loss fails to improve
+    for 50 epochs. The patience parameter represents a business decision balancing model quality (more
+    training = potentially better fit) against generalization (stop before overfitting). 50 rounds provides
+    sufficient memory for noisy validation curves while avoiding excessive overfitting. Boundary: patience
+    interacts with learning rate and model complexity.'
+  evidence: vnpy/alpha/model/models/mlp_model.py:566(__init__)
+  stage: vnpy.alpha.model.models
+  alternative_considered: Model checkpointing with best weights, learning curve-based stopping
+- id: BD-075
+  type: B/RC
+  content: Batch size of 2000 samples
+  rationale: 'Batch size of 2000 balances gradient estimation quality with computational efficiency. Larger
+    batches provide more stable gradients but may converge to sharper minima with poorer generalization.
+    2000 represents a practical tradeoff for portfolio-level prediction where cross-sectional independence
+    within batches is desirable. Boundary: batch size interacts with learning rate (linear scaling rule)
+    and available GPU memory.'
+  evidence: vnpy/alpha/model/models/mlp_model.py:41,249-251(batch_size=2000)
+  stage: vnpy.alpha.model.models
+  alternative_considered: Smaller batch with gradient accumulation, adaptive batch sizing per epoch
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: batch_size=2000 in vnpy/alpha/model/models/mlp_model.py'
+- id: BD-076
+  type: B
+  content: Feature importance via noise perturbation
+  rationale: 'Noise perturbation measures feature importance by evaluating prediction degradation when
+    Gaussian noise is added to each feature. This method provides model-agnostic importance scores that
+    are more robust than gradient-based methods for identifying which factors drive predictions. The business
+    value lies in understanding model behavior and identifying redundant or harmful features for removal.
+    Boundary: perturbation magnitude is a hyperparameter affecting importance ranking.'
+  evidence: vnpy/alpha/model/models/mlp_model.py:458(_calculate_feature_importance)
+  stage: vnpy.alpha.model.models
+  alternative_considered: SHAP values, permutation importance, integrated gradients
+- id: BD-077
+  type: BA/M
+  content: 'BacktestingEngine mandates 5-step pipeline: set_parameters→add_strategy→load_data→run_backtesting→calculate_result→calculate_statistics'
+  rationale: The backtesting workflow enforces strict execution order because each step produces state
+    required by the next. set_parameters configures global settings (annual_days=240), add_strategy attaches
+    the strategy instance, load_data fetches bars, run_backtesting executes the strategy, calculate_result
+    aggregates per-bar results, and calculate_statistics computes final metrics (Sharpe, max drawdown).
+    Skipping steps or reordering causes AttributeError from missing attributes. This is a hard API contrac
+  evidence: vnpy/alpha/strategy/backtesting.py:22(BacktestingEngine)
+  stage: alpha/strategy
+- id: BD-078
+  type: BA/DK
+  content: AlphaStrategy lifecycle requires on_init() BEFORE on_start() — init sets up indicators that
+    on_start references
+  rationale: The on_init() callback must execute first because it initializes technical indicators (moving
+    averages, RSI, Bollinger Bands) stored as instance attributes. The on_start() callback then starts
+    the strategy and begins receiving market data. If on_start() runs before on_init(), accessing uninitialized
+    indicator attributes causes AttributeError or returns None, corrupting trading signals.
+  evidence: vnpy/alpha/strategy/template.py:42(on_init)
+  stage: alpha/strategy
+- id: BD-079
+  type: BA/DK
+  content: 'PortfolioDailyResult.calculate_pnl() is stateful: pre_closes and start_poses MUST flow from
+    previous day to next in date-ascending order'
+  rationale: The calculate_pnl() method maintains rolling state through pre_closes and start_poses dictionaries
+    that carry forward between trading days. pre_closes stores the previous day's closing prices needed
+    to compute daily PnL, while start_poses tracks position sizes. Processing days out of order causes
+    stale pre_closes to be used with current prices, producing incorrect PnL calculations. This stateful
+    design supports overnight position tracking but requires deterministic date ordering.
+  evidence: vnpy/alpha/strategy/backtesting.py:875(PortfolioDailyResult)
+  stage: alpha/strategy
+- id: BD-080
+  type: BA
+  content: RpcClient.start() MUST be called before any proxy method calls; lru_cache on __getattr__ caches
+    before connection
+  rationale: The RpcClient uses lru_cache on __getattr__ to cache proxy method references. If proxy methods
+    are called before start() establishes the ZMQ connection, the cached proxy objects attempt to send
+    over an uninitialized socket, causing ZMQ errors (ENOTSOCK). The start() method initializes the ZMQ
+    context and connects sockets, enabling proper message routing. This is a critical initialization ordering
+    constraint that prevents runtime socket errors.
+  evidence: vnpy/rpc/client.py:55-86(module)
+  stage: rpc_communication
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/rpc/client.py'
+- id: BD-081
+  type: BA
+  content: RpcServer.register() MUST be called before start(); start() enters blocking run loop
+  rationale: The RpcServer.start() method enters an infinite blocking loop that processes incoming RPC
+    requests. If register() is called after start(), the registered handlers are never invoked because
+    the server is already running and the registration code is unreachable. Every service handlers (functions
+    exposed via RPC) must be registered before the blocking run loop begins. This is a fundamental initialization
+    ordering constraint.
+  evidence: vnpy/rpc/server.py:42-62(start)
+  stage: rpc_communication
+- id: BD-082
+  type: B/BA
+  content: Every AlphaModel implementations assume DataFrame columns[2:-1]=features, columns[0]=datetime,
+    columns[1]=vt_symbol, columns[-1]=label
+  rationale: AlphaModel implementations enforce a strict column contract for input DataFrames. Column
+    0 must be datetime (pandas Timestamp), column 1 must be vt_symbol (venue-symbol identifier), columns
+    2 through -2 are features for model training/prediction, and column -1 must be the label (target variable).
+    Violating this contract causes index errors, training on wrong columns, or prediction failures. This
+    invariant ensures each models process consistent data schemas across the alpha pipeline.
+  evidence: vnpy/alpha/model/models/lasso_model.py:13(LassoModel)
+  stage: alpha/model
+- id: BD-083
+  type: BA/DK
+  content: BacktestingEngine.new_bars() MUST receive bars in chronological order; dts.sort() enforces
+    this
+  rationale: The new_bars() method receives market data events for backtesting simulation. The internal
+    dts.sort() call enforces chronological ordering to prevent look-ahead bias and ensure correct historical
+    state. If bars arrive out of order (e.g., due to multi-threaded data loading), the sort ensures strategy
+    logic executes on temporally correct data. Out-of-order processing would corrupt position tracking
+    and signal generation in time-series dependent strategies.
+  evidence: vnpy/alpha/strategy/backtesting.py:150(run_backtesting)
+  stage: alpha/strategy
+- id: BD-084
+  type: B
+  content: RpcClient.callback() is abstract NotImplementedError — must be subclassed to handle pushed
+    data
+  rationale: The RpcClient.callback() method is defined as abstract with NotImplementedError, serving
+    as an interface contract that subclasses must implement. This method handles asynchronous push messages
+    from the RpcServer (PUB/SUB socket). Without implementation, any pushed data triggers NotImplementedError.
+    This design requires explicit handler registration for async notifications, preventing silent message
+    drops.
+  evidence: vnpy/rpc/client.py:152-156(callback)
+  stage: rpc_communication
+- id: BD-085
+  type: B/DK
+  content: 'RpcServer dual-socket: REP(REQ) for sync calls MUST be paired with PUB(SUB) for async pushes
+    — mixing causes ZMQ errors'
+  rationale: 'The RPC system uses two socket pairs: REP/REQ for synchronous request-response calls and
+    PUB/SUB for asynchronous push notifications. REP sockets can only receive requests from REQ sockets;
+    SUB sockets can only receive from PUB sockets. Mixing socket types (e.g., sending sync request via
+    PUB or async push via REP) causes ZMQ protocol errors. This dual-socket design separates synchronous
+    trading commands from asynchronous market data updates.'
+  evidence: vnpy/rpc/server.py:24-28(sockets),client.py:37-41(sockets)
+  stage: rpc_communication
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: sockets),client.py:37-41(sockets in vnpy/rpc/server.py'
+- id: BD-086
+  type: BA/DK
+  content: BacktestingEngine annual_days=240 hardcodes Chinese A-share trading calendar assumption in
+    Sharpe ratio calculation
+  rationale: 'The annual_days parameter is hardcoded to 240, representing approximately 48 weeks of 5
+    trading days for Chinese A-shares. This value is used in Sharpe ratio calculation (annual_return /
+    annual_volatility * sqrt(annual_days / actual_days)). Using 240 for non-Chinese markets (US: ~252,
+    crypto: 365) produces incorrect annualized metrics. This business assumption should be configurable
+    per market to enable accurate cross-market performance comparison.'
+  evidence: vnpy/alpha/strategy/backtesting.py:22(BacktestingEngine)
+  stage: alpha/strategy
+- id: BD-087
+  type: BA/M
+  content: Alpha101 expression language uses cs_ prefix (cross-sectional) vs ts_ prefix (time-series)
+    — cs_ functions use groupby, ts_ functions use window specs
+  rationale: The Alpha101 expression language distinguishes between cross-sectional (cs_) and time-series
+    (ts_) factors. cs_ functions compute features by grouping on vt_symbol within each timestamp (e.g.,
+    cs_rank, cs_zscore normalize across symbols at same time). ts_ functions compute features using rolling
+    windows within each symbol over time (e.g., ts_mean, ts_std). Using cs_ functions without proper grouping
+    or ts_ functions without sufficient history produces incorrect factor values.
+  evidence: vnpy/alpha/dataset/ts_function.py:50-300(module)
+  stage: alpha/dataset
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/dataset/ts_function.py'
+- id: BD-088
+  type: BA/M
+  content: BacktestingEngine calculate_statistics() requires positive_balance check — if any daily balance
+    ≤0, each statistics become zero
+  rationale: The calculate_statistics() method includes a positive_balance guard that checks if any daily
+    balance is ≤0. If found, each statistical metrics (Sharpe, max drawdown, win rate, profit factor)
+    are zeroed out via nan_to_num. This design prevents meaningless statistics for depleted accounts and
+    flags margin calls or risk management violations. However, it also zeros valid metrics for accounts
+    that briefly dip positive, potentially obscuring performance analysis.
+  evidence: vnpy/alpha/strategy/backtesting.py:258-282(module)
+  stage: alpha/strategy
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in vnpy/alpha/strategy/backtesting.py'
+- id: BD-089
+  type: BA/M
+  content: AlphaLab backtest() requires model.fit() before model.predict() — enforced by AlphaLab.get_infer_dataset()
+    calling fit() then infer
+  rationale: The AlphaLab.backtest() method enforces that models are trained via fit() before inference
+    via predict(). The get_infer_dataset() method internally calls model.fit() followed by model.predict(),
+    ensuring training occurs before prediction. This ordering contract prevents using untrained models
+    that produce random predictions. It also means fit() runs twice if manually called before backtest(),
+    which may be intentional for pre-validation.
+  evidence: vnpy/alpha/lab.py:20(AlphaLab)
+  stage: alpha/lab
+- id: BD-090
+  type: BA/M
+  content: LassoModel fit() deduplicates TRAIN+VALID segments by (datetime, vt_symbol) — data from same
+    timestamp+symbol across segments gets merged
+  rationale: The LassoModel.fit() method merges TRAIN and VALID segments using unique() on (datetime,
+    vt_symbol) pairs. If the same symbol appears at identical timestamps in both segments (e.g., due to
+    overlapping time ranges), the data is deduplicated rather than concatenated. This preserves only unique
+    observations but may silently drop intentional duplicates used for oversampling or ensemble training.
+  evidence: vnpy/alpha/model/models/lasso_model.py:54-56(unique on datetime+vt_symbol)
+  stage: alpha/model
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: unique on datetime+vt_symbol in vnpy/alpha/model/models/lasso_model.py'
+- id: BD-091
+  type: BA
+  content: EventEngine processes events in strict FIFO per type queue — synchronous listeners block subsequent
+    events of same type
+  rationale: The EventEngine maintains separate FIFO queues per event type. Events are processed synchronously
+    in order within each queue. If a listener takes a long time to process an event (e.g., blocking I/O,
+    complex computation), subsequent events of the same type are blocked in the queue. This design ensures
+    ordered processing within event types but can cause latency spikes for high-frequency event streams
+    when synchronous listeners are slow.
+  evidence: vnpy/event/engine.py:68-74(process)
+  stage: event_driven_core
+  _evidence_issues:
+  - 'FN_NOT_FOUND: process in vnpy/event/engine.py'
+- id: BD-092
+  type: DK/B
+  content: LassoModel merges TRAIN+VALID segments before training while LgbModel trains on TRAIN with
+    VALID as early-stopping set — inconsistent fitting semantics
+  rationale: This is a known design inconsistency between model implementations. LassoModel concatenates
+    TRAIN and VALID segments into a single dataset before fitting, effectively using each data for training
+    without holdout validation. LgbModel trains only on TRAIN and uses VALID for early stopping, preventing
+    overfitting. This inconsistency means LassoModel may overfit without early stopping, while LgbModel
+    uses a validation set that LassoModel ignores. The inconsistency makes model comparison unreliable
+    an
+  evidence: vnpy/alpha/model/models/lasso_model.py:13(LassoModel)
+  stage: alpha/model
+  alternative_considered: Unified fitting interface with configurable early stopping across each model
+    types
+- id: BD-093
+  type: DK/B
+  content: MlpModel learning_rate=0.001 with ReduceLROnPlateau patience=10, factor=0.5 — no warmup schedule
+    unlike LgbModel early_stopping
+  rationale: MlpModel uses a ReduceLROnPlateau scheduler that only reduces learning rate after 10 epochs
+    of plateau. LgbModel uses early stopping that halts training when validation loss stops improving.
+    Neither model implements learning rate warmup (gradually increasing LR from low to target). Without
+    warmup, MlpModel may take longer to converge or get stuck in sharp local minima early in training.
+    The ReduceLROnPlateau behavior differs significantly from LgbModel's early stopping, making hyperparameter
+    tra
+  evidence: vnpy/alpha/model/models/mlp_model.py:22(MlpModel)
+  stage: alpha/model
+  alternative_considered: Add warmup schedule to MlpModel; unify stopping criteria across each model types
+- id: BD-094
+  type: DK
+  content: MlpModel feature importance uses perturbation method (std of prediction diff under noise) —
+    incompatible with linear model's coef-based importance
+  rationale: 'MlpModel uses permutation importance (perturbing features and measuring prediction variance),
+    which is computationally expensive and produces different importance rankings than LassoModel''s coefficient
+    magnitudes. LassoModel assigns importance based on absolute coefficient values (interpretable as feature
+    weight), while MlpModel measures importance through prediction sensitivity to feature perturbation
+    (captures non-linear effects). This makes direct feature importance comparison between linear '
+  evidence: vnpy/alpha/model/models/mlp_model.py:458-490(_calculate_feature_importance)
+  stage: alpha/model
+  alternative_considered: Implement unified feature importance API using SHAP values compatible with each
+    model types
+- id: BD-095
+  type: BA/DK
+  content: PositionConverter.active_convert_from_orders() requires pre_closes dict from previous trading
+    day — stateful cross-day dependency
+  rationale: The PositionConverter.active_convert_from_orders() method maintains position state across
+    trading days using pre_closes from the previous day. This pre_closes dictionary maps vt_symbol to
+    previous closing prices, enabling calculation of unrealized PnL during position conversion. The stateful
+    design prevents intra-day position changes from incorrectly triggering settlement calculations. However,
+    it requires careful state management and prevents parallel processing of position updates from differe
+  evidence: vnpy/trader/converter.py:calculate_result() passes pre_closes to PositionConverter
+  stage: trader
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-096
+  type: DK
+  content: LgbModel default objective='mse' forces regression; classification strategies must override
+    params dict post-init
+  rationale: LgbModel initializes with objective='mse' (mean squared error) by default, enforcing regression
+    mode. Classification strategies must manually override the params dictionary after initialization
+    to set objective='binary' or objective='multi_class'. This post-init modification pattern is error-prone
+    as it requires knowledge of the internal params structure. There's no factory method or constructor
+    parameter to set the objective upfront, making the model type implicit rather than explicit.
+  evidence: vnpy/alpha/model/models/lgb_model.py:40-45(params dict initialization)
+  stage: alpha/model
+  alternative_considered: Add objective parameter to model constructor; provide factory methods (create_classification_model,
+    create_regression_model)
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: params dict initialization in vnpy/alpha/model/models/lgb_model.py'
+- id: BD-097
+  type: B/BA
+  content: 'INTERACTION: BD-086 × BD-008 → Annualization factor hardcoded to 240 propagates silently through
+    each performance metrics'
+  rationale: 'BD-086 hardcodes annual_days=240 in BacktestingEngine for Sharpe calculation while BD-008
+    defines 240 as standard Chinese market convention. Together they create a silent assumption that propagates
+    to each annualized metrics (Sharpe, volatility, Sortino). When users trade non-Chinese markets (US:
+    252, crypto: 365), performance metrics become systematically biased without any warning. This amplification
+    means the 240-day choice affects every performance report rather than being a single isolated c'
+  evidence: BD-086,BD-008
+  stage: global
+  alternative_considered: Market-specific calendar configuration at BacktestingEngine initialization
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-098
+  type: B/DK
+  content: 'INTERACTION: BD-003 × BD-004 → Trading hours definition becomes gate for process lifecycle
+    management'
+  rationale: BD-003 defines Chinese futures trading periods (day 8:45-15:00, night 20:45-02:45) while
+    BD-004 implements child process startup logic based on those periods. The process lifecycle decision
+    (BD-004) silently depends on BD-003's hours being accurate and complete. If BD-003 is extended to
+    include pre-market or if different exchange hours are added, BD-004's logic may not automatically
+    adapt. This hidden dependency means changes to trading hours require manual verification of process
+    management cod
+  evidence: BD-003,BD-004
+  stage: global
+  alternative_considered: Process management receives market hours as explicit configuration rather than
+    hardcoded reference
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-099
+  type: B/BA
+  content: 'INTERACTION: BD-028 × BD-029 × BD-030 → Chinese futures position close logic forms non-discoverable
+    dependency chain'
+  rationale: 'Three decisions create an interdependent position close logic chain: BD-028 tracks today/yesterday
+    frozen separately, BD-029 defines default close order (today first for non-SHFE/INE), and BD-030 handles
+    SHFE/INE exchange-specific exceptions. Each decision references the previous one implicitly. BD-030''s
+    exception handling only works correctly if BD-029''s default logic and BD-028''s tracking are both
+    correct. Modifying any single decision without verifying the others introduces subtle bugs in clo'
+  evidence: BD-028,BD-029,BD-030
+  stage: global
+  alternative_considered: Unified position close rule engine with exchange-specific configuration
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-100
+  type: B/BA
+  content: 'INTERACTION: BD-080 × BD-081 × BD-085 → RPC initialization creates fragile three-way ordering
+    contract'
+  rationale: BD-080 requires RpcClient.start() before any proxy calls, BD-081 requires RpcServer.register()
+    before start(), and BD-085 requires REP/REQ and PUB/SUB socket pairing. Violating any one constraint
+    causes ZMQ errors or silent message drops. These three decisions create a risk cascade where the first
+    violation (e.g., calling proxy before start) triggers downstream failures (messages to wrong socket
+    type). The fragility means any client or server implementation must memorize the complete ordering
+    co
+  evidence: BD-080,BD-081,BD-085
+  stage: global
+  alternative_considered: Builder pattern with enforced initialization sequence and compile-time socket
+    type checking
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-101
+  type: BA/M
+  content: 'INTERACTION: BD-051 × BD-052 → Cross-sectional normalization methods use contradictory statistical
+    assumptions'
+  rationale: 'BD-051 (MAD-based robust normalization) claims robustness to outliers as its justification,
+    while BD-052 (Z-score normalization) assumes normally distributed factors. Using both normalization
+    methods on the same factor pipeline creates a contradiction: if factors truly have outliers that require
+    MAD normalization, then Z-score normalization is inappropriate; if factors are normal, then MAD normalization
+    is unnecessarily complex. Both are labeled as cross-sectional methods, suggesting potential p'
+  evidence: BD-051,BD-052
+  stage: global
+  alternative_considered: Unified normalization interface with explicit outlier handling strategy selection
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  vague_rationale: true
+- id: BD-102
+  type: B/BA
+  content: 'INTERACTION: BD-086 × Audit #17 (Day Count Convention) → Hardcoded 240-day without DayCounter
+    creates systemic miscalculation risk'
+  rationale: 'BD-086 hardcodes annual_days=240 for Sharpe calculation while audit finding #17 shows no
+    DayCounter implementation exists (act360, thirty360, day_count not found). The 240-day factor assumes
+    5 trading days per week excluding holidays, but without explicit day count conventions, different
+    instruments or jurisdictions may have invalid assumptions. This cascades to each performance metrics
+    that use annualization: Sharpe ratio, volatility, annualized returns, risk metrics. The risk is amplified
+    becau'
+  evidence: BD-086,Audit#17
+  stage: global
+  alternative_considered: Implement DayCounter base class with ACT/360, ACT/365, 30/360 conventions and
+    market-specific calendar integration
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-103
+  type: BA
+  content: 'INTERACTION: BD-077 × Audit #12 (Train/Test Split Integrity) → Pipeline enforces ordering
+    without preventing temporal leakage'
+  rationale: 'BD-077 enforces strict 5-step pipeline ordering (set_parameters→add_strategy→load_data→run_backtesting→calculate_statistics)
+    but audit finding #12 shows no TimeSeriesSplit or train_test_split integrity enforcement exists. The
+    pipeline ordering constraint ensures methods execute in correct sequence but does not prevent users
+    from loading data with temporal overlap between train and validation sets. This creates a hidden dependency
+    where strict API ordering is mistaken for data integrity guarantee'
+  evidence: BD-077,Audit#12
+  stage: global
+  alternative_considered: Pipeline integrity checker that validates temporal boundaries between TRAIN/VALID/TEST
+    segments
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-104
+  type: B
+  content: 'INTERACTION: BD-092 (LassoModel vs LgbModel fitting inconsistency) × Audit #6 (Walk-Forward
+    Analysis) → Overfitting protection gap amplified by inconsistent model validation'
+  rationale: 'BD-092 documents that LassoModel merges TRAIN+VALID while LgbModel uses VALID for early
+    stopping, creating inconsistent validation semantics. Audit finding #6 reveals no walk-forward analysis
+    framework exists for backtest overfitting protection. Together these create an amplified risk: even
+    if walk-forward analysis were implemented, the inconsistent model validation would make results incomparable
+    across model types. Users cannot reliably compare LassoModel vs LgbModel performance because they
+    u'
+  evidence: BD-092,Audit#6
+  stage: global
+  alternative_considered: Unified fitting interface with consistent TRAIN/VALID/TEST segmentation across
+    each model types
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-GAP-001
+  type: B
+  content: Polars DataFrame chosen as internal data container for alpha factor datasets over Pandas
+  rationale: Polars provides superior columnar data performance for numerical computations; breaks under
+    legacy codebases requiring Pandas API compatibility or when Arrow interop is not needed
+  evidence: vnpy/alpha/dataset/datasets/alpha_158.py:9(__init__)
+  stage: Architecture
+  alternative_considered: Pandas (wider ecosystem), DuckDB (for SQL-like queries)
+- id: BD-GAP-002
+  type: BA/DK
+  content: Temporal train/valid/test split periods passed as string tuples instead of date objects or
+    config files
+  rationale: String format provides serialization simplicity and CLI-friendly period specification; breaks
+    when period boundaries require complex business calendar logic or when periods span non-contiguous
+    ranges
+  evidence: vnpy/alpha/dataset/datasets/alpha_158.py:9(__init__)
+  stage: Design
+  alternative_considered: DateTime objects (safer but less flexible), YAML/JSON config (more portable)
+- id: BD-GAP-003
+  type: B
+  content: Chart rendering uses QPicture caching for item redraw instead of immediate repaint
+  rationale: QPicture serialization to QPainter enables efficient repaints by caching pre-rendered graphics;
+    breaks under very large datasets where caching memory overhead exceeds redraw cost, or when sub-bar
+    precision updates are needed
+  evidence: vnpy/chart/item.py:137(_draw_item_picture)
+  stage: Architecture
+  alternative_considered: Immediate paint (lower memory), Vulkan/OpenGL acceleration (higher complexity)
+- id: BD-GAP-004
+  type: B/BA
+  content: BarManager maintains dual index mapping (sequential integer ↔ datetime) for bar access
+  rationale: Separates display index from temporal index to handle irregular bar spacing and enable O(1)
+    datetime lookups; breaks when bars arrive out-of-order or duplicate timestamps exist without explicit
+    disambiguation
+  evidence: vnpy/chart/manager.py:63(get_index)
+  stage: Design
+  alternative_considered: Pure datetime index (simpler but slower lookups), (timestamp, sequence) tuples
+    (handles duplicates)
+- id: BD-GAP-005
+  type: B/BA
+  content: Chart plot areas allocated with minimum_height=80 pixels hardcoded default
+  rationale: Prevents visual compression of chart areas below usable size; breaks under low-DPI displays
+    or when users need dense multi-symbol layouts
+  evidence: vnpy/chart/widget.py:62(add_plot)
+  stage: Design
+  alternative_considered: Dynamic minimum based on DPI (more adaptive), fixed pixel count (simpler)
+- id: BD-GAP-006
+  type: BA
+  content: DirectionCell applies color differentiation for long vs short positions
+  rationale: Color coding enables instant visual identification of position direction; breaks under colorblind
+    accessibility requirements or when directional data is not binary (e.g., hedging)
+  evidence: vnpy/trader/ui/widget.py:209(set_content)
+  stage: Design
+  alternative_considered: Icons/shapes (accessible), monochrome with text (verbose)
+- id: BD-GAP-007
+  type: BA/T
+  content: BaseMonitor subclass pattern used for each data monitors instead of generic parameterized monitor
+  rationale: Subclass-per-data-type enables specialized behavior (double-click actions) while sharing
+    common infrastructure; breaks when monitor count grows (class explosion) or when runtime monitor creation
+    is needed
+  evidence: vnpy/trader/ui/widget.py:407(TickMonitor)
+  stage: Architecture
+  alternative_considered: Generic monitor with type parameter (more flexible), decorator pattern (more
+    complex)
+- id: BD-GAP-008
+  type: B/BA
+  content: PnlCell applies green/red color based on positive/negative value instead of threshold-based
+    coloring
+  rationale: Binary color assignment provides immediate win/loss recognition; breaks when P&L significance
+    depends on position size or when near-zero values need neutral highlighting
+  evidence: vnpy/trader/ui/widget.py:209(set_content)
+  stage: Design
+  alternative_considered: Heat map gradient (more nuanced), percentage-based coloring (relative)
+- id: BD-GAP-009
+  type: BA
+  content: Window settings (size, state, dock positions) persisted to JSON for restore on restart
+  rationale: User layout persistence improves UX by eliminating manual re-arrangement after restart; breaks
+    on schema changes between versions or when settings file becomes corrupted
+  evidence: vnpy/trader/ui/mainwindow.py:291(save_window_setting)
+  stage: Design
+  alternative_considered: QSettings (native Qt persistence), registry (Windows-specific)
+- id: BD-GAP-010
+  type: BA
+  content: OrderMonitor and QuoteMonitor implement double-click cancellation for respective order types
+  rationale: Inline cancellation reduces friction vs navigating to separate cancel dialog; breaks when
+    confirmation is required for regulatory compliance or when large order quantities make accidental
+    cancellation costly
+  evidence: vnpy/trader/ui/widget.py:507(cancel_order)
+  stage: Design
+  alternative_considered: Confirmation dialog (safer), separate cancel widget (more deliberate)
+- id: BD-GAP-011
+  type: DK
+  content: 'Missing: as-of vs processing time'
+  rationale: 'Audit finding: missing: as-of vs processing time. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-012
+  type: M
+  content: 'Missing: Matrix ill-conditioning and stability'
+  rationale: 'Audit finding: missing: matrix ill-conditioning and stability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-013
+  type: DK
+  content: 'Missing: Point-in-Time data availability'
+  rationale: 'Audit finding: missing: point-in-time data availability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-014
+  type: DK
+  content: 'Missing: Stale data detection and expiry policy'
+  rationale: 'Audit finding: missing: stale data detection and expiry policy. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-015
+  type: B
+  content: 'Missing: PnL conservation'
+  rationale: 'Audit finding: missing: pnl conservation. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-016
+  type: DK
+  content: 'Missing: Model and data version snapshot binding'
+  rationale: 'Audit finding: missing: model and data version snapshot binding. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-017
+  type: B
+  content: 'Missing: Currency and unit explicit annotation'
+  rationale: 'Audit finding: missing: currency and unit explicit annotation. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-018
+  type: B
+  content: 'Missing: Signal-Execution Timing (Bar Execution)'
+  rationale: 'Audit finding: missing: signal-execution timing (bar execution). Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-019
+  type: B
+  content: 'Missing: Funding Cost Modeling (Carry)'
+  rationale: 'Audit finding: missing: funding cost modeling (carry). Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-020
+  type: B
+  content: 'Missing: Rebalancing Trigger Mechanism'
+  rationale: 'Audit finding: missing: rebalancing trigger mechanism. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-021
+  type: B
+  content: 'Missing: Provider Priority and Credential Isolation'
+  rationale: 'Audit finding: missing: provider priority and credential isolation. Identified by audit
+    checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-022
+  type: RC
+  content: 'Missing: ** "Implement explicit timezone normalization (UTC) for each timestamp fields'
+  rationale: 'Audit finding: missing: ** "implement explicit timezone normalization (utc) for each timestamp
+    fields. ** Cross-exchange strategies may have timing errors. This gap affects production reliability
+    and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  known_gap: true
+  severity: high
+  impact: '** Cross-exchange strategies may have timing errors'
+- id: BD-GAP-023
+  content: 'Missing: as-of vs processing time'
+  type: DK
+  rationale: 'Audit finding: missing: as-of vs processing time. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-024
+  content: 'Missing: Point-in-Time data availability'
+  type: DK
+  rationale: 'Audit finding: missing: point-in-time data availability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-025
+  content: 'Missing: Stale data detection and expiry policy'
+  type: DK
+  rationale: 'Audit finding: missing: stale data detection and expiry policy. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-026
+  content: 'Missing: PnL conservation'
+  type: B
+  rationale: 'Audit finding: missing: pnl conservation. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-027
+  content: 'Missing: Day count convention'
+  type: M/DK
+  rationale: 'Audit finding: missing: day count convention. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-028
+  content: 'Missing: Covariance Matrix PSD Repair'
+  type: M
+  rationale: 'Audit finding: missing: covariance matrix psd repair. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-029
+  content: 'Missing: Covariance Estimator Selection (Ledoit-Wolf)'
+  type: B
+  rationale: 'Audit finding: missing: covariance estimator selection (ledoit-wolf). Identified by audit
+    checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-030
+  content: 'Missing: ** "Implement day-count convention enforcement (ACT/360, ACT/365, 30/360) for interest
+    accrual calculations'
+  type: B
+  rationale: 'Audit finding: missing: ** "implement day-count convention enforcement (act/360, act/365,
+    30/360) for interest accrual calculations. ** Fixed income and carry calculations will be incorrect.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: event_driven_core
+  status: missing
+  severity: high
+  impact: '** Fixed income and carry calculations will be incorrect'
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: CSI300 Index Data Download via RQData
+  source: examples/alpha_research/download_data_rq.ipynb
+  type: data_pipeline
+  business_problem: Download historical CSI300 index constituent stock data from RQData data service for
+    use in alpha factor research and backtesting.
+  intent_keywords:
+  - download index constituents
+  - RQData
+  - CSI300 data
+  - historical stock data
+  - alpha research data
+  stage: data_collection
+  negative_keywords:
+  - backtesting
+  - strategy execution
+  - live trading
+  - charting
+  - XTQuant
+  disambiguation: Are you looking to download historical data for research, or do you need to run backtesting
+    or live trading with the data?
+  data_domain: market_data
+- id: UC-102
+  name: CSI300 Index Data Download via XTQuant
+  source: examples/alpha_research/download_data_xt.ipynb
+  type: data_pipeline
+  business_problem: Download historical CSI300 index constituent stock data from XTQuant data service
+    for use in alpha factor research.
+  intent_keywords:
+  - download index constituents
+  - XTQuant
+  - CSI300 data
+  - historical stock data
+  - 迅投 data
+  stage: data_collection
+  negative_keywords:
+  - backtesting
+  - strategy execution
+  - live trading
+  - charting
+  - RQData
+  disambiguation: Are you using XTQuant specifically for your data needs, or would you prefer RQData as
+    an alternative?
+  data_domain: market_data
+- id: UC-103
+  name: Alpha101 Factor Research Workflow
+  source: examples/alpha_research/research_workflow_alpha101.ipynb
+  type: research_analysis
+  business_problem: Conduct alpha factor research using the Alpha101 factor library to discover predictive
+    signals in CSI300 constituent stocks.
+  intent_keywords:
+  - alpha factor research
+  - Alpha101
+  - factor analysis
+  - machine learning
+  - CSI300
+  stage: factor_computation
+  negative_keywords:
+  - live trading
+  - backtesting
+  - data download
+  - charting
+  disambiguation: Are you conducting research to discover new alpha factors, or are you looking to backtest
+    or trade with existing factors?
+  data_domain: financial_data
+- id: UC-104
+  name: Lasso Regression Alpha Research
+  source: examples/alpha_research/research_workflow_lasso.ipynb
+  type: research_analysis
+  business_problem: Develop and test alpha factors using Lasso regression with Alpha158 dataset for feature
+    selection and regularization in stock prediction.
+  intent_keywords:
+  - lasso regression
+  - alpha factor
+  - feature selection
+  - regularization
+  - Alpha158
+  stage: factor_computation
+  negative_keywords:
+  - live trading
+  - backtesting
+  - data download
+  - deep learning
+  disambiguation: Are you interested in linear regression-based factor research with feature selection,
+    or do you need non-linear methods like neural networks?
+  data_domain: financial_data
+- id: UC-105
+  name: LightGBM Alpha Research Workflow
+  source: examples/alpha_research/research_workflow_lgb.ipynb
+  type: research_analysis
+  business_problem: Build and evaluate alpha factors using LightGBM gradient boosting with Alpha158 dataset
+    for stock return prediction.
+  intent_keywords:
+  - LightGBM
+  - gradient boosting
+  - alpha factor
+  - tree model
+  - Alpha158
+  stage: factor_computation
+  negative_keywords:
+  - live trading
+  - backtesting
+  - data download
+  - neural network
+  disambiguation: Are you looking for gradient boosting-based factor research, or would you prefer linear/tree
+    methods like Lasso/Random Forest?
+  data_domain: financial_data
+- id: UC-106
+  name: MLP Neural Network Alpha Research
+  source: examples/alpha_research/research_workflow_mlp.ipynb
+  type: research_analysis
+  business_problem: Develop and test alpha factors using multi-layer perceptron neural network with Alpha158
+    dataset for non-linear pattern recognition in stock data.
+  intent_keywords:
+  - MLP
+  - neural network
+  - deep learning
+  - alpha factor
+  - Alpha158
+  stage: factor_computation
+  negative_keywords:
+  - live trading
+  - backtesting
+  - data download
+  - tree model
+  disambiguation: Are you interested in deep learning-based factor research, or would simpler models like
+    LightGBM or Lasso be more appropriate?
+  data_domain: financial_data
+- id: UC-107
+  name: Candlestick Chart Display
+  source: examples/candle_chart/run.py
+  type: reporting
+  business_problem: Visualize historical price data with candlestick charts and volume bars for market
+    analysis and strategy review.
+  intent_keywords:
+  - candlestick chart
+  - visualization
+  - price display
+  - volume chart
+  - technical analysis
+  stage: reporting
+  negative_keywords:
+  - backtesting
+  - strategy execution
+  - data download
+  - factor research
+  disambiguation: Do you need to visualize historical data for analysis, or are you looking for real-time
+    charting during trading?
+  data_domain: market_data
+- id: UC-108
+  name: Client-Server Trading Client Setup
+  source: examples/client_server/run_client.py
+  type: live_trading
+  business_problem: Set up a VeighNa client instance connected to an RPC server for distributed CTA strategy
+    execution.
+  intent_keywords:
+  - RPC client
+  - distributed trading
+  - CTA strategy
+  - client server
+  - network trading
+  stage: live_trading
+  negative_keywords:
+  - backtesting
+  - data download
+  - research
+  - charting
+  disambiguation: Are you setting up a client for distributed live trading, or do you need standalone
+    backtesting or local execution?
+  data_domain: trading_data
+- id: UC-109
+  name: Client-Server Trading Server Setup
+  source: examples/client_server/run_server.py
+  type: live_trading
+  business_problem: Configure a VeighNa server with CTP gateway and RPC service for handling trading requests
+    from remote clients.
+  intent_keywords:
+  - RPC server
+  - CTP gateway
+  - trading server
+  - remote connection
+  - distributed system
+  stage: live_trading
+  negative_keywords:
+  - backtesting
+  - data download
+  - research
+  - charting
+  disambiguation: Are you setting up a server for remote client connections, or do you need a standalone
+    trading setup?
+  data_domain: trading_data
+- id: UC-110
+  name: CTA Strategy Backtesting Demo
+  source: examples/cta_backtesting/backtesting_demo.ipynb
+  type: data_pipeline
+  business_problem: Backtest ATR RSI trading strategy on futures contracts to evaluate performance metrics
+    and optimize parameters.
+  intent_keywords:
+  - backtesting
+  - ATR RSI strategy
+  - futures trading
+  - parameter optimization
+  - strategy evaluation
+  stage: backtesting
+  negative_keywords:
+  - live trading
+  - data download
+  - alpha research
+  - portfolio strategy
+  disambiguation: Are you looking to backtest CTA strategies, or do you need live trading, portfolio strategies,
+    or factor research?
+  data_domain: trading_data
+- id: UC-111
+  name: Multi-Strategy Portfolio Backtesting
+  source: examples/cta_backtesting/portfolio_backtesting.ipynb
+  type: data_pipeline
+  business_problem: Backtest multiple CTA strategies simultaneously to evaluate portfolio-level performance
+    and diversification benefits.
+  intent_keywords:
+  - portfolio backtesting
+  - multi-strategy
+  - strategy comparison
+  - portfolio optimization
+  stage: backtesting
+  negative_keywords:
+  - live trading
+  - single strategy
+  - alpha research
+  - data download
+  disambiguation: Do you need to backtest multiple strategies together as a portfolio, or just a single
+    CTA strategy?
+  data_domain: trading_data
+- id: UC-112
+  name: Market Data Recording via CTP
+  source: examples/data_recorder/data_recorder.py
+  type: data_pipeline
+  business_problem: Connect to futures exchanges via CTP interface and automatically record real-time
+    market data to database.
+  intent_keywords:
+  - data recording
+  - CTP interface
+  - market data capture
+  - real-time data
+  - SimNow
+  stage: data_collection
+  negative_keywords:
+  - backtesting
+  - trading execution
+  - alpha research
+  - charting
+  disambiguation: Are you looking to record market data, or do you need to execute trades or run backtests?
+  data_domain: market_data
+- id: UC-113
+  name: Historical Bar Data Download
+  source: examples/download_bars/download_bars.ipynb
+  type: data_pipeline
+  business_problem: Download historical bar data for futures contracts from data service providers for
+    backtesting and analysis.
+  intent_keywords:
+  - download bars
+  - historical data
+  - futures data
+  - data service
+  - RQData
+  stage: data_collection
+  negative_keywords:
+  - backtesting
+  - live trading
+  - alpha research
+  - charting
+  disambiguation: Are you downloading historical data for future use, or do you need to run backtests
+    or analysis now?
+  data_domain: market_data
+- id: UC-114
+  name: Headless CTA Strategy Execution
+  source: examples/no_ui/run.py
+  type: live_trading
+  business_problem: Run CTA strategy execution without graphical UI, connecting directly to CTP for automated
+    futures trading.
+  intent_keywords:
+  - headless trading
+  - automated trading
+  - CTA strategy
+  - no UI
+  - production trading
+  stage: live_trading
+  negative_keywords:
+  - backtesting
+  - research
+  - charting
+  - manual trading
+  disambiguation: Do you need fully automated headless trading, or would you prefer interactive trading
+    with GUI?
+  data_domain: trading_data
+- id: UC-115
+  name: Notebook-Based Trading Interface
+  source: examples/notebook_trading/demo_notebook.ipynb
+  type: live_trading
+  business_problem: Execute trading operations interactively from Jupyter notebook using script trader
+    for quick strategy testing and manual trading.
+  intent_keywords:
+  - notebook trading
+  - interactive trading
+  - script trader
+  - Jupyter
+  - manual execution
+  stage: live_trading
+  negative_keywords:
+  - backtesting
+  - automated strategy
+  - alpha research
+  - data download
+  disambiguation: Are you looking for interactive trading from notebooks, or automated strategy execution
+    without manual intervention?
+  data_domain: trading_data
+- id: UC-116
+  name: Portfolio Strategy Backtesting
+  source: examples/portfolio_backtesting/backtesting_demo.ipynb
+  type: data_pipeline
+  business_problem: Backtest portfolio strategies like pair trading on multiple futures contracts to evaluate
+    spread-based trading opportunities.
+  intent_keywords:
+  - portfolio strategy
+  - pair trading
+  - spread trading
+  - multi-contract
+  - backtesting
+  stage: backtesting
+  negative_keywords:
+  - single strategy
+  - live trading
+  - alpha research
+  - data download
+  disambiguation: Are you backtesting portfolio strategies involving multiple contracts, or single CTA
+    strategies?
+  data_domain: trading_data
+- id: UC-117
+  name: RPC Client Test
+  source: examples/simple_rpc/test_client.py
+  type: extension_example
+  business_problem: Test and demonstrate RPC client functionality for distributed system communication
+    and remote procedure calls.
+  intent_keywords:
+  - RPC client
+  - remote procedure call
+  - distributed system
+  - test client
+  - communication
+  stage: data_collection
+  negative_keywords:
+  - trading
+  - backtesting
+  - data download
+  - charting
+  disambiguation: Are you testing RPC infrastructure, or do you need actual trading or backtesting functionality?
+  data_domain: mixed
+- id: UC-118
+  name: RPC Server Test
+  source: examples/simple_rpc/test_server.py
+  type: extension_example
+  business_problem: Test and demonstrate RPC server functionality for handling remote client requests
+    and publishing data updates.
+  intent_keywords:
+  - RPC server
+  - remote procedure call
+  - distributed system
+  - test server
+  - publish subscribe
+  stage: data_collection
+  negative_keywords:
+  - trading
+  - backtesting
+  - data download
+  - charting
+  disambiguation: Are you testing RPC infrastructure, or do you need actual trading or backtesting functionality?
+  data_domain: mixed
+- id: UC-119
+  name: Spread Trading Backtesting
+  source: examples/spread_backtesting/backtesting.ipynb
+  type: data_pipeline
+  business_problem: Backtest statistical arbitrage strategies trading spreads between related futures
+    contracts to identify mean reversion opportunities.
+  intent_keywords:
+  - spread trading
+  - statistical arbitrage
+  - mean reversion
+  - futures spread
+  - backtesting
+  stage: backtesting
+  negative_keywords:
+  - single contract
+  - live trading
+  - alpha research
+  - data download
+  disambiguation: Are you backtesting spread trading strategies between contracts, or single contract
+    or portfolio strategies?
+  data_domain: trading_data
+- id: UC-120
+  name: Script Trading Strategy Demo
+  source: examples/veighna_trader/demo_script.py
+  type: live_trading
+  business_problem: Execute custom trading scripts for basket orders, hedging strategies, cross-exchange
+    arbitrage, and market monitoring.
+  intent_keywords:
+  - script trading
+  - basket orders
+  - custom strategy
+  - arbitrage
+  - hedge
+  stage: live_trading
+  negative_keywords:
+  - backtesting
+  - alpha research
+  - automated strategy
+  - charting
+  disambiguation: Are you looking to write custom trading scripts, or do you need standard automated strategies
+    or backtesting?
+  data_domain: trading_data
+- id: UC-121
+  name: VeighNa Trader GUI Setup
+  source: examples/veighna_trader/run.py
+  type: live_trading
+  business_problem: Launch VeighNa Trader desktop application with CTP gateway for futures trading and
+    data management capabilities.
+  intent_keywords:
+  - GUI trading
+  - desktop application
+  - CTP trading
+  - data manager
+  - VeighNa Trader
+  stage: live_trading
+  negative_keywords:
+  - backtesting
+  - headless trading
+  - script trading
+  - research
+  disambiguation: Do you need the full desktop GUI for trading, or would headless/script-based trading
+    better suit your needs?
+  data_domain: trading_data
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 33
+  evidence_invalid: 72
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.3142857142857143
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 0
+    warn: 10
+    fail: 10
+  subdomain_totals:
+    pass: 0
+    warn: 8
+    fail: 13
+  coverage: 41/41 (100%)
+  pass_rate: 0/41 (0%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: market_data_provider
+  description: 'Choose based on: (1) Asset class needed, (2) Whether real-time or historical-only, (3)
+    Budget constraints, (4) Geographic market focus'
+  used_in_stages: []
+  options:
+  - name: RQData (RiceQuant)
+    traits:
+    - real-time
+    - historical
+    - china_a_shares
+    - futures
+    - options
+    - commercial
+    fit_for:
+    - Professional quantitative research with comprehensive China market coverage
+    not_fit_for:
+    - Free usage, non-Chinese markets, high-frequency tick data
+  - name: XtQuant
+    traits:
+    - real-time
+    - historical
+    - china_a_shares
+    - convertible_bonds
+    - commercial
+    fit_for:
+    - Users with existing XunTou terminal license
+    not_fit_for:
+    - Free usage, pure futures trading
+  - name: TuShare
+    traits:
+    - free_tier
+    - historical
+    - china_a_shares
+    - fundamentals
+    fit_for:
+    - Budget-conscious researchers, historical data analysis
+    not_fit_for:
+    - Real-time trading, professional trading
+  - name: SimNow (CTP)
+    traits:
+    - real-time
+    - futures
+    - options
+    - simulation
+    fit_for:
+    - Futures/options trading, strategy development and testing
+    not_fit_for:
+    - Stock trading, production without broker
+  - name: Polygon
+    traits:
+    - global_markets
+    - real-time
+    - historical
+    - us_stocks
+    fit_for:
+    - International markets, US stocks and options
+    not_fit_for:
+    - China markets
+  - name: Interactive Brokers
+    traits:
+    - global_markets
+    - real-time
+    - futures
+    - options
+    - forex
+    fit_for:
+    - Global multi-asset trading with single account
+    not_fit_for:
+    - China markets, fixed income
+  default: SimNow (CTP) for futures, RQData for stocks
+  _source: worker_resource
+- id: slot-002
+  name: database_backend
+  description: 'Choose based on: (1) Data volume (SQLite < 10M records), (2) Concurrent access needs,
+    (3) Query complexity, (4) Operational complexity tolerance'
+  used_in_stages: []
+  options:
+  - name: SQLite
+    traits:
+    - embedded
+    - zero_config
+    - single_file
+    fit_for:
+    - Beginners, small datasets, portable deployments
+    not_fit_for:
+    - High-volume data, concurrent access, production
+  - name: MySQL
+    traits:
+    - relational
+    - client_server
+    - widely_supported
+    fit_for:
+    - Production systems, shared data access
+    not_fit_for:
+    - High-frequency tick data, simple setups
+  - name: PostgreSQL
+    traits:
+    - relational
+    - advanced_features
+    - extensible
+    fit_for:
+    - Complex queries, time-series optimizations, production
+    not_fit_for:
+    - Simple setups, beginners
+  - name: TDengine
+    traits:
+    - time_series
+    - high_performance
+    - sql_compatible
+    fit_for:
+    - High-frequency tick data, real-time analytics
+    not_fit_for:
+    - Simple deployments, small datasets
+  - name: MongoDB
+    traits:
+    - document_store
+    - flexible_schema
+    - in_memory_cache
+    fit_for:
+    - Flexible data structures, rapid prototyping
+    not_fit_for:
+    - Relational queries, SQL-based analysis
+  - name: DolphinDB
+    traits:
+    - time_series
+    - high_performance
+    - analytical
+    fit_for:
+    - Low-latency trading, real-time analytics, large datasets
+    not_fit_for:
+    - Simple setups, general-purpose use
+  default: SQLite
+  _source: worker_resource
+- id: slot-003
+  name: trading_gateway
+  description: 'Choose based on: (1) Asset class (futures vs stocks), (2) Broker compatibility, (3) Geographic
+    market, (4) API familiarity'
+  used_in_stages: []
+  options:
+  - name: CTP (vnpy_ctp)
+    traits:
+    - futures
+    - options
+    - china_domestic
+    fit_for:
+    - Chinese domestic futures/options trading
+    not_fit_for:
+    - Stocks, international markets
+  - name: CTP Mini (vnpy_mini)
+    traits:
+    - futures
+    - options
+    - china_domestic
+    fit_for:
+    - Simplified CTP access for futures
+    not_fit_for:
+    - Stocks
+  - name: XTP (vnpy_xtp)
+    traits:
+    - stocks
+    - etf
+    - china_domestic
+    fit_for:
+    - A-share equity trading
+    not_fit_for:
+    - Futures, options
+  - name: TORA (vnpy_tora)
+    traits:
+    - stocks
+    - etf
+    - china_domestic
+    fit_for:
+    - Hua Xin Qi Dian (TORA) users for A-share trading
+    not_fit_for:
+    - Futures
+  - name: Interactive Brokers (vnpy_ib)
+    traits:
+    - global
+    - multi_asset
+    - stocks
+    - futures
+    - options
+    - forex
+    fit_for:
+    - International markets, multi-asset strategies
+    not_fit_for:
+    - China markets
+  - name: Direct Access (vnpy_da)
+    traits:
+    - futures
+    - global
+    - simulation
+    fit_for:
+    - Direct futures trading for testing
+    not_fit_for:
+    - Production without broker
+  default: CTP for futures, XTP/TORA for stocks
+  _source: worker_resource
+- id: slot-004
+  name: notification_channel
+  description: 'Choose based on: (1) Urgency of notifications, (2) Team vs individual, (3) Integration
+    with existing tools'
+  used_in_stages: []
+  options:
+  - name: Email (SMTP)
+    traits:
+    - smtp
+    - qq_compatible
+    - async
+    fit_for:
+    - Standard email notifications
+    not_fit_for:
+    - Real-time push notifications
+  - name: DingTalk/RocketChat webhook
+    traits:
+    - webhook
+    - instant
+    fit_for:
+    - Team notifications, instant alerts
+    not_fit_for:
+    - Formal audit trails
+  default: Email (SMTP)
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: Shanghai Financial Futures Exchange (CFFEX)
+  description: 'Real-time futures/options market data and trading. Coverage: Chinese domestic futures
+    exchanges (CFFEX, SHFE, DCE, CZCE, GFEX, INE). Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: RiceQuant
+  description: 'Historical and real-time market data for stocks, futures, options, funds, bonds, Gold
+    TD. Coverage: China A-shares, indices, ETFs, futures, options, funds, bonds, Gold TD. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: 迅投 (XunTou)
+  description: 'Real-time and historical data for stocks, indices, convertible bonds, ETFs, futures, options.
+    Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: TuShare
+  description: 'Stocks, futures, options, funds market data. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: Wind Information
+  description: 'Stocks, futures, funds, bonds data. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: 同花顺 (iFinD)
+  description: 'Stocks, futures, funds, bonds data. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: MultiCharts
+  description: 'Futures, futures options data. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-008
+  type: external_service
+  name: 天勤 (TianQin)
+  description: 'Futures market data. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-009
+  type: external_service
+  name: GolMiner
+  description: 'Stock market data. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-010
+  type: external_service
+  name: Polygon.io
+  description: 'Global stocks, futures, options data. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-011
+  type: external_service
+  name: CTP Gateway
+  description: China Futures Warrants Transaction System - primary gateway for domestic futures
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: external_service
+  name: Interactive Brokers (IB)
+  description: Global securities, futures, options, forex trading
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: external_service
+  name: Database (Default SQLite)
+  description: Default database for storing historical bar and tick data
+  used_in_stages: []
+  _source: worker_resource
+- id: res-014
+  type: external_service
+  name: Email Service (SMTP)
+  description: Email notifications for trading events and alerts
+  used_in_stages: []
+  _source: worker_resource
+- id: res-015
+  type: external_service
+  name: RPC Service
+  description: Distributed architecture for multi-process trading systems
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: external_service
+  name: VeighNa Forum
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-017
+  type: external_service
+  name: VeighNa Station
+  description: Desktop application for managing the trading system
+  used_in_stages: []
+  _source: worker_resource
+- id: res-018
+  type: python_package
+  name: PySide6==6.8.2.1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-019
+  type: python_package
+  name: numpy>=2.2.3
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-020
+  type: python_package
+  name: pandas>=2.2.3
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-021
+  type: python_package
+  name: ta-lib>=0.6.4
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-022
+  type: python_package
+  name: deap>=1.4.2
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-023
+  type: python_package
+  name: pyzmq>=26.3.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-024
+  type: python_package
+  name: tzlocal>=5.3.1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-025
+  type: python_package
+  name: loguru>=0.7.3
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-026
+  type: python_package
+  name: tqdm>=4.67.1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-027
+  type: python_package
+  name: nbformat>=5.10.4
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-028
+  type: code_example
+  name: CSI300 Index Data Download via RQData
+  path: examples/alpha_research/download_data_rq.ipynb
+  description: Download historical CSI300 index constituent stock data from RQData data service for use
+    in alpha factor research and backtesting.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-029
+  type: code_example
+  name: CSI300 Index Data Download via XTQuant
+  path: examples/alpha_research/download_data_xt.ipynb
+  description: Download historical CSI300 index constituent stock data from XTQuant data service for use
+    in alpha factor research.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-030
+  type: code_example
+  name: Alpha101 Factor Research Workflow
+  path: examples/alpha_research/research_workflow_alpha101.ipynb
+  description: Conduct alpha factor research using the Alpha101 factor library to discover predictive
+    signals in CSI300 constituent stocks.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list
+- id: res-031
+  type: code_example
+  name: Lasso Regression Alpha Research
+  path: examples/alpha_research/research_workflow_lasso.ipynb
+  description: Develop and test alpha factors using Lasso regression with Alpha158 dataset for feature
+    selection and regularization in stock prediction.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list
+- id: res-032
+  type: code_example
+  name: LightGBM Alpha Research Workflow
+  path: examples/alpha_research/research_workflow_lgb.ipynb
+  description: Build and evaluate alpha factors using LightGBM gradient boosting with Alpha158 dataset
+    for stock return prediction.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list
+- id: res-033
+  type: code_example
+  name: MLP Neural Network Alpha Research
+  path: examples/alpha_research/research_workflow_mlp.ipynb
+  description: Develop and test alpha factors using multi-layer perceptron neural network with Alpha158
+    dataset for non-linear pattern recognition in stock data.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list
+- id: res-034
+  type: code_example
+  name: Candlestick Chart Display
+  path: examples/candle_chart/run.py
+  description: Visualize historical price data with candlestick charts and volume bars for market analysis
+    and strategy review.
+  used_in_stages:
+  - reporting
+  _source: uc_list
+- id: res-035
+  type: code_example
+  name: Client-Server Trading Client Setup
+  path: examples/client_server/run_client.py
+  description: Set up a VeighNa client instance connected to an RPC server for distributed CTA strategy
+    execution.
+  used_in_stages:
+  - live_trading
+  _source: uc_list
+- id: res-036
+  type: code_example
+  name: Client-Server Trading Server Setup
+  path: examples/client_server/run_server.py
+  description: Configure a VeighNa server with CTP gateway and RPC service for handling trading requests
+    from remote clients.
+  used_in_stages:
+  - live_trading
+  _source: uc_list
+- id: res-037
+  type: code_example
+  name: CTA Strategy Backtesting Demo
+  path: examples/cta_backtesting/backtesting_demo.ipynb
+  description: Backtest ATR RSI trading strategy on futures contracts to evaluate performance metrics
+    and optimize parameters.
+  used_in_stages:
+  - backtesting
+  _source: uc_list
+- id: res-038
+  type: code_example
+  name: Multi-Strategy Portfolio Backtesting
+  path: examples/cta_backtesting/portfolio_backtesting.ipynb
+  description: Backtest multiple CTA strategies simultaneously to evaluate portfolio-level performance
+    and diversification benefits.
+  used_in_stages:
+  - backtesting
+  _source: uc_list
+- id: res-039
+  type: code_example
+  name: Market Data Recording via CTP
+  path: examples/data_recorder/data_recorder.py
+  description: Connect to futures exchanges via CTP interface and automatically record real-time market
+    data to database.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-040
+  type: code_example
+  name: Historical Bar Data Download
+  path: examples/download_bars/download_bars.ipynb
+  description: Download historical bar data for futures contracts from data service providers for backtesting
+    and analysis.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-041
+  type: code_example
+  name: Headless CTA Strategy Execution
+  path: examples/no_ui/run.py
+  description: Run CTA strategy execution without graphical UI, connecting directly to CTP for automated
+    futures trading.
+  used_in_stages:
+  - live_trading
+  _source: uc_list
+- id: res-042
+  type: code_example
+  name: Notebook-Based Trading Interface
+  path: examples/notebook_trading/demo_notebook.ipynb
+  description: Execute trading operations interactively from Jupyter notebook using script trader for
+    quick strategy testing and manual trading.
+  used_in_stages:
+  - live_trading
+  _source: uc_list
+- id: res-043
+  type: code_example
+  name: Portfolio Strategy Backtesting
+  path: examples/portfolio_backtesting/backtesting_demo.ipynb
+  description: Backtest portfolio strategies like pair trading on multiple futures contracts to evaluate
+    spread-based trading opportunities.
+  used_in_stages:
+  - backtesting
+  _source: uc_list
+- id: res-044
+  type: code_example
+  name: RPC Client Test
+  path: examples/simple_rpc/test_client.py
+  description: Test and demonstrate RPC client functionality for distributed system communication and
+    remote procedure calls.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-045
+  type: code_example
+  name: RPC Server Test
+  path: examples/simple_rpc/test_server.py
+  description: Test and demonstrate RPC server functionality for handling remote client requests and publishing
+    data updates.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-046
+  type: code_example
+  name: Spread Trading Backtesting
+  path: examples/spread_backtesting/backtesting.ipynb
+  description: Backtest statistical arbitrage strategies trading spreads between related futures contracts
+    to identify mean reversion opportunities.
+  used_in_stages:
+  - backtesting
+  _source: uc_list
+- id: res-047
+  type: code_example
+  name: Script Trading Strategy Demo
+  path: examples/veighna_trader/demo_script.py
+  description: Execute custom trading scripts for basket orders, hedging strategies, cross-exchange arbitrage,
+    and market monitoring.
+  used_in_stages:
+  - live_trading
+  _source: uc_list
+- id: res-048
+  type: code_example
+  name: VeighNa Trader GUI Setup
+  path: examples/veighna_trader/run.py
+  description: Launch VeighNa Trader desktop application with CTP gateway for futures trading and data
+    management capabilities.
+  used_in_stages:
+  - live_trading
+  _source: uc_list

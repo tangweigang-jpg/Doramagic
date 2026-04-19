@@ -1,0 +1,2989 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-105
+name: open-climate-investing
+sop_version: '3.6'
+source:
+  projects:
+  - open-climate-investing
+  commit_hash: 8ac01b650d9133f90a64ebed84bb24d376cb5616
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Multi-factor equity returns model with climate (BMG) factor
+  description: A multi-factor equity returns model that adds a Brown Minus Green (BMG) climate risk factor
+    to the Fama-French and Carhart models for portfolio optimization, relative value trading, and climate-aligned
+    benchmark construction.
+  prerequisites: Understanding of factor investing, Fama-French models, basic Python, PostgreSQL database
+    administration, and familiarity with climate risk concepts.
+  not_suitable_for: Real-time trading systems, non-equity assets (bonds, commodities), single-factor analysis
+    workflows, users without database infrastructure, or those requiring pre-computed factor data (this
+    project computes factors from scratch).
+stages:
+- id: data_collection
+  name: Stock Data Collection
+  order: 1
+  responsibility: Fetches stock price data from Yahoo Finance API with monthly/daily frequency support.
+    Provides retry logic and incomplete data filtering. Acts as the primary data ingestion point for each
+    downstream analysis.
+  interface:
+    inputs:
+    - ticker symbol string (e.g., 'AAPL')
+    outputs:
+    - DataFrame with Date index and Close column
+  required_methods:
+  - name: stock_grabber
+    description: Core fetcher using yfinance library with 3 retry attempts on JSON decode errors. Handles
+      both monthly and daily intervals.
+    evidence: scripts/stock_price_function.py:14(function)
+  key_behaviors:
+  - behavior: Monthly interval uses 1mo yfinance interval
+    description: Monthly frequency requires monthly candles (1mo) for proper MonthEnd alignment, not daily
+      candles aggregated. This ensures financial convention compliance for monthly returns.
+    evidence: scripts/stock_price_function.py:22
+  - behavior: Last entry dropped assuming incomplete candle
+    description: Prevents partial month data from corrupting returns by dropping the most recent entry
+      which may represent an incomplete time period.
+    evidence: scripts/stock_price_function.py:28
+  - behavior: Monthly dates aligned to MonthEnd
+    description: Dates are aligned to month-end using pandas MonthEnd offset to ensure consistency with
+      financial convention for monthly return calculations.
+    evidence: scripts/stock_price_function.py:30
+  - behavior: 3 retry attempts on transient failures
+    description: Network or API failures are handled gracefully with up to 3 retry attempts for JSON decode
+      errors before failing.
+    evidence: scripts/stock_price_function.py:16-17
+  replaceable_points:
+  - name: data_source
+    description: Source of stock price data
+    options:
+    - name: yfinance
+      traits:
+      - Free
+      - No API key required
+      - Real-time data
+      - Subject to rate limits
+      fit_for:
+      - Quick prototyping
+      - Individual investors
+      - Non-commercial use
+      not_fit_for:
+      - Production trading systems
+      - High-frequency requirements
+      - Commercial data licensing
+    - name: Alpha Vantage
+      traits:
+      - Free tier available
+      - API key required
+      - Historical data
+      fit_for:
+      - Alternative to yfinance
+      - Structured API access
+      not_fit_for:
+      - Real-time data needs
+      - High volume requirements
+    - name: Bloomberg
+      traits:
+      - Professional grade
+      - Expensive license
+      - Comprehensive data
+      fit_for:
+      - Institutional use
+      - Research with budget
+      - Professional workflows
+      not_fit_for:
+      - Individual investors
+      - Budget-constrained projects
+    default: yfinance
+  design_decisions:
+  - 'Monthly interval uses 1mo yfinance interval (NOT 1d) (evidence: scripts/stock_price_function.py:22)
+    — Monthly frequency requires monthly candles for proper MonthEnd alignment L30'
+  - 'Drops last entry assuming incomplete candle (evidence: scripts/stock_price_function.py:28) — Prevents
+    partial month data from corrupting returns'
+  - 'Monthly dates aligned to MonthEnd via pandas offset (evidence: scripts/stock_price_function.py:30)
+    — Ensures consistency with financial convention for monthly returns'
+  - '3 retry attempts on JSON decode errors (evidence: scripts/stock_price_function.py:16-17) — Handles
+    transient network/API failures gracefully'
+  acceptance_hints:
+  - Returned DataFrame has 'Date' as index with name 'Date'
+  - Monthly data ends on MonthEnd dates
+  - Last entry is complete (not partial period)
+  - Fetch succeeds within 3 retry attempts for valid tickers
+  - Close column contains numeric price values
+- id: data_import
+  name: Database Setup & Data Import
+  order: 2
+  responsibility: Initializes PostgreSQL schema, imports Fama-French factors, carbon risk factors, stock
+    constituents, and other reference data. Provides batch CSV ingestion with idempotent upsert behavior.
+  interface:
+    inputs:
+    - CSV files in data/ directory (FF factors, MSCI constituents, stock stats)
+    outputs:
+    - 'PostgreSQL tables: stocks, stock_data, carbon_risk_factor, ff_factor, risk_free, stock_components,
+      stock_stats'
+  required_methods:
+  - name: load_data_files
+    description: Orchestrates each data imports from CSV files into PostgreSQL tables with proper schema
+      initialization.
+    evidence: scripts/setup_db.py:262
+  - name: import_monthly_ff_data_factors_into_sql
+    description: Parses raw Fama-French CSV files and inserts into ff_factor table using COPY FROM with
+      grep filtering for headers.
+    evidence: scripts/setup_db.py:159
+  - name: import_msci_constituents_into_sql
+    description: Imports index constituents with weights into stock_components table for composite stock
+      calculations.
+    evidence: scripts/setup_db.py:74
+  key_behaviors:
+  - behavior: ON CONFLICT DO NOTHING for data imports
+    description: Prevents duplicate key errors on re-runs while allowing incremental updates. Makes the
+      import process idempotent.
+    evidence: scripts/setup_db.py:51
+  - behavior: COPY FROM PROGRAM with grep for FF files
+    description: Raw FF files have header rows that must be filtered; grep is used as preprocessing before
+      COPY for performance.
+    evidence: scripts/setup_db.py:113
+  - behavior: Frequency column on each time series tables
+    description: Enables storing both MONTHLY and DAILY versions of the same data in the same tables with
+      different frequency designations.
+    evidence: scripts/init_schema.sql:5,92,95
+  - behavior: Stores both close price AND computed return
+    description: Avoids recomputation; return is stored as pct_change of close in stock_data table.
+    evidence: scripts/init_schema.sql:94-95
+  replaceable_points:
+  - name: database
+    description: PostgreSQL database backend
+    options:
+    - name: PostgreSQL
+      traits:
+      - Full feature set
+      - Connection pooling
+      - UPSERT support
+      - COPY FROM
+      fit_for:
+      - Production use
+      - Concurrent workers
+      - Large datasets
+      not_fit_for:
+      - Simple testing
+      - Single-user scenarios
+      - No database available
+    - name: SQLite (limited)
+      traits:
+      - No setup required
+      - File-based
+      - Limited concurrency
+      fit_for:
+      - Local testing
+      - Simple prototypes
+      - Single-user analysis
+      not_fit_for:
+      - Multiprocessing
+      - Large datasets
+      - Concurrent writes
+    default: PostgreSQL
+  design_decisions:
+  - 'ON CONFLICT DO NOTHING for data imports (evidence: scripts/setup_db.py:51) — Prevents duplicate key
+    errors on re-runs while allowing incremental updates'
+  - 'Uses COPY FROM PROGRAM with grep to filter raw FF files (evidence: scripts/setup_db.py:113) — Raw
+    FF files have header rows that must be filtered - grep as preprocessing'
+  - 'WML (weak momentum) stored in same ff_factor table (evidence: scripts/init_schema.sql:19) — Unified
+    factor storage for each FF factors'
+  - 'Stores both close price AND computed return in stock_data (evidence: scripts/init_schema.sql:94-95)
+    — Avoids recomputation; return = pct_change of close'
+  - 'Frequency column on each time series tables (evidence: scripts/init_schema.sql:5,92,95) — Enables
+    storing MONTHLY and DAILY versions of same data'
+  acceptance_hints:
+  - Schema initialized with each required tables
+  - Fama-French factors (Mkt-RF, SMB, HML, WML) loaded
+  - MSCI constituents with weights present in stock_components
+  - No duplicate primary key violations on re-run
+  - Frequency column values are 'MONTHLY' or 'DAILY'
+- id: bmg_factor_computation
+  name: BMG Factor Computation
+  order: 3
+  responsibility: Computes Brown-Minus-Green (BMG) carbon risk factor from index constituent returns.
+    BMG = Brown Returns - Green Returns. Positive BMG means brown stocks outperform green, indicating
+    carbon risk premium.
+  interface:
+    inputs:
+    - green_ticker (e.g., clean energy ETF like SMOG)
+    - brown_ticker (e.g., fossil fuel ETF like XOP)
+    outputs:
+    - carbon_risk_factor table entries with BMG column values
+  required_methods:
+  - name: add_bmg_series
+    description: Core BMG calculation that computes return_x - return_y (brown minus green) and stores
+      in database.
+    evidence: scripts/bmg_series.py:11
+  - name: get_bmg_series
+    description: Lists each BMG factors stored in database for selection in regression analysis.
+    evidence: scripts/bmg_series.py:64
+  - name: load_stocks_returns_from_db
+    description: Loads returns from database with support for composite index constituent weighting (IVV,
+      XWD.TO).
+    evidence: scripts/get_stocks.py:224
+  key_behaviors:
+  - behavior: BMG = Brown Returns - Green Returns
+    description: 'Subtraction order is critical: brown minus green. Positive BMG indicates brown stocks
+      outperform green, suggesting carbon risk premium exists.'
+    evidence: scripts/bmg_series.py:31
+  - behavior: Composite returns = weighted average of components
+    description: Index funds (IVV, XWD.TO) require constituent weighting for accurate return calculation
+      before BMG computation.
+    evidence: scripts/get_stocks.py:288
+  - behavior: NaN values removed before storing BMG
+    description: Inner join on returns ensures valid paired observations only; no incomplete data points
+      stored.
+    evidence: scripts/bmg_series.py:35-36
+  replaceable_points:
+  - name: factor_definition
+    description: Formula for carbon risk factor
+    options:
+    - name: BMG (Brown-Green)
+      traits:
+      - Long brown, short green
+      - Industry standard
+      - Interpretable
+      fit_for:
+      - Carbon risk research
+      - Climate investing
+      - Portfolio analysis
+      not_fit_for:
+      - Sector-neutral analysis
+      - Micro-cap focus
+    - name: Short Long Spread
+      traits:
+      - Similar structure
+      - Customizable
+      - Flexible
+      fit_for:
+      - Custom factor research
+      - Alternative definitions
+      not_fit_for:
+      - Standard BMG comparison
+    - name: Sector-adjusted
+      traits:
+      - Sector-neutral
+      - Removes sector bias
+      fit_for:
+      - Pure carbon exposure
+      - Sector-agnostic analysis
+      not_fit_for:
+      - Simple factor models
+      - Quick analysis
+    default: BMG
+  design_decisions:
+  - 'BMG = Brown Returns - Green Returns (evidence: scripts/bmg_series.py:31) — Positive BMG means brown
+    stocks outperform green - carbon risk premium'
+  - 'Composite stock returns = weighted average of components (evidence: scripts/get_stocks.py:288) —
+    Index funds (IVV, XWD.TO) need constituent weighting for accurate returns'
+  - 'NaN values removed before storing BMG (evidence: scripts/bmg_series.py:35-36) — Inner join on returns
+    ensures valid paired observations'
+  acceptance_hints:
+  - BMG values stored in carbon_risk_factor table
+  - BMG = return_x - return_y (brown minus green)
+  - No NaN values in stored BMG series
+  - '''DEFAULT'' is reserved as system default factor name'
+  - Factor available for regression selection by name
+- id: factor_regression
+  name: Factor Regression Analysis
+  order: 4
+  responsibility: Runs OLS regressions of stock returns on carbon risk factor and Fama-French factors.
+    Computes coefficients, t-stats, p-values, and diagnostic statistics with proper data alignment and
+    validation.
+  interface:
+    inputs:
+    - stock_returns, carbon_factor (BMG), ff_factors (Mkt-RF, SMB, HML, WML), rf_rate (risk-free)
+    outputs:
+    - OLS model output, coefficient DataFrame with diagnostic stats (t-stats, p-values, R²)
+  required_methods:
+  - name: run_regression
+    description: Single stock regression with date range filtering, data merging, and excess return calculation.
+    evidence: scripts/factor_regression.py:49
+  - name: regression_input_output
+    description: Core OLS estimation using statsmodels and coefficient extraction with winsorization filter.
+    evidence: scripts/regression_function.py:7
+  - name: merge_data
+    description: Joins multiple DataFrames on date index using inner join to ensure aligned observations.
+    evidence: scripts/factor_regression.py:29
+  key_behaviors:
+  - behavior: Inner join on dates for each DataFrame merges
+    description: Only periods with each data available are included in regression, ensuring valid statistical
+      inference.
+    evidence: scripts/factor_regression.py:32
+  - behavior: Excess returns = Close - Rf (risk-free rate)
+    description: Standard CAPM/FF methodology uses excess returns, not raw returns, for proper risk-adjusted
+      analysis.
+    evidence: scripts/factor_regression.py:57
+  - behavior: 'Winsorization: keep only |value| < 0.5'
+    description: Removes extreme returns (>50% monthly move) that would dominate regression; assumes such
+      moves are data errors.
+    evidence: scripts/regression_function.py:9-12
+  - behavior: Minimum 20 data points required
+    description: Statistical validity threshold for OLS estimation; insufficient data raises ValueError.
+    evidence: scripts/factor_regression.py:115
+  - behavior: FF factors and RF divided by 100 before use
+    description: Data stored as percentage (e.g., 5.2) but OLS expects decimal form (0.052).
+    evidence: scripts/factor_regression.py:50-51
+  replaceable_points:
+  - name: regression_model
+    description: Statistical model for factor analysis
+    options:
+    - name: OLS
+      traits:
+      - Standard
+      - Interpretable
+      - Efficient
+      fit_for:
+      - Standard factor research
+      - Academic use
+      - Benchmark comparison
+      not_fit_for:
+      - Heteroskedastic data
+      - Outlier-heavy data
+    - name: GLS
+      traits:
+      - Handles heteroskedasticity
+      - Efficient
+      fit_for:
+      - Unequal variance
+      - Advanced econometrics
+      not_fit_for:
+      - Simple analysis
+      - Quick results
+    - name: Robust Regression
+      traits:
+      - Outlier-resistant
+      - Heavy-tailed data
+      fit_for:
+      - Data with outliers
+      - Non-normal errors
+      not_fit_for:
+      - Clean data
+      - Standard reporting
+    default: OLS
+  design_decisions:
+  - 'Inner join on dates for each DataFrame merges (evidence: scripts/factor_regression.py:32) — Only
+    periods with each data available should be included in regression'
+  - 'Excess returns = Close - Rf (risk-free rate) (evidence: scripts/factor_regression.py:57) — Standard
+    CAPM/FF methodology uses excess returns, not raw returns'
+  - 'Winsorization: keep only |value| < 0.5 (evidence: scripts/regression_function.py:9-12) — Removes
+    extreme returns that would dominate regression; assumes 50x is unrealistic'
+  - 'Minimum 20 data points required (evidence: scripts/factor_regression.py:115) — Statistical validity
+    threshold for OLS estimation'
+  - 'FF factors and RF stored as percentage, divided by 100 before use (evidence: scripts/factor_regression.py:50-51)
+    — Data stored as percentage (e.g., 5.2) but OLS expects decimal (0.052)'
+  - 'Custom DateInRangeError for date boundary validation (evidence: scripts/factor_regression.py:8) —
+    Provides specific context when requested dates exceed available data'
+  acceptance_hints:
+  - Regression produces coefficients for Mkt-RF, SMB, HML, WML, and carbon factor
+  - Every data points have matching dates across each factors (inner join)
+  - No observations with |return| > 50% included
+  - Minimum 20 observations in regression
+  - Date index with name 'Date' in output DataFrames
+- id: bulk_regression
+  name: Bulk Regression Execution
+  order: 5
+  responsibility: Runs rolling-window regressions across multiple stocks with multiprocessing support.
+    Stores results incrementally in PostgreSQL using UPSERT pattern. Enables analysis of large stock universes.
+  interface:
+    inputs:
+    - stock list (CSV or DB), factor_name, interval (months), frequency (MONTHLY/DAILY)
+    outputs:
+    - stock_stats table entries with regression coefficients, t-stats, p-values, R²
+  required_methods:
+  - name: run_regression
+    description: Entry point for single or multiple stock regression. Handles CLI arguments and orchestrates
+      execution.
+    evidence: scripts/get_regressions.py:103
+  - name: run_regression_internal
+    description: Rolling window loop that advances by interval months each iteration for non-overlapping
+      windows.
+    evidence: scripts/get_regressions.py:213
+  - name: store_regression_into_db
+    description: UPSERT pattern using DELETE then INSERT to update or create regression results in database.
+    evidence: scripts/get_regressions.py:372
+  key_behaviors:
+  - behavior: Default interval = 60 months (5 years) for MONTHLY
+    description: Standard rolling window for factor analysis with enough data for statistical significance.
+    evidence: scripts/get_regressions.py:236
+  - behavior: Default interval = 730 days (2 years) for DAILY
+    description: Approximation to 60 monthly observations using trading days for shorter-term analysis.
+    evidence: scripts/get_regressions.py:231
+  - behavior: Rolling window advances by interval (NOT by 1 month)
+    description: Non-overlapping windows ensure independent observations, avoiding autocorrelation in
+      residuals.
+    evidence: scripts/get_regressions.py:343
+  - behavior: multiprocessing.set_start_method('spawn')
+    description: Required for safe fork on some platforms; psycopg2 connections cannot be forked safely.
+    evidence: scripts/get_regressions.py:400
+  - behavior: Connection pool size = 20
+    description: Supports up to 20 concurrent regression workers for parallel processing.
+    evidence: scripts/db.py:33
+  - behavior: Data loaded once, passed to workers via itertools.repeat
+    description: Avoids redundant DB queries; workers share reference to pre-loaded DataFrames.
+    evidence: scripts/get_regressions.py:428-430
+  replaceable_points:
+  - name: window_type
+    description: Rolling window overlap strategy
+    options:
+    - name: Non-overlapping (current)
+      traits:
+      - Independent observations
+      - No autocorrelation
+      - Clean statistics
+      fit_for:
+      - Academic research
+      - Statistical validity
+      - Publication-ready results
+      not_fit_for:
+      - Short data histories
+      - Rapidly changing markets
+    - name: Overlapping
+      traits:
+      - More observations
+      - Handles short histories
+      - Recent data emphasis
+      fit_for:
+      - Short histories
+      - Dynamic analysis
+      - Real-time updates
+      not_fit_for:
+      - Statistical inference
+      - Academic publication
+    default: Non-overlapping
+  - name: parallelization
+    description: Concurrency approach
+    options:
+    - name: multiprocessing.Pool
+      traits:
+      - True parallelism
+      - CPU-bound optimization
+      fit_for:
+      - Large stock universes
+      - CPU-intensive regressions
+      - Batch processing
+      not_fit_for:
+      - Small datasets
+      - I/O-bound operations
+    - name: threading
+      traits:
+      - Lightweight
+      - Shared memory
+      fit_for:
+      - I/O-bound tasks
+      - Database queries
+      not_fit_for:
+      - CPU-bound regressions
+      - GIL constraints
+    - name: sequential
+      traits:
+      - Simple
+      - Debug-friendly
+      - No concurrency
+      fit_for:
+      - Testing
+      - Small datasets
+      - Debugging
+      not_fit_for:
+      - Production batch processing
+      - Large universes
+    default: multiprocessing.Pool
+  design_decisions:
+  - 'Default interval = 60 months (5 years) for MONTHLY (evidence: scripts/get_regressions.py:236) — Standard
+    rolling window for factor analysis; enough data for significance'
+  - 'Default interval = 730 days (2 years) for DAILY (evidence: scripts/get_regressions.py:231) — Approximation
+    to 60 monthly observations using trading days'
+  - 'Rolling window advances by interval (NOT by 1 month) (evidence: scripts/get_regressions.py:343) —
+    Non-overlapping windows for independent observations'
+  - 'multiprocessing.set_start_method(''spawn'') (evidence: scripts/get_regressions.py:400) — Required
+    for safe fork on some platforms; psycopg2 connections cannot be forked'
+  - 'Connection pool size = 20 (evidence: scripts/db.py:33) — Supports up to 20 concurrent regression
+    workers'
+  - 'Data loaded once, passed to workers via itertools.repeat (evidence: scripts/get_regressions.py:428-430)
+    — Avoids redundant DB queries; workers share reference to pre-loaded DataFrames'
+  acceptance_hints:
+  - Results stored in stock_stats table with UPSERT behavior
+  - Non-overlapping windows produce independent observations
+  - Materialized views refreshed after bulk completion
+  - Multiprocessing uses spawn method (not fork)
+  - Pool connections properly returned (no leaks)
+- id: factor_orthogonalization
+  name: Factor Correlation & Orthogonalization
+  order: 6
+  responsibility: Analyzes correlation between BMG factor and other factors (Fama-French), then orthogonalizes
+    BMG by regressing on significantly correlated factors and storing residuals. Removes factor contamination.
+  interface:
+    inputs:
+    - carbon_risk_factor, additional_factors (FF factors), significance threshold
+    outputs:
+    - Orthogonalized carbon_risk_factor entries with -ORTHO suffix
+  required_methods:
+  - name: process_factor
+    description: Full orthogonalization pipeline that checks correlation, regresses on significant factors,
+      and stores residuals.
+    evidence: scripts/correlate.py:36
+  - name: execute_batch
+    description: Bulk insert helper using psycopg2.extras for efficient batch database operations.
+    evidence: scripts/correlate.py:12
+  key_behaviors:
+  - behavior: Significance threshold filter (default 0.1)
+    description: Only orthogonalizes against factors significantly correlated with BMG (p < 0.1). Avoids
+      over-fitting.
+    evidence: scripts/correlate.py:121
+  - behavior: Orthogonalized factor stored with -ORTHO suffix
+    description: Namespaced naming avoids confusion with raw factor. Users can select orthogonalized version.
+    evidence: scripts/correlate.py:134
+  - behavior: Residuals become the orthogonalized factor
+    description: Standard Gram-Schmidt orthogonalization via OLS regression residuals against correlated
+      factors.
+    evidence: scripts/correlate.py:140
+  replaceable_points:
+  - name: orthogonalization_method
+    description: How to remove factor correlation
+    options:
+    - name: OLS residuals
+      traits:
+      - Standard approach
+      - Statistical properties
+      - Interpretable
+      fit_for:
+      - Academic research
+      - Factor purification
+      - Standard models
+      not_fit_for:
+      - Collinear factors
+      - Complex dependencies
+    - name: PCA
+      traits:
+      - Removes each correlation
+      - Dimension reduction
+      fit_for:
+      - Multiple correlated factors
+      - Noise reduction
+      not_fit_for:
+      - Interpretability needs
+      - Single factor focus
+    - name: Simple subtraction
+      traits:
+      - Fast
+      - Simple
+      fit_for:
+      - Quick analysis
+      - Single correlated factor
+      not_fit_for:
+      - Multiple correlations
+      - Precision needs
+    default: OLS residuals
+  design_decisions:
+  - 'Significance threshold filter (default 0.1) (evidence: scripts/correlate.py:121) — Only orthogonalize
+    against factors significantly correlated with BMG'
+  - 'Orthogonalized factor stored with -ORTHO suffix (evidence: scripts/correlate.py:134) — Namespaced
+    naming avoids confusion with raw factor'
+  - 'Residuals become the orthogonalized factor (evidence: scripts/correlate.py:140) — Standard Gram-Schmidt
+    orthogonalization via regression residuals'
+  acceptance_hints:
+  - Orthogonalized factor has -ORTHO suffix in name
+  - Correlation with FF factors below significance threshold
+  - Stored in carbon_risk_factor table with orthogonalized designation
+  - Available for selection in subsequent regressions
+- id: results_analysis
+  name: Regression Results Analysis
+  order: 7
+  responsibility: Queries stored regression results to identify stocks and sectors with significant carbon
+    risk exposure. Aggregates statistics by sector and significance level for actionable insights.
+  interface:
+    inputs:
+    - significance threshold (p-value), factor_name
+    outputs:
+    - Lists of significant stocks/sectors with majority significant regression periods
+  required_methods:
+  - name: get_stocks_with_significant_regressions
+    description: SQL query for stocks with majority (>50%) of periods showing significant carbon factor
+      exposure.
+    evidence: scripts/bmg_analyze.py:58
+  - name: get_sectors_with_significant_final_regression
+    description: Aggregates analysis by sector for the final (most recent) regression period.
+    evidence: scripts/bmg_analyze.py:134
+  key_behaviors:
+  - behavior: Significance defined as bmg_p_gt_abs_t < threshold
+    description: Two-tailed p-value for BMG coefficient; lower values indicate more significant exposure.
+    evidence: scripts/bmg_analyze.py:38
+  - behavior: 'Majority rule: >50% of periods significant'
+    description: Requires consistent significance across time, not just one lucky period, for robust findings.
+    evidence: scripts/bmg_analyze.py:69
+  replaceable_points:
+  - name: significance_criteria
+    description: How to count significant results
+    options:
+    - name: Majority (>50%)
+      traits:
+      - Robust
+      - Time-consistent
+      - Balanced
+      fit_for:
+      - Long-term analysis
+      - Investment decisions
+      - Publication
+      not_fit_for:
+      - Short history
+      - Volatile periods
+    - name: Every periods
+      traits:
+      - Very strict
+      - High confidence
+      fit_for:
+      - Conservative analysis
+      - Regulatory use
+      not_fit_for:
+      - Most practical applications
+      - Short histories
+    - name: Final period only
+      traits:
+      - Recent focus
+      - Adaptive
+      fit_for:
+      - Real-time decisions
+      - Market timing
+      not_fit_for:
+      - Historical validation
+      - Academic research
+    default: Majority
+  design_decisions:
+  - 'Significance defined as bmg_p_gt_abs_t < threshold (evidence: scripts/bmg_analyze.py:38) — Two-tailed
+    p-value for BMG coefficient; lower = more significant'
+  - 'Majority rule: >50% of periods significant (evidence: scripts/bmg_analyze.py:69) — Requires consistent
+    significance, not just one lucky period'
+  acceptance_hints:
+  - Returns stocks with >50% periods having significant BMG coefficient
+  - Sector aggregation shows distribution of significant exposures
+  - Results filterable by p-value threshold
+  - Final period results available for most recent analysis
+data_flow:
+- from_stage: data_collection
+  to_stage: data_import
+  data: Stock prices (Close, Date index) fetched via yfinance API and passed for storage
+- from_stage: data_import
+  to_stage: bmg_factor_computation
+  data: Stock returns stored in stock_data table, used for BMG factor computation
+- from_stage: bmg_factor_computation
+  to_stage: factor_regression
+  data: BMG factor values from carbon_risk_factor table for carbon risk exposure estimation
+- from_stage: data_import
+  to_stage: factor_regression
+  data: Fama-French factors (Mkt-RF, SMB, HML, WML) from ff_factor table
+- from_stage: data_import
+  to_stage: factor_regression
+  data: Risk-free rate from risk_free table for excess return calculation
+- from_stage: factor_regression
+  to_stage: bulk_regression
+  data: Merged DataFrame with each factors for OLS regression execution
+- from_stage: bulk_regression
+  to_stage: results_analysis
+  data: Regression coefficients stored in stock_stats table for significance analysis
+- from_stage: factor_regression
+  to_stage: factor_orthogonalization
+  data: BMG factor for correlation analysis with Fama-French factors
+- from_stage: factor_orthogonalization
+  to_stage: bulk_regression
+  data: Orthogonalized BMG factor (with -ORTHO suffix) can be selected as new carbon factor for regressions
+global_contracts:
+- contract: Every time series DataFrames use Date index with name 'Date'
+  evidence: scripts/factor_regression.py:34
+- contract: Frequency is either 'MONTHLY' or 'DAILY' for each time series
+  evidence: scripts/init_schema.sql:5,92,95
+- contract: 'Primary key on stock_data: (ticker, frequency, date)'
+  evidence: scripts/init_schema.sql:96
+- contract: 'Primary key on carbon_risk_factor: (date, frequency, factor_name)'
+  evidence: scripts/init_schema.sql:8
+- contract: Regression requires inner join on dates across each factors
+  evidence: scripts/factor_regression.py:32
+- contract: Every percent values stored as percentage (e.g., 5.2) not decimal (0.052)
+  evidence: scripts/factor_regression.py:50-51
+- contract: Composite stocks require stock_components entries with percentage weights
+  evidence: scripts/get_stocks.py:270-289
+- contract: BMG factor name 'DEFAULT' is reserved as system default
+  evidence: scripts/init_schema.sql:6
+business_decisions:
+- id: BD-001
+  type: B/BA
+  content: Monthly interval uses 1mo yfinance interval (NOT 1d)
+  rationale: Monthly frequency requires monthly candles for proper MonthEnd alignment; using daily data
+    would require complex resampling and could introduce alignment errors with the financial convention
+    of monthly returns ending on the last business day of the month
+  evidence: scripts/stock_price_function.py:22(module)
+  stage: data_collection
+  alternative_considered: Using 1d interval with pandas resampling was rejected due to complexity and
+    potential MonthEnd alignment issues
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/stock_price_function.py'
+- id: BD-002
+  type: BA
+  content: Drops last entry assuming incomplete candle
+  rationale: Prevents partial month data from corrupting returns; the last observation may represent an
+    incomplete trading period and would skew return calculations if included in the time series
+  evidence: scripts/stock_price_function.py:28(module)
+  stage: data_collection
+  alternative_considered: Including each data was rejected as it could introduce noise from incomplete
+    periods at the end of the dataset
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/stock_price_function.py'
+- id: BD-003
+  type: BA/DK
+  content: Monthly dates aligned to MonthEnd via pandas offset
+  rationale: Ensures consistency with financial convention for monthly returns; MonthEnd alignment standardizes
+    the date convention across each stocks and factors in the analysis framework
+  evidence: scripts/stock_price_function.py:30(module)
+  stage: data_collection
+  alternative_considered: Using MonthBegin was rejected as it conflicts with standard financial data publishing
+    conventions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/stock_price_function.py'
+- id: BD-004
+  type: B
+  content: 3 retry attempts on JSON decode errors
+  rationale: Handles transient network/API failures gracefully; yfinance API may return malformed JSON
+    intermittently due to server issues or rate limiting
+  evidence: scripts/stock_price_function.py:16-17(module)
+  stage: data_collection
+  alternative_considered: Single attempt was rejected as it would cause unnecessary failures; more than
+    3 retries was rejected due to delay without proportional success rate improvement
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/stock_price_function.py'
+- id: BD-005
+  type: B
+  content: ON CONFLICT DO NOTHING for data imports
+  rationale: Prevents duplicate key errors on re-runs while allowing incremental updates; enables idempotent
+    data imports essential for reproducible pipeline execution
+  evidence: scripts/setup_db.py:51(module)
+  stage: data_import
+  alternative_considered: ON CONFLICT UPDATE was rejected as it would overwrite potentially corrected
+    data; truncate-and-reload was rejected due to downtime during refresh
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/setup_db.py'
+- id: BD-006
+  type: BA
+  content: Uses COPY FROM PROGRAM with grep to filter raw FF files
+  rationale: Raw FF files have header rows that must be filtered - grep as preprocessing; enables efficient
+    in-database loading without intermediate staging tables
+  evidence: scripts/setup_db.py:113(module)
+  stage: data_import
+  alternative_considered: Python preprocessing was rejected due to slower performance; manual file editing
+    was rejected as error-prone
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/setup_db.py'
+- id: BD-007
+  type: B
+  content: WML (weak momentum) stored in same ff_factor table
+  rationale: Unified factor storage for each FF factors; enables consistent querying and JOIN operations
+    across different factor types without schema complexity
+  evidence: scripts/init_schema.sql:19
+  stage: data_import
+  alternative_considered: Separate WML table was rejected due to added schema complexity; external storage
+    was rejected due to reduced queryability
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-008
+  type: B
+  content: Stores both close price AND computed return in stock_data
+  rationale: Avoids recomputation; return = pct_change of close; precomputing returns at storage time
+    improves query performance for high-frequency analysis
+  evidence: scripts/init_schema.sql:94-95
+  stage: data_import
+  alternative_considered: Computing on-demand was rejected due to repeated computation cost; computing
+    in application was rejected due to database-centric design
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-009
+  type: B
+  content: Frequency column on each time series tables
+  rationale: Enables storing MONTHLY and DAILY versions of same data; allows flexible querying for different
+    analysis frequencies without separate tables or pipelines
+  evidence: N/A:0(see_rationale)
+  stage: data_import
+  alternative_considered: Separate tables per frequency was rejected due to data duplication; separate
+    database was rejected due to complexity
+- id: BD-010
+  type: B
+  content: BMG = Brown Returns - Green Returns
+  rationale: Positive BMG means brown stocks outperform green - carbon risk premium; defines the core
+    climate factor that the entire analysis framework is designed to measure
+  evidence: scripts/bmg_series.py:31(module)
+  stage: bmg_factor_computation
+  alternative_considered: Green minus Brown was rejected as it would invert the interpretation of positive
+    values
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/bmg_series.py'
+- id: BD-011
+  type: B
+  content: Composite stock returns = weighted average of components
+  rationale: Index funds (IVV, XWD.TO) need constituent weighting for accurate returns; simple averaging
+    would over-weight small-cap stocks that comprise small portions of indices
+  evidence: scripts/get_stocks.py:288(module)
+  stage: bmg_factor_computation
+  alternative_considered: Equal weighting was rejected as it does not represent actual index composition;
+    market-cap weighting requires additional data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/get_stocks.py'
+- id: BD-012
+  type: BA
+  content: NaN values removed before storing BMG
+  rationale: Inner join on returns ensures valid paired observations; missing brown or green returns would
+    create NaN BMG values that corrupt factor time series
+  evidence: scripts/bmg_series.py:35-36(module)
+  stage: bmg_factor_computation
+  alternative_considered: Forward-fill was rejected as it would introduce look-ahead bias; leaving NaN
+    was rejected due to regression analysis requirements
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/bmg_series.py'
+- id: BD-013
+  type: B
+  content: Inner join on dates for each DataFrame merges
+  rationale: Only periods with each data available should be included in regression; missing factor data
+    would cause regression failures or biased coefficient estimates
+  evidence: scripts/factor_regression.py:32(module)
+  stage: factor_regression
+  alternative_considered: Outer join was rejected as it would introduce NaN values causing regression
+    failures; imputation was rejected due to introducing artificial data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/factor_regression.py'
+- id: BD-014
+  type: B
+  content: Excess returns = Close - Rf (risk-free rate)
+  rationale: Standard CAPM/FF methodology uses excess returns, not raw returns; subtracting risk-free
+    rate isolates the risk premium component that factors aim to explain
+  evidence: scripts/factor_regression.py:57(module)
+  stage: factor_regression
+  alternative_considered: Using raw returns was rejected as it violates standard financial econometrics
+    and would produce meaningless factor loadings
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/factor_regression.py'
+- id: BD-015
+  type: BA
+  content: 'Winsorization: keep only |value| < 0.5'
+  rationale: Removes extreme returns that would dominate regression; assumes 50x return in a month is
+    unrealistic and likely data error (stock split, delisting, etc.)
+  evidence: scripts/regression_function.py:9-12(module)
+  stage: factor_regression
+  alternative_considered: No winsorization was rejected due to outlier sensitivity; stricter threshold
+    was rejected as it would exclude legitimate high-volatility periods
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/regression_function.py'
+- id: BD-016
+  type: BA/M
+  content: Minimum 20 data points required
+  rationale: Statistical validity threshold for OLS estimation; with insufficient observations, coefficient
+    estimates become unreliable and may not converge to true values
+  evidence: scripts/factor_regression.py:115(module)
+  stage: factor_regression
+  alternative_considered: Lower threshold was rejected due to statistical invalidity; higher threshold
+    was rejected due to data availability constraints in rolling windows
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/factor_regression.py'
+- id: BD-017
+  type: B/BA
+  content: FF factors and RF stored as percentage, divided by 100 before use
+  rationale: Data stored as percentage (e.g., 5.2) but OLS expects decimal (0.052); this conversion ensures
+    consistency with standard FF factor format while maintaining human-readable storage
+  evidence: scripts/factor_regression.py:50-51(module)
+  stage: factor_regression
+  alternative_considered: Storing as decimal was rejected due to readability concerns in database inspection
+    and compatibility with standard FF data formats
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/factor_regression.py'
+- id: BD-018
+  type: M/DK
+  content: Custom DateInRangeError for date boundary validation
+  rationale: Provides specific context when requested dates exceed available data; helps users understand
+    why their query failed and what date ranges are valid for analysis
+  evidence: scripts/factor_regression.py:8(module)
+  stage: factor_regression
+  alternative_considered: Generic ValueError was rejected as it provides less actionable feedback to users
+    about valid date ranges
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/factor_regression.py'
+- id: BD-019
+  type: BA/M
+  content: Default interval = 60 months (5 years) for MONTHLY
+  rationale: Standard rolling window for factor analysis; provides sufficient data points for statistical
+    significance while remaining responsive to regime changes in carbon premium
+  evidence: scripts/get_regressions.py:236(module)
+  stage: bulk_regression
+  alternative_considered: Shorter windows (24-36 months) were rejected due to insufficient power for factor
+    detection; longer windows (120 months) were rejected due to regime shift concerns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/get_regressions.py'
+- id: BD-020
+  type: BA/DK
+  content: Default interval = 730 days (2 years) for DAILY
+  rationale: Approximation to 60 monthly observations using trading days; provides comparable statistical
+    power for daily frequency analysis while accounting for non-trading days
+  evidence: scripts/get_regressions.py:231(module)
+  stage: bulk_regression
+  alternative_considered: Using exact monthly equivalent (504 trading days) was rejected due to calendar
+    complexity; 500 days was considered but 730 provides safer buffer
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/get_regressions.py'
+- id: BD-021
+  type: B/DK
+  content: Rolling window advances by interval (NOT by 1 month)
+  rationale: Non-overlapping windows for independent observations; ensures statistical independence between
+    regression periods which is required for valid inference and avoiding spurious significance
+  evidence: scripts/get_regressions.py:343(module)
+  stage: bulk_regression
+  alternative_considered: Step size of 1 month was rejected as it would introduce overlapping windows
+    with highly correlated observations
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/get_regressions.py'
+- id: BD-022
+  type: B/RC
+  content: multiprocessing.set_start_method('spawn')
+  rationale: Required for safe fork on some platforms; psycopg2 connections cannot be forked safely, so
+    spawn method creates fresh processes with inherited state avoiding connection corruption
+  evidence: scripts/get_regressions.py:400(module)
+  stage: bulk_regression
+  alternative_considered: fork method was rejected as it causes connection sharing issues with psycopg2
+    on Linux; fork on macOS/Windows causes crashes
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/get_regressions.py'
+- id: BD-023
+  type: B/BA
+  content: Connection pool size = 20
+  rationale: Supports up to 20 concurrent regression workers; this matches typical multiprocessing CPU
+    counts and balances parallelism with database connection limits
+  evidence: scripts/db.py:33(module)
+  stage: bulk_regression
+  alternative_considered: Higher pool size (50+) was rejected due to PostgreSQL connection limits and
+    diminishing returns; lower pool size (4-8) was rejected due to insufficient parallelism
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/db.py'
+- id: BD-024
+  type: BA
+  content: Data loaded once, passed to workers via itertools.repeat
+  rationale: Avoids redundant DB queries; workers share reference to pre-loaded DataFrames reducing database
+    load and ensuring data consistency across workers processing different windows
+  evidence: scripts/get_regressions.py:428-430(module)
+  stage: bulk_regression
+  alternative_considered: Per-worker loading was rejected due to redundant queries and potential race
+    conditions if data changes between worker start times
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/get_regressions.py'
+- id: BD-025
+  type: BA/M
+  content: Significance threshold filter (default 0.1)
+  rationale: Only orthogonalize against factors significantly correlated with BMG; orthogonalization removes
+    useful information when correlation is due to chance, so filtering avoids destroying signal
+  evidence: scripts/correlate.py:121(module)
+  stage: factor_orthogonalization
+  alternative_considered: Lower threshold (0.05) was rejected due to excessive signal removal; higher
+    threshold (0.2) was rejected due to orthogonalizing factors with only chance correlation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/correlate.py'
+- id: BD-026
+  type: B
+  content: Orthogonalized factor stored with -ORTHO suffix
+  rationale: Namespaced naming avoids confusion with raw factor; clearly distinguishes processed from
+    original data in database queries and analysis scripts
+  evidence: scripts/correlate.py:134(module)
+  stage: factor_orthogonalization
+  alternative_considered: Separate table storage was rejected due to added schema complexity; in-place
+    replacement was rejected due to loss of raw factor data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/correlate.py'
+- id: BD-027
+  type: B
+  content: Residuals become the orthogonalized factor
+  rationale: Standard Gram-Schmidt orthogonalization via regression residuals; captures component of BMG
+    orthogonal to confounding Fama-French factors ensuring clean factor identification
+  evidence: scripts/correlate.py:140(module)
+  stage: factor_orthogonalization
+  alternative_considered: Alternative orthogonalization methods (PCA, conditional expectation) were rejected
+    due to complexity without statistical benefit over residual method
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/correlate.py'
+- id: BD-028
+  type: B/BA
+  content: Significance defined as bmg_p_gt_abs_t < threshold
+  rationale: Two-tailed p-value for BMG coefficient; lower = more significant; tests whether BMG effect
+    is statistically different from zero accounting for estimation uncertainty
+  evidence: scripts/bmg_analyze.py:38(module)
+  stage: results_analysis
+  alternative_considered: One-tailed test was rejected as we test for any effect (positive or negative
+    BMG premium) rather than assuming direction a priori
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/bmg_analyze.py'
+- id: BD-029
+  type: BA
+  content: 'Majority rule: >50% of periods significant'
+  rationale: Requires consistent significance, not just one lucky period; guards against finding significance
+    by chance in small number of non-overlapping windows
+  evidence: scripts/bmg_analyze.py:69(module)
+  stage: results_analysis
+  alternative_considered: Every periods significant was rejected as too strict given power limitations;
+    single period significant was rejected as too lenient and prone to false positives
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/bmg_analyze.py'
+- id: BD-030
+  type: B/BA
+  content: BMG (Brown-Minus-Green) factor = Brown stock returns minus Green stock returns, calculated
+    as return_x - return_y
+  rationale: 'The BMG factor quantifies the risk differential between high-carbon (Brown) and low-carbon
+    (Green) firms. Boundary: This long-short portfolio construction captures pure carbon risk premium
+    without contamination from other factor exposures. Used as the primary dependent variable in carbon
+    risk regression analysis to identify whether ESG differentiation affects expected returns.'
+  evidence: scripts/bmg_series.py:11(add_bmg_series)
+  stage: bmg_factor_computation
+  alternative_considered: Alternative BMG formulations (e.g., market-cap weighted) were not implemented;
+    equal-weighted subtraction was chosen for simplicity and interpretability
+- id: BD-031
+  type: T
+  content: Default data frequency is MONTHLY across each operations
+  rationale: 'Monthly frequency balances statistical power with data availability for long-horizon regression.
+    Boundary: Monthly returns provide 12 observations per year versus daily (252), enabling reliable factor
+    exposure estimation over 5-year windows while reducing noise from intra-month volatility and microstructure
+    effects.'
+  evidence: scripts/bmg_series.py:152(frequency)
+  stage: data_collection
+  alternative_considered: Daily frequency was rejected due to higher noise and microstructure bias; weekly
+    was rejected as it offers no advantage over monthly for long-horizon studies
+  _evidence_issues:
+  - 'FN_NOT_FOUND: frequency in scripts/bmg_series.py'
+- id: BD-032
+  type: T
+  content: Default significance threshold = 0.05 for regression analysis
+  rationale: 'The 5% significance level is the standard threshold in financial econometrics for hypothesis
+    testing. Boundary: Factors with p-values below 0.05 are retained in the final regression model, ensuring
+    statistical validity while avoiding overfitting from marginal predictors. Applied to t-statistics
+    for factor coefficient significance tests.'
+  evidence: scripts/bmg_analyze.py:207(significance)
+  stage: Statistical Testing
+  alternative_considered: 10% threshold was rejected as too liberal for academic publication standards;
+    1% was rejected as too conservative for exploratory analysis
+  _evidence_issues:
+  - 'FN_NOT_FOUND: significance in scripts/bmg_analyze.py'
+- id: BD-033
+  type: T
+  content: Orthogonalization significance threshold = 0.10
+  rationale: 'The 10% threshold for orthogonalization is more permissive than the 5% regression threshold
+    to ensure comprehensive factor cleaning. Boundary: BMG is orthogonalized against Fama-French factors
+    when correlation significance exceeds 0.10, preventing multicollinearity in downstream regressions
+    while retaining factors with weak but non-trivial correlations.'
+  evidence: scripts/correlate.py:177(significance)
+  stage: factor_orthogonalization
+  alternative_considered: 5% threshold was rejected as too strict for orthogonalization, which should
+    err on side of removing more correlation; 15% was rejected as potentially over-correcting
+  _evidence_issues:
+  - 'FN_NOT_FOUND: significance in scripts/correlate.py'
+- id: BD-034
+  type: T
+  content: 'Regression interval defaults: 60 months for MONTHLY, 730 days for DAILY'
+  rationale: 'The 60-month (5-year) and 730-day (2-year) windows provide sufficient observations for stable
+    beta estimation. Boundary: 60 months yields 60 observations for monthly regressions (5x the 12-factor
+    degrees of freedom requirement), while 730 days yields approximately 730 daily observations. Both
+    exceed the N+10 minimum data point requirement for statistical validity.'
+  evidence: scripts/get_regressions.py:231(interval)
+  stage: results_analysis
+  alternative_considered: 36-month window was rejected as too short for stable beta estimation; 120-month
+    window was rejected due to factor stability concerns over longer horizons
+  _evidence_issues:
+  - 'FN_NOT_FOUND: interval in scripts/get_regressions.py'
+- id: BD-035
+  type: T
+  content: Minimum 20 data points required for valid regression
+  rationale: 'The 20-point minimum prevents unreliable coefficient estimates from undersized samples.
+    Boundary: With 4 Fama-French factors, 20 points provides 16 degrees of freedom, exceeding the 14 minimum
+    (N+10 where N=4) requirement. This threshold balances data availability against statistical reliability
+    for individual stock regressions.'
+  evidence: scripts/factor_regression.py:115(module)
+  stage: data_collection
+  alternative_considered: 30-point minimum was rejected as too restrictive for monthly data with limited
+    history; 15-point minimum was rejected as insufficient for 4-factor model
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/factor_regression.py'
+- id: BD-036
+  type: T
+  content: Returns capped at ±50% (0.5) during regression to remove outliers
+  rationale: 'The ±50% return cap prevents extreme observations from distorting regression coefficients.
+    Boundary: Stock returns exceeding ±50% in a single month represent data errors or corporate actions
+    (mergers, splits) that violate return continuity assumptions. Capping preserves the sign of extreme
+    returns while limiting their influence on beta estimation.'
+  evidence: scripts/regression_function.py:9(module)
+  stage: data_collection
+  alternative_considered: ±20% cap was rejected as too aggressive for monthly data where 20% moves are
+    not unusual; winsorizing versus hard cap权衡 was made in favor of hard cap for simplicity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/regression_function.py'
+- id: BD-037
+  type: T
+  content: Abnormal returns > 100% (>1) are filtered out from stock data
+  rationale: 'Returns exceeding 100% are filtered as data quality issues indicating stock splits, dividends,
+    or API errors. Boundary: Monthly returns above 100% represent implausible monthly performance for
+    single stocks; these outliers would dominate variance and corrupt composite calculations. Filtering
+    at 1.0 (100%) removes obvious errors while preserving legitimate high-return observations up to that
+    threshold.'
+  evidence: scripts/get_stocks.py:204(stock_data['r'] <= 1)
+  stage: data_collection
+  alternative_considered: 50% filter was rejected as it would remove legitimate biotech/pharma movers;
+    no upper filter was rejected due to composite calculation contamination risk
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: stock_data[''r''] <= 1 in scripts/get_stocks.py'
+- id: BD-038
+  type: T
+  content: Inner join used when merging stock returns with factor data
+  rationale: 'Inner join ensures regression uses only complete observations where both stock returns and
+    factor values exist. Boundary: Only dates with each required data (stock return, risk-free rate, FF
+    factors) are included in regression. This prevents N/A imputation from affecting results but may reduce
+    sample size for stocks with sparse data availability.'
+  evidence: scripts/factor_regression.py:32(module)
+  stage: data_collection
+  alternative_considered: Left join was rejected as it would introduce N/A values requiring imputation;
+    outer join was rejected as it would include dates with missing factor data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/factor_regression.py'
+- id: BD-039
+  type: B/DK
+  content: Use Yahoo Finance (yfinance) as source for stock price data
+  rationale: 'Yahoo Finance provides free, accessible stock price data without licensing costs or API
+    rate limits. Boundary: The yfinance library accesses Yahoo Finance''s API, providing adjusted close
+    prices, dividends, and splits. This decision enables the entire analysis pipeline to operate without
+    expensive commercial data subscriptions while accepting the trade-off of potential data gaps during
+    market closures.'
+  evidence: scripts/stock_price_function.py:9(yf.Ticker)
+  stage: data_collection
+  alternative_considered: Bloomberg/Refinitiv were rejected due to licensing costs; Alpha Vantage was
+    rejected due to rate limits; IEX Cloud was rejected due to coverage gaps for Canadian stocks
+  _evidence_issues:
+  - 'FN_NOT_FOUND: yf.Ticker in scripts/stock_price_function.py'
+- id: BD-040
+  type: B
+  content: Store BMG series in database for reuse across analysis
+  rationale: 'Database persistence of the BMG factor enables consistent reuse across multiple analysis
+    scripts and regression runs. Boundary: Storing BMG once and querying by date prevents recomputation
+    of the Brown-Green return differential on every analysis iteration. This reduces computation time
+    and ensures each reports use identical factor values derived from the same stock classification.'
+  evidence: scripts/bmg_series.py:49(get_stocks.import_carbon_risk_factor_into_db)
+  stage: data_collection
+  alternative_considered: On-the-fly computation was rejected as it would create consistency issues across
+    scripts; file-based caching was rejected due to lack of atomicity and concurrent access
+  _evidence_issues:
+  - 'FN_NOT_FOUND: get_stocks.import_carbon_risk_factor_into_db in scripts/bmg_series.py'
+- id: BD-041
+  type: T
+  content: Convert stock prices to excess returns by subtracting risk-free rate (Rf)
+  rationale: 'Excess returns over the risk-free rate isolate the risk premium earned by taking market
+    risk. Boundary: By subtracting Rf (typically Treasury rates), we convert raw stock returns into returns
+    that represent compensation for systematic risk exposure only. This is essential for CAPM and factor
+    model validity where intercepts (alphas) represent abnormal returns beyond risk-adjusted expectations.'
+  evidence: scripts/factor_regression.py:57(all_factor_df['Close'] - all_factor_df['Rf'])
+  stage: Return Calculation
+  alternative_considered: Raw returns were rejected as they include time value of money; log returns were
+    rejected as the formula implies simple returns for factor models
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: all_factor_df[''Close''] - all_factor_df[''Rf''] in scripts/factor_regression.py'
+- id: BD-042
+  type: B/DK
+  content: 'Index stocks: IVV = S&P 500, XWD.TO = MSCI World'
+  rationale: 'These index ETFs serve as market proxies for US (IVV) and global (XWD.TO) return benchmarks.
+    Boundary: IVV tracks the S&P 500 (500 large-cap US stocks) while XWD.TO tracks MSCI World (developed
+    markets excluding Canada). These proxies enable factor model estimation using liquid ETFs rather than
+    requiring index membership data, reducing data acquisition complexity while maintaining representativeness.'
+  evidence: scripts/setup_db.py:301(INSERT INTO stocks)
+  stage: Index Definition
+  alternative_considered: SPY (SPDR S&P 500) was rejected in favor of IVV for lower expense ratio; EEM
+    was rejected for emerging markets focus versus developed markets
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: INSERT INTO stocks in scripts/setup_db.py'
+- id: BD-043
+  type: T
+  content: 'Composite stock returns calculated as weighted average: sum(pct*return) / sum(pct)'
+  rationale: 'The weighted average formula correctly aggregates component returns into a portfolio return
+    based on percentage allocation. Boundary: Each component''s return is weighted by its portfolio percentage,
+    then normalized by total percentage to handle cases where percentages sum to less than 100% (cash
+    positions). This produces the true time-weighted portfolio return rather than a simple average.'
+  evidence: scripts/get_stocks.py:288(df['sum_p_returns'] / df['sum_percentages'])
+  stage: Composite Calculation
+  alternative_considered: Equal weighting was rejected as it ignores actual portfolio allocation; geometric
+    mean was rejected as inappropriate for monthly returns
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: df[''sum_p_returns''] / df[''sum_percentages''] in scripts/get_stocks.py'
+- id: BD-044
+  type: T
+  content: Orthogonalize BMG factor by regressing on FF factors, storing residuals
+  rationale: 'Orthogonalization removes systematic factor exposures from BMG to isolate pure carbon risk.
+    Boundary: By regressing BMG on Fama-French factors (Mkt-Rf, SMB, HML, RMW, CMA) and using residuals,
+    we ensure that carbon risk premium is not confounded with standard risk factors. The residual BMG
+    captures variance unexplained by traditional risk premia, enabling clean interpretation of carbon''s
+    unique return contribution.'
+  evidence: scripts/correlate.py:105(module)
+  stage: bmg_factor_computation
+  alternative_considered: No orthogonalization was rejected as it would create multicollinearity in regressions;
+    PCA orthogonalization was rejected as less interpretable than regression residuals
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/correlate.py'
+- id: BD-045
+  type: T
+  content: 'Run two-stage OLS: first with each factors, then only significant factors'
+  rationale: 'Two-stage selection reduces overfitting by retaining only statistically significant predictors.
+    Boundary: Stage 1 includes each potential factors (BMG plus FF factors), then Stage 2 re-runs regression
+    with only factors exceeding the significance threshold. This addresses the multiple testing problem
+    while preserving factors with genuine explanatory power, improving out-of-sample prediction accuracy.'
+  evidence: scripts/correlate.py:105(stepwise selection)
+  stage: results_analysis
+  alternative_considered: Forward selection only was rejected as it may miss factors significant jointly
+    but not individually; backward elimination was rejected as computationally expensive with many factors
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: stepwise selection in scripts/correlate.py'
+- id: BD-046
+  type: T
+  content: 'Store three statistical tests: Jarque-Bera, Breusch-Pagan, Durbin-Watson'
+  rationale: 'These three diagnostic tests validate OLS assumptions: normality (JB), heteroskedasticity
+    (BP), and autocorrelation (DW). Boundary: Jarque-Bera tests residual normality for t-statistic validity;
+    Breusch-Pagan tests for non-constant variance affecting standard errors; Durbin-Watson tests for serial
+    correlation in residuals which violates independence assumption. Results are stored for model validation
+    reporting.'
+  evidence: scripts/regression_function.py:36(statistical tests)
+  stage: Model Diagnostics
+  alternative_considered: Only normality test was rejected as heteroskedasticity is common in financial
+    returns; additional tests (White, Shapiro-Wilk) were rejected to limit diagnostic overhead
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: statistical tests in scripts/regression_function.py'
+- id: BD-047
+  type: T
+  content: Drop last (incomplete) data point when fetching stock history
+  rationale: 'Dropping the last data point prevents incomplete period returns from contaminating analysis.
+    Boundary: The most recent incomplete month or day may have partial trading data due to timing of the
+    fetch, resulting in artificially low returns that do not represent full-period performance. Dropping
+    ensures only complete periods enter the return series for factor construction.'
+  evidence: scripts/stock_price_function.py:28(module)
+  stage: data_collection
+  alternative_considered: Including incomplete data was rejected as it would create systematic downward
+    bias in recent returns; partial period return calculation was rejected due to complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/stock_price_function.py'
+- id: BD-048
+  type: T
+  content: For composites with no price data, compute and store only returns
+  rationale: 'Handling composites with missing price data gracefully prevents workflow failures while
+    preserving available information. Boundary: When composite component prices are unavailable (holidays,
+    data gaps), the system still computes returns for available components and stores the partial composite
+    return. This ensures continuous return series even with intermittent data gaps rather than skipping
+    entire periods.'
+  evidence: scripts/get_stocks.py:339(if composite and no data)
+  stage: data_collection
+  alternative_considered: Skipping entire period was rejected as it creates gaps in return series; imputing
+    missing prices was rejected as it would introduce assumptions not validated by data
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: if composite and no data in scripts/get_stocks.py'
+- id: BD-049
+  type: T
+  content: '''DEFAULT'' is reserved factor name, cannot be used for custom BMG series'
+  rationale: 'Reserving ''DEFAULT'' prevents naming conflicts with SQL default constraints and system
+    defaults. Boundary: The database schema uses DEFAULT as a keyword for system-provided factors, so
+    allowing user-defined factors with this name would create ambiguity in factor lookup queries and potentially
+    cause SQL errors or incorrect factor retrieval.'
+  evidence: scripts/bmg_series.py:139(factor_name)
+  stage: Naming Convention
+  alternative_considered: Allowing DEFAULT was rejected due to SQL injection risk and query complexity;
+    using prefixes (SYS_, USER_) was considered but rejected for user experience
+  _evidence_issues:
+  - 'FN_NOT_FOUND: factor_name in scripts/bmg_series.py'
+- id: BD-050
+  type: T
+  content: Bulk regression mode loads each stocks from DB and joins in memory
+  rationale: 'In-memory processing for bulk regression enables faster computation compared to database-side
+    joins. Boundary: Loading each stocks and factors into memory allows pandas vectorized operations for
+    regression, which is faster than iterative database queries for thousands of regressions. Trade-off
+    is memory usage versus computation speed; the 20-connection pool supports this bulk loading pattern.'
+  evidence: scripts/get_regressions.py:437(load_all_stocks_from_db)
+  stage: Processing Strategy
+  alternative_considered: Database cursor iteration was rejected as slower than in-memory pandas; chunked
+    processing was rejected as unnecessary complexity for typical stock universe sizes
+  _evidence_issues:
+  - 'FN_NOT_FOUND: load_all_stocks_from_db in scripts/get_regressions.py'
+- id: BD-051
+  type: T
+  content: Monthly dates anchored to end-of-month using MonthEnd(1)
+  rationale: 'MonthEnd anchoring ensures consistent date alignment across each monthly data sources. Boundary:
+    Using pandas MonthEnd(1) normalizes each dates to the last calendar day of each month (e.g., 2023-01-31,
+    2023-02-28), preventing off-by-one errors from varying month-end conventions. This is essential for
+    accurate date matching when merging data from different sources with different recording conventions.'
+  evidence: scripts/input_function.py:46(module)
+  stage: Date Normalization
+  alternative_considered: MonthStart anchoring was rejected as Fama-French factors use month-end convention;
+    arbitrary day-15 anchoring was rejected as non-standard
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/input_function.py'
+- id: BD-052
+  type: T
+  content: WML factors adjusted to month-end by subtracting 1 day from date
+  rationale: 'The 1-day adjustment aligns WML (Winner-Loser Momentum) factors with the month-end convention
+    used elsewhere. Boundary: Standard momentum factors often use month-start dates, but the system requires
+    month-end dates for consistent alignment. Subtracting 1 day from the next month''s start moves the
+    date to the last day of the prior month, ensuring WML dates match FF factor dates for accurate regression
+    joining.'
+  evidence: scripts/setup_db.py:118(TO_DATE + interval '1 month - 1 day')
+  stage: Date Normalization
+  alternative_considered: Adding 1 month minus 1 second was rejected as it may cause timezone issues;
+    using first of month was rejected as inconsistent with FF factors
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: TO_DATE + interval ''1 month - 1 day'' in scripts/setup_db.py'
+- id: BD-053
+  type: T
+  content: Use minimum available date when user start_date precedes data range
+  rationale: 'Graceful fallback to earliest available data prevents errors when users request unavailable
+    historical periods. Boundary: When user-specified start_date is before the earliest factor data date,
+    the system automatically uses the minimum available date and prints a warning. This allows analysis
+    to proceed with available data rather than failing, while informing users of the truncated historical
+    window.'
+  evidence: scripts/factor_regression.py:98(module)
+  stage: Date Handling
+  alternative_considered: Raising error was rejected as too disruptive; using user-specified date with
+    NULL filling was rejected as it would cause join failures
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/factor_regression.py'
+- id: BD-054
+  type: T
+  content: Skip components with missing percentage when computing composite returns
+  rationale: 'Skipping missing percentages prevents division by zero and excludes unallocated positions
+    from return calculation. Boundary: When a composite component lacks a percentage allocation (e.g.,
+    newly added stock without portfolio weight), the system skips that component rather than failing.
+    This allows composites to be computed with partial data while ensuring percentages sum to 100% for
+    the included components.'
+  evidence: scripts/get_stocks.py:273(if not percentage continue)
+  stage: data_collection
+  alternative_considered: Raising error was rejected as too strict for real-world portfolio data; defaulting
+    to 0% was rejected as it would exclude legitimate zero-weight holdings
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: if not percentage continue in scripts/get_stocks.py'
+- id: BD-055
+  type: T
+  content: Rolling window advances by 1 period (month or day) between regressions
+  rationale: '1-period rolling window creates overlapping windows for time-series beta stability analysis.
+    Boundary: Advancing by exactly 1 period (1 month for monthly data, 1 day for daily) creates N-widow
+    observations where consecutive windows share (window_size - 1) periods. This enables tracking beta
+    evolution over time while maintaining sufficient overlap for statistical power in each individual
+    regression.'
+  evidence: scripts/get_regressions.py:343(start_date += interval_freq)
+  stage: results_analysis
+  alternative_considered: Non-overlapping windows (monthly step for monthly data) was rejected as it creates
+    too few observations for beta stability analysis; larger steps were rejected as too coarse
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: start_date += interval_freq in scripts/get_regressions.py'
+- id: BD-056
+  type: T
+  content: Daily frequency uses 730-day (2-year) interval when not specified
+  rationale: 'The 730-day default for daily regressions provides 2 years of data while keeping computation
+    manageable. Boundary: 730 daily observations provides sufficient data for stable beta estimation while
+    limiting computation time and memory usage. This is shorter than the 5-year (60-month) monthly default
+    because daily data has much higher noise, requiring shorter windows to avoid mean reversion biases.'
+  evidence: scripts/get_regressions.py:231(interval = 730)
+  stage: results_analysis
+  alternative_considered: 365-day window was rejected as too short for stable daily betas; 1000-day window
+    was rejected as computationally expensive and potentially including stale data
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: interval = 730 in scripts/get_regressions.py'
+- id: BD-057
+  type: T
+  content: CSV dates must be in YYYYMMDD or YYYYMM format for import
+  rationale: 'Standardized date formats ensure reliable parsing across different data sources and regional
+    conventions. Boundary: Requiring YYYYMMDD (20231231) or YYYYMM (202312) formats eliminates ambiguity
+    between US (MM/DD/YYYY) and European (DD/MM/YYYY) date conventions. This prevents silent data corruption
+    when importing factor data from various academic and commercial sources with different date conventions.'
+  evidence: scripts/setup_db.py:113(grep pattern)
+  stage: data_import
+  alternative_considered: Auto-detecting format was rejected as unreliable for ambiguous dates (01/02/2023);
+    supporting ISO 8601 (2023-12-31) was considered but rejected for consistency with existing FF factor
+    conventions
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: grep pattern in scripts/setup_db.py'
+- id: BD-058
+  type: T
+  content: Fama-French factors converted from decimal to percentage (divided by 100)
+  rationale: 'Unit conversion ensures consistent scale between factor returns and stock returns for valid
+    regression. Boundary: FF factors are stored as decimals (e.g., 0.01 for 1%) while stock returns may
+    be stored as percentages (e.g., 1.0 for 1%). Dividing FF data by 100 normalizes each returns to percentage
+    format, ensuring coefficient estimates represent the correct economic magnitude.'
+  evidence: scripts/factor_regression.py:50(ff_data/100)
+  stage: data_collection
+  alternative_considered: Multiplying stock returns instead was rejected as it would affect downstream
+    display; dynamic detection was rejected as fragile
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: ff_data/100 in scripts/factor_regression.py'
+- id: BD-059
+  type: T
+  content: Delete existing data before importing new factor data
+  rationale: 'Delete-before-insert ensures data consistency by replacing entire factor datasets atomically.
+    Boundary: Deleting existing records before importing prevents duplicate or stale data accumulation.
+    This approach assumes the import represents a complete refresh of historical data, not incremental
+    updates. The operation is wrapped in transactions to ensure atomicity.'
+  evidence: scripts/setup_db.py:13(DELETE FROM bond_factor)
+  stage: data_import
+  alternative_considered: UPSERT was rejected as it requires careful handling of deleted records; incremental
+    inserts were rejected as complex to implement correctly
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: DELETE FROM bond_factor in scripts/setup_db.py'
+- id: BD-060
+  type: T
+  content: Require at least N+10 data points where N is number of factors in regression
+  rationale: 'The N+10 rule ensures sufficient degrees of freedom for reliable coefficient estimation.
+    Boundary: With 4 FF factors, 14+ observations are required; the additional 10-point buffer above the
+    theoretical minimum (N+1) provides robustness against outliers and ensures stable covariance matrix
+    estimation. This is more stringent than the absolute minimum, reducing noise in factor loadings.'
+  evidence: scripts/regression_function.py:15(all_factor_df.shape[0] > all_factor_df.shape[1] + 10)
+  stage: Model Validity
+  alternative_considered: N+5 buffer was rejected as insufficient for stable estimation; N+20 buffer was
+    rejected as too restrictive for short-history stocks
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: all_factor_df.shape[0] > all_factor_df.shape[1] + 10 in scripts/regression_function.py'
+- id: BD-061
+  type: B/RC
+  content: 'Store stock details: EBITDA, enterprise value, P/E, cash, debt, shares outstanding'
+  rationale: 'Fundamental data storage enables value-investing factor construction and stock screening.
+    Boundary: EBITDA, EV, P/E, cash, debt, and shares outstanding are essential inputs for calculating
+    valuation ratios (EV/EBITDA, P/E) and financial health metrics (debt-to-equity). Storing these enables
+    both cross-sectional analysis (value vs. growth) and time-series analysis (fundamental momentum).'
+  evidence: scripts/get_stocks.py:65(UPDATE SET in update_stocks_info_data)
+  stage: data_collection
+  alternative_considered: Relying solely on price-based factors was rejected as it excludes fundamental
+    analysis capabilities; including more metrics (revenue, EPS history) was deferred due to storage concerns
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: UPDATE SET in update_stocks_info_data in scripts/get_stocks.py'
+- id: BD-062
+  type: B/BA
+  content: Pearson correlation for factor correlation matrix
+  rationale: 'Pearson correlation provides linear relationship measures between factors, essential for
+    building the factor covariance matrix used in portfolio optimization. Boundary: linear correlation
+    assumes normal distributions; alternative non-linear relationships may be missed.'
+  evidence: scripts/correlate.py:94(module)
+  stage: factors.orthogonalization
+  alternative_considered: Spearman rank correlation could handle non-linear monotonic relationships
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/correlate.py'
+- id: BD-063
+  type: B/BA
+  content: OLS regression for factor orthogonalization
+  rationale: 'Ordinary Least Squares provides a linear decomposition of factors into market and idiosyncratic
+    components. Boundary: OLS assumes homoscedasticity and no autocorrelation; these assumptions must
+    be validated for validity.'
+  evidence: scripts/correlate.py:105,130(module)
+  stage: factors.orthogonalization
+  alternative_considered: Generalized Least Squares (GLS) could handle heteroscedastic errors
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/correlate.py'
+- id: BD-064
+  type: B/BA
+  content: Significance threshold for variable selection at p-value 0.1
+  rationale: 'Using 0.1 significance threshold balances variable inclusion with model parsimony. Boundary:
+    stricter 0.05 threshold may exclude weak but economically meaningful factors; looser 0.2 may overfit.'
+  evidence: scripts/correlate.py:36(module)
+  stage: factors.orthogonalization
+  alternative_considered: Cross-validation could determine optimal threshold empirically
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/correlate.py'
+- id: BD-065
+  type: B
+  content: Two-stage sequential regression for orthogonalization
+  rationale: 'Full model followed by filtered model ensures each significant predictors are captured while
+    removing noise. Boundary: sequential approach may miss simultaneous interactions; full simultaneous
+    estimation could be more efficient.'
+  evidence: scripts/correlate.py:105-130(module)
+  stage: factors.orthogonalization
+  alternative_considered: Lasso regression could perform simultaneous variable selection and orthogonalization
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/correlate.py'
+- id: BD-066
+  type: B/BA
+  content: OLS residuals as orthogonalized factor values
+  rationale: 'Residuals capture the component of each factor orthogonal to the market, enabling multi-factor
+    models without multicollinearity. Boundary: assumes linear relationship between factor and market;
+    non-linear patterns become residuals.'
+  evidence: scripts/correlate.py:140(model.resid.values)
+  stage: factors.orthogonalization
+  alternative_considered: Schmidt procedure or Gram-Schmidt orthogonalization provide alternative orthogonalization
+  _evidence_issues:
+  - 'FN_NOT_FOUND: model.resid.values in scripts/correlate.py'
+- id: BD-067
+  type: B
+  content: Simple percentage change for return calculation
+  rationale: 'Simple percentage change provides intuitive return measure widely used in event study methodology.
+    Boundary: asymmetric treatment of gains vs losses; log returns provide symmetric additive properties.'
+  evidence: scripts/get_stocks.py:200(module)
+  stage: returns.calculation
+  alternative_considered: Log returns provide continuously compounded returns with symmetric properties
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/get_stocks.py'
+- id: BD-068
+  type: B
+  content: Return cap at 100% for abnormal return filtering
+  rationale: 'Capping returns at 100% prevents data errors (e.g., stock splits, delistings) from producing
+    physically impossible returns and distorting event study results. Boundary: legitimate extreme events
+    (takeovers) may be filtered; adjust cap if studying such events.'
+  evidence: scripts/get_stocks.py:204(module)
+  stage: returns.calculation
+  alternative_considered: Industry-specific caps or winsorization at different percentiles could preserve
+    legitimate extreme returns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/get_stocks.py'
+- id: BD-069
+  type: B/BA
+  content: Weighted average for composite stock returns
+  rationale: 'Weighted average using percentage holdings combines individual stock returns into portfolio
+    return consistent with index construction methodology. Boundary: assumes linear return aggregation;
+    option-like behavior of portfolios not captured.'
+  evidence: scripts/get_stocks.py:282-289(module)
+  stage: returns.calculation
+  alternative_considered: ' geometric mean could handle multiplicative return compounding across periods'
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/get_stocks.py'
+- id: BD-070
+  type: B/RC
+  content: Outer join for merging component stock data
+  rationale: 'Outer join preserves each observations from each component stocks, ensuring no data loss
+    when trading dates misalign. Boundary: introduces NaN values for missing combinations; imputation
+    required for regression analysis.'
+  evidence: scripts/get_stocks.py:278(module)
+  stage: returns.calculation
+  alternative_considered: Inner join would only include complete cases but reduces sample size
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/get_stocks.py'
+- id: BD-071
+  type: B/BA
+  content: OLS regression for stock factor analysis
+  rationale: 'OLS provides interpretable factor loadings as regression coefficients, enabling stock return
+    decomposition. Boundary: assumes linear factor relationship; non-linear exposures not captured in
+    coefficients.'
+  evidence: scripts/regression_function.py:21(module)
+  stage: regression.analysis
+  alternative_considered: Robust regression could handle outliers; GLS could address heteroscedasticity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/regression_function.py'
+- id: BD-072
+  type: B
+  content: Data clipping to [-0.5, 0.5] range for outlier removal
+  rationale: 'Clipping extreme factor values to [-0.5, 0.5] reduces estimation error from data entry errors
+    or survivorship bias while preserving signal. Boundary: clips 50% daily return equivalents; consider
+    adjusting if studying high-volatility assets.'
+  evidence: scripts/regression_function.py:9-12(module)
+  stage: regression.analysis
+  alternative_considered: Winsorization at 1st/99th percentiles or MAD-based thresholds provide data-adaptive
+    outlier handling
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/regression_function.py'
+  vague_rationale: true
+- id: BD-073
+  type: B
+  content: Minimum sample size requirement n > k + 10 for regression
+  rationale: 'Minimum 10 observations beyond number of factors ensures stable coefficient estimation with
+    finite sample adjustments. Boundary: 10 extra observations is rule-of-thumb; consider more stringent
+    n > 2k or statistical power analysis for specific applications.'
+  evidence: scripts/regression_function.py:15(module)
+  stage: regression.analysis
+  alternative_considered: Bootstrapping or shrinkage estimators could enable analysis with smaller samples
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/regression_function.py'
+  vague_rationale: true
+- id: BD-074
+  type: B/BA
+  content: Jarque-Bera test for normality of residuals
+  rationale: 'Normality test validates OLS assumption required for valid t-statistics and F-tests in factor
+    model inference. Boundary: JB test is sensitive to large samples where non-normality may not affect
+    inference materially.'
+  evidence: scripts/regression_function.py:33(module)
+  stage: regression.analysis
+  alternative_considered: Shapiro-Wilk test or visual inspection (Q-Q plots) could provide alternative
+    normality assessment
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/regression_function.py'
+- id: BD-075
+  type: B/BA
+  content: Breusch-Pagan test for heteroscedasticity
+  rationale: 'BP test detects heteroscedasticity that invalidates OLS standard errors, affecting statistical
+    inference. Boundary: BP test assumes normally distributed errors; White''s heteroscedasticity-consistent
+    SE may be preferred.'
+  evidence: scripts/regression_function.py:34-35(het_breuschpagan)
+  stage: regression.analysis
+  alternative_considered: White's robust standard errors or FGLS could address heteroscedasticity directly
+  _evidence_issues:
+  - 'FN_NOT_FOUND: het_breuschpagan in scripts/regression_function.py'
+- id: BD-076
+  type: B/BA
+  content: Durbin-Watson test for autocorrelation
+  rationale: 'DW test detects serial correlation in residuals that violates OLS independence assumption,
+    particularly important for time-series factor models. Boundary: DW test has dead zone; consider Breusch-Godfrey
+    for higher-order autocorrelation.'
+  evidence: scripts/regression_function.py:32(module)
+  stage: regression.analysis
+  alternative_considered: Newey-West HAC standard errors or AR(p) modeling could address autocorrelation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/regression_function.py'
+  vague_rationale: true
+- id: BD-077
+  type: B
+  content: R-squared for model fit assessment
+  rationale: 'R-squared measures proportion of return variance explained by factors, indicating model
+    explanatory power. Boundary: R-squared does not account for model complexity; adjusted R-squared or
+    AIC preferred for model comparison.'
+  evidence: scripts/regression_function.py:42-43(model.rsquared)
+  stage: regression.analysis
+  alternative_considered: Adjusted R-squared, AIC, or BIC could penalize model complexity in factor selection
+  _evidence_issues:
+  - 'FN_NOT_FOUND: model.rsquared in scripts/regression_function.py'
+- id: BD-078
+  type: B
+  content: Decimal type for percentage-weighted return multiplication
+  rationale: 'Decimal precision arithmetic prevents floating-point rounding errors when multiplying percentages
+    in financial calculations. Boundary: Decimal is slower than float; acceptable for batch processing
+    but consider float for real-time applications.'
+  evidence: scripts/get_stocks.py:282(module)
+  stage: returns.calculation
+  alternative_considered: Float with explicit rounding to 8 decimal places could provide faster computation
+    with acceptable precision
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/get_stocks.py'
+  vague_rationale: true
+- id: BD-079
+  type: B/BA
+  content: BMG factor MUST be brown minus green (subtraction order is critical)
+  rationale: The subtraction order determines factor sign and interpretation. Reversing x - y to y - x
+    produces negative BMG returns, fundamentally inverting factor direction and corrupting each downstream
+    alpha/factor exposure calculations. This boundary ensures mathematical consistency with standard Fama-French
+    factor construction where HML, SMB, RMW, CMA follow explicit sign conventions. Violation causes systematic
+    sign errors in portfolio construction.
+  evidence: bmg_series.py:31(bmg = merged['return_x'] - merged['return_y'])
+  stage: ordering_contract
+  alternative_considered: Named parameter swapping was considered but rejected to maintain backward compatibility
+    with existing BMG series definitions
+  _evidence_issues:
+  - 'NOT_FOUND: bmg_series.py'
+- id: BD-080
+  type: B/BA
+  content: Frequency defaults to MONTHLY; DAILY requires explicit specification
+  rationale: Defaulting to MONTHLY balances statistical power (60 months) against computational cost.
+    Explicit DAILY specification ensures users consciously accept the 12x memory increase (730 days vs
+    60 months). This boundary prevents accidental daily sampling when monthly is appropriate, avoiding
+    bloated datasets and misleadingly precise daily factor estimates from monthly-issued data. Implicit
+    daily default would waste resources and confuse data frequency expectations.
+  evidence: get_regressions.py:228-241(if frequency == 'DAILY' uses 730 days, else 'MONTHLY' uses 60 months)
+  stage: default_value
+  alternative_considered: DAILY default was considered but rejected due to 12x memory increase being inappropriate
+    for monthly-sourced fundamental data
+  _evidence_issues:
+  - 'NOT_FOUND: get_regressions.py'
+  vague_rationale: true
+- id: BD-081
+  type: B/BA
+  content: Factor data divided by 100 before regression; Close adjusted by risk-free rate
+  rationale: Dividing factor returns by 100 converts percentage returns to decimal form, producing regression
+    coefficients in correct units. Without this normalization, coefficients would be 100x too large, making
+    interpretation impossible and comparison across factors misleading. Subtracting risk-free rate from
+    Close isolates excess returns, which is the standard asset pricing convention. These boundaries ensure
+    OLS estimates align with academic literature and regulatory reporting standards.
+  evidence: scripts/factor_regression.py:50-51(module)
+  stage: default_value
+  alternative_considered: Decimal-first processing was rejected to maintain compatibility with percentage-formatted
+    CSV input sources
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/factor_regression.py'
+- id: BD-082
+  type: BA
+  content: Sliding window regression requires data_end_date <= end_date to terminate loop
+  rationale: The termination condition data_end_date <= end_date defines when the sliding window loop
+    exits. If data_end_date exceeds end_date, the loop cannot produce valid output for the requested range,
+    so returning (None, False) prevents silent failures. This boundary ensures complete date coverage
+    while avoiding infinite loops when data extends beyond requested range. Without this check, callers
+    would receive incomplete or misleading regression results.
+  evidence: scripts/get_regressions.py:306(module)
+  stage: invariant
+  alternative_considered: Truncating to end_date was considered but rejected to avoid silent data loss
+    at boundaries
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/get_regressions.py'
+- id: BD-083
+  type: BA/M
+  content: Minimum 20 data points required for valid OLS regression
+  rationale: The 20-point minimum establishes statistical reliability for regression inference. With fewer
+    observations, standard errors become unreliable, t-statistics lose validity, and confidence intervals
+    widen unpredictably. This boundary prevents meaningless regression outputs from inadequate samples
+    while acknowledging that even 20 points yields limited statistical power. Raising the threshold would
+    exclude valid monthly strategies with short backtest periods.
+  evidence: scripts/factor_regression.py:115(module)
+  stage: invariant
+  alternative_considered: Dynamic threshold based on factor count was considered but rejected for implementation
+    complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/factor_regression.py'
+- id: BD-084
+  type: B/DK
+  content: 'Date range validation: start_date < max_data AND end_date > min_data required'
+  rationale: The bidirectional range check ensures the requested date window falls entirely within available
+    data boundaries. This prevents regressions from running with truncated input, which would produce
+    biased coefficients and misleading performance attribution. The strict inequality ensures at least
+    one data point exists on each side of the window. Violation raises DateInRangeError to force explicit
+    user correction rather than silent truncation.
+  evidence: factor_regression.py:84-87(raises DateInRangeError if violated)
+  stage: ordering_contract
+  alternative_considered: Truncation with warning was considered but rejected to ensure users explicitly
+    acknowledge boundary conditions
+  _evidence_issues:
+  - 'NOT_FOUND: factor_regression.py'
+- id: BD-085
+  type: DK
+  content: Composite stocks compute returns via component weighted average BEFORE regression
+  rationale: 'Computing composite returns from weighted component returns before regression ensures the
+    composite appears as a single security with consistent factor exposures. Aggregating after regression
+    would produce meaningless blended factor loadings that don''t correspond to any tradable asset. This
+    timing boundary maintains the causal chain: returns first, then factor attribution. It also ensures
+    composites inherit the same return distribution properties as individual stocks.'
+  evidence: get_stocks.py:284-289(sum_p_returns/sum_percentages = composite_return)
+  stage: inheritance
+  alternative_considered: Post-regression aggregation was rejected as it produces factor loadings not
+    corresponding to any actual security
+  _evidence_issues:
+  - 'NOT_FOUND: get_stocks.py'
+- id: BD-086
+  type: BA
+  content: Multiprocessing uses spawn method with explicit data duplication per worker
+  rationale: The spawn method with explicit data duplication via itertools.repeat ensures each worker
+    receives independent data copies, preventing shared-state corruption in parallel OLS computations.
+    This boundary eliminates race conditions in pandas operations and ensures reproducible results across
+    runs. The trade-off is higher memory usage (N workers × data size), but this is necessary for correctness.
+    Fork-with-shared-memory was rejected due to pandas thread-safety concerns.
+  evidence: get_regressions.py:400,421-431(itertools.repeat passes carbon_data/ff_data/rf_data)
+  stage: pattern_choice
+  alternative_considered: Fork method with shared memory was rejected due to pandas operations being unsafe
+    under fork
+  _evidence_issues:
+  - 'NOT_FOUND: get_regressions.py'
+- id: BD-087
+  type: BA
+  content: Outlier filter bounds returns to [-0.5, 0.5] before regression
+  rationale: The [-0.5, 0.5] bounds correspond to ±50% single-period returns, capturing extreme events
+    while excluding data entry errors and survivorship bias artifacts. This boundary prevents outliers
+    from disproportionately influencing OLS coefficients, which are sensitive to leverage points. Tighter
+    bounds would lose legitimate extreme observations; looser bounds would let errors dominate. The threshold
+    assumes daily/monthly periodicity where 50% moves are plausible but rare.
+  evidence: scripts/regression_function.py:9-12(module)
+  stage: invariant
+  alternative_considered: Standard-deviation based bounds were considered but rejected for sensitivity
+    to the very outliers they would filter
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/regression_function.py'
+- id: BD-088
+  type: M/BA
+  content: '''DEFAULT'' is reserved factor_name; cannot be used for user-defined BMG series'
+  rationale: Reserving 'DEFAULT' as the schema default value for factor_name prevents ambiguity when querying
+    for unspecified factors. If users could define factors named 'DEFAULT', queries relying on the default
+    would return unexpected results. This naming boundary maintains a clean separation between system-reserved
+    identifiers and user-defined content. The reserved word is documented in the schema and enforced at
+    insert time.
+  evidence: init_schema.sql:6(factor_name text DEFAULT 'DEFAULT')
+  stage: default_value
+  alternative_considered: NULL default was considered but rejected to maintain backward compatibility
+    with existing queries
+  _evidence_issues:
+  - 'NOT_FOUND: init_schema.sql'
+- id: BD-089
+  type: B
+  content: 'Data merge order: stock → carbon → ff → rf (inner join on dates)'
+  rationale: The sequential merge order ensures each dataset is available before the next joins, and inner
+    joins progressively filter to complete cases. Reversing the order would produce different filtering
+    behavior depending on which dataset has the most complete date coverage. This boundary maintains the
+    invariant that final merged data contains only dates present across each four datasets. It also ensures
+    consistent behavior when date coverage differs across data sources.
+  evidence: factor_regression.py:54-56(merge_data called three times)
+  stage: ordering_contract
+  alternative_considered: Full outer join was considered but rejected as factor regression requires complete
+    case analysis
+  _evidence_issues:
+  - 'NOT_FOUND: factor_regression.py'
+- id: BD-090
+  type: BA
+  content: 'Connection pool lifecycle: getconn() must be paired with putconn()'
+  rationale: Strict pairing of getconn() and putconn() ensures connection pool resources are not leaked.
+    Failing to return connections exhausts the pool, blocking subsequent requests until timeout. This
+    boundary is enforced through code review and documented in the db.py pattern. Violations cause cascading
+    failures under concurrent load. The explicit pairing pattern is preferred over context managers for
+    compatibility with existing psycopg2 usage.
+  evidence: db.py:31, get_regressions.py:30-33(pool management pattern)
+  stage: pattern_choice
+  alternative_considered: Context manager wrapping was considered but rejected for backward compatibility
+    with existing codebase patterns
+  _evidence_issues:
+  - 'NOT_FOUND: db.py:31, get_regressions.py'
+- id: BD-091
+  type: BA/DK
+  content: 'Abnormal returns filtered: data[''r''] <= 1 before DB insert'
+  rationale: The filter data['r'] <= 1 removes returns greater than 100%, which are presumed to be data
+    errors or corporate actions requiring special handling. This boundary prevents corrupt data from entering
+    the database and ensures downstream factor calculations use valid return observations. The specific
+    threshold of 1.0 is strict but accommodates intraday spikes and overnight gaps. Returns above this
+    threshold warrant manual review before inclusion.
+  evidence: get_stocks.py:204(stock_data[stock_data['r'] <= 1])
+  stage: invariant
+  alternative_considered: Percentage threshold (100%) was rejected as less intuitive than decimal form
+    already used throughout codebase
+  _evidence_issues:
+  - 'NOT_FOUND: get_stocks.py'
+- id: BD-092
+  type: B/BA
+  content: Default interval 0 becomes 60 months (MONTHLY) or 730 days (DAILY)
+  rationale: 'Interpreting interval=0 as a request for default history length (60 months or 730 days)
+    provides sensible defaults without requiring users to calculate period counts. This boundary ensures
+    interval=0 produces statistically meaningful samples while allowing explicit period counts for precise
+    control. The 60/730 values correspond to approximately 5 years of monthly data or 2 years of daily
+    data, sufficient for standard factor model estimation. Users who need longer histories must specify
+    explicit '
+  evidence: 'get_regressions.py:230-238(if interval == 0: interval = 730 for DAILY, 60 for MONTHLY)'
+  stage: default_value
+  alternative_considered: Using None for default was considered but rejected to maintain integer-typed
+    interval parameter
+  _evidence_issues:
+  - 'NOT_FOUND: get_regressions.py'
+- id: BD-093
+  type: M
+  content: Database refresh_views called after each regressions complete
+  rationale: Deferring refresh_views until after each regressions complete batches materialized view updates
+    into a single operation, improving throughput. If refresh occurred during regression processing, concurrent
+    queries might see partially-updated views. This boundary ensures the database presents a consistent
+    snapshot to querying applications. The trade-off is that views remain stale during long-running regression
+    batches, but this is acceptable for batch-oriented workloads.
+  evidence: scripts/get_regressions.py:472(module)
+  stage: pattern_choice
+  alternative_considered: Incremental refresh during regression was rejected for consistency concerns
+    and implementation complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/get_regressions.py'
+- id: BD-094
+  type: B/DK
+  content: 'INTERACTION: BD-021 (rolling window by interval) × BD-055 (rolling window by 1 period) → Contradictory
+    window advancement logic'
+  rationale: BD-021 explicitly states 'NOT by 1 month' for MONTHLY and requires non-overlapping windows
+    for statistical independence. BD-055 states 'advances by 1 period (month or day)' creating overlapping
+    windows. These contradictory behaviors would produce different beta estimates and invalid inference
+    when both are claimed as present. The contradiction manifests when users request custom window advancement—code
+    may not match documentation, causing silent errors in rolling regression results.
+  evidence: BD-021,BD-055
+  stage: global
+  alternative_considered: Unified window advancement API with explicit overlap parameter was considered
+    but not implemented
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-095
+  type: B/BA
+  content: 'INTERACTION: BD-036 (±0.5 winsorization) × BD-091 (≤1.0 abnormal filter) → Inconsistent outlier
+    handling across pipeline stages'
+  rationale: BD-036 caps returns at ±50% (±0.5) during regression to remove outliers, while BD-091 only
+    filters returns >100% (<=1.0). This 2x discrepancy means data allowed into the pipeline (up to 100%)
+    gets aggressively winsorized (to 50%) downstream. The inconsistency creates hidden data transformation
+    dependencies where the same raw return could be treated differently depending on which processing
+    path executes. This amplifies data quality uncertainty and could bias factor loadings toward moderate-retur
+  evidence: BD-036,BD-091
+  stage: global
+  alternative_considered: Unified outlier threshold across each pipeline stages was considered but not
+    standardized
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-096
+  type: BA
+  content: 'INTERACTION: BD-009 (frequency column on tables) × BD-013 (inner join on dates) × BD-038 (inner
+    join for stock-factor merge) → Hidden data loss cascade'
+  rationale: The frequency column enables multi-frequency storage (BD-009), but inner joins (BD-013, BD-038)
+    silently drop observations where ANY factor lacks data for a given (date, frequency) combination.
+    For MONTHLY frequency, if FF factors have gaps different from stock returns, the inner join progressively
+    reduces the sample. This hidden dependency means sample composition depends on which factors have
+    the most complete coverage—a silent filter that biases results toward factors with fewer missing obser
+  evidence: BD-009,BD-013,BD-038
+  stage: global
+  alternative_considered: Sample composition reporting at each join step was considered but not implemented
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-097
+  type: B/BA
+  content: 'INTERACTION: BD-021 (rolling window by interval) × BD-019 (60-month default) × BD-020 (730-day
+    default) × BD-080 (MONTHLY default) → Risk cascade of window size misinterpretation'
+  rationale: BD-080 establishes MONTHLY as default frequency. BD-019 and BD-020 set default intervals
+    of 60 months (5 years) and 730 days (2 years) respectively. BD-021 requires windows to advance by
+    'interval' for statistical independence. If the interval advancement logic contradicts the documented
+    defaults, each rolling regressions would use wrong window sizes. This cascade amplifies into incorrect
+    beta estimates, invalid t-statistics, and wrong BMG premium conclusions. Users trusting default parameters
+    wo
+  evidence: BD-019,BD-020,BD-021,BD-080
+  stage: global
+  alternative_considered: Explicit window advancement mode parameter was considered but not added to prevent
+    API complexity
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-098
+  type: BA
+  content: 'INTERACTION: BD-039 (Yahoo Finance source) × BD-008 (precomputed returns stored) × BD-047
+    (drop last incomplete entry) → Amplification of data quality risks'
+  rationale: 'BD-039 creates single-source dependency on Yahoo Finance, whose API may return malformed
+    data. BD-047 drops the last entry assuming incompleteness. BD-008 stores precomputed returns without
+    recalculation. These decisions amplify each other''s risk: if Yahoo Finance returns corrupted data
+    (BD-039 gap), the incomplete last entry (BD-047) gets dropped, but the preceding corrupted data point''s
+    return is already precomputed and stored (BD-008). The cascade means bad data persists through the
+    pipeline '
+  evidence: BD-039,BD-008,BD-047
+  stage: global
+  alternative_considered: Recalculation verification step was considered but rejected for performance
+    overhead
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-099
+  type: BA/M
+  content: 'INTERACTION: BD-017 (FF factors /100) × BD-041 (excess returns = Close - Rf) × BD-081 (factor
+    /100 and Close - Rf) → Overlapping normalization decisions with latent contradiction risk'
+  rationale: 'BD-017 and BD-058 both document FF factors divided by 100 for OLS, while BD-041 and BD-081
+    document subtracting risk-free rate from Close for excess returns. BD-081 combines both operations
+    in a single decision. The overlapping documentation creates latent contradiction risk: if future modifications
+    apply the division or subtraction incorrectly (e.g., multiplying instead of dividing, adding instead
+    of subtracting), the error would be masked by multiple overlapping decisions. This hidden dependen'
+  evidence: BD-017,BD-041,BD-058,BD-081
+  stage: global
+  alternative_considered: Single centralized normalization function was considered but rejected for modularity
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-100
+  type: BA/DK
+  content: 'INTERACTION: BD-022 (spawn multiprocessing) × BD-090 (connection pool get/put pairing) × BD-024
+    (data loaded once, passed via repeat) → Hidden dependency on spawn-specific behavior'
+  rationale: 'BD-022 mandates ''spawn'' start method for safe psycopg2 fork. BD-090 enforces connection
+    get/put pairing. BD-024 pre-loads data and passes via itertools.repeat. These interact in production:
+    spawn creates fresh processes where connections aren''t inherited, making BD-090 necessary. But if
+    data pre-loading (BD-024) happens before workers spawn, the DataFrame gets deep-copied per worker,
+    consuming N×memory. If spawn method is changed or default changes, BD-024 would share memory incorrectly,
+    corrupt'
+  evidence: BD-022,BD-024,BD-090
+  stage: global
+  alternative_considered: Using fork-safe connection creation was considered but rejected for complexity
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-101
+  type: B
+  content: 'INTERACTION: BD-059 (DELETE before INSERT) × BD-005 (ON CONFLICT DO NOTHING) × BD-093 (refresh_views
+    after completion) → Risk cascade of atomicity violations'
+  rationale: BD-059 deletes existing factor data before importing new data. BD-005 uses ON CONFLICT DO
+    NOTHING for idempotent imports. BD-093 calls refresh_views only after ALL regressions complete. If
+    the DELETE (BD-059) succeeds but the INSERT fails, the factor table becomes empty until successful
+    re-import. During this gap, BD-013 inner joins would return no data, BD-038 stock-factor merges would
+    fail silently, and each regression workers would receive empty datasets. The cascade amplifies a transient
+    impo
+  evidence: BD-005,BD-059,BD-093
+  stage: global
+  alternative_considered: Transactional bulk upsert was considered but rejected for PostgreSQL compatibility
+    concerns
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-102
+  type: BA
+  content: 'INTERACTION: BD-015 (±0.5 winsorization) × BD-072 (outlier filter [-0.5, 0.5]) × BD-087 ([-0.5,
+    0.5] bounds) → Redundant outlier decisions across scripts'
+  rationale: 'BD-015, BD-036, BD-072, and BD-087 each implement the same ±0.5 winsorization in regression_function.py.
+    The multiplicity of decisions for the same operation indicates design fragmentation rather than deliberate
+    choice. This redundancy creates maintenance risk: if the threshold needs to change, multiple BDs must
+    be updated consistently or divergent implementations will emerge. The consistent implementation across
+    BDs is correct but the documentation overhead of maintaining four decisions for one '
+  evidence: BD-015,BD-036,BD-072,BD-087
+  stage: global
+  alternative_considered: Single centralized winsorization threshold constant was considered but not implemented
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-GAP-001
+  type: RC
+  content: 'Missing: Timezone explicit annotation + UTC'
+  rationale: 'Audit finding: missing: timezone explicit annotation + utc. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-002
+  type: DK
+  content: 'Missing: Point-in-Time data availability'
+  rationale: 'Audit finding: missing: point-in-time data availability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-003
+  type: DK
+  content: 'Missing: Stale data detection and expiry'
+  rationale: 'Audit finding: missing: stale data detection and expiry. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-004
+  type: B
+  content: 'Missing: PnL conservation (realized + unrealized)'
+  rationale: 'Audit finding: missing: pnl conservation (realized + unrealized). Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-005
+  type: B
+  content: 'Missing: Train/test time split integrity'
+  rationale: 'Audit finding: missing: train/test time split integrity. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-006
+  type: DK
+  content: 'Missing: Random seed full coverage'
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-007
+  type: RC
+  content: 'Missing: Settlement and delivery time convention'
+  rationale: 'Audit finding: missing: settlement and delivery time convention. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-008
+  type: DK
+  content: 'Missing: Rebalancing Trigger Mechanism'
+  rationale: 'Audit finding: missing: rebalancing trigger mechanism. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-009
+  type: M
+  content: 'Missing: Transition Matrix Time Homogeneity & Conditioning'
+  rationale: 'Audit finding: missing: transition matrix time homogeneity & conditioning. Identified by
+    audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-010
+  type: DK
+  content: 'Missing: Versioned Writes & Snapshot Semantics'
+  rationale: 'Audit finding: missing: versioned writes & snapshot semantics. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-011
+  type: DK
+  content: 'Missing: ** "Implement UTC timezone normalization for each datetime fields. Add tzinfo awareness
+    to stock_data, carbon_risk_factor, and ff_factor tables.'
+  rationale: 'Audit finding: missing: ** "implement utc timezone normalization for each datetime fields.
+    add tzinfo awareness to stock_data, carbon_risk_factor, and ff_factor tables.. ** "Multi-timezone
+    data ingestion (US, EU, Asia markets) will produce incorrect results without explicit timezone handling..
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: '** "Multi-timezone data ingestion (US, EU, Asia markets) will produce incorrect results without
+    explicit timezone handling.'
+- id: BD-GAP-012
+  type: DK
+  content: 'Missing: ** "Add random.seed(42) or equivalent to each stochastic operations. Document reproducibility
+    requirements in regression_function.py and correlate.py.'
+  rationale: 'Audit finding: missing: ** "add random.seed(42) or equivalent to each stochastic operations.
+    document reproducibility requirements in regression_function.py and correlate.py.. ** "Research results
+    cannot be reproduced. Model comparison and peer review are compromised.. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: '** "Research results cannot be reproduced. Model comparison and peer review are compromised.'
+- id: BD-GAP-013
+  type: RC
+  content: 'Missing: ** "Replace ON CONFLICT DO UPDATE with versioned INSERT (add valid_from/valid_to
+    timestamps). Implement append-only audit table for carbon_risk_factor changes.'
+  rationale: 'Audit finding: missing: ** "replace on conflict do update with versioned insert (add valid_from/valid_to
+    timestamps). implement append-only audit table for carbon_risk_factor changes.. ** "Historical factor
+    values are silently overwritten. Audit trail for regulatory/compliance review is lost.. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: '** "Historical factor values are silently overwritten. Audit trail for regulatory/compliance
+    review is lost.'
+- id: BD-GAP-014
+  type: B
+  content: 'Missing: ** "Add data_version column to each factor tables. Track run_id and experiment_id
+    in regression results table.'
+  rationale: 'Audit finding: missing: ** "add data_version column to each factor tables. track run_id
+    and experiment_id in regression results table.. ** "Cannot reproduce exact model state. A/B testing
+    and model versioning are not possible.. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: '** "Cannot reproduce exact model state. A/B testing and model versioning are not possible.'
+- id: BD-GAP-015
+  content: 'Missing: Stale data detection and expiry'
+  type: DK
+  rationale: 'Audit finding: missing: stale data detection and expiry. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-016
+  content: 'Missing: PnL conservation (realized + unrealized)'
+  type: B
+  rationale: 'Audit finding: missing: pnl conservation (realized + unrealized). Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-017
+  content: 'Missing: Day count convention'
+  type: M/DK
+  rationale: 'Audit finding: missing: day count convention. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-018
+  content: 'Missing: Covariance Matrix PSD Fix Strategy'
+  type: M
+  rationale: 'Audit finding: missing: covariance matrix psd fix strategy. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-019
+  content: 'Missing: Default Definition & IFRS 9 Staging'
+  type: B
+  rationale: 'Audit finding: missing: default definition & ifrs 9 staging. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-020
+  content: 'Missing: PD/LGD/EAD Estimation (IRB vs Standard)'
+  type: B
+  rationale: 'Audit finding: missing: pd/lgd/ead estimation (irb vs standard). Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-021
+  content: 'Missing: Vasicek Single-Factor Asset Correlation'
+  type: B
+  rationale: 'Audit finding: missing: vasicek single-factor asset correlation. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-022
+  content: 'Missing: ** "Implement covariance matrix PSD repair strategy (nearest correlation, eigenvalue
+    clipping, or shrinkage estimator).'
+  type: M
+  rationale: 'Audit finding: missing: ** "implement covariance matrix psd repair strategy (nearest correlation,
+    eigenvalue clipping, or shrinkage estimator).. ** "Portfolio optimization and risk calculations may
+    fail with non-positive-definite covariance matrices from sample estimation.. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: '** "Portfolio optimization and risk calculations may fail with non-positive-definite covariance
+    matrices from sample estimation.'
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: Sector Stock Count and Significant Factor Regression Analyzer
+  source: scripts/bmg_analyze.py
+  type: screening
+  business_problem: Identifies how many stocks from an index fall into each sector and screens for stocks
+    with statistically significant factor regression results based on p-values.
+  intent_keywords:
+  - sector composition
+  - significant regression
+  - p-value screening
+  - stock sectors
+  - factor analysis
+  stage: factor_computation
+  negative_keywords:
+  - stock price download
+  - correlation calculation
+  - factor series creation
+  - database setup
+  - bulk factor model
+  disambiguation: Are you looking to screen stocks by sector distribution from an index, or to find stocks
+    with statistically significant factor relationships?
+  data_domain: holding_data
+- id: UC-102
+  name: Factor Correlation Calculator
+  source: scripts/correlate.py
+  type: research_analysis
+  business_problem: Computes correlations between different factors over time to understand factor relationship
+    dynamics and potential multicollinearity issues.
+  intent_keywords:
+  - factor correlation
+  - correlation matrix
+  - factor relationships
+  - multicollinearity
+  - time series correlation
+  stage: factor_computation
+  negative_keywords:
+  - stock screening
+  - price download
+  - BMG factor
+  - regression execution
+  - database setup
+  disambiguation: Do you want to see how different factors correlate with each other, or are you looking
+    to run factor regressions on individual stocks?
+  data_domain: financial_data
+- id: UC-103
+  name: OLS Regression with Diagnostic Statistics
+  source: scripts/regression_function.py
+  type: research_analysis
+  business_problem: Performs ordinary least squares regression on factor data with comprehensive diagnostic
+    tests including Durbin-Watson, Jarque-Bera, and Breusch-Pagan tests.
+  intent_keywords:
+  - OLS regression
+  - diagnostic tests
+  - statistical tests
+  - regression analysis
+  - residual analysis
+  stage: factor_computation
+  negative_keywords:
+  - correlation
+  - stock screening
+  - data download
+  - factor creation
+  - database utilities
+  disambiguation: Are you trying to run regression analysis with statistical diagnostics, or do you need
+    something else like factor correlations or data loading?
+  data_domain: financial_data
+- id: UC-104
+  name: Fama-French Factor Model Generator
+  source: scripts/bulk_script.py
+  type: data_pipeline
+  business_problem: Builds custom Fama-French style factor models by merging stock returns, Fama-French
+    factors, and carbon risk factors into unified datasets for analysis.
+  intent_keywords:
+  - Fama-French model
+  - factor model
+  - carbon risk
+  - factor construction
+  - data merging
+  stage: data_collection
+  negative_keywords:
+  - stock screening
+  - correlation
+  - price download
+  - database setup
+  - BMG factor
+  disambiguation: Are you building a custom factor model combining multiple data sources, or are you analyzing
+    existing factors for correlations or regressions?
+  data_domain: mixed
+- id: UC-105
+  name: Stock Price Data Downloader
+  source: scripts/stock_price_function.py
+  type: data_pipeline
+  business_problem: Downloads historical stock price data from Yahoo Finance with support for daily and
+    monthly frequencies, including automatic retry on timeout.
+  intent_keywords:
+  - stock prices
+  - price download
+  - yfinance
+  - historical data
+  - market data
+  stage: data_collection
+  negative_keywords:
+  - regression
+  - correlation
+  - screening
+  - BMG factor
+  - database setup
+  disambiguation: Are you trying to download raw stock price data, or are you looking to perform analysis
+    like regressions, correlations, or screening?
+  data_domain: market_data
+- id: UC-106
+  name: BMG Factor Series Creator
+  source: scripts/bmg_series.py
+  type: builtin_factor
+  business_problem: Creates Brown-Green (BMG) factor series by calculating the return differential between
+    brown (high carbon) and green (low carbon) stocks for carbon risk analysis.
+  intent_keywords:
+  - BMG factor
+  - carbon risk
+  - brown green stocks
+  - factor creation
+  - environmental factor
+  stage: factor_computation
+  negative_keywords:
+  - regression
+  - correlation
+  - stock prices
+  - screening
+  - database setup
+  disambiguation: Are you creating a new BMG (brown-minus-green) carbon risk factor series, or are you
+    using an existing factor for analysis like regressions or correlations?
+  data_domain: financial_data
+- id: UC-107
+  name: Multi-Stock Factor Regression Runner
+  source: scripts/get_regressions.py
+  type: research_analysis
+  business_problem: Executes factor regression analysis across multiple stocks in parallel using multiprocessing,
+    loading Fama-French and carbon risk factors from database.
+  intent_keywords:
+  - regression
+  - multiprocessing
+  - parallel analysis
+  - factor regression
+  - batch analysis
+  stage: factor_computation
+  negative_keywords:
+  - correlation
+  - screening
+  - price download
+  - BMG creation
+  - database setup
+  disambiguation: Are you running factor regressions on multiple stocks at scale, or are you looking for
+    single-stock analysis, factor correlations, or data loading?
+  data_domain: financial_data
+- id: UC-108
+  name: Stock Data Import and Update
+  source: scripts/get_stocks.py
+  type: data_pipeline
+  business_problem: Imports stock return data from CSV or downloads from yfinance, with support for incremental
+    updates to maintain current database with stock returns.
+  intent_keywords:
+  - import stocks
+  - stock data
+  - data import
+  - stock returns
+  - database update
+  stage: data_collection
+  negative_keywords:
+  - regression
+  - correlation
+  - screening
+  - BMG factor
+  - factor model
+  disambiguation: Are you loading or updating stock return data in the database, or are you performing
+    analysis like regressions, screening, or factor computations?
+  data_domain: trading_data
+- id: UC-109
+  name: Database Schema Initialization and Data Import
+  source: scripts/setup_db.py
+  type: data_pipeline
+  business_problem: Initializes database schema and imports Fama-French, bond, and carbon risk factors
+    into PostgreSQL tables, including BMG factor data.
+  intent_keywords:
+  - database setup
+  - schema initialization
+  - factor import
+  - carbon data
+  - bond factors
+  stage: data_collection
+  negative_keywords:
+  - regression
+  - correlation
+  - screening
+  - stock prices
+  - factor analysis
+  disambiguation: Are you setting up the database schema and loading factor data, or are you performing
+    analysis like regressions, correlations, or screening?
+  data_domain: financial_data
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 3
+  evidence_invalid: 89
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.03260869565217391
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 0
+    warn: 9
+    fail: 11
+  subdomain_totals:
+    pass: 0
+    warn: 10
+    fail: 9
+  coverage: 39/39 (100%)
+  pass_rate: 0/39 (0%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: stock_price_data_source
+  description: Yahoo Finance is default due to free access, good fundamentals data, and no API key required.
+    Use alternatives if Yahoo Finance changes terms or for specific data needs.
+  used_in_stages: []
+  options:
+  - name: Yahoo Finance (yfinance)
+    traits:
+    - free
+    - real-time-ish
+    - global_stocks
+    - fundamentals
+    fit_for:
+    - Most common use cases; good coverage of US and global stocks with fundamentals
+    not_fit_for:
+    - High-frequency trading, custom data feeds, institutional data needs
+  - name: Alpha Vantage
+    traits:
+    - free_tier
+    - historical
+    - API_key_required
+    fit_for:
+    - Historical daily/monthly data, alternative to Yahoo
+    not_fit_for:
+    - Real-time data on free tier, high volume requests
+  - name: Pandas DataReader
+    traits:
+    - multi_source
+    - wrapper
+    fit_for:
+    - Accessing FRED, World Bank, or multiple stock sources
+    not_fit_for:
+    - Comprehensive stock fundamentals
+  default: Yahoo Finance (yfinance)
+  _source: worker_resource
+- id: slot-002
+  name: fama_french_factors_source
+  description: Ken French library is the authoritative source for academic Fama-French factors. Alternative
+    sources may offer different factor definitions or more frequent updates but require different implementations.
+  used_in_stages: []
+  options:
+  - name: Dartmouth Ken French Data Library (official)
+    traits:
+    - academic
+    - authoritative
+    - free
+    fit_for:
+    - Standard academic research, Fama-French factor replication
+    not_fit_for:
+    - Real-time factor updates
+  - name: AQR Capital Factors
+    traits:
+    - alternative
+    - quality_factors
+    fit_for:
+    - Alternative factor research, quality-minus-junk factors
+    not_fit_for:
+    - Exact Fama-French replication
+  - name: Portfolio Visualizer
+    traits:
+    - modern
+    - online_access
+    fit_for:
+    - Quick factor analysis without local data management
+    not_fit_for:
+    - Bulk processing, offline operation
+  default: Dartmouth Ken French Data Library
+  _source: worker_resource
+- id: slot-003
+  name: carbon_risk_factor_source
+  description: CARIMA provides validated academic carbon risk factors. For daily frequency or custom definitions,
+    the BMG construction using bmg_series.py allows combining any brown and green ETF pair.
+  used_in_stages: []
+  options:
+  - name: CARIMA (University of Augsburg)
+    traits:
+    - academic
+    - validated
+    - monthly
+    fit_for:
+    - Academic research, validated carbon risk measurement
+    not_fit_for:
+    - Real-time carbon risk, daily updates
+  - name: Self-constructed BMG (XOP-SMOG)
+    traits:
+    - custom
+    - daily_available
+    - transparent
+    fit_for:
+    - Daily frequency analysis, custom brown/green definitions
+    not_fit_for:
+    - Academic validation, comparison with other studies
+  - name: MSCI Low Carbon Index (CRBN)
+    traits:
+    - institutional
+    - broad_coverage
+    fit_for:
+    - Institutional investors, broader low-carbon definition
+    not_fit_for:
+    - Precise brown/green construction
+  default: CARIMA (for monthly), Self-constructed XOP-SMOG (for daily)
+  _source: worker_resource
+- id: slot-004
+  name: database_system
+  description: PostgreSQL is used for its materialized views (stock_and_stats views) which significantly
+    improve query performance for repeated analysis. Switch to SQLite for simpler local use, or MySQL
+    if hosted environment requires it.
+  used_in_stages: []
+  options:
+  - name: PostgreSQL
+    traits:
+    - relational
+    - ACID
+    - materialized_views
+    - SQL
+    fit_for:
+    - Production deployment, complex queries, materialized views for performance
+    not_fit_for:
+    - Simple single-user local analysis (use SQLite instead)
+  - name: SQLite
+    traits:
+    - serverless
+    - single_file
+    - limited_concurrency
+    fit_for:
+    - Local development, small datasets, single-user analysis
+    not_fit_for:
+    - Multi-user access, high concurrency, large datasets
+  - name: MySQL/MariaDB
+    traits:
+    - relational
+    - wide_use
+    - ACID
+    fit_for:
+    - Shared hosting, web applications
+    not_fit_for:
+    - Advanced analytics (lacks advanced PostgreSQL features)
+  default: PostgreSQL
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: Yahoo (via yfinance Python package)
+  description: 'Historical stock prices (close prices), stock details (sector, EBITDA, enterprise value,
+    etc.). Coverage: N/A. Auth: None (public API via yfinance)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: Dartmouth Ken French Data Library
+  description: 'Fama-French market risk premium (Mkt-RF), size (SMB), value (HML) factors. Coverage: N/A.
+    Auth: None (public, academic use)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: Dartmouth Ken French Data Library
+  description: 'Winner-Loser momentum factor (WML). Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: University of Augsburg (CARIMA Project)
+  description: 'Carbon risk BMG (Brown Minus Green) factor time series. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: Federal Reserve Board
+  description: 'Treasury rates (Monthly Averages). Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: Federal Reserve Bank of St. Louis
+  description: 'BBB OAS spread, High Yield OAS spread. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: iShares/BlackRock (via XWD.TO ETF)
+  description: 'Index constituent details (ticker, name, weight, sector, country). Coverage: N/A. Auth:
+    N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-008
+  type: external_service
+  name: iShares/BlackRock (via ACWI ETF)
+  description: 'Index constituent data. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-009
+  type: external_service
+  name: iShares/BlackRock (via CRBN ETF)
+  description: 'Low carbon index constituent data. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-010
+  type: external_service
+  name: iShares/BlackRock (via IVV ETF)
+  description: 'Index constituent weights. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-011
+  type: external_service
+  name: iShares (via UPAB ETF)
+  description: 'Paris-aligned S&P 500 constituent data. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-012
+  type: external_service
+  name: SPDR (via XOP ETF)
+  description: 'Brown stock proxy for BMG factor (oil & gas stocks). Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-013
+  type: external_service
+  name: VanEck (via SMOG ETF)
+  description: 'Green stock proxy for BMG factor (low carbon energy). Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-014
+  type: external_service
+  name: SPDR Sector SPDRs
+  description: 'ETF ticker to sector mapping. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-015
+  type: external_service
+  name: MSCI
+  description: 'MSCI sector ETF listings. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-016
+  type: external_service
+  name: PostgreSQL Database
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-017
+  type: code_example
+  name: Sector Stock Count and Significant Factor Regression Analyzer
+  path: scripts/bmg_analyze.py
+  description: Identifies how many stocks from an index fall into each sector and screens for stocks with
+    statistically significant factor regression results based on p-values.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list
+- id: res-018
+  type: code_example
+  name: Factor Correlation Calculator
+  path: scripts/correlate.py
+  description: Computes correlations between different factors over time to understand factor relationship
+    dynamics and potential multicollinearity issues.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list
+- id: res-019
+  type: code_example
+  name: OLS Regression with Diagnostic Statistics
+  path: scripts/regression_function.py
+  description: Performs ordinary least squares regression on factor data with comprehensive diagnostic
+    tests including Durbin-Watson, Jarque-Bera, and Breusch-Pagan tests.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list
+- id: res-020
+  type: code_example
+  name: Fama-French Factor Model Generator
+  path: scripts/bulk_script.py
+  description: Builds custom Fama-French style factor models by merging stock returns, Fama-French factors,
+    and carbon risk factors into unified datasets for analysis.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-021
+  type: code_example
+  name: Stock Price Data Downloader
+  path: scripts/stock_price_function.py
+  description: Downloads historical stock price data from Yahoo Finance with support for daily and monthly
+    frequencies, including automatic retry on timeout.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-022
+  type: code_example
+  name: BMG Factor Series Creator
+  path: scripts/bmg_series.py
+  description: Creates Brown-Green (BMG) factor series by calculating the return differential between
+    brown (high carbon) and green (low carbon) stocks for carbon risk analysis.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list
+- id: res-023
+  type: code_example
+  name: Multi-Stock Factor Regression Runner
+  path: scripts/get_regressions.py
+  description: Executes factor regression analysis across multiple stocks in parallel using multiprocessing,
+    loading Fama-French and carbon risk factors from database.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list
+- id: res-024
+  type: code_example
+  name: Stock Data Import and Update
+  path: scripts/get_stocks.py
+  description: Imports stock return data from CSV or downloads from yfinance, with support for incremental
+    updates to maintain current database with stock returns.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-025
+  type: code_example
+  name: Database Schema Initialization and Data Import
+  path: scripts/setup_db.py
+  description: Initializes database schema and imports Fama-French, bond, and carbon risk factors into
+    PostgreSQL tables, including BMG factor data.
+  used_in_stages:
+  - data_collection
+  _source: uc_list

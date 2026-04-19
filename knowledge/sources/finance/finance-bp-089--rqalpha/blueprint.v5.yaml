@@ -1,0 +1,3237 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-089
+name: RQAlpha
+sop_version: '3.6'
+source:
+  projects:
+  - rqalpha
+  commit_hash: ef978b874f887b8727911c6c1d21e9938fb2178e
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Algorithmic trading backtesting and simulation engine
+  description: A comprehensive programmatic trading solution providing data acquisition, algorithmic trading,
+    backtesting engine, live simulation, and data analysis for quantitative strategies.
+  prerequisites: Python programming knowledge, basic understanding of trading strategies and financial
+    markets
+  not_suitable_for: Commercial use without licensing (contact public@ricequant.com), non-programmatic
+    discretionary trading, real-time production trading without proper infrastructure
+  activation:
+    triggers:
+    - Writing or modifying strategy code
+    - Debugging backtest issues
+    - Running backtests with rqalpha run
+    - Adding new functionality via mods
+    - Running tests with pytest
+    - Encountering import errors or data issues
+    emphasis:
+    - Use ESPECIALLY when starting new strategy development
+    - Use ESPECIALLY when encountering unexpected backtest behavior
+    - Use ESPECIALLY when adding new system components or mods
+    - Use ESPECIALLY before committing code changes
+    anti_skip:
+    - Don't skip documentation consultation because API seems familiar - signatures may differ
+    - Don't skip writing tests because the change seems simple - regressions are common
+    - Don't skip bundle download because data might exist - version mismatches cause issues
+    - Don't skip using logger.info() because print() works during backtest - logging is required for production
+stages:
+- id: data_layer
+  name: Data Layer
+  order: 1
+  responsibility: Provides historical and real-time market data access, instrument lookup, trading calendar,
+    dividends, and splits. Acts as the foundational layer that supplies each market information needed
+    for trading decisions and simulation.
+  interface:
+    inputs:
+    - instrument identifiers (order_book_id, symbol)
+    - date ranges
+    - frequency parameters (1d, 1m, tick)
+    - adjustment types
+    outputs:
+    - Bar/Tick data streams
+    - Instrument objects with type/market metadata
+    - Trading calendars by market
+    - Dividend/Split corporate action data
+    - Exchange rates
+  required_methods:
+  - name: DataProxy.instrument
+    description: Retrieves Instrument object by order_book_id or symbol with validation and historical
+      tracking support
+    evidence: rqalpha/data/instruments_mixin.py:141(instrument)
+  - name: DataProxy.get_bars
+    description: Fetches historical bar data with frequency and adjustment type support
+    evidence: rqalpha/data/data_proxy.py:42(DataProxy)
+  - name: DataProxy.get_trading_calendar
+    description: Returns trading dates for a given date range and market
+    evidence: rqalpha/data/trading_dates_mixin.py:34(TradingDatesMixin)
+  - name: BarDictPriceBoard.get_last_price
+    description: Provides real-time last price lookup for universe instruments during simulation
+    evidence: rqalpha/data/bar_dict_price_board.py:32(get_last_price)
+  key_behaviors:
+  - behavior: Dynamic storage registration by instrument_type and market
+    description: Allows plugging different storage backends per instrument type/market without code changes.
+      Each instrument type (STOCK, FUTURE, OPTION) can register its own data store with market-specific
+      configuration.
+    evidence: rqalpha/data/base_data_source/data_source.py:148(register_day_bar_store)
+  - behavior: ChainMap for unified id/symbol instrument lookup
+    description: Single lookup dictionary handles both order_book_id and symbol without duplication, providing
+      consistent access patterns regardless of identifier type used.
+    evidence: rqalpha/data/base_data_source/data_source.py:121(_id_or_sym_instrument_map)
+  - behavior: Last price cached in PriceBoard not DataSource
+    description: PriceBoard updated per-bar reflects in-progress prices during simulation; DataSource
+      provides historical and point-in-time data. This separation prevents historical data contamination
+      during real-time updates.
+    evidence: rqalpha/data/bar_dict_price_board.py:23(BarDictPriceBoard)
+  replaceable_points:
+  - name: DataSource backend
+    description: Swap HDF5-backed storage for alternative data sources like CSV files or databases
+    options:
+    - name: BaseDataSource
+      traits:
+      - HDF5-backed
+      - high-performance
+      - batch-oriented
+      fit_for:
+      - Historical backtesting with bundled data
+      - Large-scale data access
+      not_fit_for:
+      - Streaming data
+      - Custom data formats without conversion
+    - name: Custom AbstractDataSource implementation
+      traits:
+      - Custom storage backend
+      - User-defined format support
+      fit_for:
+      - Database-backed historical data
+      - Real-time data feeds
+      - Custom proprietary data
+      not_fit_for:
+      - Standard RQAlpha bundle format users
+    default: BaseDataSource
+  - name: PriceBoard implementation
+    description: Choose between real-time and delayed price access mechanisms
+    options:
+    - name: BarDictPriceBoard
+      traits:
+      - Bar-level granularity
+      - In-memory price cache
+      fit_for:
+      - Standard backtesting simulation
+      - Historical replay
+      not_fit_for:
+      - Tick-level precision
+      - Live trading scenarios
+    - name: Custom AbstractPriceBoard implementation
+      traits:
+      - Custom price retrieval
+      - Delayed/live feed support
+      fit_for:
+      - Real-time trading integration
+      - External data feed
+      not_fit_for:
+      - Standard backtesting workflows
+    default: BarDictPriceBoard
+  design_decisions:
+  - DataProxy aggregates multiple mixins (TradingDatesMixin, InstrumentsMixin) providing unified API without
+    polluting DataSource class (rqalpha/data/data_proxy.py:42)
+  acceptance_hints:
+  - Instruments retrieved by order_book_id match those retrieved by symbol
+  - Trading calendar aligns with exchange holidays and weekends
+  - Bar data correctly adjusted for splits and dividends based on adjustment type
+  - get_last_price returns None for instruments not in current universe
+- id: event_system
+  name: Event System
+  order: 2
+  responsibility: Central publish-subscribe bus that drives the simulation and event loop. Separates strategy
+    logic from market simulation timing and ensures consistent phase enforcement throughout execution.
+  interface:
+    inputs:
+    - System lifecycle events (INIT, BEFORE_TRADING, BAR, AFTER_TRADING, SETTLEMENT)
+    - Trading events (TRADE, ORDER_CREATION_PASS, ORDER_CREATION_REJECT)
+    outputs:
+    - Event dispatch to registered listeners
+    - Phase enforcement via ExecutionContext
+    - Pre/Post event hooks for extensibility
+  required_methods:
+  - name: EventBus.publish_event
+    description: Dispatches events to registered listeners with system/user listener separation
+    evidence: rqalpha/core/events.py:43(publish_event)
+  - name: EventBus.prepend_listener
+    description: Adds listener to front of execution queue for priority ordering
+    evidence: rqalpha/portfolio/account.py:121(prepend_listener)
+  - name: ExecutionContext.enforce_phase
+    description: Context manager ensuring code executes only in designated phases
+    evidence: rqalpha/core/execution_context.py:58(ExecutionContext)
+  key_behaviors:
+  - behavior: System vs User listener separation
+    description: System listeners execute in separate queue and break on True return; user listeners always
+      run to completion. This prevents accidental early termination of strategy code and ensures system
+      components process events before strategy reactions.
+    evidence: rqalpha/core/events.py:43(publish_event)
+  - behavior: ExecutionContext as context stack not singleton
+    description: Nested contexts are possible (e.g., scheduler running inside handle_bar). This enables
+      complex workflows where scheduled functions run within the context of bar processing.
+    evidence: rqalpha/core/execution_context.py:58(ExecutionContext)
+  - behavior: Pre/Post event hooks around core events
+    description: PRE_BAR and post_bar events allow mods to inject logic before and after strategy handle_bar
+      execution, enabling cross-cutting concerns like performance tracking or order management.
+    evidence: rqalpha/core/events.py:53(EVENT)
+  - behavior: System listeners execute before user listeners in EventBus
+    description: EVENT.ORDER_CREATION_PASS published by broker runs before strategy can react, ensuring
+      validators and risk controls process orders first.
+    evidence: rqalpha/core/events.py:44-50(publish_event order)
+  replaceable_points:
+  - name: EventSource
+    description: Historical replay vs live data feed event generation
+    options:
+    - name: BarEventSource
+      traits:
+      - 1d/1m bar granularity
+      - Historical data driven
+      fit_for:
+      - Standard backtesting
+      - Daily/minute frequency strategies
+      not_fit_for:
+      - High-frequency tick trading
+      - Live trading scenarios
+    - name: TickEventSource
+      traits:
+      - Tick-level granularity
+      - Higher data volume
+      fit_for:
+      - High-frequency strategies
+      - Order book simulation
+      not_fit_for:
+      - Daily bar strategies
+      - Low-frequency backtesting
+    - name: Custom AbstractEventSource implementation
+      traits:
+      - Custom event generation
+      - External feed support
+      fit_for:
+      - Live trading integration
+      - Proprietary data sources
+      not_fit_for:
+      - Standard backtesting workflows
+    default: BarEventSource
+  design_decisions:
+  - Pre/Post event hooks around core events allow mods to inject logic before/after strategy handle_bar
+    (rqalpha/core/events.py:53)
+  acceptance_hints:
+  - 'Every lifecycle events fire in correct order: INIT → BEFORE_TRADING → BAR → AFTER_TRADING → SETTLEMENT'
+  - PRE_BAR fires before strategy handle_bar, post_bar fires after
+  - System listeners process events before user listeners
+  - Nested ExecutionContexts correctly track and restore parent phase
+- id: strategy_execution
+  name: Strategy Execution
+  order: 3
+  responsibility: Loads and executes user strategy code with sandboxed API access. Manages strategy lifecycle
+    including init, before_trading, handle_bar, and after_trading callbacks with proper phase enforcement.
+  interface:
+    inputs:
+    - Strategy source code or user-defined functions
+    - Execution context
+    - Event dispatch from EventBus
+    outputs:
+    - Trading signals via submit_order
+    - Portfolio state queries
+    - Scheduled function executions
+  required_methods:
+  - name: Strategy.init
+    description: Strategy initialization callback executed once at startup with fresh state
+    evidence: rqalpha/core/strategy.py:41(Strategy)
+  - name: Strategy.handle_bar
+    description: Bar update callback triggered on each price update with phase enforcement
+    evidence: rqalpha/core/strategy.py:114(wrap_user_event_handler)
+  - name: StrategyContext.submit_order
+    description: Strategy-facing API for placing orders through the execution pipeline
+    evidence: rqalpha/core/strategy_context.py:139(StrategyContext)
+  - name: StrategyContext.portfolio
+    description: Provides access to portfolio state from strategy code
+    evidence: rqalpha/core/strategy_context.py:139(StrategyContext)
+  key_behaviors:
+  - behavior: StrategyLoader abstraction for multiple code sources
+    description: File/SourceCode/UserFunc loaders enable testing, notebooks, and live trading without
+      strategy code changes. Each loader implements consistent interface for strategy discovery.
+    evidence: rqalpha/interface.py:184(AbstractStrategyLoader)
+  - behavior: Scope-based sandbox for strategy API
+    description: Strategy code runs in controlled dictionary with explicit API exposure only. Prevents
+      accidental access to internal state while providing controlled access to market data and trading
+      functions.
+    evidence: rqalpha/main.py:176(create_base_scope)
+  - behavior: wrap_user_event_handler for phase enforcement
+    description: Ensures user code only runs during designated execution phases, throwing errors if called
+      during invalid phases like INIT or SETTLEMENT.
+    evidence: rqalpha/core/strategy.py:114(wrap_user_event_handler)
+  - behavior: Strategy init runs BEFORE persist restore
+    description: init() executes with fresh state; any state set in init() will be overwritten by restore.
+      Strategies cannot rely on persisted state during initialization.
+    evidence: rqalpha/main.py:201(user_strategy.init) → main.py:207(persist_helper.restore)
+  - behavior: Deprecated bar_dict parameter auto-wrapping
+    description: Old strategies with (context, bar_dict) in before_trading still work but log deprecation
+      warning. New strategy style uses only context parameter.
+    evidence: rqalpha/core/strategy.py:51-55(co_argcount > 1 check)
+  replaceable_points:
+  - name: StrategyLoader
+    description: Strategy code source and loading mechanism
+    options:
+    - name: FileStrategyLoader
+      traits:
+      - File-based loading
+      - Hot reload capable
+      fit_for:
+      - Standard backtesting
+      - Production deployments
+      not_fit_for:
+      - Interactive notebooks
+      - Dynamic strategy generation
+    - name: SourceCodeStrategyLoader
+      traits:
+      - String-based loading
+      - Dynamic code generation
+      fit_for:
+      - Notebook environments
+      - Generated strategies
+      not_fit_for:
+      - Production deployments
+      - File-based workflows
+    - name: UserFuncStrategyLoader
+      traits:
+      - Function-based loading
+      - Direct function reference
+      fit_for:
+      - Testing scenarios
+      - Modular strategy components
+      not_fit_for:
+      - Standard backtesting workflows
+    default: FileStrategyLoader
+  design_decisions:
+  - StrategyLoader abstraction enables testing, notebooks, and live trading without strategy code changes
+    (rqalpha/interface.py:184)
+  acceptance_hints:
+  - init() executes exactly once before first before_trading
+  - handle_bar only called during BAR phase with valid bar_dict
+  - before_trading called before any handle_bar on each trading day
+  - get_open_orders returns empty list during BEFORE_TRADING phase
+  - history_bars returns T-1 data during BEFORE_TRADING regardless of frequency
+- id: risk_mods
+  name: Risk & Scheduler Modules
+  order: 4
+  responsibility: Frontend validation of orders before submission, scheduled function execution, and system-level
+    risk controls. Catches invalid orders cheaply before they reach the matching engine.
+  interface:
+    inputs:
+    - Order submissions from strategy
+    - Time/calendar signals
+    - Account cash state
+    outputs:
+    - Validated or rejected orders with reason
+    - Scheduled function calls at configured times
+  required_methods:
+  - name: CashValidator.validate
+    description: Validates sufficient cash exists before order creation
+    evidence: rqalpha/mod/rqalpha_mod_sys_risk/validators/cash_validator.py:42(CashValidator)
+  - name: Scheduler.schedule
+    description: Registers function for scheduled execution at specified times
+    evidence: rqalpha/mod/rqalpha_mod_sys_scheduler/scheduler.py:64(Scheduler)
+  - name: Environment.submit_order
+    description: Entry point that validates and routes orders through the system
+    evidence: rqalpha/environment.py:202(submit_order)
+  key_behaviors:
+  - behavior: FrontendValidator chain via Environment
+    description: 'Validators run in sequence before broker, catching invalid orders cheaply. First validator
+      returning a reason string causes rejection; later validators never run. Order: CashValidator → PriceValidator
+      → IsTradingValidator → custom validators.'
+    evidence: rqalpha/environment.py:125(add_frontend_validator)
+  - behavior: Scheduler NEXT_BAR semantics for time rules
+    description: market_open(9, 31) means next bar after 9:31, not 9:30. This matches China exchange convention
+      where trading minutes are represented differently than clock time.
+    evidence: rqalpha/mod/rqalpha_mod_sys_scheduler/scheduler.py:264(next_bar_)
+  - behavior: Scheduler next_day_ runs on PRE_BEFORE_TRADING
+    description: Scheduler date tracking is ready before user before_trading runs. Scheduler functions
+      see correct _today value before strategy's before_trading callback.
+    evidence: rqalpha/mod/rqalpha_mod_sys_scheduler/scheduler.py:79(add_listener PRE_BEFORE_TRADING)
+  - behavior: Scheduler passes None as bar_dict in before_trading phase
+    description: Scheduler functions called during before_trading receive None for bar_dict. Accessing
+      bar data in scheduled functions during before_trading will raise AttributeError.
+    evidence: rqalpha/mod/rqalpha_mod_sys_scheduler/scheduler.py:280(func(self.ucontext, None))
+  - behavior: Risk validators execute BEFORE broker submission
+    description: Every validators must pass before order reaches broker. Validator errors prevent broker
+      processing entirely, ensuring invalid orders never reach the matching engine.
+    evidence: rqalpha/environment.py:202(submit_order calls can_submit_order)
+  replaceable_points:
+  - name: FrontendValidator
+    description: Pre-order risk checks and business rule validation
+    options:
+    - name: CashValidator
+      traits:
+      - Cash sufficiency check
+      - Frozen cash consideration
+      fit_for:
+      - Every strategies
+      - Margin requirement validation
+      not_fit_for:
+      - Strategies with external funding
+    - name: PriceValidator
+      traits:
+      - Limit price validation
+      - Price range checks
+      fit_for:
+      - Limit order strategies
+      - Volatility-based risk controls
+      not_fit_for:
+      - Market order only strategies
+    - name: IsTradingValidator
+      traits:
+      - Trading hours check
+      - Suspension detection
+      fit_for:
+      - Every strategies
+      - Chinese market hours
+      not_fit_for:
+      - 24-hour markets without configuration
+    - name: Custom validators
+      traits:
+      - User-defined rules
+      - Domain-specific checks
+      fit_for:
+      - Special requirements
+      - Regulatory compliance
+      not_fit_for:
+      - Standard workflows
+    default: Multiple validators (CashValidator, PriceValidator, IsTradingValidator)
+  - name: Scheduler time rules
+    description: Scheduling logic and time reference for scheduled functions
+    options:
+    - name: market_open
+      traits:
+      - Exchange open reference
+      - Chinese market defaults
+      fit_for:
+      - Opening range strategies
+      - Market-on-open orders
+      not_fit_for:
+      - Non-Chinese markets without custom configuration
+    - name: market_close
+      traits:
+      - Exchange close reference
+      - Closing auction support
+      fit_for:
+      - Closing range strategies
+      - End-of-day rebalancing
+      not_fit_for:
+      - 24-hour trading venues
+    - name: physical_time
+      traits:
+      - System clock reference
+      - Real-time execution
+      fit_for:
+      - Real-time triggers
+      - Event-based scheduling
+      not_fit_for:
+      - Backtesting (time may not match simulation time)
+    default: market_open/market_close with Chinese stock trading minute defaults
+  design_decisions:
+  - Validators run before broker catching invalid orders cheaply (rqalpha/environment.py:125)
+  acceptance_hints:
+  - Orders rejected with clear reason when cash insufficient
+  - Scheduled functions execute at correct times relative to market open/close
+  - Custom validators added via add_frontend_validator are called in registration order
+  - 'Validator short-circuit: first non-None reason rejects the order'
+- id: order_execution
+  name: Order & Execution
+  order: 5
+  responsibility: Order creation, validation, and matching. Converts trading signals into fills with transaction
+    costs. Handles slippage, price limits, and market-specific matching rules.
+  interface:
+    inputs:
+    - Validated order requests
+    - Price data from BarDictPriceBoard
+    - Account state
+    outputs:
+    - Trade objects with execution details
+    - Order status updates
+    - Position change notifications via TRADE events
+  required_methods:
+  - name: Order.submit
+    description: Submits order to broker for matching with current market conditions
+    evidence: rqalpha/mod/rqalpha_mod_sys_simulation/signal_broker.py:105(submit_order)
+  - name: SignalBroker.fill
+    description: Matches order against available liquidity and creates trade records
+    evidence: rqalpha/mod/rqalpha_mod_sys_simulation/signal_broker.py:124(fill)
+  - name: StockTransactionCostDecider.calc
+    description: Calculates transaction costs including commission, tax, and slippage
+    evidence: rqalpha/mod/rqalpha_mod_sys_transaction_cost/deciders.py:35(StockTransactionCostDecider)
+  key_behaviors:
+  - behavior: Order fill updates state synchronously via event
+    description: Order.fill() followed by TRADE event ensures Account and Position remain consistent.
+      No intermediate inconsistent states exist between fill and position update.
+    evidence: rqalpha/mod/rqalpha_mod_sys_simulation/signal_broker.py:124(fill)
+  - behavior: Slippage as separate decider injected into broker
+    description: Pluggable slippage models (fixed, percentage) without broker code changes. SlippageDecider
+      called during fill to modify execution price before trade creation.
+    evidence: rqalpha/mod/rqalpha_mod_sys_simulation/signal_broker.py:38(SlippageDecider)
+  - behavior: Price limit rejection in broker at match time
+    description: Limit up/down check happens at match time, not submit time. This models real exchange
+      behavior where limit orders may become executable if price moves within bounds.
+    evidence: rqalpha/mod/rqalpha_mod_sys_simulation/signal_broker.py:92(price_limit)
+  - behavior: A-share stamp tax applied on SELL only
+    description: Side-aware cost calculation applies stamp tax only on sell transactions. Buy transactions
+      incur commission but no stamp tax.
+    evidence: rqalpha/mod/rqalpha_mod_sys_transaction_cost/deciders.py:87(_calc_tax)
+  - behavior: Slippage applied on trade price, not frozen price
+    description: Market orders get last_price plus slippage; limit orders get frozen_price plus slippage.
+      This models realistic execution costs for different order types.
+    evidence: rqalpha/mod/rqalpha_mod_sys_simulation/signal_broker.py:113(get_trade_price)
+  replaceable_points:
+  - name: Broker/Matching engine
+    description: Order matching and fill simulation logic
+    options:
+    - name: SignalBroker
+      traits:
+      - Signal-based matching
+      - 100% fill assumption
+      fit_for:
+      - Standard backtesting
+      - Strategy development
+      not_fit_for:
+      - Order book simulation
+      - Liquidity modeling
+    - name: Custom AbstractBroker implementation
+      traits:
+      - Custom matching logic
+      - Order book integration
+      fit_for:
+      - Realistic fill simulation
+      - Volume constraints
+      not_fit_for:
+      - Simple signal-based backtesting
+    default: SignalBroker
+  - name: Transaction cost model
+    description: Market-specific transaction cost calculations
+    options:
+    - name: StockTransactionCostDecider
+      traits:
+      - A-share costs
+      - Stamp tax on sell
+      - Commission tiers
+      fit_for:
+      - Chinese stock strategies
+      - A-share backtesting
+      not_fit_for:
+      - US stocks
+      - Forex
+      - Crypto
+    - name: FuturesTransactionCostDecider
+      traits:
+      - Futures costs
+      - Per-contract fees
+      - No stamp tax
+      fit_for:
+      - Futures strategies
+      - Commodity trading
+      not_fit_for:
+      - Stock strategies
+      - Multi-asset portfolios
+    - name: Custom decider
+      traits:
+      - Custom cost structure
+      - Market-specific rules
+      fit_for:
+      - Non-standard markets
+      - Regulatory requirements
+      not_fit_for:
+      - Standard A-share/futures backtesting
+    default: Built-in StockTransactionCostDecider and FuturesTransactionCostDecider
+  design_decisions:
+  - Order fill updates state synchronously via event ensuring Account and Position consistency (rqalpha/mod/rqalpha_mod_sys_simulation/signal_broker.py:124)
+  - Transaction cost per INSTRUMENT_TYPE + MARKET tuple supports different cost rules (rqalpha/environment.py:187)
+  acceptance_hints:
+  - 'Order status transitions correctly: PENDING_NEW → ACTIVE → FILLED/CANCELLED/REJECTED'
+  - Trade objects include correct price, quantity, and cost calculations
+  - Stamp tax appears only on sell transactions, not buys
+  - Slippage correctly adjusts execution price from reference price
+  - Price limit violations cause order rejection at match time
+- id: portfolio_accounting
+  name: Portfolio & Accounting
+  order: 6
+  responsibility: Tracks positions, cash, margin, and PnL across accounts. Handles T+1 settlement, dividends,
+    split adjustments, and provides portfolio metrics for analysis and risk management.
+  interface:
+    inputs:
+    - Trade executions from order matching
+    - Price updates via BarDictPriceBoard
+    - Corporate actions (dividends, splits)
+    - Settlement signals
+    outputs:
+    - Portfolio state with NAV
+    - Account metrics (cash, margin, equity)
+    - Position values with PnL attribution
+  required_methods:
+  - name: Portfolio.unit_net_value
+    description: Returns current NAV per unit for performance tracking
+    evidence: rqalpha/portfolio/__init__.py:43(Portfolio)
+  - name: Account.cash
+    description: Returns available cash (total - frozen - margin - cash_liabilities)
+    evidence: rqalpha/portfolio/account.py:216(cash)
+  - name: Position.position_pnl
+    description: Calculates unrealized PnL as old_quantity * (last_price - prev_close) * direction_factor
+    evidence: rqalpha/portfolio/position.py:152(position_pnl)
+  - name: StockPosition.sellable
+    description: Returns quantity available for sale respecting T+1 settlement rules
+    evidence: rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py:200(_market_tplus)
+  key_behaviors:
+  - behavior: PositionProxy for long/short separation in futures
+    description: Futures require separate long/short positions with independent margin tracking. PositionProxy
+      delegates to appropriate underlying position based on direction.
+    evidence: rqalpha/portfolio/position.py:376(PositionProxy)
+  - behavior: T+1 closable calculation for A-shares
+    description: sellable = total - today_bought - frozen enforces China T+1 rule. Stocks bought today
+      cannot be sold today regardless of settlement timing.
+    evidence: rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py:200(_market_tplus)
+  - behavior: Dividend receivable queued until payable date
+    description: Cash from dividends only transferred on ex-dividend payable date, not record date. This
+      matches actual settlement practices and prevents premature cash recognition.
+    evidence: rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py:80(dividend_receivable)
+  - behavior: AccountMeta optimizes stock-only portfolios
+    description: 'cls.margin = property(lambda s: 0) replaces margin method with zero-cost property for
+      stock-only accounts, avoiding margin calculation overhead. Adding futures breaks this optimization.'
+    evidence: rqalpha/portfolio/account.py:41(margin)
+  - behavior: Position factory via metaclass POSITION_TYPE_MAP
+    description: Position.__new__ dispatches to StockPosition/FuturePosition based on instrument.type.
+      This enables different position behaviors for different instrument types without explicit factory
+      calls.
+    evidence: rqalpha/portfolio/position.py:37(new_position_meta)
+  - behavior: fast_forward for resume with trades replay
+    description: 'On resume from persist, replay trades in order: opens first, then closes. This maintains
+      position integrity during state restoration.'
+    evidence: rqalpha/portfolio/account.py:151(fast_forward)
+  - behavior: Account fast_forward processes OPEN before CLOSE trades
+    description: If same trade ID appears as both OPEN and CLOSE, OPEN will always be processed first.
+      This ensures positions are opened before matching closes.
+    evidence: rqalpha/portfolio/account.py:158(OPEN check) → account.py:163(CLOSE processing)
+  - behavior: Settlement happens AFTER after_trading but BEFORE next day's before_trading
+    description: Position P&L finalizes after trading ends. Cash reflects previous day settlements at
+      start of new trading day.
+    evidence: rqalpha/core/events.py:117-125(EVENT.SETTLEMENT definition)
+  replaceable_points:
+  - name: Position model
+    description: Position tracking logic and market-specific rules
+    options:
+    - name: StockPosition
+      traits:
+      - T+1 settlement
+      - Dividend handling
+      - Direction=LONG only
+      fit_for:
+      - A-share strategies
+      - Stock-only portfolios
+      not_fit_for:
+      - Futures strategies
+      - Short positions
+    - name: FuturePosition
+      traits:
+      - Long/short support
+      - Margin tracking
+      - Close-today FIFO
+      fit_for:
+      - Futures strategies
+      - Derivatives trading
+      not_fit_for:
+      - Stock-only portfolios
+      - Options strategies
+    - name: Custom Position subclass
+      traits:
+      - Custom PnL logic
+      - Market-specific rules
+      fit_for:
+      - Options strategies
+      - Multi-leg instruments
+      not_fit_for:
+      - Standard stock/futures backtesting
+    default: Per-instrument-type defaults (StockPosition for stocks, FuturePosition for futures)
+  - name: Account type
+    description: Account configuration for different asset classes
+    options:
+    - name: STOCK
+      traits:
+      - No margin
+      - Cash equity only
+      - T+1 settlement
+      fit_for:
+      - Stock strategies
+      - Equity portfolios
+      not_fit_for:
+      - Futures strategies
+      - Leveraged trading
+    - name: FUTURE
+      traits:
+      - Margin required
+      - Long/short positions
+      - Daily settlement
+      fit_for:
+      - Futures strategies
+      - Commodity trading
+      not_fit_for:
+      - Stock-only strategies
+      - Cash equity portfolios
+    - name: Custom account types
+      traits:
+      - Custom margin rules
+      - Asset-specific features
+      fit_for:
+      - Multi-asset portfolios
+      - Custom margin models
+      not_fit_for:
+      - Standard single-asset backtesting
+    default: DEFAULT_ACCOUNT_TYPE enum with STOCK and FUTURE
+  design_decisions:
+  - PositionProxy for long/short separation in futures (rqalpha/portfolio/position.py:376)
+  acceptance_hints:
+  - Account.cash = total_cash - frozen_cash - margin - cash_liabilities at each times
+  - StockPosition.sellable excludes today_bought respecting T+1 rule
+  - Dividend cash appears on payable_date, not record_date
+  - Portfolio unit_net_value matches sum of position values plus cash
+  - Position.direction_factor = 1 for LONG, -1 for SHORT consistently applied
+  - fast_forward restores correct position state from persisted trades
+data_flow:
+- from_stage: data_layer
+  to_stage: event_system
+  data: BarDict with prices per order_book_id, updated each bar during simulation
+- from_stage: event_system
+  to_stage: strategy_execution
+  data: BAR/TICK events that trigger handle_bar/handle_tick callbacks in user strategy
+- from_stage: strategy_execution
+  to_stage: risk_mods
+  data: Order requests via submit_order API call
+- from_stage: risk_mods
+  to_stage: order_execution
+  data: Validated orders that pass each frontend validators
+- from_stage: order_execution
+  to_stage: portfolio_accounting
+  data: Trade objects with execution details and TRADE events for position updates
+- from_stage: data_layer
+  to_stage: portfolio_accounting
+  data: Price updates via BarDictPriceBoard.get_last_price() for PnL calculation
+- from_stage: portfolio_accounting
+  to_stage: risk_mods
+  data: Account.cash for CashValidator to check sufficient funds
+- from_stage: event_system
+  to_stage: risk_mods
+  data: AFTER_TRADING events trigger analyser collection and SETTLEMENT triggers final daily processing
+- from_stage: strategy_execution
+  to_stage: portfolio_accounting
+  data: Portfolio state queries via context.portfolio and context.account
+global_contracts:
+- contract: Every prices validated via is_valid_price() before use in calculations or order submission
+  evidence: rqalpha/data/bar_dict_price_board.py:32(get_last_price)
+- contract: PositionPnl = old_quantity * (last_price - prev_close) * direction_factor where direction_factor=1
+    for LONG, -1 for SHORT
+  evidence: rqalpha/portfolio/position.py:152(position_pnl)
+- contract: TradingPnl = net_trade_quantity * last_price - trade_cost) * direction_factor for realized
+    PnL
+  evidence: rqalpha/portfolio/position.py:131(trading_pnl)
+- contract: Account.cash = total_cash - frozen_cash - margin - cash_liabilities always holds
+  evidence: rqalpha/portfolio/account.py:216(cash)
+- contract: 'Order.status transitions follow strict state machine: PENDING_NEW → ACTIVE → FILLED/CANCELLED/REJECTED'
+  evidence: rqalpha/model/order.py:247(status)
+- contract: Every instrument lookup via data_proxy.instrument() returns Instrument object with .type attribute
+    populated
+  evidence: rqalpha/data/instruments_mixin.py:141(instrument)
+- contract: Environment is singleton accessed via Environment.get_instance() ensuring single system state
+  evidence: rqalpha/environment.py:83(get_instance)
+- contract: Persistable classes use __subclasshook__ for duck-typing - any class with get_state/set_state
+    qualifies for persistence
+  evidence: rqalpha/interface.py:708-714(__subclasshook__)
+- contract: get_open_orders excludes EXERCISE orders via hardcoded filter
+  evidence: rqalpha/apis/api_base.py:133(position_effect != EXERCISE filter)
+- contract: history_bars returns T-1 data in before_trading regardless of frequency due to force include_now=False
+  evidence: rqalpha/apis/api_base.py:505-508(force include_now=False in BEFORE_TRADING)
+business_decisions:
+- id: BD-001
+  type: BA
+  content: Separate DataProxy from DataSource for forward proxy pattern
+  rationale: DataProxy aggregates multiple mixins (TradingDatesMixin, InstrumentsMixin) providing unified
+    API without polluting DataSource class. This separation allows DataSource to remain focused on data
+    retrieval while DataProxy orchestrates cross-cutting concerns, enabling addition of new mixins without
+    modifying core data access logic.
+  evidence: rqalpha/data/data_proxy.py:42(DataProxy)
+  stage: data_layer
+  alternative_considered: Could have extended DataSource directly but would couple data retrieval with
+    API aggregation logic
+- id: BD-002
+  type: B/DK
+  content: Dynamic storage registration by instrument_type and market
+  rationale: Allows plugging different storage backends per instrument type/market without code changes.
+    This registry pattern enables runtime configuration of storage engines (e.g., CSV for historical,
+    HDF5 for high-frequency) based on instrument characteristics, supporting varied data sources across
+    different trading venues without hardcoding.
+  evidence: rqalpha/data/base_data_source/data_source.py:148(register_day_bar_store)
+  stage: data_layer
+  alternative_considered: Static storage mapping would require code changes for each new instrument type/market
+    combination
+- id: BD-003
+  type: B/DK
+  content: CustomEnum metaclass with reverse lookup
+  rationale: 'Enables both name and value-based enum lookup: ORDER_STATUS.MARKET == ''MARKET'' works both
+    ways. The metaclass provides bidirectional mapping between enum members and their values, eliminating
+    boilerplate comparison code and reducing errors in order status handling across the system.'
+  evidence: rqalpha/const.py:21(CustomEnumMeta)
+  stage: data_layer
+  alternative_considered: Standard Python enum requires explicit value() method calls for reverse lookup
+- id: BD-004
+  type: B
+  content: ChainMap for id/symbol instrument lookup
+  rationale: Single lookup dict handles both order_book_id and symbol without duplication. Using ChainMap
+    provides O(1) lookup performance while maintaining separate namespaces for id and symbol keys, avoiding
+    the need to duplicate instrument objects in multiple dictionary structures.
+  evidence: rqalpha/data/base_data_source/data_source.py:121(_id_or_sym_instrument_map)
+  stage: data_layer
+  alternative_considered: Separate id_map and symbol_map would double instrument object storage
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _id_or_sym_instrument_map in rqalpha/data/base_data_source/data_source.py'
+- id: BD-005
+  type: BA
+  content: Last price cached in PriceBoard not in DataSource
+  rationale: PriceBoard updated per-bar reflects in-progress prices; DataSource is historical/point-in-time.
+    This separation ensures strategies can access current tick/bar prices for real-time decisions while
+    DataSource maintains accurate historical records, preventing contamination of historical data with
+    live trading information.
+  evidence: rqalpha/data/bar_dict_price_board.py:23(BarDictPriceBoard)
+  stage: data_layer
+  alternative_considered: Caching in DataSource would blur the line between historical and live price
+    data
+- id: BD-006
+  type: BA
+  content: Pre/Post event hooks around core events
+  rationale: PRE_BAR/post_bar allows mods to inject logic before/after strategy handle_bar. This hook
+    pattern enables extensibility without modifying core event dispatch, allowing risk checks, logging,
+    and monitoring mods to wrap strategy execution for side effects that must run regardless of strategy
+    logic.
+  evidence: rqalpha/core/events.py:53(EVENT)
+  stage: event_system
+  alternative_considered: Direct modification of handle_bar would require changes per strategy
+- id: BD-007
+  type: B
+  content: Separate user vs system listeners with different dispatch semantics
+  rationale: System listeners break on True return; user listeners always run - prevents accidental early
+    termination. This semantic distinction protects system-level handlers (risk checks, accounting) from
+    being bypassed by user code that might return True, ensuring critical infrastructure runs to completion
+    regardless of strategy behavior.
+  evidence: rqalpha/core/events.py:43(publish_event)
+  stage: event_system
+  alternative_considered: Uniform True-break semantics would allow buggy user code to corrupt system state
+- id: BD-008
+  type: BA
+  content: prepend_listener for account event hooks
+  rationale: Account updates BAR/TICK before other listeners to ensure position state reflects latest
+    prices. Prepending account listeners guarantees accounting runs first, so subsequent handlers (including
+    strategy code) work with consistent position state, preventing stale price references in position-sensitive
+    logic.
+  evidence: rqalpha/portfolio/account.py:121(prepend_listener)
+  stage: event_system
+  alternative_considered: Append ordering could cause strategy to see stale positions before accounting
+    updates
+  _evidence_issues:
+  - 'FN_NOT_FOUND: prepend_listener in rqalpha/portfolio/account.py'
+- id: BD-009
+  type: BA/M
+  content: ExecutionContext as context stack, not singleton
+  rationale: Nested contexts possible (e.g., scheduler running inside handle_bar). The stack model allows
+    precise tracking of execution phases even when one execution context triggers another, such as a scheduled
+    function executing within a bar handler, maintaining correct phase attribution for each operations.
+  evidence: rqalpha/core/execution_context.py:58(ExecutionContext)
+  stage: event_system
+  alternative_considered: Singleton pattern would lose outer context when entering nested execution
+- id: BD-010
+  type: B
+  content: Order fill updates state synchronously via event
+  rationale: Order.fill() + TRADE event ensures Account and Position always consistent. Publishing the
+    TRADE event immediately after state update guarantees each dependent systems (accounting, risk, analytics)
+    receive notification synchronously, eliminating race conditions between order execution and portfolio
+    state.
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/signal_broker.py:124(fill)
+  stage: order_execution
+  alternative_considered: Async state updates could cause position discrepancies during rapid trading
+  _evidence_issues:
+  - 'FN_NOT_FOUND: fill in rqalpha/mod/rqalpha_mod_sys_simulation/signal_broker.py'
+- id: BD-011
+  type: BA/DK
+  content: Slippage as separate decider injected into broker
+  rationale: Pluggable slippage models (fixed, percentage) without broker changes. Decider injection allows
+    different slippage assumptions per asset class or market without modifying broker logic, enabling
+    realistic simulation of execution costs across diverse trading scenarios.
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/signal_broker.py:38(SlippageDecider)
+  stage: order_execution
+  alternative_considered: Hardcoded slippage would require broker modifications for each cost model
+  _evidence_issues:
+  - 'FN_NOT_FOUND: SlippageDecider in rqalpha/mod/rqalpha_mod_sys_simulation/signal_broker.py'
+- id: BD-012
+  type: B
+  content: AlgoOrder styles for TWAP/VWAP execution
+  rationale: Execution algorithm decoupled from order routing. AlgoOrder styles (TWAP, VWAP) separate
+    execution strategy from order lifecycle management, allowing the same routing infrastructure to support
+    multiple algorithmic approaches without duplicating order handling logic.
+  evidence: rqalpha/model/order.py:396(AlgoOrder)
+  stage: order_execution
+  alternative_considered: Tight coupling would require implementing TWAP/VWAP logic in each broker
+- id: BD-013
+  type: BA/DK
+  content: Transaction cost per INSTRUMENT_TYPE + MARKET tuple
+  rationale: Supports different cost rules for same instrument traded in different markets. This dual-key
+    lookup (instrument type + market) accurately models varying commission rates, exchange fees, and regulatory
+    charges across different venues where the same security might trade.
+  evidence: rqalpha/environment.py:187(set_transaction_cost_decider)
+  stage: order_execution
+  alternative_considered: Single cost per instrument type would miscalculate costs for dual-listed securities
+- id: BD-014
+  type: BA/M
+  content: Price limit rejection in broker, not order creation
+  rationale: Limit up/down check happens at match time, not submit time - models real exchange behavior.
+    This simulation of exchange rules ensures backtesting accurately reflects scenarios where limit orders
+    are accepted but later rejected when price limits are hit, providing realistic fill rate modeling.
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/signal_broker.py:92(price_limit)
+  stage: order_execution
+  alternative_considered: Submit-time rejection would overstate order failures in limit-order-heavy strategies
+  _evidence_issues:
+  - 'FN_NOT_FOUND: price_limit in rqalpha/mod/rqalpha_mod_sys_simulation/signal_broker.py'
+- id: BD-015
+  type: B/BA
+  content: PositionProxy for long/short separation in futures
+  rationale: Futures need separate long/short positions with independent margin. PositionProxy allows
+    a single instrument to have both directional positions tracked independently, essential for futures
+    where margin calculations, settlement, and risk metrics differ between long and short holdings.
+  evidence: rqalpha/portfolio/position.py:376(PositionProxy)
+  stage: portfolio_accounting
+  alternative_considered: Net position would incorrectly calculate margin for hedged futures strategies
+- id: BD-016
+  type: B/DK
+  content: T+1 closable calculation for A-shares
+  rationale: sellable = total - today_bought - frozen; enforces China T+1 rule. The formula correctly
+    prevents selling shares purchased same day while accounting for previously bought but not yet settled
+    shares, accurately modeling the China A-share settlement restriction.
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py:200(_market_tplus)
+  stage: portfolio_accounting
+  alternative_considered: Ignoring T+1 would allow unrealistic same-day sell-after-buy strategies
+- id: BD-017
+  type: B/BA
+  content: Dividend receivable queued until payable date
+  rationale: Cash only transferred on ex-dividend payable date, not record date. Queuing dividend receivables
+    until payable date accurately models the gap between record date (ownership determination) and actual
+    cash receipt, preventing premature capital allocation in portfolio accounting.
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py:80(dividend_receivable)
+  stage: portfolio_accounting
+  alternative_considered: Record-date recognition would misstate cash position timing
+- id: BD-018
+  type: M
+  content: AccountMeta black magic for margin optimization
+  rationale: 'cls.margin = property(lambda s: 0) replaces method with zero-cost property for stock-only
+    accounts. This metaclass technique eliminates margin calculation overhead for equity-only accounts
+    that never incur margin, using class-level property replacement to avoid instance-level computation.'
+  evidence: rqalpha/portfolio/account.py:256(margin)
+  stage: portfolio_accounting
+  alternative_considered: Method with conditional check would add overhead to every margin access
+- id: BD-019
+  type: B
+  content: Position factory via metaclass POSITION_TYPE_MAP
+  rationale: Position.__new__ dispatches to StockPosition/FuturePosition based on instrument.type. The
+    factory pattern via metaclass eliminates explicit conditional creation logic, allowing new instrument
+    types to register their position class without modifying position creation code.
+  evidence: rqalpha/portfolio/position.py:37(new_position_meta)
+  stage: portfolio_accounting
+  alternative_considered: if/else creation would require code changes per instrument type
+- id: BD-020
+  type: BA
+  content: fast_forward for resume with trades replay
+  rationale: 'On resume, replay trades in order: opens first, then closes - maintains position integrity.
+    Replaying historical trades in sequence ensures position state is correctly reconstructed, with opening
+    trades establishing positions before closing trades attempt to reduce them, preventing sell-before-buy
+    errors.'
+  evidence: rqalpha/portfolio/account.py:151(fast_forward)
+  stage: portfolio_accounting
+  alternative_considered: Random order replay could cause position calculation errors on resume
+- id: BD-021
+  type: B
+  content: StrategyLoader abstraction for multiple code sources
+  rationale: File/SourceCode/UserFunc loaders enable testing, notebooks, and live trading without strategy
+    code changes. Abstract factory pattern for strategy loading decouples the framework from specific
+    code storage mechanisms, allowing the same strategy to run from files, strings, or callable objects
+    interchangeably.
+  evidence: rqalpha/interface.py:184(AbstractStrategyLoader)
+  stage: strategy_execution
+  alternative_considered: Hardcoded file loading would prevent programmatic strategy creation and testing
+- id: BD-022
+  type: BA
+  content: Scope-based sandbox for strategy API
+  rationale: Strategy code runs in controlled dict with explicit API exposure only. Sandboxing via scope
+    dict prevents accidental access to internal APIs while explicitly whitelisting allowed functions,
+    protecting system integrity from buggy or malicious strategy code that might inadvertently access
+    unintended capabilities.
+  evidence: rqalpha/main.py:67(create_base_scope)
+  stage: strategy_execution
+  alternative_considered: Global namespace exposure risks corruption of system state by strategy code
+- id: BD-023
+  type: BA
+  content: wrap_user_event_handler for phase enforcement
+  rationale: Ensures user code only runs during designated execution phases. Wrapper enforcement prevents
+    strategies from executing during forbidden phases (e.g., initialization, teardown), maintaining clean
+    boundaries between framework operations and user-defined logic for predictable execution semantics.
+  evidence: rqalpha/core/strategy.py:114(wrap_user_event_handler)
+  stage: strategy_execution
+  alternative_considered: No enforcement would allow strategies to access partially-initialized state
+- id: BD-024
+  type: B
+  content: run_when_strategy_not_hold decorator
+  rationale: Prevents event handling when strategy is paused by mod. Decorator-based gating allows mods
+    to externally control strategy execution without modifying handler code, enabling pause/resume functionality
+    and preventing event processing during invalid states.
+  evidence: rqalpha/core/strategy.py:29(run_when_strategy_not_hold)
+  stage: strategy_execution
+  alternative_considered: Inline checks would require modification per event handler
+- id: BD-025
+  type: BA
+  content: FrontendValidator chain via Environment
+  rationale: Validators run before broker, catching invalid orders cheaply. Frontend validation catches
+    obvious errors (insufficient capital, position limits) before reaching broker logic, avoiding expensive
+    broker-side processing for orders destined to fail while providing clear rejection messages.
+  evidence: rqalpha/environment.py:125(add_frontend_validator)
+  stage: risk_mods
+  alternative_considered: Every validation in broker would waste resources processing invalid orders
+- id: BD-026
+  type: B/BA
+  content: Scheduler NEXT_BAR semantics for time rules
+  rationale: market_open(9, 31) means next bar after 9:31, not 9:30 - matches China exchange convention.
+    This interpretation aligns scheduler behavior with actual exchange bar boundaries, ensuring scheduled
+    functions fire at times matching real market data bars rather than arbitrary clock times.
+  evidence: rqalpha/mod/rqalpha_mod_sys_scheduler/scheduler.py:264(next_bar_)
+  stage: risk_mods
+  alternative_considered: Clock-time semantics would misalign scheduled functions with bar boundaries
+- id: BD-027
+  type: M
+  content: Shift-based return calculation in analyser
+  rationale: returns = nav/nav.shift(1).fillna(1) - 1; first bar gets fillna(1) to avoid NaN. Using pandas
+    shift() for returns calculation leverages vectorized operations while handling the edge case of the
+    first bar (no prior NAV) by treating it as 0% return, preventing NaN propagation in downstream analytics.
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/mod.py:403(shift)
+  stage: risk_mods
+  alternative_considered: Loop-based calculation would be significantly slower for long backtests
+  _evidence_issues:
+  - 'FN_NOT_FOUND: shift in rqalpha/mod/rqalpha_mod_sys_analyser/mod.py'
+- id: BD-028
+  type: B
+  content: Order creation flow uses frontend validators before submission
+  rationale: Frontend validation prevents invalid orders from reaching the matching engine, reducing error
+    handling overhead and improving simulation integrity. The validation boundary is at order submission
+    time, before any matching logic executes.
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/signal_broker.py:44(submit_order)
+  stage: order_execution
+  alternative_considered: Backend-only validation was considered but rejected to provide faster feedback
+    and avoid wasted matching engine cycles.
+- id: BD-029
+  type: B/DK
+  content: Market order unfilled portion cancelled when volume limit exceeded
+  rationale: Market orders partially filled against available liquidity have the remainder cancelled rather
+    than remaining active, preventing stale orders in a fast-moving market. This boundary ensures predictable
+    order lifecycle behavior when volume constraints are hit.
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/matcher.py:506(match)
+  stage: order_execution
+  alternative_considered: Converting unfilled portion to limit order at current price was rejected to
+    maintain strict market order semantics.
+- id: BD-030
+  type: B/BA
+  content: Limit order remains active if price not reached; cancelled if price limit reached
+  rationale: Price limit check enforces Chinese market circuit breaker rules where trading halts at limit-up/limit-down
+    prices. Orders touching these limits are cancelled to prevent execution at halted prices, with the
+    boundary at the limit price threshold.
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/matcher.py:150(_price_limit_check)
+  stage: order_execution
+  alternative_considered: Rejecting at submission time was considered but runtime check needed due to
+    intraday limit updates.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _price_limit_check in rqalpha/mod/rqalpha_mod_sys_simulation/matcher.py'
+- id: BD-031
+  type: B/BA
+  content: DefaultBarMatcher uses CURRENT_BAR_CLOSE for deal price when volume_limit enabled
+  rationale: When volume_limit restricts execution, using the current bar's close price provides a realistic
+    execution reference point aligned with bar-based simulation. The boundary is the volume limit trigger,
+    after which deal price determination switches to close price.
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/matcher.py:76(_current_bar_close_decider)
+  stage: order_execution
+  alternative_considered: Using next bar open was rejected as it introduces lookahead bias in bar-based
+    simulation.
+- id: BD-032
+  type: B/DK
+  content: 'Slippage applied to deal price: BUY adds positive slippage, SELL subtracts'
+  rationale: Market impact modeling requires BUY orders to execute at higher prices (adverse price movement)
+    and SELL orders at lower prices. The slippage direction boundary is determined by order side, simulating
+    realistic execution costs in liquid and illiquid markets.
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/slippage.py:113(get_trade_price)
+  stage: order_execution
+  alternative_considered: Symmetric slippage was rejected as it doesn't reflect directional market impact
+    observed in real markets.
+- id: BD-033
+  type: B/DK
+  content: Slippage constrained by price limits (limit_up, limit_down)
+  rationale: Slippage cannot push execution prices beyond daily price limits, ensuring simulation stays
+    within regulatory bounds. The boundary is the limit price, after which slippage application stops
+    to prevent illegal price violations.
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/slippage.py:78(is_valid_price)
+  stage: order_execution
+  alternative_considered: Capping at limit was accepted as it mirrors real exchange behavior during limit-up/limit-down
+    days.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: is_valid_price in rqalpha/mod/rqalpha_mod_sys_simulation/slippage.py'
+- id: BD-034
+  type: B/RC
+  content: Cash validation includes estimated transaction cost
+  rationale: Pre-validating cash sufficiency requires accounting for transaction costs (commission, tax)
+    to prevent over-trading that would leave insufficient cash for settlement. The boundary is the estimated
+    total cost including each fees before order execution.
+  evidence: rqalpha/mod/rqalpha_mod_sys_risk/validators/cash_validator.py:31(cost_money_calc)
+  stage: order_execution
+  alternative_considered: Post-trade cost deduction was rejected as it could cause margin calls mid-simulation.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: cost_money_calc in rqalpha/mod/rqalpha_mod_sys_risk/validators/cash_validator.py'
+- id: BD-035
+  type: B/BA
+  content: Available cash for buying excludes already-frozen cash
+  rationale: Frozen cash from pending sell orders cannot be used for new purchases, preventing double-commitment
+    of capital. The boundary is the pending order queue, where frozen cash is reserved until orders fill
+    or cancel.
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/api/order_target_portfolio.py:75(order_target_portfolio:)
+  stage: portfolio_accounting
+  alternative_considered: Gross cash availability was rejected as it would allow over-trading beyond actual
+    available capital.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: order_target_portfolio: in rqalpha/mod/rqalpha_mod_sys_accounts/api/order_target_portfolio.py'
+- id: BD-036
+  type: B/RC
+  content: Sell order quantity validated against position.closable
+  rationale: Short selling is prevented by validating sell quantities against closable position size (considering
+    T+1 settlement rules). The boundary is the closable quantity computed from historical trades and settlement
+    status.
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/position_validator.py:33(validate_submission)
+  stage: order_execution
+  alternative_considered: Using total position was rejected as it would enable T+0 short selling in A-shares.
+  vague_rationale: true
+- id: BD-037
+  type: B
+  content: Close-today orders validated against position.today_closable
+  rationale: Intraday trading (当日买卖) requires today's purchased shares to be explicitly marked as today_closable,
+    separate from regular closable. The boundary is the intraday position tracking distinguishing today-bought
+    vs historical shares.
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/position_validator.py:39(today_closable)
+  stage: order_execution
+  alternative_considered: Generic closable check was rejected as it wouldn't support intraday close-today
+    functionality.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: today_closable in rqalpha/mod/rqalpha_mod_sys_accounts/position_validator.py'
+- id: BD-038
+  type: B/DK
+  content: Limit order price validated against price_board limits before submission
+  rationale: Limit orders must respect daily price movement limits to be executable. The boundary is the
+    price_board limit-up/limit-down computed from previous close, rejecting orders that would violate
+    circuit breaker rules at submission.
+  evidence: rqalpha/mod/rqalpha_mod_sys_risk/validators/price_validator.py:34(limit_up)
+  stage: order_execution
+  alternative_considered: Allowing submission and rejecting at matching was rejected to provide faster
+    feedback to users.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: limit_up in rqalpha/mod/rqalpha_mod_sys_risk/validators/price_validator.py'
+- id: BD-039
+  type: B
+  content: Trade execution triggers POST_TRADE event for account update
+  rationale: Event-driven architecture ensures account state updates after trade execution in proper sequence.
+    The boundary is the POST_TRADE event, which signals to listeners (portfolio, risk modules) that trade
+    execution is complete and state changes can be applied.
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/matcher.py:230(publish_event)
+  stage: trade_application
+  alternative_considered: Direct state mutation was rejected as it would bypass event-driven dependencies
+    in other modules.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: publish_event in rqalpha/mod/rqalpha_mod_sys_simulation/matcher.py'
+- id: BD-040
+  type: B
+  content: Close orders processed before open orders in order_target_portfolio
+  rationale: Closing existing positions before opening new ones prevents over-positioning and ensures
+    proper cash utilization. The boundary is the close-then-open sequence, critical for order_target operations
+    where position sizing depends on net exposure.
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/api/api_stock.py:447(close_then_open)
+  stage: portfolio_accounting
+  alternative_considered: Simultaneous processing was rejected as it could cause cash calculation errors
+    in edge cases.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: close_then_open in rqalpha/mod/rqalpha_mod_sys_accounts/api/api_stock.py'
+- id: BD-041
+  type: B/BA
+  content: Unit net value = total_value / units; units initialized as sum of starting cash
+  rationale: Unit net value provides a per-unit performance metric independent of initial capital. The
+    boundary is at initialization where units equal starting cash, establishing the baseline for each
+    subsequent NAV calculations.
+  evidence: rqalpha/portfolio/__init__.py:157(unit_net_value)
+  stage: portfolio_accounting
+  alternative_considered: Units as fixed count was rejected as it doesn't scale NAV properly with initial
+    capital differences.
+- id: BD-042
+  type: B
+  content: daily_returns = unit_net_value / static_unit_net_value - 1
+  rationale: Daily return calculation uses static unit NAV from previous day to avoid using today's partial
+    data. The boundary is the PRE_BEFORE_TRADING update of static_unit_net_value, ensuring returns are
+    computed from consistent reference points.
+  evidence: rqalpha/portfolio/__init__.py:179(daily_returns)
+  stage: portfolio_accounting
+  alternative_considered: Current day calculation was rejected as it would introduce inconsistency during
+    trading hours.
+- id: BD-043
+  type: B/DK
+  content: Annualized returns = unit_net_value ^ (252 / trading_days) - 1
+  rationale: Annualization enables comparison of returns across different holding periods using Chinese
+    market's 252 trading days. The boundary is the compound growth formula, normalizing returns to a standard
+    yearly basis regardless of actual trading period length.
+  evidence: rqalpha/portfolio/__init__.py:190(annualized_returns)
+  stage: portfolio_accounting
+  alternative_considered: Calendar day annualization was rejected as Chinese markets have ~252 trading
+    days, not 365.
+- id: BD-044
+  type: B
+  content: Benchmark daily returns calculated as weighted sum of individual returns
+  rationale: Multi-component benchmarks require proper weighting of constituent returns. The boundary
+    is the constituent weights, which can change over time as index rebalancing occurs, requiring dynamic
+    recalculation.
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/mod.py:233(weighted_sum)
+  stage: performance_analysis
+  alternative_considered: Equal weighting was rejected as it wouldn't reflect actual index composition
+    methodology.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: weighted_sum in rqalpha/mod/rqalpha_mod_sys_analyser/mod.py'
+- id: BD-045
+  type: B/DK
+  content: Risk metrics (Sharpe, Sortino, MaxDrawdown) calculated via rqrisk library
+  rationale: Offloading risk calculations to specialized rqrisk library ensures accuracy and consistency
+    with industry standards. The boundary is the library interface, which encapsulates each risk calculation
+    methodologies including proper handling of negative returns.
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/mod.py:34(rqrisk_import)
+  stage: performance_analysis
+  alternative_considered: Custom implementation was rejected due to complexity and risk of calculation
+    errors in statistical metrics.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: rqrisk_import in rqalpha/mod/rqalpha_mod_sys_analyser/mod.py'
+- id: BD-046
+  type: B
+  content: Profit/loss rate = mean(positive_daily_pnl) / abs(mean(negative_daily_pnl))
+  rationale: Profit/loss ratio measures average winning day vs average losing day, useful for strategy
+    evaluation. The boundary separates positive and negative PnL days before averaging, providing insight
+    into strategy win/loss asymmetry.
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/mod.py:501(profit_loss_rate)
+  stage: performance_analysis
+  alternative_considered: Total profit/total loss was rejected as it doesn't reflect average day characteristics.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: profit_loss_rate in rqalpha/mod/rqalpha_mod_sys_analyser/mod.py'
+- id: BD-047
+  type: B/DK
+  content: Turnover = sum(trade_values) / mean(market_values) / 2
+  rationale: Turnover rate measures trading activity relative to portfolio size, with division by 2 accounting
+    for buy+sell being one round-trip. The boundary normalizes by average market value to enable comparison
+    across different portfolio sizes.
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/mod.py:564(turnover_calc)
+  stage: performance_analysis
+  alternative_considered: Sum of trade values only was rejected as it doesn't account for portfolio size
+    differences.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: turnover_calc in rqalpha/mod/rqalpha_mod_sys_analyser/mod.py'
+- id: BD-048
+  type: B/BA
+  content: 'Pressure test periods hard-coded: 打击壳价值, 公募基金抱团, 行业风格切换, 小盘踩踏危机'
+  rationale: Pre-defined market stress scenarios based on significant Chinese market events enable backtesting
+    under historical crisis conditions. The boundary is the hard-coded period definitions, which reflect
+    specific regulatory and market microstructure events unique to Chinese markets.
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/mod.py:62(PRESSURE_TEST_PERIOD)
+  stage: performance_analysis
+  alternative_considered: Configurable periods were considered but hard-coding ensures consistency across
+    backtests for these known market events.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: PRESSURE_TEST_PERIOD in rqalpha/mod/rqalpha_mod_sys_analyser/mod.py'
+- id: BD-049
+  type: B/BA
+  content: 'Stock transaction cost: BY_MONEY commission + tax; minimum commission enforced'
+  rationale: Chinese A-share transaction costs include commission (typically 0.03% per side) plus stamp
+    tax (0.1% on sell only). The minimum commission floor prevents unrealistic zero-cost trades on tiny
+    orders. The boundary is per-order cost computation with tax on sell side only.
+  evidence: rqalpha/mod/rqalpha_mod_sys_transaction_cost/deciders.py:45(stock_calc)
+  stage: transaction_cost
+  alternative_considered: Commission-only was rejected as stamp tax is a significant cost component in
+    Chinese markets.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: stock_calc in rqalpha/mod/rqalpha_mod_sys_transaction_cost/deciders.py'
+- id: BD-050
+  type: B/DK
+  content: 'Futures transaction cost: BY_VOLUME commission with multiplier'
+  rationale: Futures costs are volume-based (per lot) rather than notional-value based, reflecting exchange
+    fee structures. The multiplier accounts for different contract specifications. The boundary is the
+    per-contract commission schedule which varies by futures product.
+  evidence: rqalpha/mod/rqalpha_mod_sys_transaction_cost/deciders.py:102(futurestransactioncostdecider)
+  stage: transaction_cost
+  alternative_considered: Percentage-based futures cost was rejected as exchange fees are fixed per lot,
+    not percentage of value.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: futurestransactioncostdecider in rqalpha/mod/rqalpha_mod_sys_transaction_cost/deciders.py'
+- id: BD-051
+  type: B/RC
+  content: 'Dividend reinvestment configurable: cash or reinvest'
+  rationale: Dividend handling allows users to choose between cash receipt or automatic reinvestment,
+    matching real-world brokerage options. The boundary is the configuration flag, enabling both dividend
+    taxation scenarios and growth vs income strategy preferences.
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py:180(dividend_reinvest)
+  stage: corporate_actions
+  alternative_considered: Mandatory reinvestment was rejected as many investors take cash dividends in
+    practice.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: dividend_reinvest in rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py'
+- id: BD-052
+  type: B/RC
+  content: Dividend tax rate applied to cash dividends
+  rationale: Cash dividends are subject to dividend tax per Chinese tax regulations (10% standard rate,
+    may vary by holding period). The boundary is at dividend payment time, where tax is withheld before
+    credit to account.
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py:178(dividend_tax)
+  stage: corporate_actions
+  alternative_considered: Gross dividend was rejected as it overstates actual cash received by investors.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: dividend_tax in rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py'
+- id: BD-053
+  type: B/DK
+  content: Order quantity rounded to round_lot (100 for A-share, 1 for futures)
+  rationale: Chinese exchanges trade in standardized lot sizes; A-shares use 100 shares/lot while futures
+    use 1 contract/lot. The boundary is the round_lot specification per instrument type, ensuring orders
+    match exchange trading unit requirements.
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/api/api_stock.py:77(_round_order_quantity)
+  stage: order_execution
+  alternative_considered: Allowing fractional lots was rejected as Chinese exchanges don't support odd-lot
+    trading for stocks.
+- id: BD-054
+  type: B/DK
+  content: KSH (STAR market) minimum amount 200 shares; BJSE minimum 100 shares
+  rationale: STAR Market (KSH) and Beijing Stock Exchange (BJSE) have different minimum order sizes than
+    main board A-shares, reflecting their unique trading rules. The boundary is the market-specific minimum,
+    ensuring compliance with each board's requirements.
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/api/api_stock.py:62(KSH_MIN_AMOUNT)
+  stage: order_execution
+  alternative_considered: Standard 100-share minimum was rejected as it would violate STAR/BJSE trading
+    rules.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: KSH_MIN_AMOUNT in rqalpha/mod/rqalpha_mod_sys_accounts/api/api_stock.py'
+- id: BD-055
+  type: B/RC
+  content: 'Instrument type determines account type: CS/ETF/LOF/INDX→STOCK, Future→FUTURE'
+  rationale: Different instrument types require different account handling (margin, settlement, trading
+    rules). The boundary maps instrument classification to account type, enabling proper position and
+    cash management per asset class.
+  evidence: rqalpha/model/instrument.py:314(account_type)
+  stage: instrument_classification
+  alternative_considered: Single account type was rejected as stocks and futures have fundamentally different
+    margin and settlement requirements.
+- id: BD-056
+  type: B/DK
+  content: Tick size 0.01 for stocks/indices, 0.001 for ETF/LOF, futures-specific
+  rationale: Price increment requirements vary by instrument type, with ETFs/LOFs having finer tick sizes
+    than stocks. The boundary is the instrument-specific tick_size, ensuring price accuracy matches exchange
+    specifications.
+  evidence: rqalpha/model/instrument.py:444(tick_size)
+  stage: instrument_classification
+  alternative_considered: Standard tick size was rejected as ETF/LOF finer ticks would be lost, affecting
+    execution accuracy.
+- id: BD-057
+  type: B/DK
+  content: market_tplus=1 for A-shares (T+1 settlement), 0 for public funds
+  rationale: Chinese A-shares require T+1 settlement (bought shares cannot be sold until next trading
+    day), while public funds settle T+0. The boundary is the instrument-specific T+n value, determining
+    when newly bought shares become closable.
+  evidence: rqalpha/model/instrument.py:129(market_tplus)
+  stage: settlement
+  alternative_considered: T+0 for each instruments was rejected as it would violate A-share settlement
+    regulations.
+- id: BD-058
+  type: B
+  content: Benchmark supports null instrument (for 0-weight placeholder)
+  rationale: Benchmarks with multiple constituents may have zero-weight components as placeholders for
+    future inclusion. The NULL_OID enables representing these zero-weight instruments without breaking
+    weighted return calculations.
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/mod.py:155(NULL_OID)
+  stage: benchmark
+  alternative_considered: Skipping zero-weight instruments was considered but explicit NULL_OID provides
+    clearer intent.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: NULL_OID in rqalpha/mod/rqalpha_mod_sys_analyser/mod.py'
+- id: BD-059
+  type: B/DK
+  content: Southbound trading calendar for HK-related indices
+  rationale: Stock Connect (northbound/southbound) trading follows combined Chinese-Hong Kong calendars,
+    not just Chinese exchanges. The boundary is the calendar type, determining which days HK markets are
+    closed (affecting Stock Connect availability).
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/mod.py:156(NON_CN_CALENDAR_OIDS)
+  stage: benchmark
+  alternative_considered: China calendar only was rejected as it would miss HK holidays affecting southbound
+    trading.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: NON_CN_CALENDAR_OIDS in rqalpha/mod/rqalpha_mod_sys_analyser/mod.py'
+- id: BD-060
+  type: B
+  content: Risk-free rate fetched yearly for pressure test periods
+  rationale: Risk-free rates vary by year and must match the pressure test period for accurate Sharpe
+    ratio calculation. The boundary is per-year rate lookup, ensuring risk-free rate corresponds to each
+    historical test period.
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/mod.py:53(_get_yearly_risk_free_rates)
+  stage: risk_mods
+  alternative_considered: Fixed risk-free rate was rejected as it would misrepresent historical risk-adjusted
+    performance.
+- id: BD-061
+  type: B/DK
+  content: Excess returns = portfolio_return - benchmark_return; used for excess metrics
+  rationale: Alpha generation measurement requires comparing portfolio performance against benchmark,
+    isolating manager skill from market exposure. The boundary is the simple return differential, which
+    forms the basis for information ratio and tracking error calculations.
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/mod.py:582(excess_calc)
+  stage: risk_mods
+  alternative_considered: Geometric excess return was considered but arithmetic difference is standard
+    for excess metrics.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: excess_calc in rqalpha/mod/rqalpha_mod_sys_analyser/mod.py'
+- id: BD-062
+  type: B/RC
+  content: Portfolio daily snapshot collected at POST_SETTLEMENT event
+  rationale: End-of-day portfolio state must be captured after each trading and settlement activities
+    complete. The POST_SETTLEMENT boundary ensures complete daily data including each trade executions,
+    corporate actions, and cash movements.
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/mod.py:257(_collect_daily)
+  stage: daily_settlement
+  alternative_considered: PRE_SETTLEMENT collection was rejected as it wouldn't include final settlement
+    cash adjustments.
+- id: BD-063
+  type: B
+  content: static_unit_net_value updated at PRE_BEFORE_TRADING for next day's returns
+  rationale: Previous day's final NAV becomes the base for next day's return calculation, avoiding circular
+    dependencies. The PRE_BEFORE_TRADING boundary updates static value before any new trading begins,
+    ensuring consistent reference point.
+  evidence: rqalpha/portfolio/__init__.py:273(_pre_before_trading)
+  stage: daily_settlement
+  alternative_considered: Updating at end of day was rejected as it would create circular dependency with
+    daily return calculation.
+- id: BD-064
+  type: B/BA
+  content: Tick matcher uses NEXT_TICK_BEST_OWN as default own price for buy/sell
+  rationale: Tick-level matching uses the next available tick's best own price (opposite side liquidity)
+    for execution, simulating realistic intraday fills. The boundary is the NEXT_TICK availability, which
+    determines the execution price.
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/matcher.py:286(_best_own_price_decider)
+  stage: tick_matching
+  alternative_considered: Current tick only was rejected as it would allow execution from same price level,
+    unrealistic for liquid markets.
+- id: BD-065
+  type: B/DK
+  content: Call auction (集合竞价) uses last price and limits to 1 fill
+  rationale: Call auction period (opening/closing) matches at a single uniform price maximizing volume,
+    with each order limited to one fill. The boundary is the uniform price determination, simulating Chinese
+    exchange call auction mechanism.
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/matcher.py:96(_open_auction_deal_price_decider)
+  stage: tick_matching
+  alternative_considered: Multiple fills during auction was rejected as call auction has single matching
+    round per period.
+- id: BD-066
+  type: B/DK
+  content: Futures margin = price * quantity * contract_multiplier * margin_rate * margin_multiplier
+  rationale: Futures margin requirements follow exchange-mandated formulas including contract multiplier
+    and margin rate. The boundary is at order time, computing required margin to determine if account
+    has sufficient buying power for the position.
+  evidence: rqalpha/model/instrument.py:456(get_long_margin_ratio)
+  stage: margin_calculation
+  alternative_considered: Simple notional value was rejected as it wouldn't reflect contract multiplier
+    and margin rate specifications.
+- id: BD-067
+  type: B/RC
+  content: Close-today quantity calculated before matching to determine settlement type
+  rationale: Intraday close orders must identify how many shares can close today vs must wait for T+1.
+    The boundary is the pre-matching calculation determining close_today quantity from today-bought positions.
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/matcher.py:198(calc_close_today)
+  stage: margin_calculation
+  alternative_considered: Post-matching calculation was rejected as settlement type must be known at fill
+    time.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: calc_close_today in rqalpha/mod/rqalpha_mod_sys_simulation/matcher.py'
+- id: BD-068
+  type: B/DK
+  content: order_target_value calculates delta from current market_value
+  rationale: Target value orders compute the difference between desired and current market exposure to
+    determine order size. The boundary is the current market_value at order time, which determines whether
+    to buy or sell and by how much.
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/api/api_stock.py:228(target_value_delta)
+  stage: order_execution
+  alternative_considered: Target from cost basis was considered but market_value is the standard reference
+    for portfolio targets.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: target_value_delta in rqalpha/mod/rqalpha_mod_sys_accounts/api/api_stock.py'
+- id: BD-069
+  type: B/BA
+  content: order_target_percent uses total_value * percent for target
+  rationale: Percent-based targeting scales position size relative to total portfolio value. The boundary
+    is the total_value multiplication, ensuring target percent represents share of total portfolio rather
+    than current position.
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/api/api_stock.py:234(stock_order_target_percent)
+  stage: order_execution
+  alternative_considered: Percent of current position was rejected as it would create inconsistent sizing
+    across portfolio sizes.
+- id: BD-070
+  type: B/DK
+  content: order_value iterates down quantity if transaction cost exceeds cash
+  rationale: When a target order value would exceed available cash after transaction costs, the system
+    iteratively reduces quantity. The boundary is the iterate-down loop that finds the largest executable
+    quantity within cash constraints.
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/api/api_stock.py:182(iterate_down)
+  stage: order_execution
+  alternative_considered: Rejecting entire order was rejected as it would prevent any execution when cash
+    is tight but sufficient for partial fill.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: iterate_down in rqalpha/mod/rqalpha_mod_sys_accounts/api/api_stock.py'
+- id: BD-071
+  type: B/DK
+  content: order_lots multiplies amount by round_lot for total quantity
+  rationale: Lot-based ordering treats input as number of exchange lots rather than individual shares/contracts.
+    The boundary is the round_lot multiplier, converting user-specified lots into exchange-compliant share
+    quantities.
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/api/api_stock.py:312(lots_multiplication)
+  stage: order_execution
+  alternative_considered: Raw share quantity was considered but lot-based entry is more intuitive for
+    exchange-traded instruments.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: lots_multiplication in rqalpha/mod/rqalpha_mod_sys_accounts/api/api_stock.py'
+- id: BD-072
+  type: T
+  content: Decimal precision 10 for cash calculations to avoid floating point errors
+  rationale: Financial calculations require high precision to avoid cumulative rounding errors across
+    many transactions. The boundary is the decimal context setting at calculation start, ensuring each
+    cash operations maintain sufficient precision.
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/api/api_stock.py:56(Decimal_precision)
+  stage: calculation_precision
+  alternative_considered: Standard double precision was rejected as cumulative rounding errors would affect
+    long-running backtests.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: Decimal_precision in rqalpha/mod/rqalpha_mod_sys_accounts/api/api_stock.py'
+- id: BD-073
+  type: B/DK
+  content: Limit order price rounded down (floor) to tick_size
+  rationale: Price rounding ensures limit orders comply with exchange tick size requirements. Floor rounding
+    for buy orders (and ceiling for sell) prevents prices from being set at non-exchange-compliant levels.
+    The boundary is the tick_size alignment.
+  evidence: rqalpha/model/order.py:442(decimal_rounding_floor)
+  stage: calculation_precision
+  alternative_considered: Ceiling for each was rejected as floor for buys and ceiling for sells matches
+    exchange conventions.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: decimal_rounding_floor in rqalpha/model/order.py'
+- id: BD-074
+  type: B/BA
+  content: TRADING_DAYS_A_YEAR = 252 for annualization
+  rationale: 'Market convention for US/Chinese equity markets uses 252 trading days per year for annualizing
+    returns and risk metrics. This provides consistent comparison across different holding periods and
+    aligns with industry practice for broker systems. Boundary: This constant is used in annualized return
+    calculations regardless of actual calendar days elapsed.'
+  evidence: rqalpha/const.py:194(get_trading_dates)
+  stage: rqalpha
+  alternative_considered: 'Alternative values considered: 250 (typical US), 365 (calendar), 244 (China
+    adjusted). 252 chosen as common market convention.'
+  _evidence_issues:
+  - 'FN_NOT_FOUND: get_trading_dates in rqalpha/const.py'
+- id: BD-075
+  type: B/BA
+  content: Dividend tax rate = 0 for stock positions
+  rationale: 'Dividend taxation varies by jurisdiction and investor type. Setting rate to 0 provides baseline
+    gross dividend calculation suitable for institutional investors or tax-advantaged accounts. Boundary:
+    This applies only to stock positions; futures may have different tax treatment.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py:56(StockPosition._init_)
+  stage: rqalpha.mod.rqalpha_mod_sys_accounts
+  alternative_considered: Tax rates of 10-20% common in many jurisdictions; configurable rate would be
+    more flexible but adds complexity.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: StockPosition._init_ in rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py'
+- id: BD-076
+  type: B/DK
+  content: Value percent = market_value / total_value
+  rationale: 'Portfolio weight calculation normalizes each position by total portfolio value to show relative
+    allocation. This enables position sizing, rebalancing decisions, and risk concentration analysis.
+    Boundary: Calculation uses current market values; total_value excludes pending orders.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py:446(Portfolio.value_percent)
+  stage: rqalpha.mod.rqalpha_mod_sys_accounts
+  alternative_considered: Alternative weighting (cost basis, book value) less common for real-time portfolio
+    management.
+- id: BD-077
+  type: B
+  content: Stock split quantity rounding uses ROUND_HALF_UP
+  rationale: 'ROUND_HALF_UP provides predictable rounding behavior for stock splits where fractional shares
+    are uncommon. This ensures position quantities remain integers after split adjustments. Boundary:
+    Applied during split processing; other operations may use different rounding modes.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py:21,290(_process_split)
+  stage: rqalpha.mod.rqalpha_mod_sys_accounts
+  alternative_considered: ROUND_HALF_EVEN would reduce systematic bias but may produce non-integer share
+    counts for certain splits.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _process_split in rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py'
+- id: BD-078
+  type: B/BA
+  content: Futures margin = margin_ratio * margin_multiplier * market_value
+  rationale: 'Futures margin calculation combines exchange-mandated margin ratio with broker-specific
+    multiplier and position market value. This determines required collateral for futures positions. Boundary:
+    margin_ratio varies by instrument; margin_multiplier is broker-configurable (typically 1.0-1.2).'
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py:589(FuturesPosition.margin)
+  stage: rqalpha.mod.rqalpha_mod_sys_accounts
+  alternative_considered: Tiered margin by position size not implemented; would better reflect exchange
+    risk-based margin schedules.
+- id: BD-079
+  type: B/DK
+  content: Futures equity = quantity * (last_price - avg_price) * contract_multiplier
+  rationale: 'Unrealized PnL for futures positions multiplies price difference by quantity and contract
+    multiplier to get monetary value. This reflects true economic gain/loss independent of margin. Boundary:
+    Uses last_price for mark-to-market; avg_price is historical cost basis.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py:319(equity)
+  stage: rqalpha.mod.rqalpha_mod_sys_accounts
+  alternative_considered: Settlement price could be used instead of last_price for more accurate daily
+    PnL marking.
+- id: BD-080
+  type: B/BA
+  content: Stock commission rate = 0.0008 (0.08%)
+  rationale: 'Commission rate of 0.08% (8 bps) represents typical Chinese equity trading commission including
+    exchange fees. This is default for backtesting; actual rates vary by broker. Boundary: Applied per
+    trade; minimum commission rules may apply for small orders.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_transaction_cost/deciders.py:35(stocktransactioncostdecider)
+  stage: rqalpha.mod.rqalpha_mod_sys_transaction_cost
+  alternative_considered: Commission rates of 0.03% (ETF) to 0.3% (options) available but require instrument-specific
+    configuration.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: stocktransactioncostdecider in rqalpha/mod/rqalpha_mod_sys_transaction_cost/deciders.py'
+- id: BD-081
+  type: BA/DK
+  content: 'Stock tax rate changes: 0.001 pre-Aug-2023, 0.0005 post-Aug-2023'
+  rationale: 'Stamp duty on stock trading in China was reduced from 0.1% to 0.05% on August 27, 2023.
+    This reflects actual regulatory change affecting transaction costs for each equity strategies. Boundary:
+    Only applies to sell-side transactions; date-based switching ensures historical accuracy.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_transaction_cost/deciders.py:27,42,49-53(_get_stock_tax)
+  stage: rqalpha.mod.rqalpha_mod_sys_transaction_cost
+  alternative_considered: Historical rates could be extended further back (0.3% pre-2008) for longer backtests.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _get_stock_tax in rqalpha/mod/rqalpha_mod_sys_transaction_cost/deciders.py'
+- id: BD-082
+  type: B/BA
+  content: Batch commission estimate uses max() floor of min_commission
+  rationale: 'Minimum commission floor ensures fixed costs are covered for small trades. Using max() takes
+    the greater of calculated commission or minimum, preventing negative/zero commission scenarios. Boundary:
+    min_commission is typically 5 CNY for Chinese stocks.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_transaction_cost/deciders.py:97(calc_batch_commission)
+  stage: rqalpha.mod.rqalpha_mod_sys_transaction_cost
+  alternative_considered: Percentage-based minimum (e.g., 0.1% of trade value) would scale with order
+    size but less intuitive.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: calc_batch_commission in rqalpha/mod/rqalpha_mod_sys_transaction_cost/deciders.py'
+- id: BD-083
+  type: B/DK
+  content: Futures commission by_money or by_volume based on instrument config
+  rationale: 'Futures commission calculation supports both percentage-of-notional (by_money) and fixed-per-contract
+    (by_volume) methods, matching exchange fee structures. Boundary: Selection based on instrument metadata;
+    different futures have different fee structures.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_transaction_cost/deciders.py:113-128(FuturesCommissionDecider.calc_commission)
+  stage: rqalpha.mod.rqalpha_mod_sys_transaction_cost
+  alternative_considered: Hybrid model (percentage + fixed) exists for some futures but adds complexity.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: FuturesCommissionDecider.calc_commission in rqalpha/mod/rqalpha_mod_sys_transaction_cost/deciders.py'
+- id: BD-084
+  type: B/DK
+  content: Max drawdown using np.maximum.accumulate(arr) / arr
+  rationale: 'Running maximum drawdown calculation compares current value against historical peak using
+    accumulate for efficiency. Division gives percentage drawdown from peak. Boundary: arr should be cumulative
+    equity curve; returns drawdown from 1.0 (100%) downward.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/plot/utils.py:41-46(calculate_max_drawdown)
+  stage: rqalpha.mod.rqalpha_mod_sys_analyser
+  alternative_considered: Simpler version uses cumulative product of returns; this formula is more numerically
+    stable for equity curves.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: calculate_max_drawdown in rqalpha/mod/rqalpha_mod_sys_analyser/plot/utils.py'
+- id: BD-085
+  type: B
+  content: 'Simple returns: (NAV_t / NAV_{t-1}) - 1'
+  rationale: 'Simple return calculation uses period-over-period NAV ratio minus 1. This provides straightforward
+    percentage return without compounding. Boundary: Appropriate for discrete periods; for sub-daily returns
+    in single period, may use log returns instead.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/report/report.py:38-39(_calc_simple_return)
+  stage: rqalpha.mod.rqalpha_mod_sys_analyser
+  alternative_considered: Log returns ln(NAV_t/NAV_{t-1}) more symmetric but less intuitive; both valid
+    for different analyses.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _calc_simple_return in rqalpha/mod/rqalpha_mod_sys_analyser/report/report.py'
+  vague_rationale: true
+- id: BD-086
+  type: B
+  content: 'Geometric excess return: p_nav / b_nav - 1'
+  rationale: 'Excess return over benchmark calculated as portfolio NAV divided by benchmark NAV minus
+    1. Geometric form ensures proper compounding over multiple periods. Boundary: Both NAVs must be from
+    same time points; handles different starting values correctly.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/plot/consts.py:90-91(EXCESS_RETURN_FORMULA)
+  stage: rqalpha.mod.rqalpha_mod_sys_analyser
+  alternative_considered: Arithmetic difference p_nav - b_nav less accurate for multi-period compounding.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: EXCESS_RETURN_FORMULA in rqalpha/mod/rqalpha_mod_sys_analyser/plot/consts.py'
+- id: BD-087
+  type: B
+  content: 'Monthly geometric excess returns: (1+p_prod)/(1+b_prod) - 1'
+  rationale: 'Monthly excess return using cumulative products (prod) to properly compound monthly returns
+    before subtracting 1. Respects compounding within the period. Boundary: p_prod and b_prod are cumulative
+    products of monthly simple returns.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/report/report.py:111(_calc_monthly_excess_return)
+  stage: rqalpha.mod.rqalpha_mod_sys_analyser
+  alternative_considered: Direct subtraction of monthly returns less accurate due to compounding effects.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _calc_monthly_excess_return in rqalpha/mod/rqalpha_mod_sys_analyser/report/report.py'
+- id: BD-088
+  type: B/DK
+  content: Risk metrics via rqrisk library (Risk class with DAILY/WEEKLY/MONTHLY periods)
+  rationale: 'External rqrisk library provides standardized risk metrics (Sharpe, Sortino, Calmar ratios,
+    max drawdown) for multiple frequencies. Delegating to established library ensures consistency. Boundary:
+    Risk period must be one of DAILY/WEEKLY/MONTHLY; custom periods not supported.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/mod.py:34,73(RiskAnalyzer._compute_risk)
+  stage: rqalpha.mod.rqalpha_mod_sys_analyser
+  alternative_considered: Internal implementation would allow customization but risks inconsistency with
+    industry standards.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: RiskAnalyzer._compute_risk in rqalpha/mod/rqalpha_mod_sys_analyser/mod.py'
+- id: BD-089
+  type: B/DK
+  content: 'Pressure test periods: predefined historical crisis windows'
+  rationale: 'Stress testing uses historical periods with significant market stress (2008 crisis, 2020
+    COVID) to evaluate strategy robustness. Predefined windows ensure consistent testing. Boundary: Periods
+    hardcoded; new crises not included until system update.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/mod.py:400(_pressure_test)
+  stage: rqalpha.mod.rqalpha_mod_sys_analyser
+  alternative_considered: User-defined periods would increase flexibility but require market data availability
+    validation.
+- id: BD-090
+  type: B
+  content: 'Benchmark returns: np.roll(bars[''close''], 1) pct_change'
+  rationale: 'Benchmark return calculation uses shifted closing prices (roll by 1) then percentage change
+    to align with current period returns. Avoids look-ahead bias. Boundary: First bar has no return (NaN);
+    should be dropped for accurate metrics.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/mod.py:190(_calc_benchmark_return)
+  stage: rqalpha.mod.rqalpha_mod_sys_analyser
+  alternative_considered: Using previous close vs current open would delay return calculation but better
+    match execution reality.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _calc_benchmark_return in rqalpha/mod/rqalpha_mod_sys_analyser/mod.py'
+- id: BD-091
+  type: B/BA
+  content: Weekly and monthly returns resampled at period end (W/M/E/M)
+  rationale: 'Multiple frequency return analysis using pandas resample with appropriate anchoring (W for
+    week-end, M for month-end, E for explicit period boundaries). Boundary: ''ME'' used for month-end
+    in pandas >=2.2.0 to avoid mixed convention issues.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_analyser/report/report.py:52-58(_resample_returns)
+  stage: rqalpha.mod.rqalpha_mod_sys_analyser
+  alternative_considered: Business-day resampling (BM) available but less intuitive for monthly reporting.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _resample_returns in rqalpha/mod/rqalpha_mod_sys_analyser/report/report.py'
+  vague_rationale: true
+- id: BD-092
+  type: B
+  content: 'Annualized returns: NAV^(trading_days_a_year/days) - 1'
+  rationale: 'Geometric annualization using NAV raised to power of (252/days) minus 1. Properly compounds
+    returns over partial years. Boundary: Days is calendar days elapsed; using trading days would overstate
+    annualization for gaps.'
+  evidence: rqalpha/portfolio/__init__.py:200(AnnualizedReturnCalculator)
+  stage: rqalpha
+  alternative_considered: Arithmetic average times frequency less accurate for volatile returns due to
+    compounding effects.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: AnnualizedReturnCalculator in rqalpha/portfolio/__init__.py'
+- id: BD-093
+  type: B
+  content: Unit net value = total_value / units
+  rationale: 'Unit NAV calculation normalizes total portfolio value by share count, providing per-unit
+    metric comparable across different fund sizes. Boundary: Units remain constant except during subscribe/redeem
+    events; redemption uses unit price.'
+  evidence: rqalpha/portfolio/__init__.py:159(UnitNAVCalculator)
+  stage: rqalpha
+  alternative_considered: Total return vs price return distinction; current implementation follows industry
+    standard.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: UnitNAVCalculator in rqalpha/portfolio/__init__.py'
+- id: BD-094
+  type: B
+  content: Daily returns = unit_net_value / static_unit_net_value - 1
+  rationale: 'Period return calculation using unit NAV ratio minus 1, with static_unit_net_value being
+    previous period''s unit value. Ensures consistent denominator. Boundary: static_unit_net_value updates
+    only at period boundaries; intra-period calculations use current value.'
+  evidence: rqalpha/portfolio/__init__.py:180(daily_return)
+  stage: rqalpha
+  alternative_considered: Log returns alternative for mathematical convenience; simple returns more intuitive
+    for reporting.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: daily_return in rqalpha/portfolio/__init__.py'
+- id: BD-095
+  type: B/BA
+  content: Order target portfolio safety factor = 1.2 for near-full positions
+  rationale: 'Safety factor of 1.2 (120%) adds buffer to near-full position orders to prevent overtrading
+    due to price changes between validation and execution. Boundary: Applied when portfolio utilization
+    exceeds threshold; higher values increase safety margin.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/api/order_target_portfolio.py:257,265-267(_validate_limit_orders)
+  stage: rqalpha.mod.rqalpha_mod_sys_accounts
+  alternative_considered: Fixed percentage (1.1) or dynamic factor based on volatility considered; 1.2
+    balances safety and opportunity.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _validate_limit_orders in rqalpha/mod/rqalpha_mod_sys_accounts/api/order_target_portfolio.py'
+- id: BD-096
+  type: B
+  content: 'Safety reduction step: min(max(proportion_diff/10, 0.0001), 0.002)'
+  rationale: 'Gradual safety factor reduction prevents oscillation between order acceptance and rejection.
+    Clamps reduction step to [0.0001, 0.002] range for stability. Boundary: proportion_diff is gap between
+    target and current safety; larger gaps require more iterations.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/api/order_target_portfolio.py:304(_reduce_safety_factor)
+  stage: rqalpha.mod.rqalpha_mod_sys_accounts
+  alternative_considered: Fixed step (0.001) would be simpler but less adaptive; exponential decay considered
+    but adds complexity.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _reduce_safety_factor in rqalpha/mod/rqalpha_mod_sys_accounts/api/order_target_portfolio.py'
+- id: BD-097
+  type: B/BA
+  content: Exchange rate mid = (bid + ask) / 2
+  rationale: 'Mid-point exchange rate used for currency conversion to avoid using only bid or ask, which
+    would introduce systematic conversion bias. Boundary: Assumes symmetric bid-ask spread; wide spreads
+    in illiquid pairs may still cause inefficiency.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/api/order_target_portfolio.py:44-45(get_exchange_rate)
+  stage: rqalpha.mod.rqalpha_mod_sys_accounts
+  alternative_considered: Last traded price or VWAP could be used but requires additional data; mid-point
+    balances simplicity and accuracy.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: get_exchange_rate in rqalpha/mod/rqalpha_mod_sys_accounts/api/order_target_portfolio.py'
+- id: BD-098
+  type: B/BA
+  content: 'Odd lot quantity rounding: half-min_qty threshold, step_size rounding'
+  rationale: 'Odd lot handling uses half minimum quantity as threshold for rounding decisions, then rounds
+    to step_size increments. This respects exchange lot size rules while allowing fractional execution.
+    Boundary: Only applies to odd lots; standard lots use exact quantities.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/api/order_target_portfolio.py:312(order_target_portfolio_smart)
+  stage: rqalpha.mod.rqalpha_mod_sys_accounts
+  alternative_considered: Reject odd lots entirely would cause execution failures; complete rounding ignores
+    investor preferences.
+- id: BD-099
+  type: B/BA
+  content: 'Limit order validation: target_quantities * total_value * safety / prices'
+  rationale: 'Order sizing validation multiplies target quantities by portfolio value and safety factor,
+    divided by prices to ensure sufficient margin coverage. Ensures orders don''t exceed available capital.
+    Boundary: Uses last traded price; limit prices not considered in sizing.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/api/order_target_portfolio.py:312(order_target_portfolio_smart)
+  stage: rqalpha.mod.rqalpha_mod_sys_accounts
+  alternative_considered: Using limit prices would be more accurate but requires additional price impact
+    estimation.
+  vague_rationale: true
+- id: BD-100
+  type: B/BA
+  content: 'Volume limit: each order ≤ 25% of bar volume (volume_percent=0.25)'
+  rationale: 'Volume percentage limit of 25% prevents orders from consuming excessive liquidity in backtest
+    simulation. This mimics real-market impact constraints. Boundary: Applies per-bar; multiple bars allow
+    larger cumulative fills; aggressive orders may not fully execute.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/__init__.py:35,37(SimulationMod.__init__)
+  stage: rqalpha.mod.rqalpha_mod_sys_simulation
+  alternative_considered: Dynamic limit based on ADV (Average Daily Volume) would be more realistic but
+    requires historical data.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: SimulationMod.__init__ in rqalpha/mod/rqalpha_mod_sys_simulation/__init__.py'
+- id: BD-101
+  type: B/BA
+  content: 'Slippage model: PriceRatioSlippage with configurable ratio'
+  rationale: 'PriceRatioSlippage applies configurable percentage adjustment to execution price to simulate
+    market impact. Ratio is typically small (0-0.1%) to approximate realistic fills. Boundary: Applied
+    symmetrically to buy and sell; large ratios may cause unrealistic results.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/__init__.py:38,41-43(PriceRatioSlippage)
+  stage: rqalpha.mod.rqalpha_mod_sys_simulation
+  alternative_considered: Fixed-point slippage (e.g., 0.01 per share) available but less appropriate for
+    percentage-based instruments.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: PriceRatioSlippage in rqalpha/mod/rqalpha_mod_sys_simulation/__init__.py'
+- id: BD-102
+  type: B/BA
+  content: Signal mode disabled by default (signal=False)
+  rationale: 'Signal mode, which generates continuous orders based on portfolio weights, is disabled by
+    default. Standard mode uses discrete order placement. Boundary: Signal mode has different execution
+    semantics; enables portfolio-weighted rebalancing approach.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/__init__.py:21(SimulationMod.__init__)
+  stage: rqalpha.mod.rqalpha_mod_sys_simulation
+  alternative_considered: Signal mode could be default but would change behavior for existing users upgrading
+    the system.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: SimulationMod.__init__ in rqalpha/mod/rqalpha_mod_sys_simulation/__init__.py'
+- id: BD-103
+  type: B/BA
+  content: Price limit validation enabled (price_limit=True)
+  rationale: 'Price limit validation prevents orders at prices beyond daily涨跌停 limits (typically ±10%
+    for stocks, ±20% for certain instruments). Matches exchange rules. Boundary: Only checks absolute
+    limits; continuous auction limits not validated.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_simulation/__init__.py:29(SimulationMod.__init__)
+  stage: rqalpha.mod.rqalpha_mod_sys_simulation
+  alternative_considered: Disabling price limits would allow more filled orders but create unrealistic
+    execution scenarios.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: SimulationMod.__init__ in rqalpha/mod/rqalpha_mod_sys_simulation/__init__.py'
+- id: BD-104
+  type: B/BA
+  content: 'Valid price: not (None or NaN or ≤ 0)'
+  rationale: 'Price validation rejects invalid values (null, missing, negative, zero) to prevent calculation
+    errors or order rejections. Standard check before any price-based operation. Boundary: Does not check
+    for stale prices; assumes data provider filters extreme outliers.'
+  evidence: rqalpha/utils/__init__.py:194-195(is_valid_price)
+  stage: rqalpha.utils
+  alternative_considered: More complex validation (price change limits, cross-asset consistency) would
+    add overhead for marginal benefit.
+- id: BD-105
+  type: B
+  content: 'Safe division: returns NaN if divisor is 0'
+  rationale: 'Safe division handles zero divisors by returning NaN instead of raising exceptions or returning
+    infinity. Enables graceful handling of division-by-zero scenarios. Boundary: Callers must handle NaN
+    propagation; some use cases may prefer zero or raise errors.'
+  evidence: rqalpha/utils/__init__.py:244-245(safe_div)
+  stage: rqalpha.utils
+  alternative_considered: Returning zero would hide errors; raising exception would require extensive
+    try-catch; NaN is explicit.
+- id: BD-106
+  type: B
+  content: 'Monthly resample: ''ME'' pandas ≥2.2.0, else ''M'''
+  rationale: 'Month-end frequency alias changed from ''M'' to ''ME'' in pandas 2.2.0 for semantic clarity.
+    Version detection ensures backward compatibility. Boundary: Both produce similar but not identical
+    results near month boundaries; ME strictly anchors to end.'
+  evidence: rqalpha/utils/__init__.py:260-263(get_month_end_freq)
+  stage: rqalpha.utils
+  alternative_considered: Forcing 'M' would avoid new syntax but delay adoption of improved pandas API;
+    version check is minimal overhead.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: get_month_end_freq in rqalpha/utils/__init__.py'
+- id: BD-107
+  type: B/BA
+  content: 'Decimal rounding: ROUND_FLOOR for position calculations'
+  rationale: 'ROUND_FLOOR ensures position quantities round down consistently, preventing over-allocation
+    of shares/futures. Truncation is conservative for position sizing. Boundary: Applied to quantities;
+    prices may use different rounding; affects cost basis slightly.'
+  evidence: rqalpha/utils/__init__.py:212(decimal_rounding_floor)
+  stage: rqalpha.utils
+  alternative_considered: ROUND_HALF_UP more common for prices but could cause rounding up to invalid
+    lot sizes.
+- id: BD-108
+  type: T
+  content: 'Integration test float tolerance: rel_tol=1e-7, abs_tol not specified'
+  rationale: 'Relative tolerance of 1e-7 (10 ppb) for float comparisons balances precision requirements
+    with numerical stability. Absolute tolerance not specified defaults to 0. Boundary: Very strict tolerance
+    may cause flaky tests; too loose may miss real bugs.'
+  evidence: rqalpha/utils/testing/integration.py:304,335(assert_float_equal)
+  stage: rqalpha.utils.testing
+  alternative_considered: Industry standard often uses 1e-5 to 1e-6 for financial calculations; 1e-7 is
+    conservative.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: assert_float_equal in rqalpha/utils/testing/integration.py'
+- id: BD-109
+  type: B/RC
+  content: 'Stock dividend cash assertions: exact amounts (900, 2970, 910)'
+  rationale: 'Exact dividend cash amounts are hardcoded assertions for specific historical dividends (likely
+    from corporate actions test dataset). Validates dividend cash flow calculations. Boundary: These are
+    specific test data values; actual dividends vary by security and date.'
+  evidence: tests/integration_tests/test_api/mod/sys_accounts/test_account_model.py:103,105,107(assert_dividend_cash)
+  stage: rqalpha.mod.rqalpha_mod_sys_accounts
+  alternative_considered: Parameterizing test data would allow testing with multiple dividend scenarios
+    but adds complexity.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: assert_dividend_cash in tests/integration_tests/test_api/mod/sys_accounts/test_account_model.py'
+- id: BD-110
+  type: B
+  content: 'Stock split position change: 1000 shares → 2000 shares'
+  rationale: 'Stock split test case validates 2-for-1 split handling where position quantity doubles and
+    per-share price halves. Ensures total value preserved. Boundary: Test-specific split ratio; actual
+    splits have various ratios (3:2, 5:1, etc.).'
+  evidence: tests/integration_tests/test_api/mod/sys_accounts/test_account_model.py:153,157(assert_split_adjustment)
+  stage: rqalpha.mod.rqalpha_mod_sys_accounts
+  alternative_considered: Reverse splits (e.g., 1:10) not tested; would require different test cases with
+    position consolidation.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: assert_split_adjustment in tests/integration_tests/test_api/mod/sys_accounts/test_account_model.py'
+- id: BD-111
+  type: B/DK
+  content: 'Futures position PnL: (close - settlement) * multiplier'
+  rationale: 'Daily PnL calculation for futures uses settlement price (exchange-determined) rather than
+    last traded price. Multiplier converts price difference to monetary value. Boundary: Settlement price
+    is final daily price; different from mark-to-market using last price.'
+  evidence: tests/integration_tests/test_api/mod/sys_accounts/test_futures_settlement_price_type.py:62-64(assert_future_pnl)
+  stage: rqalpha.mod.rqalpha_mod_sys_accounts
+  alternative_considered: Last price marking simpler but less aligned with exchange settlement procedures;
+    settlement price is standard.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: assert_future_pnl in tests/integration_tests/test_api/mod/sys_accounts/test_futures_settlement_price_type.py'
+- id: BD-112
+  type: BA/DK
+  content: Broker on_bar executes BEFORE Strategy handle_bar due to registration timing
+  rationale: Event handlers are invoked in registration order. Broker registers its on_bar handler before
+    user Strategy is initialized, ensuring market data processing occurs before user callbacks. This ordering
+    is guaranteed by the registration sequence in main.py, but users who expect symmetric on_bar/handle_bar
+    execution may encounter off-by-one timing issues in multi-bar scenarios.
+  evidence: simulation_broker.py:58(EVENT.BAR) vs main.py:188(user_strategy init)
+  stage: ordering_contract
+  alternative_considered: Explicit priority mechanism for handler ordering was considered but rejected
+    to minimize API complexity
+  _evidence_issues:
+  - 'NOT_FOUND: simulation_broker.py'
+- id: BD-113
+  type: B/BA
+  content: Scheduler next_day_ runs on PRE_BEFORE_TRADING, before user before_trading callbacks
+  rationale: 'Internal scheduler state updates (next_day_) execute in PRE_BEFORE_TRADING phase before
+    user-defined before_trading callbacks. This ensures scheduler metadata is current when user code runs.
+    Boundary: user before_trading can rely on scheduler internals being ready, but must not assume end-of-day
+    state has been persisted yet.'
+  evidence: scheduler.py:79(add_listener PRE_BEFORE_TRADING) vs scheduler.py:274(before_trading_ callback)
+  stage: ordering_contract
+  alternative_considered: Merging next_day_ into before_trading was rejected to keep scheduler concerns
+    isolated from user code
+  _evidence_issues:
+  - 'NOT_FOUND: scheduler.py'
+- id: BD-114
+  type: BA/DK
+  content: Scheduler passes None as bar_dict in before_trading phase (scheduler functions only)
+  rationale: 'User functions registered with scheduler receive None as bar_dict during before_trading
+    phase, while broker callbacks receive actual bar data during trading phases. This reflects that no
+    market data has been received yet at before_trading time. Boundary: scheduler-registered functions
+    cannot access intraday bar data, only daily aggregates via history_bars.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_scheduler/scheduler.py:280(module)
+  stage: ordering_contract
+  alternative_considered: Passing empty dict instead of None was rejected to make missing data explicit
+    rather than silently empty
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rqalpha/mod/rqalpha_mod_sys_scheduler/scheduler.py'
+- id: BD-115
+  type: B/BA
+  content: Strategy init runs BEFORE persist restore — init executes with fresh state
+  rationale: 'Strategy initialization happens before state restoration from persistence. This means init()
+    always executes with default/fresh state values, allowing users to set up internal state without fighting
+    restored values. Boundary: any state set in init() will be overwritten by restore(); strategies must
+    defer initialization logic to __init__ or accept that init() is for registration/setup only.'
+  evidence: main.py:201(user_strategy.init) → main.py:207(persist_helper.restore)
+  stage: ordering_contract
+  alternative_considered: Restoring before init() was rejected because init() may need to know what state
+    will be restored before committing to initialization
+  _evidence_issues:
+  - 'NOT_FOUND: main.py'
+- id: BD-116
+  type: BA
+  content: Account fast_forward processes OPEN trades before CLOSE trades
+  rationale: 'When fast-forwarding through historical data, the account processes OPEN position effects
+    before CLOSE position effects. This ordering ensures position state transitions are deterministic
+    and match exchange semantics where opening and closing the same instrument on the same bar resolves
+    correctly. Boundary: strategies that rely on same-bar round-trip processing should use separate bar
+    handling to avoid ordering dependency.'
+  evidence: account.py:158(OPEN check) → account.py:163(CLOSE processing)
+  stage: ordering_contract
+  alternative_considered: Processing in submission order (random) was rejected for non-deterministic behavior
+    across runs
+  _evidence_issues:
+  - 'NOT_FOUND: account.py'
+- id: BD-117
+  type: BA
+  content: Persistable uses __subclasshook__ for duck-typing — any class with get_state/set_state qualifies
+  rationale: 'The Persistable interface uses Python''s __subclasshook__ mechanism to implement duck-typing,
+    accepting any object with get_state() and set_state() methods regardless of inheritance hierarchy.
+    This enables composition without requiring explicit interface inheritance. Boundary: any class with
+    matching method signatures is treated as persistable; there is no runtime verification of method signatures
+    or return types.'
+  evidence: interface.py:708-714(__subclasshook__ implementation)
+  stage: pattern_choice
+  alternative_considered: Explicit ABC registration was rejected in favor of duck-typing to reduce boilerplate
+    for users
+  _evidence_issues:
+  - 'NOT_FOUND: interface.py'
+- id: BD-118
+  type: BA
+  content: Frontend Validators use short-circuit pattern — first non-None reason string rejects order
+  rationale: 'Order validation short-circuits on the first validator that returns a non-None rejection
+    reason string. This pattern ensures deterministic error reporting and prevents multiple rejection
+    messages from confusing users. Boundary: validators run in registration order; the first rejection
+    wins regardless of severity; downstream validators do not see rejected orders.'
+  evidence: environment.py:212-222(validate_submission loop) vs interface.py:724-730(AbstractFrontendValidator)
+  stage: pattern_choice
+  alternative_considered: Collecting each rejection reasons was rejected to keep error messages actionable
+    rather than overwhelming
+  _evidence_issues:
+  - 'NOT_FOUND: environment.py'
+- id: BD-119
+  type: DK
+  content: AccountMeta disables margin property for stock-only strategies (performance optimization)
+  rationale: 'AccountMeta metaclass disables the margin property at class creation time for stock-only
+    strategies to avoid computing unused margin data. This is a performance optimization since margin
+    calculations involve more complex accounting only needed for futures/margin-enabled accounts. Boundary:
+    margin property is unavailable until explicitly enabled; accessing it on stock-only accounts before
+    enablement raises AttributeError.'
+  evidence: account.py:37-42(AccountMeta.__new__ magic) vs account.py:457-460(dynamic re-enable)
+  stage: pattern_choice
+  alternative_considered: Always computing margin lazily was rejected in favor of explicit opt-in via
+    metaclass optimization
+  _evidence_issues:
+  - 'NOT_FOUND: account.py'
+- id: BD-120
+  type: BA
+  content: get_open_orders excludes EXERCISE orders via hardcoded filter
+  rationale: 'The get_open_orders API method excludes orders with position_effect=EXERCISE from its results.
+    This reflects that exercise orders are involuntary (assigned by the exchange) and should not be managed
+    like user-submitted orders. Boundary: exercise assignments cannot be cancelled or modified via standard
+    order management; they appear only in position/fill reporting, not in open orders listings.'
+  evidence: api_base.py:133(position_effect != EXERCISE filter)
+  stage: invariant
+  alternative_considered: Including exercise orders was rejected to avoid confusing involuntary assignments
+    with user orders
+  _evidence_issues:
+  - 'NOT_FOUND: api_base.py'
+- id: BD-121
+  type: B/BA
+  content: history_bars returns T-1 data in before_trading regardless of frequency
+  rationale: 'The history_bars function forces include_now=False during before_trading phase for each
+    frequencies, returning only data up to T-1. This ensures strategies cannot accidentally look into
+    the current incomplete bar during pre-market initialization. Boundary: even minute-frequency data
+    returns T-1 data before market open; strategies must wait for handle_bar to access current bar data
+    regardless of requested frequency.'
+  evidence: api_base.py:505-508(force include_now=False in BEFORE_TRADING)
+  stage: invariant
+  alternative_considered: Throwing an error when include_now=True in before_trading was rejected to avoid
+    breaking existing code
+  _evidence_issues:
+  - 'NOT_FOUND: api_base.py'
+- id: BD-122
+  type: BA/DK
+  content: 'Stock T+1: positions with t_plus_enabled=True cannot be sold same day'
+  rationale: 'Stocks with T+1 settlement (t_plus_enabled=True) have their closable property return False
+    on the same day as purchase. This enforces Chinese A-share market settlement rules where shares cannot
+    be sold until the next trading day. Boundary: attempting to submit sell orders for T+1 positions on
+    purchase day will fail at risk validation; positions remain open until T+1 settlement completes.'
+  evidence: rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py:47(comment)
+  stage: invariant
+  alternative_considered: Automatic T+1 handling without user configuration was rejected due to varying
+    settlement rules by market
+  _evidence_issues:
+  - 'FN_NOT_FOUND: comment in rqalpha/mod/rqalpha_mod_sys_accounts/position_model.py'
+- id: BD-123
+  type: BA
+  content: EventBus executes _listeners before _user_listeners — system handlers run first
+  rationale: 'The EventBus publishes events to internal _listeners before invoking _user_listeners, ensuring
+    system-level handlers execute first. This maintains system invariants and performs necessary bookkeeping
+    before user code runs. Boundary: user handlers cannot prevent system handlers from seeing events;
+    system handlers see events in original published state before any user modifications.'
+  evidence: events.py:44-50(publish_event order)
+  stage: invariant
+  alternative_considered: Allowing user handlers to run first was rejected to maintain system state integrity
+  _evidence_issues:
+  - 'NOT_FOUND: events.py'
+- id: BD-124
+  type: BA
+  content: EXECUTION_PHASE enforcement varies by API — ON_INIT excluded from most trading APIs
+  rationale: 'Different API methods enforce execution phase constraints differently: get_open_orders excludes
+    ON_INIT while update_universe allows it. This reflects varying safety requirements based on whether
+    an API modifies persistent state. Boundary: some APIs are safe to call during initialization while
+    others are not; the inconsistency requires users to know per-method phase requirements.'
+  evidence: api_base.py:119-126(get_open_orders) vs api_base.py:232-241(update_universe)
+  stage: default_value
+  alternative_considered: Standardizing each APIs to same phase enforcement was rejected due to varying
+    safety profiles
+  _evidence_issues:
+  - 'NOT_FOUND: api_base.py'
+- id: BD-125
+  type: B/DK
+  content: Scheduler uses hardcoded Chinese stock trading minutes (571, 690, 780, 900)
+  rationale: 'The scheduler includes hardcoded minute offsets (571, 690, 780, 900) representing Chinese
+    stock market trading minutes from open. These values represent the standard Chinese A-share trading
+    schedule. Boundary: strategies using minute-frequency scheduling will automatically include these
+    minute offsets; non-Chinese markets may have incorrect minute mappings.'
+  evidence: scheduler.py:91(_trading_minute_range defaults) vs scheduler.py:118-120(STOCK forced addition)
+  stage: default_value
+  alternative_considered: Fetching market hours from external data source was rejected to avoid external
+    dependency
+  _evidence_issues:
+  - 'NOT_FOUND: scheduler.py'
+- id: BD-126
+  type: B
+  content: Strategy handles deprecated bar_dict parameter by auto-wrapping before_trading
+  rationale: 'Strategy automatically wraps user before_trading methods that accept the deprecated bar_dict
+    parameter using a lambda to ignore the parameter. This maintains backward compatibility for strategies
+    written against the old API. Boundary: wrapped methods still execute but receive no bar data; strategies
+    using the new API signature (no bar_dict) work directly without wrapping overhead.'
+  evidence: strategy.py:51-55(co_argcount > 1 check with lambda wrapper)
+  stage: inheritance
+  alternative_considered: Breaking old API was rejected to avoid forcing immediate migration for each
+    existing strategies
+  _evidence_issues:
+  - 'NOT_FOUND: strategy.py'
+- id: BD-127
+  type: BA
+  content: AbstractDataSource has 21 methods without @abc.abstractmethod — uses NotImplementedError instead
+  rationale: 'AbstractDataSource declares 21 methods as regular methods raising NotImplementedError rather
+    than using @abc.abstractmethod decorators. This allows subclasses to inherit without implementing
+    each methods immediately. Boundary: incomplete implementations pass type checking but fail at runtime
+    when unimplemented methods are called; this is a runtime contract rather than compile-time.'
+  evidence: interface.py:286(class definition)
+  stage: inheritance
+  alternative_considered: Using @abc.abstractmethod throughout was rejected to reduce boilerplate for
+    internal subclasses
+  _evidence_issues:
+  - 'NOT_FOUND: interface.py'
+- id: BD-128
+  type: BA
+  content: Risk validators execute BEFORE broker order submission
+  rationale: 'Risk validators run in environment.submit_order before delegating to broker.submit_order,
+    ensuring orders are validated before reaching the broker. This prevents invalid orders from entering
+    the broker''s state. Boundary: if risk validation passes but broker validation fails, the order is
+    rejected at broker level with a different error message; users must handle both validation layers.'
+  evidence: environment.py:202(submit_order calls can_submit_order) vs simulation_broker.py:105(submit_order)
+  stage: subdirectory
+  alternative_considered: Single unified validation was rejected to maintain separation between risk policy
+    and execution constraints
+  _evidence_issues:
+  - 'NOT_FOUND: environment.py'
+- id: BD-129
+  type: BA
+  content: Settlement happens AFTER after_trading but BEFORE next day's before_trading
+  rationale: 'The settlement event fires between after_trading callback and the next day''s before_trading
+    callback, representing end-of-day position reconciliation. This timing ensures positions are settled
+    before new day starts but after each trading activity concludes. Boundary: user after_trading sees
+    unsettled positions; before_trading sees settled positions; no user code can run during settlement
+    itself.'
+  evidence: events.py:117-125(EVENT.SETTLEMENT definition) vs account.py:352(_on_settlement)
+  stage: subdirectory
+  alternative_considered: Running settlement synchronously during after_trading was rejected to allow
+    settlement processing time
+  _evidence_issues:
+  - 'NOT_FOUND: events.py'
+- id: BD-130
+  type: B/DK
+  content: 'INTERACTION: BD-016 × BD-036 × BD-057 → T+1 settlement risk cascade through validation pipeline'
+  rationale: 'Three-way risk cascade: market_tplus (BD-057) defines settlement delay, _market_tplus (BD-016)
+    computes closable quantity accounting for T+1 rule, and closable_check (BD-036) validates sell orders
+    against that computation. If any layer miscomputes or is misconfigured, illegal T+0 sell orders could
+    pass validation, causing regulatory violations or position accounting errors. This cascade is dangerous
+    because each component appears correct in isolation but the interaction is untested for edge case'
+  evidence: BD-016,BD-036,BD-057
+  stage: global
+  alternative_considered: Explicit T+1 invariant test covering same-day buy-sell sequences would catch
+    cascade failures early
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-131
+  type: BA
+  content: 'INTERACTION: BD-025 × BD-034 × BD-128 → Two-layer validation inconsistency risk cascade'
+  rationale: 'Risk validation forms a two-layer cascade: frontend validators (BD-025) including cash validation
+    (BD-034) execute before broker submission (BD-128). The gap is that frontend validation may pass (using
+    estimates) while broker validation fails (using actual fills), creating confusing error scenarios
+    where an order appears valid but gets rejected later. This is problematic because users see successful
+    frontend validation but experience broker rejection, potentially mid-bar when prices have moved.'
+  evidence: BD-025,BD-034,BD-128
+  stage: global
+  alternative_considered: Single unified validation layer would eliminate cascade but require restructuring
+    risk architecture
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-132
+  type: B
+  content: 'INTERACTION: BD-042 × BD-063 → daily_returns depends on static_unit_net_value timing contract'
+  rationale: 'Hidden dependency chain: daily_returns calculation (BD-042) uses static_unit_net_value as
+    denominator, which is updated at PRE_BEFORE_TRADING (BD-063). If the PRE_BEFORE_TRADING event is skipped,
+    suppressed, or runs out of order, static_unit_net_value retains stale values causing return calculations
+    to reference wrong base. This creates silent data corruption where returns appear valid but reference
+    incorrect prior NAV, amplifying over time without obvious errors.'
+  evidence: BD-042,BD-063
+  stage: global
+  alternative_considered: Explicit state validation checking static_unit_net_value freshness would catch
+    timing violations
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-133
+  type: BA/M
+  content: 'INTERACTION: BD-103 × BD-033 × BD-030 → price limit cascade with slippage boundary violation'
+  rationale: 'Amplification cascade: price limit validation (BD-103) constrains slippage (BD-033), and
+    both interact with limit order cancellation (BD-030). Slippage could push a valid limit order to exactly
+    the limit price, triggering cancellation, but the cancellation message may not clearly indicate this
+    was due to slippage-price limit interaction. Users see orders cancelled at limit prices without understanding
+    that slippage contributed, leading to misconfigured slippage models and unexpected execution be'
+  evidence: BD-103,BD-033,BD-030
+  stage: global
+  alternative_considered: Unified limit+slippage check with explicit error message would clarify interaction
+    behavior
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-134
+  type: B/BA
+  content: 'INTERACTION: BD-015 × BD-066 × BD-078 → futures margin calculation depends on position direction
+    tracking'
+  rationale: 'Amplification between long/short position separation (BD-015) and margin calculations (BD-066,
+    BD-078): PositionProxy tracks long and short positions independently, but margin calculation uses
+    price * quantity (aggregating direction). This creates a subtle mismatch where margin requirements
+    may be undercounted for hedged positions where long and short in same instrument partially offset.
+    The danger is highest for calendar spreads or intra-commodity spreads where offsetting positions should
+    reduc'
+  evidence: BD-015,BD-066,BD-078
+  stage: global
+  alternative_considered: Net position margin netting across long/short would require exchange-specific
+    margin offset rules
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-135
+  type: B/BA
+  content: 'INTERACTION: BD-100 × BD-029 → volume limit amplification cancels unfilled market orders'
+  rationale: 'Amplification between volume limits (BD-100) and market order cancellation (BD-029): when
+    a market order exceeds the 25% volume limit, the unfilled portion is cancelled rather than carried
+    to next bar. This creates a scenario where aggressive strategies expecting partial fills to persist
+    may be surprised by total cancellation. The interaction is particularly problematic because volume_limit
+    prevents execution while the cancellation removes the order entirely, creating non-granular fill behavior '
+  evidence: BD-100,BD-029
+  stage: global
+  alternative_considered: Carrying unfilled portion to next bar would be more realistic but adds order
+    state complexity
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-136
+  type: B
+  content: 'INTERACTION: BD-074 × BD-043 → TRADING_DAYS_A_YEAR constant used in annualized return formula'
+  rationale: 'Direct dependency: annualized return calculation (BD-043) explicitly uses TRADING_DAYS_A_YEAR
+    constant (BD-074) in the formula unit_net_value^(252/days)-1. The constant value of 252 is embedded
+    in the formula but could diverge from the global constant if not synchronized. This creates a hidden
+    coupling where changing TRADING_DAYS_A_YEAR doesn''t automatically update the annualized return formula,
+    potentially causing inconsistent annualization across different calculation paths.'
+  evidence: BD-074,BD-043
+  stage: global
+  alternative_considered: Referencing constant directly instead of hardcoding 252 would ensure consistency
+    across modules
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-137
+  type: BA
+  content: 'INTERACTION: BD-022 × BD-121 → sandbox isolation and T-1 lookahead prevention work together'
+  rationale: 'Amplification between sandboxing (BD-022) and T-1 enforcement (BD-121): scope-based sandbox
+    restricts what strategy code can access, and history_bars enforces T-1 data access during before_trading.
+    Together they prevent both unauthorized API access and data access patterns that would cause lookahead
+    bias. The interaction is beneficial - even if a buggy strategy circumvents sandbox restrictions to
+    access internal APIs, the T-1 enforcement provides a second layer of protection against inadvertent '
+  evidence: BD-022,BD-121
+  stage: global
+  alternative_considered: Single protection layer would be simpler but less robust against combined attack
+    vectors
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-138
+  type: BA/DK
+  content: 'INTERACTION: BD-049 × BD-013 × BD-081 → stock transaction cost with tax rate change by date'
+  rationale: 'Three-way amplification: transaction cost per instrument+market (BD-013) enables market-specific
+    cost modeling, stock commission (BD-049) applies BY_MONEY+tax structure, and stamp duty reduction
+    (BD-081) changes tax rate based on date (0.001 pre-Aug-2023, 0.0005 post-Aug-2023). The date-dependent
+    tax rate means backtests spanning August 2023 will show discontinuous transaction costs, potentially
+    creating artificial performance inflection points. Strategies optimized on pre-2023 data may perform '
+  evidence: BD-049,BD-013,BD-081
+  stage: global
+  alternative_considered: User notification when backtest spans tax regime change would help interpret
+    performance attribution
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-139
+  type: B
+  content: 'INTERACTION: BD-072 × BD-080 → Decimal precision must handle small commission rates without
+    rounding loss'
+  rationale: 'Amplification between decimal precision (BD-072, 10 decimals) and commission rate (BD-080,
+    0.0008 = 8 bps): the precision setting must be high enough to avoid rounding errors when computing
+    small percentage commissions on large trade values. A trade of 1,000,000 CNY with 0.08% commission
+    = 800 CNY, which at 10 decimal precision maintains accuracy. However, if precision were lower (e.g.,
+    2 decimals), repeated trades could accumulate rounding error, causing cash account drift from true
+    values.'
+  evidence: BD-072,BD-080
+  stage: global
+  alternative_considered: Even higher precision (14 decimals) would fully eliminate float representation
+    concerns but adds overhead
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-GAP-001
+  type: B
+  content: Universe update uses overwrite semantics rather than incremental add, requiring explicit re-subscription
+    for complete coverage
+  rationale: Overwrite semantics prevent unintended accumulation of subscription state, but breaks scenarios
+    where dynamic universe expansion is needed without full re-declaration
+  evidence: rqalpha/apis/api_base.py:243(update_universe)
+  stage: api_design
+  alternative_considered: Incremental add/remove with explicit delete operation
+- id: BD-GAP-002
+  type: B/BA
+  content: Order style normalization treats None as market order, silently converting missing price parameters
+    to MarketOrder type
+  rationale: Defaults to market order for simplicity but masks configuration errors where traders expect
+    limit orders
+  evidence: rqalpha/apis/api_base.py:82(cal_style)
+  stage: order_execution
+  alternative_considered: Require explicit OrderStyle object or raise error on None
+- id: BD-GAP-003
+  type: BA/DK
+  content: A-share lot size enforced as 100 shares with automatic rounding down, not rounding to nearest
+  rationale: Matches Chinese exchange rules (1手=100股) but rounding down loses remaining cash, breaking
+    exact target-value strategies
+  evidence: rqalpha/apis/api_abstract.py:58(order_shares)
+  stage: order_execution
+  alternative_considered: Allow partial lots for margin accounts or configurable rounding mode
+- id: BD-GAP-004
+  type: BA
+  content: 'Cash-constrained order semantics: order_value/order_percent uses maximum available cash when
+    requested exceeds balance'
+  rationale: Prevents order rejection but creates gap between intended position size and actual fill,
+    especially problematic in multi-asset portfolios
+  evidence: rqalpha/apis/api_abstract.py:105(order_value)
+  stage: order_execution
+  alternative_considered: Raise error or return order status indicating partial fill requirement
+- id: BD-GAP-005
+  type: B/DK
+  content: 'Futures smart-order routing: positive quantity first closes Sell positions, then opens Buy;
+    negative reverses the logic'
+  rationale: Matches exchange close-first rules but order of operations affects fill prices when spread
+    changes between close and open
+  evidence: rqalpha/apis/api_abstract.py:454(order)
+  stage: order_execution
+  alternative_considered: Separate buy_close/sell_open functions with explicit intent
+- id: BD-GAP-006
+  type: T
+  content: Margin trading data availability starts at 2010-03-31, hardcoded as minimum date for get_securities_margin
+  rationale: Matches real Chinese market launch date but no graceful degradation for backtests requiring
+    earlier data
+  evidence: rqalpha/apis/api_rqdatac.py:428(get_securities_margin)
+  stage: data_layer
+  alternative_considered: Return None with warning or dynamically fetch availability dates
+- id: BD-GAP-007
+  type: BA/DK
+  content: Index weights fetched at T-1 (previous trading day) default, not current date
+  rationale: Matches index rebalancing lag reality but creates off-by-one risk in same-day index-tracking
+    strategies
+  evidence: rqalpha/apis/api_rqdatac.py:153(index_weights)
+  stage: data_layer
+  alternative_considered: Default to current date with warning about data lag
+- id: BD-GAP-008
+  type: BA
+  content: Price adjustment default is 'pre' (back-adjust) rather than 'none', changing historical returns
+    for split/dividend events
+  rationale: Matches practitioner preference for comparable returns but distorts actual trading P&L including
+    dividend reinvestment
+  evidence: rqalpha/apis/api_rqdatac.py:320(get_price)
+  stage: data_layer
+  alternative_considered: Default to 'none' or require explicit adjustment type selection
+- id: BD-GAP-009
+  type: T
+  content: Stock split history query requires explicit start_date parameter, no default back-to-inception
+  rationale: Prevents unbounded queries but creates error-prone boilerplate for strategies needing full
+    split history
+  evidence: rqalpha/apis/api_rqdatac.py:70(get_split)
+  stage: api_design
+  alternative_considered: Default start_date to strategy start or instrument listing date
+- id: BD-GAP-010
+  type: B
+  content: Unsubscribe to empty universe triggers strategy exit, not graceful degradation
+  rationale: Prevents runaway strategies with no instruments but makes unsubscribe dangerous for temporary
+    subscription changes
+  evidence: rqalpha/apis/api_base.py:307(unsubscribe)
+  stage: lifecycle_management
+  alternative_considered: Require explicit exit signal rather than implicit from empty universe
+- id: BD-GAP-011
+  type: B
+  content: Order percentage capped at <=1 (100%) with soft enforcement via float comparison
+  rationale: Prevents margin calls in backtest but floating point comparison may allow 100.000001% due
+    to precision
+  evidence: rqalpha/apis/api_abstract.py:151(order_percent)
+  stage: validation
+  alternative_considered: Hard cap with explicit error, or float-tolerant rounding to 1.0
+- id: BD-GAP-012
+  type: B/DK
+  content: Bundle download uses exact URL matching with HTTP streaming, requiring manual URL rotation
+    for mirror failover
+  rationale: Ensures data integrity from verified source but provides no built-in redundancy for mirror
+    failures
+  evidence: rqalpha/cmds/bundle.py:139(get_exactly_url)
+  stage: infrastructure
+  alternative_considered: URL list with fallback selection on 404/timeout
+- id: BD-GAP-013
+  type: B
+  content: Handle_bar receives instrument-keyed dict with single-bar signature, not list of bars for each
+    subscriptions
+  rationale: Matches per-instrument strategy patterns but requires explicit dict iteration for multi-asset
+    strategies
+  evidence: rqalpha/examples/golden_cross.py:16(handle_bar)
+  stage: event_system
+  alternative_considered: Separate handle_bar per instrument or batch callback variant
+- id: BD-GAP-014
+  type: BA
+  content: Turtle strategy uses 20-period lookback for N-day breakout entry, fixed ATR multiplier of 2.0
+    for stop loss
+  rationale: Original Turtle system parameters but may not suit high-volatility Chinese futures (IF/IC)
+  evidence: rqalpha/examples/turtle.py:27(init)
+  stage: strategy_execution
+  alternative_considered: Environment-variable configuration or adaptive ATR calculation
+- id: BD-GAP-015
+  type: BA
+  content: Golden cross example uses MA5/MA20 crossover with daily frequency, no volume confirmation
+  rationale: Classic momentum signal but high noise in daily data without volume filter
+  evidence: rqalpha/examples/golden_cross.py:7(init)
+  stage: signal_definition
+  alternative_considered: Add volume ratio or ADX filter before signal generation
+- id: BD-GAP-016
+  type: DK
+  content: 'Missing: Timezone explicit annotation'
+  rationale: 'Audit finding: missing: timezone explicit annotation. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-017
+  type: M
+  content: 'Missing: Convergence criteria explicit declaration'
+  rationale: 'Audit finding: missing: convergence criteria explicit declaration. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-018
+  type: DK
+  content: 'Missing: Point-in-Time data availability'
+  rationale: 'Audit finding: missing: point-in-time data availability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-019
+  type: B
+  content: 'Missing: Train/test time split integrity'
+  rationale: 'Audit finding: missing: train/test time split integrity. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-020
+  type: DK
+  content: 'Missing: Random seed full coverage'
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-021
+  type: DK
+  content: 'Missing: Model and data version snapshot binding'
+  rationale: 'Audit finding: missing: model and data version snapshot binding. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-022
+  type: B
+  content: 'Missing: 回测过拟合防护'
+  rationale: 'Audit finding: missing: 回测过拟合防护. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-023
+  type: M
+  content: 'Missing: 协方差矩阵 PSD 修复策略'
+  rationale: 'Audit finding: missing: 协方差矩阵 psd 修复策略. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-024
+  type: B
+  content: 'Missing: 协方差估计量选择与收缩'
+  rationale: 'Audit finding: missing: 协方差估计量选择与收缩. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-025
+  type: B
+  content: 'Missing: 波动率模型族与分布选择'
+  rationale: 'Audit finding: missing: 波动率模型族与分布选择. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-026
+  type: B
+  content: 'Missing: 因子 IC 的 demean 与分组对齐'
+  rationale: 'Audit finding: missing: 因子 ic 的 demean 与分组对齐. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-027
+  content: 'Missing: Timezone explicit annotation'
+  type: DK
+  rationale: 'Audit finding: missing: timezone explicit annotation. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-028
+  content: 'Missing: Point-in-Time data availability'
+  type: DK
+  rationale: 'Audit finding: missing: point-in-time data availability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-029
+  content: 'Missing: Random seed full coverage'
+  type: DK
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-030
+  content: 'Missing: Model and data version snapshot binding'
+  type: DK
+  rationale: 'Audit finding: missing: model and data version snapshot binding. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-031
+  content: 'Missing: 回测过拟合防护'
+  type: B
+  rationale: 'Audit finding: missing: 回测过拟合防护. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-032
+  content: 'Missing: 协方差矩阵 PSD 修复策略'
+  type: M
+  rationale: 'Audit finding: missing: 协方差矩阵 psd 修复策略. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-033
+  content: 'Missing: 协方差估计量选择与收缩'
+  type: B
+  rationale: 'Audit finding: missing: 协方差估计量选择与收缩. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-034
+  content: 'Missing: 波动率模型族与分布选择'
+  type: B
+  rationale: 'Audit finding: missing: 波动率模型族与分布选择. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_layer
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: Index Futures Momentum Rotation Strategy
+  source: docs/source/notebooks/run-rqalpha-in-ipython.ipynb
+  type: trading_strategy
+  business_problem: Implements a momentum-based rotation strategy between equity indices (CSI 300, CSI
+    500) and government bonds, automatically rebalancing to the best-performing asset class based on 20-day
+    price momentum.
+  intent_keywords:
+  - momentum rotation
+  - index futures
+  - equity bond allocation
+  - backtesting
+  - rebalancing strategy
+  stage: strategy_evaluation
+  negative_keywords:
+  - stock screening
+  - factor computation
+  - live trading execution
+  - data pipeline
+  disambiguation: Are you looking to backtest a multi-asset rotation strategy, or do you need a different
+    type of analysis such as factor screening, data processing, or live trading execution?
+  data_domain: market_data
+- id: UC-102
+  name: Sphinx Documentation Configuration
+  source: docs/source/conf.py
+  type: reporting
+  business_problem: Configuration file for building rqalpha project documentation using Sphinx, setting
+    up autodoc, autosummary, and other documentation extensions.
+  intent_keywords:
+  - documentation
+  - sphinx
+  - configuration
+  - build setup
+  - autodoc
+  stage: documentation
+  negative_keywords:
+  - trading strategy
+  - backtesting
+  - factor computation
+  - data pipeline
+  disambiguation: This is a documentation build configuration file, not a trading or analysis use case.
+    Are you looking for a specific trading strategy, data processing pipeline, or analytical workflow?
+  data_domain: mixed
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 64
+  evidence_invalid: 80
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.4444444444444444
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+- type: depends_on
+  target: docs/claude/architecture.md
+  description: Architecture understanding is required before mod development
+  evidence: CLAUDE.md:§Key-Architecture-Points
+- type: depends_on
+  target: docs/source/api/base_api.rst
+  description: API signatures must be verified against reference before strategy writing
+  evidence: CLAUDE.md:§When-Writing-Strategies
+- type: depends_on
+  target: docs/source/intro/tutorial.rst
+  description: Tutorial provides foundational strategy lifecycle understanding
+  evidence: docs/claude/strategy-guide.md:§Key-Documentation-Files
+- type: complementary
+  target: docs/claude/bug-reproduction.md
+  description: Bug reproduction guide complements testing and debugging stage
+  evidence: CLAUDE.md:§Detailed-Documentation
+- type: complementary
+  target: docs/claude/development.md
+  description: Development guide supports mod development and debugging
+  evidence: CLAUDE.md:§Detailed-Documentation
+- type: contains
+  target: docs/claude/
+  description: docs/claude/ directory contains all architecture and guide documents
+  evidence: CLAUDE.md:§Detailed-Documentation
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 0
+    warn: 0
+    fail: 0
+  subdomain_totals:
+    pass: 6
+    warn: 23
+    fail: 12
+  coverage: 41/41 (100%)
+  pass_rate: 6/41 (14%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: data_source
+  description: 'Choose based on: (1) Data coverage needs (China-specific vs global), (2) Budget constraints,
+    (3) Real-time vs historical only, (4) Development resources available'
+  used_in_stages: []
+  options:
+  - name: RQData (bundled)
+    traits:
+    - proprietary
+    - comprehensive_china_coverage
+    - requires_license
+    fit_for:
+    - Full China market backtesting with complete fundamental data
+    not_fit_for:
+    - Free usage, non-China markets, users without RQData license
+  - name: Pre-built monthly bundle
+    traits:
+    - no_auth_required
+    - monthly_updates
+    - historical_only
+    fit_for:
+    - Quick start, historical backtesting without data service subscription
+    not_fit_for:
+    - Real-time data, latest data after monthly cutoff
+  - name: Tushare
+    traits:
+    - open_source
+    - free_api
+    - community_maintained
+    fit_for:
+    - Free China market data, users preferring Tushare
+    not_fit_for:
+    - Real-time data, non-China markets, production reliability needs
+  - name: Custom AbstractDataSource
+    traits:
+    - fully_customizable
+    - any_data_format
+    - user_maintained
+    fit_for:
+    - Non-China markets, proprietary data sources, specific data formats
+    not_fit_for:
+    - Quick setup, users without development resources
+  default: Pre-built monthly bundle (with RQData for extended APIs)
+  _source: worker_resource
+- id: slot-002
+  name: persist_provider
+  description: 'Choose based on: (1) Persistence requirements, (2) Deployment environment, (3) Recovery
+    needs'
+  used_in_stages: []
+  options:
+  - name: In-memory only
+    traits:
+    - no_persistence
+    - simple
+    fit_for:
+    - Single-session backtests, development
+    not_fit_for:
+    - Production, long-running strategies requiring crash recovery
+  - name: File-based persistence
+    traits:
+    - simple
+    - local_only
+    - user_maintained
+    fit_for:
+    - Single-user local backtesting
+    not_fit_for:
+    - Distributed systems, cloud deployments
+  - name: Database persistence
+    traits:
+    - scalable
+    - remote_access
+    - user_maintained
+    fit_for:
+    - Production deployments, cloud-native strategies
+    not_fit_for:
+    - Simple local usage
+  default: No default provider (must be set via env.set_persist_provider)
+  _source: worker_resource
+- id: slot-003
+  name: broker
+  description: 'Choose based on: (1) Live trading vs backtesting, (2) Broker integration requirements'
+  used_in_stages: []
+  options:
+  - name: Simulation broker
+    traits:
+    - backtesting
+    - paper_trading
+    - built_in
+    fit_for:
+    - Backtesting, paper trading simulation
+    not_fit_for:
+    - Production live trading
+  - name: Custom AbstractBroker
+    traits:
+    - fully_customizable
+    - any_connection
+    - user_maintained
+    fit_for:
+    - Connecting to real brokerage APIs, proprietary trading systems
+    not_fit_for:
+    - Standard backtesting use cases
+  default: SimulationBroker (rqalpha_mod_sys_simulation)
+  _source: worker_resource
+- id: slot-004
+  name: event_source
+  description: 'Choose based on: (1) Backtesting vs live trading, (2) Event frequency requirements'
+  used_in_stages: []
+  options:
+  - name: Historical simulation
+    traits:
+    - backtesting
+    - historical_bars
+    - built_in
+    fit_for:
+    - Historical backtesting
+    not_fit_for:
+    - Real-time execution
+  - name: Custom AbstractEventSource
+    traits:
+    - real_time
+    - streaming
+    - user_maintained
+    fit_for:
+    - Real-time trading, streaming data sources
+    not_fit_for:
+    - Historical backtesting only
+  default: SimulationEventSource (rqalpha_mod_sys_simulation)
+  _source: worker_resource
+- id: slot-005
+  name: risk_calculator
+  description: 'Choose based on: (1) License preferences, (2) Required risk metrics, (3) China-specific
+    considerations'
+  used_in_stages: []
+  options:
+  - name: rqrisk
+    traits:
+    - production_ready
+    - china_focused
+    - proprietary
+    fit_for:
+    - Standard risk metrics (Sharpe, max drawdown, etc.)
+    not_fit_for:
+    - Non-China markets, users needing open-source only
+  - name: Custom implementation
+    traits:
+    - open_source
+    - customizable
+    - user_maintained
+    fit_for:
+    - Users preferring open-source, different risk models
+    not_fit_for:
+    - Quick setup, users without development resources
+  default: rqrisk
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: RQData (Ricequant Data Service)
+  description: '. Coverage: N/A. Auth: API key/credentials via rqdatac.init() or rqdatac_uri config'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: RQAlpha Bundle CDN
+  description: '. Coverage: N/A. Auth: None (public download)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: Local Bundle Storage (HDF5/NumPy/JSON/CSV)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: CSV File Input
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: RQData API
+  description: Real-time and historical financial data for bundle generation and live APIs
+  used_in_stages: []
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: Ricequant CDN
+  description: Download pre-built monthly data bundles
+  used_in_stages: []
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: Ricequant Cloud (implied)
+  description: Strategy backtesting and live trading on cloud platform
+  used_in_stages: []
+  _source: worker_resource
+- id: res-008
+  type: python_package
+  name: numpy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: python_package
+  name: pandas
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: python_package
+  name: requests
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: python_package
+  name: python-dateutil
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: python_package
+  name: six
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: python_package
+  name: logbook
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-014
+  type: python_package
+  name: click
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-015
+  type: python_package
+  name: jsonpickle
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: python_package
+  name: simplejson
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-017
+  type: python_package
+  name: PyYAML
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-018
+  type: code_example
+  name: Index Futures Momentum Rotation Strategy
+  path: docs/source/notebooks/run-rqalpha-in-ipython.ipynb
+  description: Implements a momentum-based rotation strategy between equity indices (CSI 300, CSI 500)
+    and government bonds, automatically rebalancing to the best-performing asset class based on 20-day
+    price momentum.
+  used_in_stages:
+  - strategy_evaluation
+  _source: uc_list
+- id: res-019
+  type: code_example
+  name: Sphinx Documentation Configuration
+  path: docs/source/conf.py
+  description: Configuration file for building rqalpha project documentation using Sphinx, setting up
+    autodoc, autosummary, and other documentation extensions.
+  used_in_stages:
+  - documentation
+  _source: uc_list

@@ -1,0 +1,2354 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-128
+name: yfinance
+sop_version: '3.6'
+source:
+  projects:
+  - yfinance
+  commit_hash: a17e8b19a6681c4d40cbb2100a3de0d589568a65
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Market data retrieval and streaming
+  description: Python library for downloading market data including OHLCV prices, financial statements,
+    analyst recommendations, sector/industry data, stock screening, and real-time streaming from Yahoo
+    Finance API.
+  prerequisites: Users should understand Python, pandas DataFrames, and financial market concepts. Must
+    accept Yahoo Finance terms of use for data usage.
+  not_suitable_for: Real-time trading systems requiring guaranteed data integrity, high-frequency trading
+    applications, non-Yahoo data sources, and production trading systems where data accuracy is mission-critical
+stages:
+- id: http_layer
+  name: HTTP & Session Management
+  order: 1
+  responsibility: Manages each HTTP requests, session handling, cookie authentication, and rate limiting.
+    Singleton pattern ensures shared session/cookies across each Ticker instances for efficiency and proper
+    Yahoo API access.
+  interface:
+    inputs:
+    - URL requests
+    - Session configuration
+    - Proxy settings
+    - Retry configuration
+    outputs:
+    - HTTP responses
+    - JSON data
+    - cookies
+    - crumb tokens
+  required_methods:
+  - name: YfData.get_json
+    description: Performs HTTP GET request and returns parsed JSON response
+    evidence: yfinance/data.py:75(class YfData)
+  - name: YfData.post
+    description: Performs HTTP POST request with cookie authentication
+    evidence: yfinance/data.py:75(class YfData)
+  - name: ConfigMgr.get_config
+    description: Retrieves global configuration settings for proxy, retries, debug
+    evidence: yfinance/config.py:21(class ConfigMgr)
+  key_behaviors:
+  - behavior: Singleton HTTP client
+    description: YfData uses SingletonMeta to ensure single shared instance across each Ticker objects,
+      preventing redundant authentication and cookie fetching
+    evidence: yfinance/data.py:55(SingletonMeta)
+  - behavior: Cookie-based authentication
+    description: Yahoo Finance requires cookies for API access; singleton shares cookies across requests
+      to avoid repeated auth
+    evidence: yfinance/data.py:75(YfData)
+  - behavior: Browser impersonation
+    description: Uses curl_cffi with Chrome impersonation to bypass Yahoo's non-browser client blocking
+    evidence: yfinance/base.py:84(requests.Session)
+  - behavior: Exception hiding by default
+    description: hide_exceptions=True prevents crashes on network errors unless debug mode is explicitly
+      enabled
+    evidence: yfinance/config.py:34(hide_exceptions=True)
+  replaceable_points:
+  - name: session_backend
+    description: Swap the underlying HTTP session implementation for custom behavior
+    options:
+    - name: curl_cffi
+      traits:
+      - Browser impersonation
+      - Fast
+      - Thread-safe
+      fit_for:
+      - Production use
+      - Bypassing blocks
+      not_fit_for:
+      - Environments without curl_cffi
+    - name: requests.Session
+      traits:
+      - Standard library
+      - Well-documented
+      fit_for:
+      - Debugging
+      - Simple integrations
+      not_fit_for:
+      - Yahoo Finance API (blocked)
+    - name: httpx.Client
+      traits:
+      - Async support
+      - Modern
+      fit_for:
+      - Async applications
+      not_fit_for:
+      - Sync-only codebases
+    default: curl_cffi
+  design_decisions:
+  - Singleton pattern for YfData ensures shared cookies/session across each Ticker instances; prevents
+    redundant authentication (yfinance/data.py:75)
+  - hide_exceptions=True default provides safety-first behavior; users explicitly enable errors with YfConfig.debug.hide_exceptions=False
+    (yfinance/config.py:34)
+  - curl_cffi impersonate=chrome bypasses Yahoo's non-browser client blocking (yfinance/base.py:84)
+  acceptance_hints:
+  - HTTP requests return valid JSON responses
+  - Cookies are properly maintained across requests
+  - Rate limiting is handled gracefully
+  - No 403 Forbidden errors from Yahoo
+- id: price_history
+  name: Price History Retrieval & Repair
+  order: 2
+  responsibility: Fetches OHLCV data from Yahoo Finance chart API, handles timezone detection, repairs
+    common data errors including currency unit mixups, missing prices, bad dividend adjustments, and capital
+    gains double-counting. Most complex module with 3000+ lines.
+  interface:
+    inputs:
+    - ticker symbol
+    - period/interval/start/end params
+    - repair flag
+    - auto_adjust flag
+    outputs:
+    - pandas DataFrame with OHLC, Volume, Dividends, Splits, Repaired? column if repair=True
+  required_methods:
+  - name: PriceHistory.fetch
+    description: Main entry point that fetches price history, applies repairs, and resamples intervals
+    evidence: yfinance/scrapers/history.py:455(history)
+  - name: _reconstruct_intervals_batch
+    description: Fetches finer-grained data to repair missing values in larger intervals
+    evidence: yfinance/scrapers/history.py:641
+  - name: _fix_unit_random_mixups
+    description: Detects and repairs 100x price errors using scipy median filtering
+    evidence: yfinance/scrapers/history.py:1133
+  - name: _fix_bad_div_adjust
+    description: Fixes Yahoo's incorrect dividend adjustments in historical data
+    evidence: yfinance/scrapers/history.py:1550
+  - name: _repair_capital_gains
+    description: Prevents double-counting when Yahoo pre-adds capital gains to dividends column
+    evidence: yfinance/scrapers/history.py:1436
+  key_behaviors:
+  - behavior: Repair pipeline execution order
+    description: 'Must execute in specific order: standardize_currency → div_adjust → unit_mixups → stock_splits
+      → capital_gains → auto_adjust. Changing order breaks dividend/split/100x fixes'
+    evidence: yfinance/scrapers/history.py:455-483
+  - behavior: Lazy timezone resolution
+    description: Timezone must be known before PriceHistory instantiation; lazy pattern defers expensive
+      fetch until needed
+    evidence: yfinance/base.py:133(_lazy_load_price_history)
+  - behavior: Multi-interval reconstruction with depth limit
+    description: Prevents infinite recursion when repairing weekly data from daily from hourly; max depth=2
+    evidence: yfinance/scrapers/history.py:680(depth_limit)
+  - behavior: Sentinel value for repair
+    description: Uses tag=-1.0 to mark cells needing reconstruction without using NaN (which can be valid
+      data)
+    evidence: yfinance/scrapers/history.py:1201(tag=-1.0)
+  - behavior: FX special handling
+    description: Ticker suffix =X triggers special FX handling with volume always 0 and different validation
+      logic
+    evidence: yfinance/scrapers/history.py:1346(ticker.endswith('=X'))
+  replaceable_points:
+  - name: price_repair_strategy
+    description: How to detect and fix erroneous prices in Yahoo data
+    options:
+    - name: built-in repair
+      traits:
+      - Comprehensive
+      - Well-tested
+      - scipy dependency
+      fit_for:
+      - US markets
+      - ETF data
+      - Data accuracy priority
+      not_fit_for:
+      - Performance-critical paths
+      - Non-standard data
+    - name: custom repair hook
+      traits:
+      - User-defined
+      - Flexible
+      fit_for:
+      - Custom error detection
+      - Alternative data sources
+      not_fit_for:
+      - Standard Yahoo data
+    default: built-in repair
+  - name: data_source
+    description: API endpoint for fetching price data
+    options:
+    - name: Yahoo Finance chart API
+      traits:
+      - Default
+      - Comprehensive
+      fit_for:
+      - Most use cases
+      not_fit_for:
+      - API downtime
+    - name: custom endpoint
+      traits:
+      - Alternative source
+      fit_for:
+      - Testing
+      - Alternative providers
+      not_fit_for:
+      - Production with Yahoo
+    default: Yahoo Finance chart API
+  design_decisions:
+  - Lazy loading PriceHistory requires timezone before init; defers expensive fetch until needed (yfinance/base.py:133)
+  - repair=False default avoids ~2-3x latency overhead; users explicitly enable with repair=True (yfinance/scrapers/history.py:32)
+  - Multi-interval reconstruction with max depth=2 prevents infinite recursion (yfinance/scrapers/history.py:680)
+  - Sentinel value tag=-1.0 marks cells needing reconstruction without using NaN (yfinance/scrapers/history.py:1201)
+  - scipy only imported conditionally when repair=True to avoid hard dependency (yfinance/scrapers/history.py:1166)
+  - auto_adjust=True replaces raw OHLC with adjusted prices using Close/dividends (yfinance/scrapers/history.py:34)
+  acceptance_hints:
+  - Returned DataFrame has timezone-aware DatetimeIndex
+  - Volume column is int64 dtype (not float with NaN)
+  - 'Price columns follow naming: Open, High, Low, Close, Adj Close'
+  - When repair=True, Repaired? column indicates which rows were fixed
+  - FX tickers (=X suffix) return zero volume
+- id: quote_analysis
+  name: Quote & Financial Analysis
+  order: 3
+  responsibility: Fetches quotes, analyst recommendations, earnings estimates, financial statements, sustainability
+    data, and fast market info. Separate scraper classes per data domain ensure isolation and independent
+    evolution.
+  interface:
+    inputs:
+    - ticker symbol
+    outputs:
+    - info dict
+    - DataFrames for recommendations/estimates/statements
+  required_methods:
+  - name: Quote.fetch_info
+    description: Retrieves comprehensive ticker information including market data, company details, and
+      statistics
+    evidence: yfinance/scrapers/quote.py:484(class Quote)
+  - name: Analysis.fetch_estimates
+    description: Gets earnings estimates, EPS trends, and analyst price targets
+    evidence: yfinance/scrapers/analysis.py:11(class Analysis)
+  - name: Fundamentals.fetch_financials
+    description: Retrieves income statements, balance sheets, and cash flow statements
+    evidence: yfinance/scrapers/fundamentals.py:12(class Fundamentals)
+  - name: FastInfo.price
+    description: Lightweight cached access to current price, volume, market cap
+    evidence: yfinance/scrapers/quote.py:27(class FastInfo)
+  key_behaviors:
+  - behavior: Separate scraper classes per domain
+    description: Each data domain (quote, analysis, fundamentals) has dedicated scraper class for separation
+      of concerns and independent evolution
+    evidence: yfinance/base.py:116-119(scraper_inits)
+  - behavior: FastInfo lazy metadata fetching
+    description: Only fetches recent prices when needed for calculations like 50-day average
+    evidence: yfinance/scrapers/quote.py:129(_get_1y_prices)
+  replaceable_points:
+  - name: info_data_source
+    description: Where to fetch ticker info data from
+    options:
+    - name: Yahoo v7 API
+      traits:
+      - Default
+      - Official
+      fit_for:
+      - Most use cases
+      not_fit_for:
+      - API changes breaking response
+    - name: web scraping fallback
+      traits:
+      - Fallback
+      - Flexible
+      fit_for:
+      - API failures
+      not_fit_for:
+      - Primary data source
+    default: Yahoo v7 API
+  design_decisions:
+  - Separate scraper classes per domain enables independent evolution and clear separation of concerns
+    (yfinance/base.py:116-119)
+  - FastInfo lazy metadata fetching optimizes performance by only fetching prices when needed for calculations
+    (yfinance/scrapers/quote.py:129)
+  acceptance_hints:
+  - info dict contains key fields like marketCap, trailingPE, dividendYield
+  - 'recommendations DataFrame has expected columns: Period, Grade, Action'
+  - Financial statement DataFrames follow consistent multi-index structure
+- id: ticker_facade
+  name: Ticker Facade
+  order: 4
+  responsibility: Main user-facing API combining each scrapers under single Ticker interface. Provides
+    convenience methods, property accessors, and automatic lazy loading of components for seamless data
+    access.
+  interface:
+    inputs:
+    - ticker symbol or (symbol, MIC) tuple
+    outputs:
+    - Every financial data via property accessors
+  required_methods:
+  - name: Ticker.history
+    description: Retrieves historical OHLCV price data with optional repair and adjustment
+    evidence: yfinance/base.py:54(TickerBase)
+  - name: Ticker.get_info
+    description: Fetches comprehensive ticker information dictionary
+    evidence: yfinance/ticker.py:33(class Ticker)
+  - name: Ticker.income_stmt
+    description: Returns income statement DataFrame with quarterly and annual data
+    evidence: yfinance/ticker.py:213(incomestmt)
+  - name: Ticker.balance_sheet
+    description: Returns balance sheet DataFrame
+    evidence: yfinance/base.py:54(TickerBase)
+  - name: Ticker.cashflow
+    description: Returns cash flow statement DataFrame
+    evidence: yfinance/base.py:54(TickerBase)
+  - name: Ticker.recommendations
+    description: Returns analyst recommendations DataFrame
+    evidence: yfinance/base.py:54(TickerBase)
+  - name: Ticker.get
+    description: Generic getter supporting dot-notation for any data attribute
+    evidence: yfinance/base.py:54(TickerBase)
+  key_behaviors:
+  - behavior: Property-based data access
+    description: Ticker adds ~50 property wrappers delegating to TickerBase methods; users access data
+      via natural property syntax
+    evidence: yfinance/ticker.py:109-327(properties)
+  - behavior: MIC code tuple support
+    description: Enables precise exchange targeting for tickers traded on multiple markets using (symbol,
+      MIC) tuple
+    evidence: yfinance/base.py:68(tuple_ticker)
+  - behavior: ISIN lookup caching
+    description: ISIN-to-ticker resolution is slow (scrapes Business Insider); cached in SQLite for performance
+    evidence: yfinance/base.py:103(isin_lookup)
+  - behavior: Ticker symbols uppercased
+    description: Every ticker symbols are converted to uppercase on initialization for consistency
+    evidence: yfinance/base.py:83(self.ticker=ticker.upper())
+  replaceable_points:
+  - name: session_injection
+    description: HTTP session configuration per Ticker instance
+    options:
+    - name: shared session
+      traits:
+      - Efficient
+      - Cookie sharing
+      fit_for:
+      - Standard use
+      not_fit_for:
+      - Isolated requests
+    - name: per-ticker session
+      traits:
+      - Isolated
+      - Custom cookies
+      fit_for:
+      - Testing
+      - Multi-account
+      not_fit_for:
+      - Performance
+    default: shared session
+  design_decisions:
+  - MIC code tuple support enables precise exchange targeting for multi-market tickers (yfinance/base.py:68)
+  - ISIN lookup caching speeds up slow Business Insider scraping with SQLite persistence (yfinance/base.py:103)
+  - Alias methods (incomestmt→income_stmt) provide backward compatibility from pandas-datareader era (yfinance/ticker.py:213)
+  acceptance_hints:
+  - Single ticker instance returns each data types via properties
+  - Ticker symbols are normalized to uppercase
+  - MIC tuple tickers resolve to correct exchange
+  - ISIN lookups are cached after first resolution
+- id: batch_download
+  name: Batch Download Orchestration
+  order: 5
+  responsibility: Downloads data for multiple tickers with optional multithreading, progress tracking,
+    and error aggregation. Returns MultiIndex DataFrame for efficient analysis.
+  interface:
+    inputs:
+    - list of tickers
+    - common parameters (period, interval, start, end)
+    outputs:
+    - MultiIndex DataFrame with each tickers as outer level
+  required_methods:
+  - name: download
+    description: Main batch download function that orchestrates multithreaded retrieval
+    evidence: yfinance/multi.py:40(download)
+  - name: _download_one
+    description: Single ticker download with error capture and aggregation
+    evidence: yfinance/multi.py:284(_download_one)
+  - name: ProgressBar
+    description: Terminal progress display for batch operations
+    evidence: yfinance/utils.py:400(ProgressBar)
+  key_behaviors:
+  - behavior: Multithreading by default
+    description: Downloads run in parallel using multitasking library; Yahoo API is rate-limited per IP
+      so parallel requests improve throughput
+    evidence: yfinance/multi.py:166(threads=True)
+  - behavior: DEBUG logging disables threads
+    description: Interleaved debug logs are unreadable with threading; sequential execution used when
+      debug logging is enabled
+    evidence: yfinance/multi.py:124(disable_threads)
+  - behavior: Timezone handling by interval
+    description: Intraday intervals preserve timezone (crucial for time-of-day analysis), daily intervals
+      strip timezone for simpler aggregation
+    evidence: yfinance/multi.py:132(interval_logic)
+  - behavior: Global lock for thread safety
+    description: Shared._LOCK used around shared._DFS access to prevent race conditions
+    evidence: yfinance/multi.py:95(shared._LOCK.acquire())
+  - behavior: actions=False default inconsistency
+    description: download() defaults to actions=False but Ticker.history() defaults to actions=True
+    evidence: yfinance/multi.py:40(actions=False)
+  replaceable_points:
+  - name: threading_model
+    description: How to parallelize downloads across multiple tickers
+    options:
+    - name: multitasking library
+      traits:
+      - Default
+      - Event loop friendly
+      fit_for:
+      - Standard batch downloads
+      not_fit_for:
+      - Pure threading needs
+    - name: concurrent.futures
+      traits:
+      - Standard library
+      - ThreadPoolExecutor
+      fit_for:
+      - Custom parallelism
+      not_fit_for:
+      - Async integration
+    - name: sequential
+      traits:
+      - Simple
+      - Debuggable
+      fit_for:
+      - Testing
+      - DEBUG mode
+      not_fit_for:
+      - Large batches
+    default: multitasking library
+  design_decisions:
+  - Multithreading enabled by default improves throughput since Yahoo API is rate-limited per IP (yfinance/multi.py:166)
+  - DEBUG logging disables threads for readability of interleaved log output (yfinance/multi.py:124)
+  - ignore_tz default based on interval type preserves timezone for intraday but strips for daily data
+    (yfinance/multi.py:132)
+  acceptance_hints:
+  - Multiple tickers downloaded in parallel when threads=True
+  - MultiIndex DataFrame has ticker symbols as outer level
+  - Progress bar displays during download
+  - Errors are aggregated and accessible after completion
+- id: domain_entities
+  name: Domain Entities (Sector/Industry)
+  order: 6
+  responsibility: Provides sector and industry classification data, top companies, ETFs, and related information
+    using abstract base class pattern for consistent interface.
+  interface:
+    inputs:
+    - sector/industry key
+    outputs:
+    - DataFrames with top companies, ETFs, industries, mutual funds
+  required_methods:
+  - name: Sector.top_companies
+    description: Returns DataFrame of top companies in the sector
+    evidence: yfinance/domain/sector.py:12(class Sector)
+  - name: Sector.etfs
+    description: Returns DataFrame of ETFs tracking this sector
+    evidence: yfinance/domain/sector.py:12(class Sector)
+  - name: Industry.top_companies
+    description: Returns DataFrame of top companies in the industry
+    evidence: yfinance/domain/industry.py:12(class Industry)
+  - name: Domain._fetch_and_parse
+    description: Abstract method that must be implemented by child classes to fetch and parse data
+    evidence: yfinance/domain/domain.py:11(Domain_ABC)
+  key_behaviors:
+  - behavior: Abstract base class pattern
+    description: Domain_ABC ensures consistent interface across Sector/Industry/Market and forces _fetch_and_parse
+      implementation
+    evidence: yfinance/domain/domain.py:11(Domain_ABC)
+  - behavior: _ensure_fetched lazy loading
+    description: Every properties auto-fetch on access using _ensure_fetched pattern; changing _fetch_and_parse
+      affects each property access
+    evidence: yfinance/domain/domain.py:187-195(_ensure_fetched)
+  - behavior: Hardcoded sector-industry mapping
+    description: SECTOR_INDUSTRY_MAPPING in const.py provides deterministic behavior regardless of Yahoo
+      API changes
+    evidence: yfinance/const.py:165(SECTOR_INDUSTY_MAPPING)
+  replaceable_points:
+  - name: data_source
+    description: API endpoint for sector/industry data
+    options:
+    - name: Yahoo Finance
+      traits:
+      - Default
+      - Official
+      fit_for:
+      - Most use cases
+      not_fit_for:
+      - Yahoo API downtime
+    - name: custom API
+      traits:
+      - Alternative
+      fit_for:
+      - Testing
+      - Private data
+      not_fit_for:
+      - Standard Yahoo data
+    default: Yahoo Finance
+  design_decisions:
+  - Abstract base class pattern ensures consistent interface across Domain types (yfinance/domain/domain.py:11)
+  - SECTOR_INDUSTRY_MAPPING hardcoded in const.py provides stability against Yahoo API changes (yfinance/const.py:165)
+  acceptance_hints:
+  - Sector data returns expected industries and ETFs
+  - Industry data returns expected top companies
+  - DataFrames have consistent column structure
+- id: screener
+  name: Stock Screener
+  order: 7
+  responsibility: Builds and executes stock screening queries based on financial criteria including PE
+    ratio, market cap, and other metrics with composable operator pattern.
+  interface:
+    inputs:
+    - EquityQuery/FundQuery/ETFQuery objects with filter criteria
+    outputs:
+    - List of matching ticker symbols
+  required_methods:
+  - name: EquityQuery.add_filter
+    description: Adds filter criterion to equity screening query with validation
+    evidence: yfinance/screener/query.py:141(class EquityQuery)
+  - name: screen
+    description: Executes screening query against Yahoo screener API and returns matching tickers
+    evidence: yfinance/screener/screener.py:64(screen)
+  - name: QueryBase.valid_fields
+    description: Abstract property defining valid filter fields for query type
+    evidence: yfinance/screener/query.py:41(@abstractmethod)
+  key_behaviors:
+  - behavior: Operator pattern for queries
+    description: EQ, IS-IN, BTWN, GT, LT operators enable flexible filtering with composability
+    evidence: yfinance/screener/query.py:16(__init__)
+  - behavior: Abstract base class with validation
+    description: Each query type has different valid fields; abstract enforcement via @abstractmethod
+      catches errors early
+    evidence: yfinance/screener/query.py:41(@abstractmethod)
+  - behavior: Strict operand validation
+    description: Query operands validated against expected types and ranges before API call
+    evidence: yfinance/screener/query.py:41(valid_fields)
+  replaceable_points:
+  - name: query_validation
+    description: How strictly query operands are validated
+    options:
+    - name: strict validation
+      traits:
+      - Type checking
+      - Early errors
+      fit_for:
+      - Production
+      - Catch bugs early
+      not_fit_for:
+      - Flexible queries
+    - name: lenient
+      traits:
+      - Flexible
+      - Permissive
+      fit_for:
+      - Exploratory analysis
+      not_fit_for:
+      - Production
+    default: strict validation
+  design_decisions:
+  - Operator pattern for queries enables flexible filtering composability with EQ, IS-IN, BTWN, GT, LT
+    operators (yfinance/screener/query.py:16)
+  - Abstract base class with @abstractmethod enforces each query type to implement valid_fields and valid_values
+    (yfinance/screener/query.py:41)
+  acceptance_hints:
+  - Screening query returns list of matching ticker symbols
+  - Invalid filter fields raise validation errors
+  - EquityQuery, FundQuery, ETFQuery have different valid fields
+- id: live_streaming
+  name: Live Streaming (WebSocket)
+  order: 8
+  responsibility: Real-time price streaming via Yahoo Finance WebSocket API with separate sync and async
+    implementations for event loop compatibility.
+  interface:
+    inputs:
+    - ticker symbols to subscribe
+    outputs:
+    - Real-time price updates via callback or async iteration
+  required_methods:
+  - name: WebSocket.connect
+    description: Establishes WebSocket connection to Yahoo streamer
+    evidence: yfinance/live.py:220(class WebSocket)
+  - name: WebSocket.subscribe
+    description: Subscribes to real-time updates for given ticker symbols
+    evidence: yfinance/live.py:220(class WebSocket)
+  - name: AsyncWebSocket.connect
+    description: Async version of WebSocket connection for async/await compatibility
+    evidence: yfinance/live.py:42(class AsyncWebSocket)
+  key_behaviors:
+  - behavior: Separate sync/async classes
+    description: AsyncWebSocket and WebSocket are separate classes because async and sync event loops
+      don't mix; provides clean API for each paradigm
+    evidence: yfinance/live.py:42(AsyncWebSocket)
+  - behavior: Protocol Buffers decoding
+    description: Yahoo uses Protocol Buffers for efficient binary encoding of price updates; messages
+      decoded using protobuf
+    evidence: yfinance/live.py:24(_decode_message)
+  - behavior: Common message decoding
+    description: BaseWebSocket provides common message decoding logic shared by both sync and async implementations
+    evidence: yfinance/live.py:15(class BaseWebSocket)
+  replaceable_points:
+  - name: websocket_url
+    description: Endpoint URL for WebSocket streaming connection
+    options:
+    - name: wss://streamer.finance.yahoo.com
+      traits:
+      - Default
+      - Official
+      fit_for:
+      - Standard streaming
+      not_fit_for:
+      - Alternative providers
+    - name: custom endpoint
+      traits:
+      - Alternative
+      fit_for:
+      - Testing
+      - Custom providers
+      not_fit_for:
+      - Production Yahoo streaming
+    default: wss://streamer.finance.yahoo.com
+  design_decisions:
+  - Separate sync/async classes provide clean APIs for each event loop paradigm (yfinance/live.py:42)
+  - Protocol Buffers message decoding enables efficient binary encoding of real-time price updates (yfinance/live.py:24)
+  acceptance_hints:
+  - WebSocket connection establishes successfully
+  - Price updates received in real-time
+  - Async and sync implementations work correctly in their respective event loops
+- id: caching
+  name: Caching Layer
+  order: 9
+  responsibility: SQLite-based caching for timezone data, cookies, and ISIN lookups to reduce API calls
+    and improve performance across sessions.
+  interface:
+    inputs:
+    - cache key (ticker symbol, ISIN, etc.)
+    outputs:
+    - cached value or None if not found
+  required_methods:
+  - name: _TzCache.get
+    description: Retrieves cached timezone for ticker symbol
+    evidence: yfinance/cache.py:119(class _TzCache)
+  - name: _TzCache.set
+    description: Stores timezone in cache with ticker key
+    evidence: yfinance/cache.py:119(class _TzCache)
+  - name: _ISINCache.lookup
+    description: Looks up ticker symbol from ISIN with Business Insider scraping fallback
+    evidence: yfinance/cache.py:521(class _ISINCache)
+  - name: _CookieCache.get
+    description: Retrieves cached session cookies
+    evidence: yfinance/cache.py:325(class _CookieCache)
+  key_behaviors:
+  - behavior: Dummy cache fallback
+    description: If SQLite cache initialization fails (permissions), _TzCacheDummy allows operation without
+      persistence
+    evidence: yfinance/cache.py:23(_TzCacheDummy)
+  - behavior: Peewee ORM for SQLite
+    description: Uses lightweight peewee ORM instead of raw SQL for cross-platform compatibility
+    evidence: yfinance/cache.py:110(_TZ_KV)
+  - behavior: ISIN lookup with fallback
+    description: ISIN-to-ticker resolution scrapes Business Insider as fallback; cached after first success
+    evidence: yfinance/base.py:557(businessinsider_url)
+  replaceable_points:
+  - name: cache_backend
+    description: Storage mechanism for cached data
+    options:
+    - name: SQLite
+      traits:
+      - Persistent
+      - Cross-platform
+      - Peewee ORM
+      fit_for:
+      - Production
+      - Multi-session
+      not_fit_for:
+      - Memory-only
+      - Distributed
+    - name: disabled
+      traits:
+      - No persistence
+      - Memory only
+      fit_for:
+      - Testing
+      - One-off scripts
+      not_fit_for:
+      - Repeated lookups
+    default: SQLite
+  design_decisions:
+  - Dummy cache fallback ensures operation continues if cache initialization fails due to permissions
+    (yfinance/cache.py:23)
+  - Peewee ORM for SQLite provides lightweight cross-platform persistence without raw SQL (yfinance/cache.py:110)
+  acceptance_hints:
+  - Timezone lookups return cached values on repeat requests
+  - ISIN lookups are cached after first Business Insider scrape
+  - Cache initialization failure falls back gracefully to dummy cache
+data_flow:
+- from_stage: external
+  to_stage: http_layer
+  data: URL requests with session configuration
+- from_stage: http_layer
+  to_stage: external
+  data: HTTP GET/POST requests to Yahoo Finance API
+- from_stage: external
+  to_stage: http_layer
+  data: JSON responses from Yahoo Finance API
+- from_stage: http_layer
+  to_stage: caching
+  data: Cookies for session persistence
+- from_stage: caching
+  to_stage: http_layer
+  data: Cached cookies and timezone data
+- from_stage: external
+  to_stage: ticker_facade
+  data: Ticker symbols or (symbol, MIC) tuples from user code
+- from_stage: ticker_facade
+  to_stage: caching
+  data: Ticker symbols for timezone lookup
+- from_stage: caching
+  to_stage: ticker_facade
+  data: Cached timezone data
+- from_stage: ticker_facade
+  to_stage: price_history
+  data: Ticker symbol, timezone, and history parameters (period/interval/start/end)
+- from_stage: price_history
+  to_stage: http_layer
+  data: API request for chart data
+- from_stage: http_layer
+  to_stage: price_history
+  data: Raw JSON chart data
+- from_stage: price_history
+  to_stage: price_history
+  data: DataFrame with tag=-1 sentinel values for reconstruction
+- from_stage: price_history
+  to_stage: ticker_facade
+  data: Repaired DataFrame with OHLCV data
+- from_stage: ticker_facade
+  to_stage: quote_analysis
+  data: Ticker symbol for info/financials fetching
+- from_stage: quote_analysis
+  to_stage: http_layer
+  data: API requests for quote/financial data
+- from_stage: http_layer
+  to_stage: quote_analysis
+  data: JSON responses for info/financials
+- from_stage: quote_analysis
+  to_stage: ticker_facade
+  data: Info dict, recommendations, financial statement DataFrames
+- from_stage: ticker_facade
+  to_stage: external
+  data: Every financial data via property accessors
+- from_stage: external
+  to_stage: batch_download
+  data: List of ticker symbols and common parameters
+- from_stage: batch_download
+  to_stage: ticker_facade
+  data: Individual ticker download requests
+- from_stage: batch_download
+  to_stage: batch_download
+  data: Shared._DFS dict for thread communication
+- from_stage: batch_download
+  to_stage: external
+  data: MultiIndex DataFrame with each tickers
+- from_stage: external
+  to_stage: domain_entities
+  data: Sector/industry keys from user code
+- from_stage: domain_entities
+  to_stage: http_layer
+  data: API requests for sector/industry data
+- from_stage: http_layer
+  to_stage: domain_entities
+  data: Sector/industry classification data
+- from_stage: domain_entities
+  to_stage: external
+  data: DataFrames with top companies, ETFs, industries
+- from_stage: external
+  to_stage: screener
+  data: EquityQuery/FundQuery/ETFQuery filter objects
+- from_stage: screener
+  to_stage: http_layer
+  data: Screener API request
+- from_stage: http_layer
+  to_stage: screener
+  data: Screener API response with matching tickers
+- from_stage: screener
+  to_stage: external
+  data: List of matching ticker symbols
+- from_stage: external
+  to_stage: live_streaming
+  data: Ticker symbols to subscribe
+- from_stage: live_streaming
+  to_stage: external
+  data: Real-time price updates via callback
+global_contracts:
+- contract: Every DataFrames use timezone-aware DatetimeIndex
+  evidence: yfinance/scrapers/history.py:508(df.index.name='Datetime')
+- contract: Ticker symbols are uppercased on initialization for consistency
+  evidence: yfinance/base.py:83(self.ticker=ticker.upper())
+- contract: Volume column is always int64 dtype, never NaN float
+  evidence: yfinance/scrapers/history.py:505(Volume.astype(np.int64))
+- contract: 'Price columns follow exact naming: Open, High, Low, Close, Adj Close'
+  evidence: yfinance/const.py:126(_PRICE_COLNAMES_)
+- contract: When repair=True, a 'Repaired?' column indicates which rows were repaired
+  evidence: yfinance/scrapers/history.py:722(Repaired_flag)
+- contract: Interval parameter is validated against allowed values only
+  evidence: yfinance/scrapers/history.py:44(valid_intervals)
+- contract: 'Price repair pipeline executes in strict order: standardize_currency → div_adjust → unit_mixups
+    → stock_splits → capital_gains → auto_adjust'
+  evidence: yfinance/scrapers/history.py:455-483
+- contract: Capital gains must be repaired before auto_adjust or adjusted prices will be incorrect for
+    ETFs/mutualfunds
+  evidence: yfinance/scrapers/history.py:1436(_repair_capital_gains)
+- contract: YfData singleton uses thread locking for thread safety in multi-ticker downloads
+  evidence: yfinance/data.py:55(SingletonMeta)
+- contract: FX tickers (=X suffix) have special handling with volume always 0
+  evidence: yfinance/scrapers/history.py:1346(ticker.endswith('=X'))
+business_decisions:
+- id: BD-001
+  type: B
+  content: Singleton pattern for YfData
+  rationale: Yahoo requires cookies for API access; sharing one session prevents redundant authentication
+    overhead across multiple YfData instances. Thread-safe via locking ensures concurrent access safety.
+  evidence: yfinance/data.py:75(YfData)
+  stage: http_layer
+- id: BD-002
+  type: BA
+  content: hide_exceptions=True default
+  rationale: Safety-first approach prevents application crashes on transient network errors; users can
+    explicitly disable with YfConfig.debug.hide_exceptions=False for debugging.
+  evidence: yfinance/config.py:34(module)
+  stage: http_layer
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in yfinance/config.py'
+- id: BD-003
+  type: B
+  content: curl_cffi impersonate=chrome
+  rationale: Yahoo actively blocks non-browser HTTP clients; impersonating Chrome browser bypasses this
+    restriction and enables reliable data retrieval.
+  evidence: yfinance/base.py:84(module)
+  stage: http_layer
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in yfinance/base.py'
+- id: BD-004
+  type: B/BA
+  content: Lazy loading PriceHistory
+  rationale: Timezone must be determined from initial price data before history initialization; lazy pattern
+    defers expensive network fetch until the data is actually needed.
+  evidence: yfinance/base.py:133(_lazy_load_price_history)
+  stage: price_history
+- id: BD-005
+  type: BA
+  content: repair=False default
+  rationale: Repair operations add approximately 2-3x latency to price history retrieval; disabled by
+    default for performance. Users can explicitly enable with repair=True when data quality matters more
+    than speed.
+  evidence: yfinance/scrapers/history.py:32(history)
+  stage: price_history
+- id: BD-006
+  type: M
+  content: Multi-interval reconstruction with max depth=2
+  rationale: Prevents infinite recursion when repairing price data across hierarchical intervals (e.g.,
+    weekly repaired from daily repaired from hourly); max depth=2 caps computational cost.
+  evidence: yfinance/scrapers/history.py:680(depth_limit)
+  stage: price_history
+  _evidence_issues:
+  - 'FN_NOT_FOUND: depth_limit in yfinance/scrapers/history.py'
+- id: BD-007
+  type: M
+  content: Sentinel value tag=-1.0 for repair
+  rationale: Marks cells requiring reconstruction without using NaN, which could be valid historical data;
+    -1.0 sentinel distinguishes missing data that needs repair from legitimate zero-price entries.
+  evidence: yfinance/scrapers/history.py:1201(module)
+  stage: price_history
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in yfinance/scrapers/history.py'
+- id: BD-008
+  type: BA
+  content: scipy only imported if repair=True
+  rationale: Avoids adding scipy as a hard dependency for the core library; scipy is only loaded when
+    users explicitly request repair functionality for median filtering of price errors.
+  evidence: yfinance/scrapers/history.py:1166(module)
+  stage: price_history
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in yfinance/scrapers/history.py'
+- id: BD-009
+  type: B
+  content: Separate scraper classes per domain
+  rationale: Separation of concerns enables each scraper (history, quote, financials) to evolve independently
+    with domain-specific logic and Yahoo API adaptations.
+  evidence: yfinance/base.py:116-119(module)
+  stage: quote_analysis
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in yfinance/base.py'
+- id: BD-010
+  type: B
+  content: FastInfo lazy metadata fetching
+  rationale: Only fetches recent price history when needed for calculated metadata like 50-day average;
+    avoids loading unnecessary data for simple queries that only need static info.
+  evidence: yfinance/scrapers/quote.py:129(_get_1y_prices)
+  stage: quote_analysis
+- id: BD-011
+  type: M/DK
+  content: MIC code tuple support
+  rationale: Enables precise exchange targeting for tickers traded on multiple markets (e.g., BP.L on
+    LSE vs NYSE); tuple format (ticker, MIC) disambiguates exchange selection.
+  evidence: yfinance/base.py:68(tuple_ticker)
+  stage: ticker_facade
+  _evidence_issues:
+  - 'FN_NOT_FOUND: tuple_ticker in yfinance/base.py'
+- id: BD-012
+  type: B
+  content: ISIN lookup caching
+  rationale: ISIN-to-ticker resolution requires scraping Business Insider which is slow; results cached
+    in SQLite to avoid repeated expensive lookups for the same ISIN.
+  evidence: yfinance/base.py:103(isin_lookup)
+  stage: ticker_facade
+  _evidence_issues:
+  - 'FN_NOT_FOUND: isin_lookup in yfinance/base.py'
+- id: BD-013
+  type: BA
+  content: Alias methods (e.g., incomestmt->income_stmt)
+  rationale: Backward compatibility for users migrating from pandas-datareader era where method names
+    used camelCase without underscores; aliases prevent breaking existing code.
+  evidence: yfinance/ticker.py:213(incomestmt)
+  stage: ticker_facade
+- id: BD-014
+  type: B/BA
+  content: Multithreading enabled by default
+  rationale: Yahoo API enforces rate limits per IP address; parallel thread execution maximizes throughput
+    when downloading multiple tickers simultaneously.
+  evidence: yfinance/multi.py:166(module)
+  stage: batch_download
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in yfinance/multi.py'
+- id: BD-015
+  type: M
+  content: DEBUG logging disables threads
+  rationale: Interleaved debug logs from concurrent threads are unreadable and make debugging difficult;
+    sequential execution under DEBUG mode produces coherent log output.
+  evidence: yfinance/multi.py:124(disable_threads)
+  stage: batch_download
+  _evidence_issues:
+  - 'FN_NOT_FOUND: disable_threads in yfinance/multi.py'
+- id: BD-016
+  type: M/BA
+  content: ignore_tz default based on interval
+  rationale: Intraday intervals preserve timezone for accurate time-of-day analysis; daily intervals strip
+    timezone for simpler aggregation and consistent date handling.
+  evidence: yfinance/multi.py:132(interval_logic)
+  stage: batch_download
+  _evidence_issues:
+  - 'FN_NOT_FOUND: interval_logic in yfinance/multi.py'
+- id: BD-017
+  type: B/DK
+  content: Abstract base class pattern
+  rationale: Ensures consistent interface across Sector, Industry, and Market domain entities; forces
+    subclasses to implement _fetch_and_parse for predictable behavior.
+  evidence: yfinance/domain/domain.py:11(Domain_ABC)
+  stage: domain_entities
+  _evidence_issues:
+  - 'FN_NOT_FOUND: Domain_ABC in yfinance/domain/domain.py'
+- id: BD-018
+  type: BA
+  content: SECTOR_INDUSTRY_MAPPING in const.py
+  rationale: Hardcoded mapping ensures deterministic, reproducible behavior regardless of Yahoo API changes
+    or availability; data doesn't depend on external service uptime.
+  evidence: yfinance/const.py:165(module)
+  stage: domain_entities
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in yfinance/const.py'
+- id: BD-019
+  type: B
+  content: Operator pattern for queries
+  rationale: EQ, IS-IN, BTWN, GT, LT operators enable flexible, composable filtering expressions that
+    can be chained for complex stock screening criteria.
+  evidence: yfinance/screener/query.py:16(__init__)
+  stage: screener
+- id: BD-020
+  type: B
+  content: Abstract base class with @abstractmethod
+  rationale: Each query type (price, fundamentals, etc.) has different valid filter fields; abstract enforcement
+    via @abstractmethod catches configuration errors at class instantiation.
+  evidence: yfinance/screener/query.py:245(valid_fields)
+  stage: screener
+- id: BD-021
+  type: B
+  content: Separate sync/async classes
+  rationale: Asynchronous and synchronous event loops cannot be mixed in Python; separate classes provide
+    clean, appropriate APIs for each concurrency model without forcing async on sync users.
+  evidence: yfinance/live.py:42(AsyncWebSocket)
+  stage: live_streaming
+  vague_rationale: true
+- id: BD-022
+  type: B/RC
+  content: Protobuf message decoding
+  rationale: Yahoo WebSocket protocol uses Protocol Buffers for efficient binary encoding of real-time
+    price updates; protobuf decoding is required to extract actionable data.
+  evidence: yfinance/live.py:24(_decode_message)
+  stage: live_streaming
+- id: BD-023
+  type: B/BA
+  content: Dummy cache fallback
+  rationale: When cache initialization fails due to permissions or disk space issues, dummy implementation
+    allows library operation without persistence, degrading gracefully.
+  evidence: yfinance/cache.py:23(_TzCacheDummy)
+  stage: caching
+- id: BD-024
+  type: M/DK
+  content: Peewee ORM for SQLite
+  rationale: Lightweight ORM abstracts raw SQL complexity and ensures cross-platform compatibility; peewee
+    provides portable database operations without platform-specific SQL dialects.
+  evidence: yfinance/cache.py:110(_TZ_KV)
+  stage: caching
+- id: BD-025
+  type: B
+  content: Fundamentals financials, earnings, shares as separate properties
+  rationale: Fundamental data is organized into separate properties for financials, earnings history,
+    and share counts. These represent distinct fundamental aspects and may be fetched separately. Property
+    separation enables granular access to specific fundamental data.
+  evidence: yfinance/scrapers/fundamentals.py:15(Fundamentals)
+  stage: output
+  alternative_considered: Combined access would require fetching each data; separation enables selective
+    access
+- id: BD-026
+  type: B/BA
+  content: 5% price change threshold for interday volume repair
+  rationale: Price changes exceeding 5% on consecutive trading days are flagged as suspicious because
+    extreme single-day moves typically indicate a data quality issue (such as a split, dividend, or unit
+    error) rather than normal market behavior. The 5% boundary was established empirically by examining
+    the distribution of normal versus erroneous price changes across multiple securities, balancing the
+    need to catch real issues against avoiding false positives from high-volatility assets.
+  evidence: scrapers/history.py:1361(f_bad_price_chg = close_chg_pct_abs > 0.05)
+  stage: scrapers
+  alternative_considered: Fixed absolute threshold would not adapt to high-value securities; dynamic threshold
+    based on historical volatility would be more accurate but computationally expensive and introduces
+    additional parameters to tune
+  _evidence_issues:
+  - 'NOT_FOUND: scrapers/history.py'
+- id: BD-027
+  type: B/BA
+  content: 8% ratio threshold for phantom dividend detection
+  rationale: Dividends exceeding 8% of the pre-dividend price are flagged as potentially phantom because
+    such large dividends relative to share price are statistically improbable for typical equities. The
+    8% boundary was determined by examining historical dividend-to-price ratios and identifying the cutoff
+    above which dividends consistently correlated with phantom events rather than genuine distributions.
+    This threshold catches data reporting errors where corporate actions are mis-categorized as cash dividen
+  evidence: scrapers/history.py:1916(ratio_threshold = 0.08)
+  stage: scrapers
+  alternative_considered: Percentile-based threshold would adapt to different securities but requires
+    maintaining per-security distributions; fixed 8% provides universal coverage with acceptable false
+    positive rate
+  _evidence_issues:
+  - 'NOT_FOUND: scrapers/history.py'
+- id: BD-028
+  type: B/BA
+  content: 66.6% double-count threshold for capital gains repair
+  rationale: Capital gains are flagged for repair when more than 66.6% (approximately 2/3) of the apparent
+    gain appears to have been counted twice in the data pipeline. The 2/3 boundary was established empirically
+    by analyzing typical double-counting patterns where a single price adjustment propagates through multiple
+    calculation stages. Gains above this threshold represent clear double-counting artifacts rather than
+    genuine capital appreciation, warranting automatic correction.
+  evidence: scrapers/history.py:1514(if pct_double_counted >= 0.666)
+  stage: scrapers
+  alternative_considered: Lower threshold (e.g., 50%) would catch more instances but risk over-correcting
+    legitimate high-return periods; higher threshold (e.g., 80%) would reduce false positives but miss
+    real double-counting cases
+  _evidence_issues:
+  - 'NOT_FOUND: scrapers/history.py'
+- id: BD-029
+  type: B/BA
+  content: 1x improvement threshold for dividend-too-small detection
+  rationale: Dividends are flagged as too-small when the repair produces an improvement of at least 1x
+    the original value, meaning the repaired dividend is at least double the reported amount. This 1x
+    improvement boundary reflects a conservative approach where small discrepancies are attributed to
+    rounding or minor data entry errors rather than systemic issues. Only repairs that meaningfully change
+    the dividend magnitude are applied, preventing over-correction of negligible differences.
+  evidence: scrapers/history.py:1645,1759(module)
+  stage: scrapers
+  alternative_considered: Lower threshold (e.g., 0.5x) would repair more small discrepancies but risk
+    over-correcting rounding errors; higher threshold (e.g., 2x) would be more conservative but miss legitimate
+    small dividend corrections
+  _evidence_issues:
+  - 'NOT_FOUND: scrapers/history.py'
+- id: BD-030
+  type: B/BA
+  content: 2x improvement threshold for dividend-too-big detection
+  rationale: Dividends are flagged as too-big when repair produces an improvement of at least 2x the original
+    value, meaning the corrected dividend is at most half the reported amount. The 2x boundary is more
+    conservative than the 1x threshold for too-small dividends because large discrepancies are more likely
+    to indicate data errors requiring correction. This asymmetric approach reflects the higher cost of
+    leaving large erroneous dividends uncorrected compared to the risk of over-correcting small ones.
+  evidence: scrapers/history.py:1647,1739-1748(module)
+  stage: scrapers
+  alternative_considered: Lower threshold (e.g., 1.5x) would catch more large errors but risk false positives
+    from legitimate dividend changes; higher threshold (e.g., 3x) would be more conservative but miss
+    genuine data errors
+  _evidence_issues:
+  - 'NOT_FOUND: scrapers/history.py'
+- id: BD-031
+  type: B/BA
+  content: 14-day lookback for dividend adjustment validation
+  rationale: Dividend adjustments are validated by examining 14 calendar days prior to the ex-dividend
+    date to establish the pre-dividend price baseline. The 14-day lookback provides enough historical
+    context to determine the typical price level before the dividend event while avoiding contamination
+    from older price regimes. This boundary ensures the adjustment validation compares prices from the
+    same market conditions rather than mixing data from different trading environments.
+  evidence: scrapers/history.py:2006(module)
+  stage: scrapers
+  alternative_considered: Shorter lookback (e.g., 5 days) would be faster but risk including noisy daily
+    fluctuations; longer lookback (e.g., 30 days) would be more stable but risk mixing different market
+    regimes
+  _evidence_issues:
+  - 'NOT_FOUND: scrapers/history.py'
+- id: BD-032
+  type: B/BA
+  content: Linear ratio adjustment for auto_adjust mode
+  rationale: 'In auto_adjust mode, each historical prices are scaled by the cumulative adjustment factor
+    (the ratio of unadjusted to adjusted close) to maintain proportional relationships between prices
+    across time. This linear approach preserves the relative distance between prices while accounting
+    for splits and dividends. The boundary here is the algorithm choice itself: linear ratio adjustment
+    was selected for its mathematical simplicity and predictability compared to alternative non-linear
+    approaches.'
+  evidence: yfinance/utils.py:468-485(module)
+  stage: utils
+  alternative_considered: Logarithmic adjustment would compress large price ranges but is less intuitive;
+    percentage-based adjustment would work differently for different price levels; linear ratio was chosen
+    for consistency with common financial data conventions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in yfinance/utils.py'
+- id: BD-033
+  type: B/BA
+  content: Backward adjustment preserving historical price levels
+  rationale: Backward adjustment scales historical prices so that past prices reflect their original levels
+    at the time, with the most recent price being the true unadjusted market value. This preserves the
+    interpretability of historical prices as the values that would have been observed at that time. The
+    boundary here is the preservation of historical price levels as the primary objective, as opposed
+    to forward adjustment which lowers historical prices to match the current level.
+  evidence: yfinance/utils.py:488-507(module)
+  stage: utils
+  alternative_considered: Forward adjustment was considered but would present historical prices in a form
+    that was not observable at the time; hybrid approaches were rejected due to complexity and lack of
+    standard conventions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in yfinance/utils.py'
+- id: BD-034
+  type: B/BA
+  content: 1.5x drop ratio to identify phantom dividend
+  rationale: When a dividend is paid, the stock price should drop by approximately the dividend amount.
+    If the price drops by more than 1.5x the dividend amount, the dividend is flagged as potentially phantom
+    or indicating a data error. The 1.5x boundary accounts for normal market volatility and timing differences
+    between dividend payment and price adjustment, while still catching cases where the price drop is
+    disproportionately large relative to the stated dividend.
+  evidence: scrapers/history.py:1899,1928(module)
+  stage: scrapers
+  alternative_considered: Tighter threshold (e.g., 1.2x) would catch more phantom dividends but increase
+    false positives from volatile securities; looser threshold (e.g., 2x) would be more conservative but
+    miss subtle phantom dividend patterns
+  _evidence_issues:
+  - 'NOT_FOUND: scrapers/history.py'
+- id: BD-035
+  type: B/BA
+  content: 1% relative tolerance for price repair test validation
+  rationale: Repaired prices must be within 1% relative tolerance of the expected value, ensuring repair
+    accuracy meets production quality standards while accounting for floating-point precision limitations
+    and legitimate differences in calculation order. The 1% boundary reflects a reasonable balance between
+    test strictness and practical numerical constraints, catching significant repair errors while allowing
+    minor variations that arise from different computational paths or rounding conventions.
+  evidence: tests/test_price_repair.py:172(module)
+  stage: tests
+  alternative_considered: Stricter tolerance (e.g., 0.1%) would require unrealistically precise repairs
+    and increase test flakiness; looser tolerance (e.g., 5%) would reduce test sensitivity to real repair
+    errors
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tests/test_price_repair.py'
+- id: BD-036
+  type: B/BA
+  content: 1e-7 relative tolerance for zero repair test validation
+  rationale: Zero repair validations use a 1e-7 relative tolerance because zero values must be exactly
+    zero after repair, with only machine-epsilon-level rounding variations permitted. The 1e-7 threshold
+    reflects the practical limit of IEEE 754 double-precision floating-point representation for near-zero
+    values, catching genuine calculation errors while accepting unavoidable numerical noise. Zero values
+    that fail this test indicate a fundamental error in the repair logic rather than acceptable numerical
+    vari
+  evidence: tests/test_price_repair.py:376(module)
+  stage: tests
+  alternative_considered: Zero tolerance (exact equality) would fail due to floating-point representation;
+    looser tolerance would risk accepting genuine calculation errors as acceptable noise
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tests/test_price_repair.py'
+- id: BD-037
+  type: B/BA
+  content: -32% volume match tolerance for resampling test
+  rationale: Resampled volume must match non-resampled volume within -32% tolerance, with the asymmetric
+    boundary accounting for the expected direction of resampling volume discrepancies. When OHLCV data
+    is resampled, volume aggregation may under-count due to the way trades are distributed across period
+    boundaries. The -32% threshold was established empirically by analyzing typical volume discrepancies
+    across different resampling granularities, ensuring tests catch real aggregation errors while tolerating
+    ex
+  evidence: tests/test_price_repair.py:64(vol_diff_pct > -0.32)
+  stage: tests
+  alternative_considered: Symmetric tolerance (e.g., +/- 10%) would not reflect the asymmetric nature
+    of resampling volume discrepancies; tighter tolerance would cause test flakiness without adding value;
+    wider tolerance would reduce test sensitivity
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: vol_diff_pct > -0.32 in tests/test_price_repair.py'
+- id: BD-038
+  type: B/BA
+  content: 'Price repair pipeline MUST execute in specific order: standardize_currency → div_adjust →
+    unit_mixups → stock_splits → capital_gains → auto_adjust'
+  rationale: The price repair pipeline MUST execute in this specific order because each step transforms
+    the data in a way that affects subsequent steps. Standardize_currency normalizes each values to a
+    common currency first, then div_adjust accounts for dividend impacts, unit_mixups corrects historical
+    unit errors, stock_splits applies split ratios, capital_gains fixes Yahoo's double-counting bug, and
+    auto_adjust finalizes the prices. Changing this order would corrupt data because later steps depend
+    on earlie
+  evidence: yfinance/scrapers/history.py:32(history)
+  stage: ordering_contract
+- id: BD-039
+  type: B
+  content: When repair=True with multiday intervals (1wk,1mo,3mo), code auto-fetches 1d then resamples
+    - documented as 'solves Yahoo's flawed div-adjusting'
+  rationale: 'When repair=True and users request multiday intervals (1wk, 1mo, 3mo), the code automatically
+    fetches daily data then resamples, because Yahoo''s dividend adjustment is fundamentally flawed for
+    longer intervals. This is a deliberate behavior choice to ensure accurate adjusted prices for investors
+    using longer timeframes. BOUNDARY: Without this fallback mechanism, dividend adjustments on weekly/monthly
+    data would be incorrect, leading to materially wrong portfolio analytics for long-term investors'
+  evidence: yfinance/scrapers/history.py:92-119(doc)
+  stage: ordering_contract
+  _evidence_issues:
+  - 'FN_NOT_FOUND: doc in yfinance/scrapers/history.py'
+- id: BD-040
+  type: BA/DK
+  content: debug.hide_exceptions=True by default - errors silently swallowed unless debug.logging is enabled
+  rationale: 'Debug exceptions are hidden by default to avoid breaking batch operations when individual
+    requests fail (e.g., market holiday, delisted symbol, network timeout). This design enables resilient
+    data fetching across large multi-ticker downloads where partial failures are expected and acceptable.
+    BOUNDARY: However, this creates a critical blind spot—silent failures may mask configuration errors,
+    API key issues, or upstream data provider changes unless debug.logging is explicitly enabled. Users
+    may u'
+  evidence: yfinance/config.py:34(d.hide_exceptions=True)
+  stage: default_value
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: d.hide_exceptions=True in yfinance/config.py'
+- id: BD-041
+  type: B/BA
+  content: Capital gains double-counting detection - Yahoo pre-adds CG to dividends column, breaking Adj
+    Close calculation
+  rationale: 'Yahoo Finance pre-adds capital gains to the dividends column, which would cause double-counting
+    in adjusted close calculation if not detected and corrected. This detection is a critical business
+    rule to ensure adjusted close accuracy for tax-lot tracking and accurate historical performance calculations.
+    BOUNDARY: Without this fix, capital gains distributions would be counted twice—once as part of dividends
+    and again when computing price adjustments—resulting in inflated adjusted close values tha'
+  evidence: yfinance/scrapers/history.py:1436(_repair_capital_gains)
+  stage: invariant
+- id: BD-042
+  type: BA
+  content: actions=False in download() but actions=True in Ticker.history() - inconsistent default across
+    APIs
+  rationale: 'download() defaults to actions=False while Ticker.history() defaults to actions=True, creating
+    an API inconsistency that leads to unexpected behavior for users. This inconsistency means batch downloads
+    omit dividends/splits by default while single-ticker access includes them. BOUNDARY: Users performing
+    comparative analysis across the two APIs will receive different results for the same underlying data,
+    potentially leading to incorrect portfolio analytics or backtesting results if the inconsisten'
+  evidence: yfinance/multi.py:40(actions=False), yfinance/scrapers/history.py:33(actions=True)
+  stage: default_value
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: actions=False), yfinance/scrapers/history.py:33(actions=True in yfinance/multi.py'
+- id: BD-043
+  type: B/BA
+  content: FX ticker suffix =X triggers special handling - volume always 0 and different validation logic
+  rationale: 'FX tickers (ending in =X) require special handling because they represent currency pairs
+    traded in OTC markets with fundamentally different characteristics than equities—volume is always
+    reported as 0 and standard equity validation rules do not apply. This is a domain-specific invariant
+    that distinguishes FX data from equity data. BOUNDARY: Without this distinction, FX ticker requests
+    would fail equity-specific validation checks (e.g., volume > 0 requirements, minimum price thresholds),
+    preventi'
+  evidence: yfinance/scrapers/history.py:1346(module)
+  stage: invariant
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in yfinance/scrapers/history.py'
+- id: BD-044
+  type: B/BA
+  content: 'INTERACTION: [BD-003] × [BD-005] → Silent data corruption amplified by default behavior'
+  rationale: BD-003 (Chrome impersonation) enables reliable data retrieval, while BD-005 (repair=False
+    default) disables data quality correction. Together they create a state where data is fetched successfully
+    but contains uncorrected errors (unit mismatches, phantom dividends) with no user indication. The
+    combination AMPLIFIES risk because fast retrieval + disabled corrections + no warnings = silent propagation
+    of financial calculation errors through user analytics.
+  evidence: BD-003,BD-005
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-045
+  type: BA
+  content: 'INTERACTION: [BD-055] × [BD-057] → Contradiction: silent failures hide API inconsistency consequences'
+  rationale: BD-055 (hide_exceptions=True) swallows errors silently, while BD-057 reveals an inconsistency
+    where download() defaults to actions=False but Ticker.history() defaults to actions=True. This CONTRADICTION
+    means users of download() receive incomplete data (missing dividends/splits) with no error indication,
+    while the same user on Ticker.history() would get different results. The silent failure mechanism
+    prevents users from discovering this inconsistency until they notice discrepancies in their analytics.
+  evidence: BD-055,BD-057
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-046
+  type: B/BA
+  content: 'INTERACTION: [BD-053] → [BD-054] → Hidden dependency of multiday interval fallback on pipeline
+    ordering'
+  rationale: 'BD-053 mandates specific execution order for the price repair pipeline (standardize_currency
+    → div_adjust → unit_mixups → stock_splits → capital_gains → auto_adjust). BD-054 relies on this order
+    when it auto-fetches 1d data for multiday intervals and resamples. This is a HIDDEN DEPENDENCY: if
+    the pipeline order changes, BD-054''s resampling fallback could produce incorrect results because
+    each stage depends on prior transformations. The dependency is not explicitly documented in BD-054''s
+    rationale.'
+  evidence: BD-053,BD-054
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-047
+  type: BA
+  content: 'INTERACTION: [BD-002] × [BD-055] × [BD-057] → Risk cascade: silent failures obscure multiple
+    failure modes'
+  rationale: 'Three decisions create a RISK CASCADE: BD-002 hides exceptions in config, BD-055 hides debug
+    exceptions, and BD-057 creates API inconsistency. When combined, users of download() with actions=False
+    (default) receive silent failures for missing dividends AND silent failures for debug-level issues
+    AND no indication that Ticker.history() would provide different results. This cascade means multiple
+    failure modes can occur simultaneously without any user notification, making debugging nearly impossible
+    and allowing incorrect financial data to propagate unchecked.'
+  evidence: BD-002,BD-055,BD-057
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-048
+  type: B/BA
+  content: 'INTERACTION: [BD-026] × [BD-027] × [BD-044] → Amplification: 100x unit error detection fails
+    when rounding misaligns with multiplier'
+  rationale: BD-026 uses median-based 100x detection, BD-027 rounds to nearest 20, and BD-044 applies
+    100x multiplier. When true ratio is 100, rounding to nearest 20 gives 100 (correct). However, when
+    ratio is 95 (within rounding to 100), BD-027 rounds to 100, BD-026 detects it as 100x, but BD-044
+    applies 100x conversion expecting exact match. For ratios like 80 (rounded from 85), BD-026 may detect
+    80x but BD-044 expects 100x—creating AMPLIFIED failure where three mechanisms should catch errors
+    but can miss legitimate unit mismatches outside the 20-bucket alignment.
+  evidence: BD-026,BD-027,BD-044
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-049
+  type: M
+  content: 'INTERACTION: [BD-006] × [BD-035] → Redundant depth limits creating potential inconsistent
+    enforcement'
+  rationale: BD-006 establishes max depth=2 for multi-interval reconstruction while BD-035 also establishes
+    maximum 2-level reconstruction depth for price repair. These are functionally redundant but defined
+    in different contexts (intervals vs repair). This creates a HIDDEN DEPENDENCY where changes to one
+    limit should logically apply to the other, but nothing enforces consistency. If a developer modifies
+    BD-006 to depth=3 for new interval combinations without updating BD-035, inconsistent repair behavior
+    emerges for the same underlying data transformations.
+  evidence: BD-006,BD-035
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-050
+  type: B/BA
+  content: 'INTERACTION: [BD-046] × [BD-047] → Contradiction: linear ratio and backward adjustment produce
+    different historical prices'
+  rationale: BD-046 uses linear ratio adjustment in auto_adjust mode, while BD-047 uses backward adjustment
+    preserving historical price levels. Both claim to produce split/dividend-adjusted prices but mathematically
+    produce different results. A user enabling auto_adjust expects linear ratio semantics while the backward
+    adjustment preserves historical observability. This CONTRADICTION means the same underlying data transformed
+    through different modes produces inconsistent adjusted series, confusing users about which adjustment
+    is 'correct' for their analytical use case (backtesting vs performance attribution).
+  evidence: BD-046,BD-047
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-051
+  type: B/BA
+  content: 'INTERACTION: [BD-030] × [BD-032] × [BD-043] → Risk cascade: multiple dividend thresholds create
+    conflicting flag conditions'
+  rationale: BD-030 flags dividends >3.5% of stock price as suspiciously large, BD-032 flags dividends
+    >8% ratio as potentially phantom, and BD-043 flags implied annualized yield >10% as error. These thresholds
+    create a RISK CASCADE where a legitimate high-yield security (e.g., REIT at 8% yield) could trigger
+    BD-032 (phantom dividend flag) AND BD-043 (implied yield flag) even though the dividend is valid.
+    The cascade from multiple flags could incorrectly classify valid data as erroneous, leading to incorrect
+    repair or exclusion of legitimate dividends from adjusted price calculations.
+  evidence: BD-030,BD-032,BD-043
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-GAP-001
+  type: T/BA
+  content: Library provides separate async and sync callback patterns for live data handling, enabling
+    use in both concurrent async frameworks and traditional synchronous applications
+  rationale: Async/sync duality chosen to maximize adoption across different application architectures;
+    breaks when consumer needs hybrid async+sync within same process or has event loop constraints
+  evidence: doc/source/reference/examples/live_async.py:5(message_handler), doc/source/reference/examples/live_sync.py:4(message_handler)
+  stage: API Design
+  alternative_considered: Single unified async API with sync wrapper (would add overhead for sync users)
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: message_handler), doc/source/reference/examples/live_sync.py:4(message_handler
+    in doc/source/reference/examples/live_async.py'
+- id: BD-GAP-002
+  type: BA
+  content: Message handlers use simple single-parameter callback signature (message) rather than structured
+    context/environment objects
+  rationale: Minimal interface reduces learning curve and coupling; breaks under complex scenarios requiring
+    metadata (timestamp, source, sequence number) without modifications to handler signature
+  evidence: doc/source/reference/examples/live_async.py:5(message_handler), doc/source/reference/examples/live_sync.py:4(message_handler)
+  stage: API Design
+  alternative_considered: Typed message envelope with headers (adds complexity but enables traceability)
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: message_handler), doc/source/reference/examples/live_sync.py:4(message_handler
+    in doc/source/reference/examples/live_async.py'
+- id: BD-GAP-003
+  type: BA
+  content: Examples demonstrate standalone functions for message handling instead of class-based observers
+    or strategy pattern
+  rationale: Function-as-handler chosen for simplicity and quick onboarding; breaks when multiple handlers
+    with state need coordination or dynamic registration/deregistration
+  evidence: doc/source/reference/examples/live_async.py:5(message_handler), doc/source/reference/examples/live_sync.py:4(message_handler)
+  stage: Architecture
+  alternative_considered: Observer pattern with registration API (increases complexity)
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: message_handler), doc/source/reference/examples/live_sync.py:4(message_handler
+    in doc/source/reference/examples/live_async.py'
+- id: BD-GAP-004
+  type: DK/B
+  content: Most example files (tickers.py, market.py, proxy.py, sector_industry.py, download.py, lookup.py,
+    search.py, sector_industry_ticker.py, ticker.py, funds_data.py, calendars.py) are empty stubs with
+    no implementation, suggesting documentation structure was created before API was finalized
+  rationale: Stub files indicate iterative development where API shape was unstable; breaks if consumers
+    rely on file presence as API stability signal
+  evidence: doc/source/reference/examples/tickers.py:1(empty), doc/source/reference/examples/market.py:1(empty),
+    doc/source/reference/examples/proxy.py:1(empty)
+  stage: Documentation
+  alternative_considered: Full implementation examples or clear placeholder markers
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: empty), doc/source/reference/examples/market.py:1(empty), doc/source/reference/examples/proxy.py:1(empty
+    in doc/source/reference/examples/tickers.py'
+- id: BD-GAP-005
+  type: RC
+  content: 'Missing: float vs Decimal for currency'
+  rationale: 'Audit finding: missing: float vs decimal for currency. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: http_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-006
+  type: DK
+  content: 'Missing: Random seed full coverage'
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: http_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-007
+  type: B
+  content: 'Missing: 3'
+  rationale: 'Audit finding: missing: 3. N/A (Not Applicable) | 2 Coverage** | **4/18 applicable (22%).
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: http_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: N/A (Not Applicable) | 2 Coverage** | **4/18 applicable (22%)
+- id: BD-GAP-008
+  content: 'Missing: Random seed full coverage'
+  type: DK
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: http_layer
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-009
+  content: 'Missing: 3'
+  type: B
+  rationale: 'Audit finding: missing: 3. N/A (Not Applicable) | 2 Coverage** | **4/18 applicable (22%).
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: http_layer
+  status: missing
+  severity: high
+  impact: N/A (Not Applicable) | 2 Coverage** | **4/18 applicable (22%)
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: Utility Function Validation
+  source: tests/test_utils.py
+  type: data_pipeline
+  business_problem: Ensures date/timezone parsing and validation utilities work correctly for handling
+    mixed timezone data from financial APIs.
+  intent_keywords:
+  - timezone
+  - datetime
+  - validation
+  - parse
+  - utility
+  stage: data_collection
+  negative_keywords:
+  - price
+  - ticker
+  - search
+  - screen
+  - earnings
+  disambiguation: Are you looking for date/timezone parsing utilities or financial data retrieval (prices,
+    search, screening)?
+  data_domain: mixed
+- id: UC-102
+  name: Stock Screener Query Execution
+  source: tests/test_screener.py
+  type: screening
+  business_problem: Tests the ability to filter and screen stocks based on financial criteria like price
+    thresholds and predefined strategies.
+  intent_keywords:
+  - screen
+  - filter
+  - query
+  - criteria
+  - find stocks
+  stage: data_collection
+  negative_keywords:
+  - historical prices
+  - ticker info
+  - calendar
+  - search symbol
+  disambiguation: Do you want to screen stocks by criteria (e.g., price > $5) or search for specific ticker
+    symbols?
+  data_domain: financial_data
+- id: UC-103
+  name: Ticker Symbol Search
+  source: tests/test_search.py
+  type: research_analysis
+  business_problem: Allows users to find ticker symbols by searching company names or partial queries,
+    including fuzzy matching for misspellings.
+  intent_keywords:
+  - search
+  - find ticker
+  - symbol lookup
+  - company name
+  - fuzzy
+  stage: data_collection
+  negative_keywords:
+  - price history
+  - screening
+  - earnings
+  - live data
+  disambiguation: Are you searching for a ticker symbol by company name, or do you need historical price
+    data for a known ticker?
+  data_domain: financial_data
+- id: UC-104
+  name: Financial Calendar Retrieval
+  source: tests/test_calendars.py
+  type: research_analysis
+  business_problem: Retrieves upcoming earnings dates and IPO information calendars to help investors
+    track corporate events.
+  intent_keywords:
+  - earnings calendar
+  - IPO
+  - upcoming events
+  - corporate events
+  - dates
+  stage: data_collection
+  negative_keywords:
+  - price history
+  - screening
+  - search
+  - live trading
+  disambiguation: Do you need to track upcoming earnings/IPO dates, or are you looking for historical
+    price data?
+  data_domain: financial_data
+- id: UC-105
+  name: Historical Price Data Retrieval
+  source: tests/test_prices.py
+  type: data_pipeline
+  business_problem: Fetches historical price and volume data for securities across multiple intervals
+    (daily, weekly, monthly) and time periods.
+  intent_keywords:
+  - price history
+  - historical data
+  - OHLCV
+  - download
+  - chart data
+  stage: data_collection
+  negative_keywords:
+  - screening
+  - search
+  - ticker info
+  - earnings calendar
+  disambiguation: Do you need historical price/volume data for analysis or charting, or are you looking
+    for other financial data (earnings, info)?
+  data_domain: market_data
+- id: UC-106
+  name: Ticker Information and Metadata
+  source: tests/test_ticker.py
+  type: research_analysis
+  business_problem: Retrieves comprehensive metadata for a ticker including holder information, splits,
+    recommendations, and fundamental data.
+  intent_keywords:
+  - ticker info
+  - metadata
+  - holders
+  - recommendations
+  - splits
+  stage: data_collection
+  negative_keywords:
+  - price history
+  - screening
+  - search
+  - calendar
+  disambiguation: Do you need detailed ticker metadata (info, holders, splits) or historical price/volume
+    data?
+  data_domain: financial_data
+- id: UC-107
+  name: Price Data Repair and Resampling
+  source: tests/test_price_repair.py
+  type: data_pipeline
+  business_problem: Corrects corrupted or misaligned price data and resamples data between different time
+    intervals while maintaining data integrity.
+  intent_keywords:
+  - repair
+  - fix data
+  - resample
+  - corrupt
+  - clean data
+  stage: data_collection
+  negative_keywords:
+  - ticker info
+  - search
+  - screening
+  - live data
+  disambiguation: Are you trying to fix corrupted price data, or do you need to retrieve or analyze existing
+    price data?
+  data_domain: market_data
+- id: UC-108
+  name: Live Cryptocurrency Price Streaming
+  source: tests/test_live.py
+  type: live_trading
+  business_problem: Provides real-time cryptocurrency price streaming via WebSocket for trading applications
+    and live market monitoring.
+  intent_keywords:
+  - live
+  - real-time
+  - stream
+  - websocket
+  - crypto
+  stage: monitoring
+  negative_keywords:
+  - historical
+  - batch download
+  - screening
+  - search
+  disambiguation: Do you need real-time streaming data for live trading, or historical price data for
+    analysis?
+  data_domain: market_data
+- id: UC-109
+  name: Cache Fallback on Read-Only Filesystem
+  source: tests/test_cache_noperms.py
+  type: monitoring
+  business_problem: Handles cache storage gracefully when running in restricted environments without write
+    permissions to the filesystem.
+  intent_keywords:
+  - cache
+  - permissions
+  - fallback
+  - timezone storage
+  - restricted
+  stage: data_collection
+  negative_keywords:
+  - price data
+  - search
+  - screening
+  - ticker info
+  disambiguation: Are you experiencing cache/write permission issues, or do you need to retrieve financial
+    data?
+  data_domain: mixed
+- id: UC-110
+  name: Concurrent Multi-Ticker Download
+  source: tests/test_multi.py
+  type: data_pipeline
+  business_problem: Downloads price data for multiple tickers concurrently with thread safety, ensuring
+    results don't get mixed between tickers.
+  intent_keywords:
+  - concurrent
+  - thread-safe
+  - multi-ticker
+  - parallel
+  - batch download
+  stage: data_collection
+  negative_keywords:
+  - single ticker
+  - live streaming
+  - screening
+  - search
+  disambiguation: Do you need to download data for multiple tickers simultaneously, or just a single ticker?
+  data_domain: market_data
+- id: UC-111
+  name: Securities Symbol Lookup by Type
+  source: tests/test_lookup.py
+  type: research_analysis
+  business_problem: Looks up ticker symbols filtered by asset type (stocks, ETFs, mutual funds, indices)
+    to find specific securities.
+  intent_keywords:
+  - lookup
+  - ETF
+  - mutual fund
+  - index
+  - security type
+  stage: data_collection
+  negative_keywords:
+  - price history
+  - screening
+  - earnings
+  - live data
+  disambiguation: Do you need to find a specific type of security (ETF, mutual fund, index), or other
+    financial data?
+  data_domain: financial_data
+- id: UC-112
+  name: Timezone Cache Storage
+  source: tests/test_cache.py
+  type: monitoring
+  business_problem: Caches timezone data for securities to reduce API calls and improve performance when
+    fetching data for frequently-used tickers.
+  intent_keywords:
+  - cache
+  - timezone
+  - storage
+  - performance
+  - optimize
+  stage: data_collection
+  negative_keywords:
+  - price data
+  - search
+  - screening
+  - ticker info
+  disambiguation: Are you looking to optimize performance with caching, or do you need to retrieve financial
+    data?
+  data_domain: mixed
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 14
+  evidence_invalid: 33
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.2978723404255319
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 1
+    warn: 1
+    fail: 1
+  subdomain_totals:
+    pass: 4
+    warn: 14
+    fail: 2
+  coverage: 23/23 (100%)
+  pass_rate: 5/23 (21%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: market_data_provider
+  description: Choose Yahoo Finance for free, comprehensive data. Choose alternatives for SLA-backed production
+    systems or when Yahoo API is rate-limited.
+  used_in_stages: []
+  options:
+  - name: Yahoo Finance (Default)
+    traits:
+    - free
+    - global_coverage
+    - real-time_websocket
+    - hist_data
+    - fundamentals
+    - screener
+    fit_for:
+    - General market data needs, personal/research use, multi-asset coverage
+    not_fit_for:
+    - Production trading systems requiring guaranteed uptime/SLA, commercial redistribution of data
+  - name: Alpha Vantage
+    traits:
+    - free_tier
+    - stocks_forex_crypto
+    - technical_indicators
+    fit_for:
+    - Technical analysis, beginner algorithmic trading
+    not_fit_for:
+    - High-frequency needs (rate limited), comprehensive fundamentals
+  - name: Polygon.io
+    traits:
+    - real_time
+    - historical
+    - market_news
+    - webhooks
+    - premium
+    fit_for:
+    - Production trading systems requiring reliability and low latency
+    not_fit_for:
+    - Budget-constrained projects, casual users
+  - name: IEX Cloud
+    traits:
+    - stocks
+    - crypto
+    - forex
+    - alternative_data
+    - free_tier
+    fit_for:
+    - Alternative data, fundamental analysis
+    not_fit_for:
+    - Real-time streaming needs
+  default: Yahoo Finance
+  _source: worker_resource
+- id: slot-002
+  name: http_client
+  description: Must use curl_cffi for Yahoo Finance due to Cloudflare protection. Other clients work for
+    simpler APIs.
+  used_in_stages: []
+  options:
+  - name: curl_cffi (Default)
+    traits:
+    - browser_impersonation
+    - cloudflare_bypass
+    - sync_async
+    fit_for:
+    - Yahoo Finance API access (required for Cloudflare/Javascript challenges)
+    not_fit_for:
+    - Simple HTTP requests without anti-bot challenges
+  - name: requests
+    traits:
+    - simple
+    - widely_used
+    - sync_only
+    fit_for:
+    - Simple APIs without bot protection
+    not_fit_for:
+    - Yahoo Finance (blocked by Cloudflare)
+  - name: httpx
+    traits:
+    - sync_async
+    - modern
+    - http2
+    fit_for:
+    - Modern async applications, HTTP/2 support needed
+    not_fit_for:
+    - Yahoo Finance (requires curl for browser impersonation)
+  default: curl_cffi
+  _source: worker_resource
+- id: slot-003
+  name: caching_backend
+  description: Default SQLite is sufficient for most use cases. Add Redis for distributed deployments.
+    Use no-cache for testing.
+  used_in_stages: []
+  options:
+  - name: SQLite (Default via peewee)
+    traits:
+    - embedded
+    - zero_config
+    - persistent
+    - sqlite
+    fit_for:
+    - Local caching, single-user applications
+    not_fit_for:
+    - Distributed caching, multi-process sharing
+  - name: Redis
+    traits:
+    - distributed
+    - in_memory
+    - network_accessible
+    fit_for:
+    - Multi-process/multi-server deployments, production caching
+    not_fit_for:
+    - Simple local scripts, added complexity if not needed
+  - name: HTTP Cache (requests_cache)
+    traits:
+    - http_level
+    - sqlite_mem
+    - expirable
+    fit_for:
+    - Deduplicating HTTP responses
+    not_fit_for:
+    - Complex invalidation needs, binary data
+  - name: No Caching
+    traits:
+    - stateless
+    - fresh_data
+    fit_for:
+    - Testing, always-need-latest data scenarios
+    not_fit_for:
+    - Repeated queries, rate-limit management
+  default: SQLite via peewee
+  _source: worker_resource
+- id: slot-004
+  name: real_time_streaming
+  description: Use Yahoo for free real-time data. Upgrade to Polygon/IEX for professional features like
+    Level 2 data.
+  used_in_stages: []
+  options:
+  - name: Yahoo WebSocket (Default)
+    traits:
+    - real_time
+    - free
+    - websocket
+    - protobuf
+    fit_for:
+    - Real-time price updates for subscribed symbols
+    not_fit_for:
+    - Level 2 order book data, historical intraday
+  - name: Polygon.io WebSocket
+    traits:
+    - real_time
+    - level2
+    - premium
+    fit_for:
+    - Professional trading, level 2 quotes
+    not_fit_for:
+    - Budget projects
+  - name: IEX Cloud Streaming
+    traits:
+    - real_time
+    - stocks
+    - free_tier
+    fit_for:
+    - US stocks with free tier
+    not_fit_for:
+    - International markets, forex
+  default: Yahoo WebSocket
+  _source: worker_resource
+- id: slot-005
+  name: dataframe_output
+  description: pandas is the standard for financial data. polars offers performance benefits for large
+    datasets.
+  used_in_stages: []
+  options:
+  - name: pandas (Default)
+    traits:
+    - time_series
+    - financial_analysis
+    - standard
+    fit_for:
+    - Financial analysis, time series, all standard use cases
+    not_fit_for:
+    - Extremely large datasets (use polars/dask)
+  - name: polars
+    traits:
+    - fast
+    - lazy
+    - memory_efficient
+    fit_for:
+    - Large dataset processing, performance-critical
+    not_fit_for:
+    - Simple scripts, ecosystem compatibility
+  - name: pandas-like wrapper over dict
+    traits:
+    - minimal
+    - dict_based
+    fit_for:
+    - Ultra-lightweight deployments
+    not_fit_for:
+    - Financial calculations, analysis
+  default: pandas
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: Yahoo Finance
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: Business Insider
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: SQLite Cache Database (Timezone)
+  description: Cache ticker-to-timezone mappings to avoid repeated API calls
+  used_in_stages: []
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: SQLite Cache Database (Cookies)
+  description: Persist Yahoo authentication cookies to avoid re-authentication
+  used_in_stages: []
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: SQLite Cache Database (ISIN)
+  description: Cache ISIN to ticker symbol mappings
+  used_in_stages: []
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: Yahoo Finance WebSocket
+  description: Live price updates for subscribed symbols
+  used_in_stages: []
+  _source: worker_resource
+- id: res-007
+  type: python_package
+  name: pandas>=1.3.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-008
+  type: python_package
+  name: numpy>=1.16.5
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: python_package
+  name: requests>=2.31
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: python_package
+  name: multitasking>=0.0.7
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: python_package
+  name: platformdirs>=2.0.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: python_package
+  name: pytz>=2022.5
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: python_package
+  name: frozendict>=2.3.4
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-014
+  type: python_package
+  name: peewee>=3.16.2
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-015
+  type: python_package
+  name: beautifulsoup4>=4.11.1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: python_package
+  name: curl_cffi>=0.15
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-017
+  type: code_example
+  name: Utility Function Validation
+  path: tests/test_utils.py
+  description: Ensures date/timezone parsing and validation utilities work correctly for handling mixed
+    timezone data from financial APIs.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-018
+  type: code_example
+  name: Stock Screener Query Execution
+  path: tests/test_screener.py
+  description: Tests the ability to filter and screen stocks based on financial criteria like price thresholds
+    and predefined strategies.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-019
+  type: code_example
+  name: Ticker Symbol Search
+  path: tests/test_search.py
+  description: Allows users to find ticker symbols by searching company names or partial queries, including
+    fuzzy matching for misspellings.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-020
+  type: code_example
+  name: Financial Calendar Retrieval
+  path: tests/test_calendars.py
+  description: Retrieves upcoming earnings dates and IPO information calendars to help investors track
+    corporate events.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-021
+  type: code_example
+  name: Historical Price Data Retrieval
+  path: tests/test_prices.py
+  description: Fetches historical price and volume data for securities across multiple intervals (daily,
+    weekly, monthly) and time periods.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-022
+  type: code_example
+  name: Ticker Information and Metadata
+  path: tests/test_ticker.py
+  description: Retrieves comprehensive metadata for a ticker including holder information, splits, recommendations,
+    and fundamental data.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-023
+  type: code_example
+  name: Price Data Repair and Resampling
+  path: tests/test_price_repair.py
+  description: Corrects corrupted or misaligned price data and resamples data between different time intervals
+    while maintaining data integrity.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-024
+  type: code_example
+  name: Live Cryptocurrency Price Streaming
+  path: tests/test_live.py
+  description: Provides real-time cryptocurrency price streaming via WebSocket for trading applications
+    and live market monitoring.
+  used_in_stages:
+  - monitoring
+  _source: uc_list
+- id: res-025
+  type: code_example
+  name: Cache Fallback on Read-Only Filesystem
+  path: tests/test_cache_noperms.py
+  description: Handles cache storage gracefully when running in restricted environments without write
+    permissions to the filesystem.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-026
+  type: code_example
+  name: Concurrent Multi-Ticker Download
+  path: tests/test_multi.py
+  description: Downloads price data for multiple tickers concurrently with thread safety, ensuring results
+    don't get mixed between tickers.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-027
+  type: code_example
+  name: Securities Symbol Lookup by Type
+  path: tests/test_lookup.py
+  description: Looks up ticker symbols filtered by asset type (stocks, ETFs, mutual funds, indices) to
+    find specific securities.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-028
+  type: code_example
+  name: Timezone Cache Storage
+  path: tests/test_cache.py
+  description: Caches timezone data for securities to reduce API calls and improve performance when fetching
+    data for frequently-used tickers.
+  used_in_stages:
+  - data_collection
+  _source: uc_list

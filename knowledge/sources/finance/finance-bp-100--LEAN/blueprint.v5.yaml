@@ -1,0 +1,3366 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-100
+name: LEAN
+sop_version: '3.6'
+source:
+  projects:
+  - LEAN
+  commit_hash: f00d02be834b461557c61fd73146f46a8d4a6b86
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: algorithmic trading engine with quantitative portfolio management framework
+  description: Event-driven algorithmic trading platform providing modular framework for universe selection,
+    alpha generation, portfolio construction, execution, and risk management with support for equities,
+    options, futures, ETFs, and forex.
+  prerequisites: Understanding of quantitative finance concepts (Modern Portfolio Theory, factor models,
+    technical indicators), Python or C# programming, familiarity with financial market data structures
+  not_suitable_for: Manual discretionary trading, pure fundamental analysis without systematic rules,
+    high-frequency trading requiring ultra-low latency, non-financial time series prediction, real-time
+    market making without backtesting validation
+stages:
+- id: universe_selection
+  name: Universe Selection
+  order: 1
+  responsibility: Selects tradable securities from available market data based on user-defined criteria.
+    Acts as the entry point for the algorithm framework pipeline by filtering the investable universe
+    to securities meeting fundamental or technical criteria.
+  interface:
+    inputs:
+    - Market data feed (Coarse/Fine Fundamental, ETF, Future, Option data)
+    outputs:
+    - IEnumerable<Universe> - set of securities to subscribe to for downstream stages
+  required_methods:
+  - name: FundamentalUniverseSelectionModel.Select
+    description: Unified single-pass selection method accepting coarse and fine fundamental data, replacing
+      deprecated two-pass SelectCoarse/SelectFine approach
+    evidence: Algorithm.Framework/Selection/FundamentalUniverseSelectionModel.cs:205(Select)
+  - name: UniverseSelectionModel.GetNextRefreshTimeUtc
+    description: Determines when universe should be re-evaluated, defaults to DateTime.MaxValue for lazy
+      refresh
+    evidence: Algorithm/Selection/UniverseSelectionModel.cs:40(GetNextRefreshTimeUtc)
+  key_behaviors:
+  - behavior: Unified Select() method over deprecated two-pass filtering
+    description: Single-pass selection consolidates coarse and fine filtering into one method call, improving
+      efficiency. Old SelectCoarse/SelectFine marked [Obsolete] at lines 226,244.
+    evidence: Algorithm.Framework/Selection/FundamentalUniverseSelectionModel.cs:205(Select)
+  - behavior: Universe.UNCHANGED semantics
+    description: Universe selection returns UNCHANGED to skip rebalancing when no changes needed. This
+      semantic is depended upon by 14+ algorithms and must be handled by universe manager.
+    evidence: Algorithm.Framework/Selection/QC500UniverseSelectionModel.py:37,47,70
+  - behavior: Python selector function conversion via TrySafeAs/TryConvert
+    description: PythonNet cannot convert python methods to Func delegates natively, requiring explicit
+      conversion helpers in the selection model.
+    evidence: Algorithm.Framework/Selection/FundamentalUniverseSelectionModel.cs:101(TrySafeAs)
+  - behavior: QC500 dollar volume ranking within sectors
+    description: Selects 500 symbols using dollar volume ranking filtered by USA/NYSE/NASDAQ exchanges
+      with >$500M market cap threshold.
+    evidence: Algorithm.Framework/Selection/QC500UniverseSelectionModel.py:59-85
+  replaceable_points:
+  - name: Security selection logic
+    description: Override Select() method or pass Func<IEnumerable<Fundamental>, IEnumerable<Symbol>>
+      selector to implement custom filtering criteria
+    options:
+    - name: Fundamental filter
+      traits:
+      - Fundamental data
+      - Sector weighting
+      - Market cap filtering
+      fit_for:
+      - Long-only equity strategies
+      - Factor-based selection
+      - Value/growth screening
+      not_fit_for:
+      - Technical-only strategies
+      - Options-only universes
+      - Future spreads
+    - name: ETF holdings
+      traits:
+      - ETF constituent data
+      - Passive tracking
+      - Automatic rebalancing
+      fit_for:
+      - Index replication
+      - ETF rotation strategies
+      - Sector ETF plays
+      not_fit_for:
+      - Custom factor selection
+      - Micro-cap stocks
+      - Illiquid securities
+    - name: Manual universe
+      traits:
+      - User-defined symbols
+      - Fixed list
+      - No dynamic filtering
+      fit_for:
+      - Focused portfolios
+      - Special situations
+      - Event-driven with known names
+      not_fit_for:
+      - Large universes
+      - Dynamic rebalancing
+      - High turnover strategies
+    - name: Future/Option chain filter
+      traits:
+      - Derivatives data
+      - Chain expiration
+      - Strike filtering
+      fit_for:
+      - Options strategies
+      - Futures spread trading
+      - Derivatives arbitrage
+      not_fit_for:
+      - Equity-only strategies
+      - Long-term investments
+      - Spot FX trading
+    default: FundamentalUniverseSelectionModel with default USA market filter
+  design_decisions:
+  - 'FundamentalUniverseSelectionModel uses unified Select() over deprecated SelectCoarse/SelectFine —
+    Single-pass selection is more efficient than two-pass coarse/fine filtering. Evidence: Algorithm.Framework/Selection/FundamentalUniverseSelectionModel.cs:205(Select)'
+  - 'UniverseSelectionModel.GetNextRefreshTimeUtc() defaults to DateTime.MaxValue — Lazy refresh: only
+    refresh when explicitly scheduled or on security changes. Evidence: Algorithm/Selection/UniverseSelectionModel.cs:40(GetNextRefreshTimeUtc)'
+  - 'Python selector functions converted via TrySafeAs/TryConvert — PythonNet cannot convert python methods
+    to Func delegates natively, requiring explicit conversion helpers. Evidence: Algorithm.Framework/Selection/FundamentalUniverseSelectionModel.cs:101(TrySafeAs)'
+  - 'QC500 selects 500 symbols using dollar volume ranking within sectors, filtering USA/NYSE/NASDAQ with
+    >$500M cap — Universe filtering criteria encoded in selection logic. Evidence: Algorithm.Framework/Selection/QC500UniverseSelectionModel.py:59-85'
+  acceptance_hints:
+  - Universe contains expected number of securities (e.g., 500 for QC500)
+  - Universe excludes securities not meeting filter criteria
+  - OnSecuritiesChanged fires correctly when universe changes
+  - GetNextRefreshTimeUtc returns correct next refresh timestamp
+- id: alpha_generation
+  name: Alpha Generation
+  order: 2
+  responsibility: Produces directional predictions (Insights) about security price movements, magnitude,
+    confidence, and time horizon for the portfolio construction stage. Generates trading signals from
+    technical, fundamental, or statistical models.
+  interface:
+    inputs:
+    - Slice data (market data including prices, volumes, fundamental data)
+    - SecurityChanges notifications
+    outputs:
+    - IEnumerable<Insight> - predictions about symbols with direction, magnitude, confidence, and period
+  required_methods:
+  - name: AlphaModel.Update
+    description: Core method generating insights from market data. Throws NotImplementedException by default,
+      forcing explicit override for signal generation.
+    evidence: Algorithm/Alphas/AlphaModel.cs:51(throw NotImplementedException)
+  - name: AlphaModel.OnSecuritiesChanged
+    description: Handles universe changes by resetting per-symbol state when securities are added or removed.
+    evidence: Algorithm/Alphas/AlphaModel.cs:59(OnSecuritiesChanged)
+  key_behaviors:
+  - behavior: Mandatory Update() override
+    description: AlphaModel.Update() throws NotImplementedException by default, forcing implementers to
+      explicitly override with signal generation logic. Insights are not auto-generated.
+    evidence: Algorithm/Alphas/AlphaModel.cs:51(throw NotImplementedException)
+  - behavior: Canonical futures/options symbol filtering
+    description: Insight.ContainsSymbol() filters canonical contracts which are non-tradable placeholders.
+      Emitting insights for canonical symbols would cause order failures.
+    evidence: Algorithm.Framework/Alphas/ConstantAlphaModel.cs:119(ShouldEmitInsight)
+  - behavior: SymbolData per-symbol state isolation
+    description: SymbolData helper classes track per-security state (e.g., _rsiBySymbol) preventing cross-contamination
+      of indicator state between symbols in multi-symbol models.
+    evidence: Algorithm.Framework/Alphas/RsiAlphaModel.cs:46(_rsiBySymbol)
+  - behavior: Pairs trading state machine enforcement
+    description: Pairs trading uses SHORT_RATIO/FLAT_RATIO/LONG_RATIO state machine with enforced transitions
+      preventing re-emitting same direction insights. Removing state check would allow duplicate insights
+      per cycle.
+    evidence: Algorithm.Framework/Alphas/BasePairsTradingAlphaModel.py:108-194(Pair.State)
+  - behavior: Price gap mean reversion threshold
+    description: Uses 3x volatility threshold to define outliers (abs(100*price_jump) > 3*volatility).
+      Changing threshold alters which gaps trigger insights.
+    evidence: Algorithm.Python/Alphas/PriceGapMeanReversionAlpha.py:139
+  - behavior: Pairs trading EMA mean period
+    description: Uses hardcoded period of 500 for ratio EMA mean calculation. Shortening period reduces
+      stability of mean and changes signal frequency.
+    evidence: Algorithm.Framework/Alphas/BasePairsTradingAlphaModel.py:147
+  replaceable_points:
+  - name: Alpha generation strategy
+    description: Override Update() to implement custom signal logic using any combination of data sources
+      and prediction models
+    options:
+    - name: Technical indicators (MACD, RSI, EMA)
+      traits:
+      - Price-based
+      - Fast response
+      - No fundamental data
+      fit_for:
+      - Trend following
+      - Mean reversion
+      - Short-term trading
+      - High turnover
+      not_fit_for:
+      - Long-term investments
+      - Event-driven
+      - Low frequency
+    - name: Statistical arbitrage
+      traits:
+      - Pair correlation
+      - Mean reversion
+      - Market neutral
+      fit_for:
+      - Market neutral strategies
+      - Pairs trading
+      - Short-term alpha
+      not_fit_for:
+      - Directional bets
+      - Long-only portfolios
+      - Low-frequency
+    - name: Machine learning predictions
+      traits:
+      - Data-driven
+      - Multi-factor
+      - Non-linear patterns
+      fit_for:
+      - Alpha combination
+      - Alternative data
+      - Complex patterns
+      not_fit_for:
+      - Interpretability required
+      - Small datasets
+      - High-frequency
+    - name: External signal providers
+      traits:
+      - Third-party data
+      - Proprietary models
+      - Research-backed
+      fit_for:
+      - Research-driven alpha
+      - Alternative data
+      - Specialized expertise
+      not_fit_for:
+      - Latency-sensitive
+      - Full control required
+      - Regulatory compliance
+    default: NullAlphaModel (no insights emitted)
+  design_decisions:
+  - 'AlphaModel.Update() throws NotImplementedException by default — Forces implementers to explicitly
+    override Update() - insights are not auto-generated. Evidence: Algorithm/Alphas/AlphaModel.cs:51(throw
+    NotImplementedException)'
+  - 'Insight.ContainsSymbol() filters canonical futures/options — Canonical contracts are non-tradable
+    placeholders; emitting insights for them would fail. Evidence: Algorithm.Framework/Alphas/ConstantAlphaModel.cs:119(ShouldEmitInsight)'
+  - 'Guid-based default Name for AlphaModel — Ensures unique identification for Python-wrapped models
+    without explicit naming. Evidence: Algorithm/Alphas/AlphaModel.cs:39(Guid.NewGuid)'
+  - 'SymbolData helper classes track per-security state — Prevents cross-contamination of indicator state
+    between symbols in multi-symbol models. Evidence: Algorithm.Framework/Alphas/RsiAlphaModel.cs:46(_rsiBySymbol)'
+  - 'Pairs trading state machine (SHORT_RATIO/FLAT_RATIO/LONG_RATIO) with enforced state transitions —
+    Prevents re-emitting same direction. Evidence: Algorithm.Framework/Alphas/BasePairsTradingAlphaModel.py:108-194(Pair.State)'
+  acceptance_hints:
+  - Insights are generated with valid direction (Up/Down/Flat), magnitude, and period
+  - Insight.ContainsSymbol() correctly filters canonical contracts
+  - OnSecuritiesChanged properly resets per-symbol state
+  - SymbolData instances are created per unique Symbol
+  - Pairs trading respects state machine transitions
+- id: portfolio_construction
+  name: Portfolio Construction
+  order: 3
+  responsibility: Converts insights into portfolio weight targets using configured weighting strategy
+    and rebalancing rules. Manages position sizing, portfolio bias (long/short), and insight expiration
+    handling.
+  interface:
+    inputs:
+    - Insight[] - active alpha predictions from alpha generation stage
+    outputs:
+    - IEnumerable<IPortfolioTarget> - desired holdings as Symbol + percentage pairs
+  required_methods:
+  - name: PortfolioConstructionModel.CreateTargets
+    description: Main method converting active insights into portfolio targets. Handles rebalancing logic,
+      insight expiration, and portfolio bias filtering.
+    evidence: Algorithm/Portfolio/PortfolioConstructionModel.cs:30(CreateTargets)
+  - name: PortfolioConstructionModel.DetermineTargetPercent
+    description: Virtual method computing weight for individual insight. Override for custom weighting
+      logic.
+    evidence: Algorithm/Portfolio/PortfolioConstructionModel.cs:140(DetermineTargetPercent)
+  key_behaviors:
+  - behavior: Rebalance triggers on security and insight changes
+    description: Both RebalanceOnSecurityChanges and RebalanceOnInsightChanges default to true, triggering
+      target recalculation on any change. Disabling breaks expected portfolio behavior.
+    evidence: Algorithm/Portfolio/PortfolioConstructionModel.cs:39-44
+  - behavior: PortfolioBias controls long/short direction
+    description: PortfolioBias enum (Long, Short, LongShort) enforced at portfolio construction. Alpha
+      can generate shorts but bias filter may exclude them. Defaults to LONG_SHORT enabling short positions.
+    evidence: Algorithm.Framework/Portfolio/EqualWeightingPortfolioConstructionModel.py:22(__init__)
+  - behavior: Equal weighting excludes Flat direction insights
+    description: Equal weighting computes 1/N excluding FLAT direction insights. Sum may not equal 100%
+      if bias excludes some insights, resulting in underallocation.
+    evidence: Algorithm.Framework/Portfolio/EqualWeightingPortfolioConstructionModel.py:51-52
+  - behavior: Insight weight normalization
+    description: InsightWeightingPortfolioConstructionModel normalizes weights to sum=1 if weight_sums
+      > 1. Overweighted insights get scaled down; removing normalization could exceed 100% allocation.
+    evidence: Algorithm.Framework/Portfolio/InsightWeightingPortfolioConstructionModel.py:53-56
+  - behavior: Minimum order margin filtering
+    description: FilterInvalidInsightMagnitude validates against algorithm settings. Prevents extreme
+      position sizes from corrupting portfolio. Default minimum often set to 0 in algorithms.
+    evidence: Algorithm/Portfolio/PortfolioConstructionModel.cs:311(FilterInvalidInsightMagnitude)
+  - behavior: Func<DateTime, DateTime?> rebalancing scheduling
+    description: Rebalancing function with null return means immediate rebalance. Allows time-based scheduling
+      (daily, resolution-based) with null meaning 'rebalance now'.
+    evidence: Algorithm/Portfolio/PortfolioConstructionModel.cs:64(rebalancingFunc)
+  replaceable_points:
+  - name: Weighting methodology
+    description: Override DetermineTargetPercent() for custom weighting logic, or use built-in models
+      with configurable parameters
+    options:
+    - name: Equal weighting
+      traits:
+      - Simple 1/N
+      - Market neutral capable
+      - No optimization needed
+      fit_for:
+      - Uncorrelated alpha
+      - Diversified signals
+      - Risk-balanced portfolios
+      not_fit_for:
+      - Concentrated bets
+      - High-conviction alpha
+      - Risk-adjusted optimization
+    - name: Insight-weighted
+      traits:
+      - Confidence-based
+      - Magnitude-aware
+      - Simple optimization
+      fit_for:
+      - Varied signal strength
+      - Confidence-adjusted sizing
+      - Quick implementation
+      not_fit_for:
+      - Uniform alpha quality
+      - Risk parity requirements
+      - Constraints optimization
+    - name: Mean-variance optimized
+      traits:
+      - Modern Portfolio Theory
+      - Sharpe optimization
+      - scipy-based
+      fit_for:
+      - Return-risk tradeoff
+      - Diversification optimization
+      - Academic approaches
+      not_fit_for:
+      - Robustness concerns
+      - Non-normal returns
+      - Multi-objective
+    - name: Risk parity
+      traits:
+      - Equal risk contribution
+      - Volatility-based
+      - Leverage often needed
+      fit_for:
+      - Multi-asset portfolios
+      - Balanced risk allocation
+      - Diversified sources
+      not_fit_for:
+      - Return maximization
+      - Leverage-constrained
+      - Concentrated alpha
+    - name: Black-Litterman
+      traits:
+      - Bayesian views
+      - CAPM prior
+      - View uncertainty (tau=0.05)
+      fit_for:
+      - Informed views
+      - Prior distribution
+      - Balanced active/passive
+      not_fit_for:
+      - No market prior
+      - Pure alpha
+      - Small-cap focus
+    default: EqualWeightingPortfolioConstructionModel with Daily rebalance and LongShort bias
+  design_decisions:
+  - 'RebalanceOnSecurityChanges defaults to true — Universe changes require portfolio adjustment to maintain
+    intended exposure. Evidence: Algorithm/Portfolio/PortfolioConstructionModel.cs:39(RebalanceOnSecurityChanges)'
+  - 'RebalanceOnInsightChanges defaults to true — New or expired insights should trigger target recalculation.
+    Evidence: Algorithm/Portfolio/PortfolioConstructionModel.cs:44(RebalanceOnInsightChanges)'
+  - 'Func<DateTime, DateTime?> rebalancing func with null = immediate — Allows time-based scheduling with
+    null meaning ''rebalance now''. Evidence: Algorithm/Portfolio/PortfolioConstructionModel.cs:64(rebalancingFunc)'
+  - 'PortfolioBias.LongShort is default for EqualWeighting — Default allows both long and short positions.
+    Evidence: Algorithm.Framework/Portfolio/EqualWeightingPortfolioConstructionModel.cs:55(PortfolioBias.LongShort)'
+  - 'FilterInvalidInsightMagnitude validates against algorithm settings — Prevents extreme position sizes
+    from corrupting portfolio. Evidence: Algorithm/Portfolio/PortfolioConstructionModel.cs:311(FilterInvalidInsightMagnitude)'
+  - 'Black-Litterman tau parameter defaults to 0.05 — Uncertainty of CAPM prior trusts views appropriately.
+    Evidence: Algorithm.Framework/Portfolio/BlackLittermanOptimizationPortfolioConstructionModel.py:38'
+  - 'AccumulativeInsight inherits from EqualWeighting with percent-based incremental sizing — Subclass
+    overrides determine_target_percent with 0.03 default. Evidence: Algorithm.Framework/Portfolio/AccumulativeInsightPortfolioConstructionModel.py:29,44-72'
+  acceptance_hints:
+  - Portfolio targets sum to appropriate allocation (may not be 100% if bias filters insights)
+  - Rebalancing fires on security changes when RebalanceOnSecurityChanges is true
+  - Rebalancing fires on new/expired insights when RebalanceOnInsightChanges is true
+  - PortfolioBias correctly filters long/short directions
+  - Minimum order margin filtering removes tiny positions
+  - Insight weights normalize correctly when sum exceeds 1
+- id: risk_management
+  name: Risk Management
+  order: 4
+  responsibility: Monitors portfolio risk and modifies or liquidates positions when risk thresholds are
+    breached. Final safety layer before order submission that can override portfolio targets to reduce
+    exposure.
+  interface:
+    inputs:
+    - IPortfolioTarget[] - current targets from portfolio construction
+    - QCAlgorithm portfolio state (prices, holdings)
+    outputs:
+    - IEnumerable<IPortfolioTarget> - risk-adjusted targets (often 0% for liquidation)
+  required_methods:
+  - name: RiskManagementModel.ManageRisk
+    description: Core method evaluating current positions against risk thresholds and returning adjusted
+      targets. Called after portfolio construction before execution.
+    evidence: Algorithm/Risk/RiskManagementModel.cs:25(ManageRisk)
+  key_behaviors:
+  - behavior: Trailing stop tracks absolute holdings value per position
+    description: Must track high/low separately for long vs short positions to determine correct drawdown
+      reference. Position side tracked separately from order direction for covered calls.
+    evidence: Algorithm.Framework/Risk/TrailingStopRiskManagementModel.cs:68(HoldingsState)
+  - behavior: Math.Abs for drawdown calculation
+    description: _maximumDrawdownPercent uses Math.Abs for sign insensitivity. Both long and short positions
+      use same percentage threshold regardless of direction.
+    evidence: Algorithm.Framework/Risk/TrailingStopRiskManagementModel.cs:38(Math.Abs)
+  - behavior: Insight cancellation on risk trigger
+    description: Cancelled insights via algorithm.Insights.Cancel() on risk trigger. Stops new position
+      entries for symbol being liquidated to prevent re-entry.
+    evidence: Algorithm.Framework/Risk/TrailingStopRiskManagementModel.cs:86(Cancel)
+  - behavior: Trailing vs fixed drawdown modes
+    description: MaximumDrawdownPercentPortfolio is_trailing flag changes drawdown calculation from initial
+      value vs trailing high. Different modes require different portfolio high tracking.
+    evidence: Algorithm.Framework/Risk/MaximumDrawdownPercentPortfolio.py:19-44
+  replaceable_points:
+  - name: Risk control mechanism
+    description: Override ManageRisk() for custom risk logic or use built-in risk models
+    options:
+    - name: Trailing stop
+      traits:
+      - High water mark
+      - Dynamic stop
+      - Profit locking
+      fit_for:
+      - Trend following
+      - Volatile markets
+      - Profit protection
+      not_fit_for:
+      - Mean reversion
+      - Range-bound
+      - Whipsaw-prone
+    - name: Hard stop loss
+      traits:
+      - Fixed threshold
+      - Immediate exit
+      - Simple
+      fit_for:
+      - Defined risk
+      - Short-term trades
+      - Simple strategies
+      not_fit_for:
+      - Trend following
+      - Volatile underlyings
+      - Gaps
+    - name: Sector limits
+      traits:
+      - Concentration control
+      - Sector exposure
+      - Diversification
+      fit_for:
+      - Diversified alpha
+      - Sector-neutral
+      - Institutional
+      not_fit_for:
+      - Concentrated bets
+      - Sector rotation
+      - Thematic
+    - name: Delta hedging
+      traits:
+      - Options Greeks
+      - Market neutral
+      - Continuous adjustment
+      fit_for:
+      - Options strategies
+      - Volatility trading
+      - Gamma scalping
+      not_fit_for:
+      - Equity-only
+      - Long-term positions
+      - Simple strategies
+    - name: Position sizing limits
+      traits:
+      - Max position size
+      - Order sizing
+      - Exposure control
+      fit_for:
+      - Every strategies
+      - Risk budgeting
+      - Multi-strategy
+      not_fit_for:
+      - Fixed weight mandates
+      - Concentrated alpha
+      - All-in signals
+    default: NullRiskManagementModel (no intervention, pass-through targets)
+  design_decisions:
+  - 'TrailingStopRiskManagementModel tracks absolute holdings value per position — Must track high/low
+    separately for long vs short positions. Evidence: Algorithm.Framework/Risk/TrailingStopRiskManagementModel.cs:68(HoldingsState)'
+  - '_maximumDrawdownPercent uses Math.Abs for sign insensitivity — Both long and short positions use
+    same percentage threshold. Evidence: Algorithm.Framework/Risk/TrailingStopRiskManagementModel.cs:38(Math.Abs)'
+  - 'Cancelled insights via algorithm.Insights.Cancel() on risk trigger — Stops new position entries for
+    symbol being liquidated. Evidence: Algorithm.Framework/Risk/TrailingStopRiskManagementModel.cs:86(Cancel)'
+  - 'Default maximumDrawdownPercent of 5% for TrailingStopRiskManagementModel — Conservative default suitable
+    for most strategies. Evidence: Algorithm.Framework/Risk/TrailingStopRiskManagementModel.cs:36(0.05m)'
+  acceptance_hints:
+  - Risk model correctly identifies when positions breach thresholds
+  - Risk-adjusted targets returned before execution
+  - Trailing stop correctly tracks high water marks for long and short
+  - Insights cancelled when risk triggers liquidation
+  - Math.Abs correctly applied for drawdown on both long and short
+- id: execution
+  name: Execution
+  order: 5
+  responsibility: Translates portfolio targets into actual orders with smart order routing, spread management,
+    and price optimization strategies. Implements execution algorithms for optimal fill quality.
+  interface:
+    inputs:
+    - IPortfolioTarget[] - desired positions from portfolio/risk stages
+    outputs:
+    - Order submissions to brokerage via algorithm.MarketOrder/LimitOrder/etc.
+  required_methods:
+  - name: ExecutionModel.Execute
+    description: Core method receiving portfolio targets and generating order requests. Implements order
+      sizing, timing, and routing logic.
+    evidence: Algorithm/Execution/ExecutionModel.cs:26(Execute)
+  - name: ExecutionModel.OnOrderEvent
+    description: Handles order fill events for tracking execution quality and adjusting future orders.
+    evidence: Algorithm/Execution/ExecutionModel.cs:26(OnOrderEvent)
+  key_behaviors:
+  - behavior: Asynchronous order submission by default
+    description: Asynchronous order submission defaults to true for non-blocking execution improving backtest
+      throughput. Synchronous mode available for precise fill simulation.
+    evidence: Algorithm/Execution/ExecutionModel.cs:37(asynchronous=true)
+  - behavior: VWAP-based price favorability
+    description: PriceIsFavorable uses BidPrice/VWAP for buys (buy when price below average) and AskPrice/VWAP
+      for sells (sell when price above average). Swapping would buy at unfavorable prices.
+    evidence: Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.cs:155(BidPrice<VWAP)
+  - behavior: Volume-based order sizing
+    description: MaximumOrderQuantityPercentVolume defaults to 1% of bar volume. Large orders split across
+      multiple bars to prevent market impact.
+    evidence: Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.py:28
+  - behavior: Standard deviation execution limits
+    description: MaximumOrderValue defaults to $20,000 capping single order size. Large cap stocks may
+      require multiple orders.
+    evidence: Algorithm.Framework/Execution/StandardDeviationExecutionModel.py:41
+  - behavior: VWAP resets on daily boundaries
+    description: VWAP resets at midnight, not algorithm time boundaries. Partial day VWAP calculations
+      may be incorrect if algorithm spans multiple days.
+    evidence: Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.py:128-132
+  replaceable_points:
+  - name: Order execution strategy
+    description: Override Execute() for custom order management or use built-in execution models
+    options:
+    - name: Immediate execution
+      traits:
+      - Market orders
+      - Instant fills
+      - No optimization
+      fit_for:
+      - Liquid securities
+      - High-frequency
+      - Simple strategies
+      not_fit_for:
+      - Illiquid securities
+      - Large orders
+      - Cost-sensitive
+    - name: VWAP-based
+      traits:
+      - Volume-weighted
+      - Day-range
+      - Price improvement
+      fit_for:
+      - Liquid stocks
+      - Day trades
+      - VWAP benchmark
+      not_fit_for:
+      - Illiquid securities
+      - Intraday-only
+      - Low volume
+    - name: Time-weighted average (TWAP)
+      traits:
+      - Equal time slices
+      - Scheduled fills
+      - Simple
+      fit_for:
+      - Illiquid securities
+      - Dark pools
+      - Simple execution
+      not_fit_for:
+      - Volume-sensitive
+      - Fast markets
+      - Cost optimization
+    - name: Implementation shortfall
+      traits:
+      - Arrival price
+      - Urgency-based
+      - Cost-delay tradeoff
+      fit_for:
+      - Urgency-driven
+      - Large orders
+      - Benchmark-sensitive
+      not_fit_for:
+      - Passive strategies
+      - Small orders
+      - Low urgency
+    - name: Pairs spread
+      traits:
+      - Spread monitoring
+      - Pairs trading
+      - Ratio-based
+      fit_for:
+      - Pairs trading
+      - Mean reversion
+      - Market neutral
+      not_fit_for:
+      - Directional strategies
+      - Single-leg
+      - Uncorrelated pairs
+    default: ImmediateExecutionModel
+  design_decisions:
+  - 'Asynchronous order submission defaults to true — Non-blocking execution improves backtest throughput.
+    Evidence: Algorithm/Execution/ExecutionModel.cs:37(asynchronous=true)'
+  - 'MaximumOrderQuantityPercentVolume defaults to 1% of bar volume — Prevents large orders from moving
+    market excessively. Evidence: Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.cs:42(0.01m)'
+  - 'PriceIsFavorable uses BidPrice/VWAP for buys, AskPrice/VWAP for sells — Buy when price is below average
+    cost basis reduces impact. Evidence: Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.cs:155(BidPrice<VWAP)'
+  - 'SymbolData helper tracks VWAP per symbol with consolidator — Each security needs its own VWAP calculation
+    and data consolidator. Evidence: Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.cs:176(SymbolData)'
+  - 'StandardDeviationExecutionModel maximum_order_value defaults to $20,000 — Large cap stocks may require
+    multiple orders. Evidence: Algorithm.Framework/Execution/StandardDeviationExecutionModel.py:41'
+  acceptance_hints:
+  - Orders submitted with correct symbol and quantity
+  - Execution respects volume limits (1% of bar volume default)
+  - PriceIsFavorable correctly evaluates bid/ask vs VWAP
+  - Asynchronous mode enables parallel order processing
+  - OnOrderEvent correctly handles fill events
+- id: order_lifecycle
+  name: Order Lifecycle Management
+  order: 6
+  responsibility: Manages order submission, fills, updates, and cancellations. Integrates slippage/fee
+    models and margin calculations. Handles the complete order lifecycle from request to settlement.
+  interface:
+    inputs:
+    - Order requests from execution stage
+    - Fill events from brokerage
+    - Price data from market
+    outputs:
+    - OrderStatus updates
+    - Portfolio updates
+    - Margin call events
+  required_methods:
+  - name: SecurityTransactionManager.UpdateOrder
+    description: Central order management method handling order modifications and cancellations with proper
+      state transitions.
+    evidence: Common/Securities/SecurityTransactionManager.cs:17(UpdateOrder)
+  - name: VolumeShareSlippageModel.get_slippage_approximation
+    description: Calculates slippage based on order size relative to bar volume using quadratic volume_share
+      formula.
+    evidence: Common/Orders/Slippage/VolumeShareSlippageModel.py:59(get_slippage_approximation)
+  key_behaviors:
+  - behavior: Quadratic volume_share slippage model
+    description: VolumeShareSlippageModel uses volume_share^2 * price_impact for non-linear slippage.
+      Larger orders have disproportionately higher impact than linear models would estimate.
+    evidence: Common/Orders/Slippage/VolumeShareSlippageModel.py:59(volume_share*volume_share)
+  - behavior: Volume limit caps slippage calculation
+    description: volume_limit caps slippage calculation at 2.5% (0.025) volume share. Prevents infinite
+      slippage estimates for very large orders facing liquidity constraints.
+    evidence: Common/Orders/Slippage/VolumeShareSlippageModel.py:19(volume_limit=0.025)
+  - behavior: Option strategies batch multiple legs
+    description: OptionStrategies helper batches multiple legs for proper margin and correlation in margin
+      calculations. Strategy buying power < sum of individual legs.
+    evidence: Algorithm.Python/OptionStrategyFactoryMethodsBaseAlgorithm.py:68(trade_strategy)
+  - behavior: Forex/CFD zero slippage with warning
+    description: Forex/CFD volume not reported, resulting in zero slippage with warning. Continuous markets
+      lack volume bars making slippage estimation unreliable.
+    evidence: Common/Orders/Slippage/VolumeShareSlippageModel.py:50(security_type check)
+  replaceable_points:
+  - name: Slippage model
+    description: Implement get_slippage_approximation() for custom slippage calculation
+    options:
+    - name: Volume-based
+      traits:
+      - Quadratic volume_share
+      - Market impact
+      - Volume limits
+      fit_for:
+      - Equities with volume
+      - Liquid securities
+      - Backtesting accuracy
+      not_fit_for:
+      - Forex/CFD
+      - Illiquid securities
+      - Options
+    - name: Constant spread
+      traits:
+      - Fixed spread
+      - Simple
+      - Conservative
+      fit_for:
+      - Fixed spread brokers
+      - Forex
+      - Simple estimation
+      not_fit_for:
+      - Variable spreads
+      - Volume-sensitive
+      - High-frequency
+    - name: Market impact models
+      traits:
+      - Advanced impact
+      - Liquidity modeling
+      - Price dynamics
+      fit_for:
+      - Institutional
+      - Large orders
+      - Multi-asset
+      not_fit_for:
+      - Retail strategies
+      - Small orders
+      - Simple backtests
+    default: VolumeShareSlippageModel with defaults (volume_share² × price_impact)
+  - name: Fee model
+    description: Implement get_order_fee() for brokerage-specific fee calculations
+    options:
+    - name: Fixed per share
+      traits:
+      - Per-contract/share
+      - Volume-independent
+      fit_for:
+      - Standard equities
+      - Options
+      - Fixed-cost brokers
+      not_fit_for:
+      - Percentage fees
+      - Tiered pricing
+      - Variable costs
+    - name: Percentage-based
+      traits:
+      - Fraction of value
+      - AUM-sensitive
+      fit_for:
+      - Percentage fee brokers
+      - Large positions
+      - Advisory accounts
+      not_fit_for:
+      - Fixed-cost brokers
+      - High-frequency
+      - Small positions
+    - name: Brokerage-specific
+      traits:
+      - Live data integration
+      - Tiered pricing
+      - Promotions
+      fit_for:
+      - Live trading
+      - Specific brokers
+      - Accurate costs
+      not_fit_for:
+      - General backtesting
+      - Broker-agnostic
+      - Unknown fees
+    default: Brokerage fee model
+  design_decisions:
+  - 'VolumeShareSlippageModel uses volume_share^2 * price_impact — Quadratic relationship models increasing
+    market impact for larger orders. Evidence: Common/Orders/Slippage/VolumeShareSlippageModel.py:59(volume_share*volume_share)'
+  - 'volume_limit caps slippage calculation at 2.5% volume share — Prevents infinite slippage estimates.
+    Evidence: Common/Orders/Slippage/VolumeShareSlippageModel.py:19(volume_limit=0.025)'
+  - 'Option strategies batch multiple legs via OptionStrategies helper — Strategy-level orders ensure
+    proper margin and correlation. Evidence: Algorithm.Python/OptionStrategyFactoryMethodsBaseAlgorithm.py:68(trade_strategy)'
+  - 'Forex/CFD volume not reported → zero slippage with warning — Continuous markets lack volume bars.
+    Evidence: Common/Orders/Slippage/VolumeShareSlippageModel.py:50(security_type check)'
+  acceptance_hints:
+  - Orders complete full lifecycle (Pending -> PartiallyFilled -> Filled/Cancelled)
+  - Slippage correctly calculated based on order volume relative to bar
+  - Fees correctly applied per brokerage model
+  - Margin calculations prevent overtrading
+  - Option strategies correctly batched for margin efficiency
+- id: algorithm_manager
+  name: Algorithm Manager (Orchestration)
+  order: 7
+  responsibility: Central coordinator that streams time slices, invokes framework pipeline in sequence,
+    and manages algorithm lifecycle (warmup, margin calls, events). Orchestrates each stages and manages
+    the main execution loop.
+  interface:
+    inputs:
+    - AlgorithmNodePacket
+    - IAlgorithm
+    - ISynchronizer
+    - ITransactionHandler
+    - IResultHandler
+    outputs:
+    - Algorithm execution
+    - Results streaming
+    - Final statistics
+  required_methods:
+  - name: AlgorithmManager.Run
+    description: Main execution loop coordinating each framework components, streaming time slices, and
+      managing algorithm lifecycle.
+    evidence: Engine/AlgorithmManager.cs:47(Run)
+  - name: AlgorithmManager.OnFrameworkData
+    description: 'Invokes the framework pipeline in sequence: Universe -> Alpha -> Portfolio -> Risk ->
+      Execute. Called for each time slice with framework data.'
+    evidence: Engine/AlgorithmManager.cs:562(OnFrameworkData)
+  - name: AlgorithmManager.ProcessSynchronousEvents
+    description: Processes synchronous events after OnData, simulating immediate fill for market orders
+      in historical mode.
+    evidence: Engine/AlgorithmManager.cs:574(ProcessSynchronousEvents)
+  key_behaviors:
+  - behavior: Framework pipeline order enforcement
+    description: 'Pipeline invokes in strict order: Universe -> Alpha -> Portfolio -> Risk -> Execute.
+      Canonical MPT pipeline ensures signals flow correctly through sizing to execution.'
+    evidence: Engine/AlgorithmManager.cs:562(OnFrameworkData)
+  - behavior: Margin call frequency management
+    description: Margin call frequency of 5 minutes in backtest. Frequent enough to prevent cascade failures
+      but not so frequent as to slow backtests.
+    evidence: Engine/AlgorithmManager.cs:132(marginCallFrequency)
+  - behavior: SecurityChanges filtering
+    description: SecurityChanges filtered by default (custom/internal securities excluded). User algorithms
+      don't need internal securities in change notifications.
+    evidence: Engine/AlgorithmManager.cs:405(FilterCustomSecurities)
+  - behavior: Consolidator scanning after data injection
+    description: Consolidator scan happens after each data pumped through each time slice. Ensures each
+      data points contribute to indicator values before scanning for events.
+    evidence: Engine/AlgorithmManager.cs:446(scan after)
+  - behavior: Warmup mode differences
+    description: Live mode warmup uses DateTime.UtcNow; backtest uses algorithm.StartDate. Historical
+      backtests start from algorithm start date; live needs real-time warmup window.
+    evidence: Engine/AlgorithmManager.cs:696(UtcNow vs algorithm.StartDate)
+  - behavior: Performance tracking per stage
+    description: PerformanceTrackingTool monitors each pipeline stage independently, enabling profiling
+      to identify bottlenecks in alpha, portfolio, execution, or risk stages.
+    evidence: Engine/AlgorithmManager.cs:420(Start/Stop PerformanceTarget)
+  replaceable_points:
+  - name: Transaction handler
+    description: Handle order processing and execution simulation
+    options:
+    - name: Backtesting (immediate fills)
+      traits:
+      - Instant fills
+      - No latency
+      - Simplified simulation
+      fit_for:
+      - Strategy development
+      - Historical testing
+      - Rapid iteration
+      not_fit_for:
+      - Live trading
+      - Broker integration
+      - Latency modeling
+    - name: Brokerage integration
+      traits:
+      - Real fills
+      - Live data
+      - Actual execution
+      fit_for:
+      - Live trading
+      - Paper trading
+      - Production
+      not_fit_for:
+      - Backtesting
+      - Historical simulation
+      - Offline development
+    default: BacktestingTransactionHandler
+  design_decisions:
+  - 'Framework pipeline order: Universe -> Alpha -> Portfolio -> Risk -> Execute — Canonical MPT pipeline.
+    Evidence: Engine/AlgorithmManager.cs:562(OnFrameworkData)'
+  - 'Margin call frequency of 5 minutes in backtest — Frequent enough to prevent cascade failures. Evidence:
+    Engine/AlgorithmManager.cs:132(marginCallFrequency)'
+  - 'SecurityChanges filtered by default (custom/internal securities) — User algorithms don''t need internal
+    securities. Evidence: Engine/AlgorithmManager.cs:405(FilterCustomSecurities)'
+  - 'Consolidator scan happens after each data pumped through — Ensures each data points contribute to
+    indicators. Evidence: Engine/AlgorithmManager.cs:446(scan after)'
+  - 'ProcessSynchronousEvents called after OnData for backtest — Simulates immediate fill for market orders.
+    Evidence: Engine/AlgorithmManager.cs:574(ProcessSynchronousEvents)'
+  - 'Live mode warmup uses DateTime.UtcNow; backtest uses algorithm.StartDate — Historical backtests start
+    from algorithm start date. Evidence: Engine/AlgorithmManager.cs:696(UtcNow vs algorithm.StartDate)'
+  - 'Python/C# interop via BasePythonWrapper with TryInvokePythonOverride pattern — Python models can
+    override virtual methods. Evidence: Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.cs:135(TryInvokePythonOverride)'
+  - 'Multiple constructor overloads for Python compatibility — Python cannot pass Func delegates. Evidence:
+    Algorithm/Portfolio/PortfolioConstructionModel.cs:74(Func<DateTime,DateTime> overload)'
+  acceptance_hints:
+  - Algorithm executes end-to-end with correct results
+  - Framework pipeline executes in correct order
+  - Margin calls processed every 5 minutes
+  - Consolidators produce correct aggregated bars
+  - Warmup period correctly populated with historical data
+  - Performance metrics available per pipeline stage
+data_flow:
+- from_stage: universe_selection
+  to_stage: alpha_generation
+  data: Securities added/removed via OnSecuritiesChanged; Slice data contains prices for selected securities
+- from_stage: alpha_generation
+  to_stage: portfolio_construction
+  data: Insight[] - directional predictions with magnitude, confidence, period, and weight
+- from_stage: portfolio_construction
+  to_stage: risk_management
+  data: IPortfolioTarget[] - desired targets before risk intervention
+- from_stage: portfolio_construction
+  to_stage: execution
+  data: IPortfolioTarget[] - initial targets in case risk management passes through
+- from_stage: risk_management
+  to_stage: execution
+  data: IPortfolioTarget[] - risk-adjusted targets (may include 0% for liquidation)
+- from_stage: execution
+  to_stage: order_lifecycle
+  data: Order requests (MarketOrder, LimitOrder, etc.)
+- from_stage: order_lifecycle
+  to_stage: algorithm_manager
+  data: OrderStatus updates, Portfolio updates, Margin calls
+- from_stage: algorithm_manager
+  to_stage: universe_selection
+  data: Time slice events and market data via Slice
+- from_stage: algorithm_manager
+  to_stage: alpha_generation
+  data: SecurityChanges events via OnSecuritiesChanged/OnFrameworkSecuritiesChanged
+global_contracts:
+- contract: 'Every framework models must implement OnSecuritiesChanged(QCAlgorithm, SecurityChanges) —
+    Evidence: Algorithm/Alphas/AlphaModel.cs:59(OnSecuritiesChanged)'
+  evidence: ''
+- contract: 'Insight.Magnitude must pass Min/MaxAbsolutePortfolioTargetPercentage filter or be skipped
+    — Evidence: Algorithm/Portfolio/PortfolioConstructionModel.cs:315(FilterInvalidInsightMagnitude)'
+  evidence: ''
+- contract: 'Universe selections use Symbol as canonical identifier across each stages — Evidence: Algorithm.Framework/Selection/FundamentalUniverseSelectionModel.cs:150(Symbol
+    in FundamentalUniverseFactory)'
+  evidence: ''
+- contract: 'Portfolio targets expressed as decimal percentage (0.25 = 25% of portfolio) — Evidence: Algorithm.Framework/Portfolio/EqualWeightingPortfolioConstructionModel.cs:124(1m/count)'
+  evidence: ''
+- contract: 'Rebalancing function returns DateTime? - null means ''don''t rebalance this period'' — Evidence:
+    Algorithm/Portfolio/PortfolioConstructionModel.cs:248(_rebalancingFunc==null)'
+  evidence: ''
+- contract: 'Canonical futures/options symbols are non-tradable and excluded from insights — Evidence:
+    Algorithm.Framework/Alphas/ConstantAlphaModel.cs:119(IsCanonical)'
+  evidence: ''
+- contract: 'Every timestamps in algorithm are in algorithm TimeZone; framework uses UTC — Evidence: Engine/AlgorithmManager.cs:691(TimeZone
+    conversion)'
+  evidence: ''
+- contract: 'SymbolData inner classes isolate per-symbol state to prevent leakage — Evidence: Algorithm.Framework/Alphas/RsiAlphaModel.cs:46(_rsiBySymbol)'
+  evidence: ''
+- contract: 'PortfolioBias enum controls long/short constraint: Long, Short, LongShort — Evidence: Algorithm.Framework/Portfolio/EqualWeightingPortfolioConstructionModel.cs:141(RespectPortfolioBias)'
+  evidence: ''
+- contract: 'Position side tracked separately from order direction for pairs/strategies — Evidence: Algorithm.Framework/Risk/TrailingStopRiskManagementModel.cs:60(PositionSide.Long)'
+  evidence: ''
+- contract: 'OptionStrategies helper batches multiple legs for margin efficiency — Evidence: Common/Securities/Option/OptionStrategies.cs:40(CoveredCall)'
+  evidence: ''
+- contract: 'IAlgorithmSettings controls minimum order margin percentage — Evidence: Algorithm/Portfolio/PortfolioConstructionModel.cs:322(MinAbsolutePortfolioTargetPercentage)'
+  evidence: ''
+- contract: 'PerformanceTrackingTool monitors each pipeline stage independently — Evidence: Engine/AlgorithmManager.cs:420(Start/Stop
+    PerformanceTarget)'
+  evidence: ''
+- contract: 'QCAlgorithmFramework bridges to QCAlgorithm for Python framework algorithms — Evidence: Common/AlgorithmImports.py:102(QCAlgorithmFramework)'
+  evidence: ''
+- contract: 'VWAP IntradayVwap resets on daily boundaries (midnight), not on algorithm time boundaries
+    — Evidence: Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.py:128-132'
+  evidence: ''
+- contract: 'MaximumDrawdownPercentPortfolio is_trailing flag changes drawdown calculation from initial
+    value vs trailing high — Evidence: Algorithm.Framework/Risk/MaximumDrawdownPercentPortfolio.py:19-44'
+  evidence: ''
+- contract: 'Pairs trading EMA mean uses hardcoded period of 500 for ratio calculation — Evidence: Algorithm.Framework/Alphas/BasePairsTradingAlphaModel.py:147'
+  evidence: ''
+business_decisions:
+- id: BD-001
+  type: BA/M
+  content: FundamentalUniverseSelectionModel uses unified Select() over deprecated SelectCoarse/SelectFine
+  rationale: Single-pass selection is more efficient than two-pass coarse/fine filtering. The old SelectCoarse/SelectFine
+    methods are marked [Obsolete] at lines 226 and 244, forcing migration. This reduces algorithm complexity
+    and eliminates redundant universe evaluation cycles.
+  evidence: Algorithm.Framework/Selection/FundamentalUniverseSelectionModel.cs:205(Select)
+  stage: universe_selection
+  alternative_considered: Keeping dual-pass SelectCoarse/SelectFine for backward compatibility was rejected
+    due to maintenance burden and performance cost
+- id: BD-002
+  type: B/BA
+  content: UniverseSelectionModel.GetNextRefreshTimeUtc() defaults to DateTime.MaxValue
+  rationale: 'Lazy refresh pattern: universes only refresh when explicitly scheduled or when security
+    changes occur. Defaulting to DateTime.MaxValue prevents unnecessary evaluation cycles, reducing CPU
+    overhead and improving backtest performance without sacrificing correctness.'
+  evidence: Algorithm/Selection/UniverseSelectionModel.cs:40(GetNextRefreshTimeUtc)
+  stage: universe_selection
+  alternative_considered: Defaulting to immediate refresh was rejected due to excessive re-evaluation
+    in large universes
+- id: BD-003
+  type: M
+  content: Python selector functions converted via TrySafeAs/TryConvert
+  rationale: PythonNet cannot natively convert Python methods to Func delegates required by the framework.
+    TrySafeAs and TryConvert helpers bridge this gap by providing explicit type conversion, enabling Python
+    users to define universe selection logic using native Python syntax.
+  evidence: Algorithm.Framework/Selection/FundamentalUniverseSelectionModel.cs:101(TrySafeAs)
+  stage: universe_selection
+  alternative_considered: Requiring C# delegates was rejected; would break Python workflow and reduce
+    accessibility
+- id: BD-004
+  type: B/BA
+  content: AlphaModel.Update() throws NotImplementedException by default
+  rationale: Forces framework implementers to explicitly override Update() method, ensuring alpha generation
+    logic is intentional. This prevents accidental no-op alpha models and guarantees insights are generated
+    through deliberate strategy implementation rather than default behavior.
+  evidence: Algorithm/Alphas/AlphaModel.cs:51(Update)
+  stage: alpha_generation
+  alternative_considered: Defaulting to empty implementation was rejected; would mask configuration errors
+- id: BD-005
+  type: B
+  content: Insight.ContainsSymbol() filters canonical futures/options
+  rationale: Canonical contracts are non-tradable placeholders in the futures/options chain hierarchy.
+    Emitting insights for canonical symbols would fail at execution since these contracts cannot be ordered.
+    Filtering prevents runtime errors and ensures insights target tradeable symbols.
+  evidence: Algorithm.Framework/Alphas/ConstantAlphaModel.cs:119(ShouldEmitInsight)
+  stage: alpha_generation
+  alternative_considered: Allowing canonical insights was rejected; would cause unresolved order errors
+- id: BD-006
+  type: B/BA
+  content: Guid-based default Name for AlphaModel
+  rationale: Ensures unique identification for Python-wrapped models when users don't provide explicit
+    naming. GUID generation guarantees no naming collisions when multiple model instances are created,
+    enabling proper insight attribution and debugging in multi-model algorithms.
+  evidence: Algorithm/Alphas/AlphaModel.cs:39(AlphaModel)
+  stage: alpha_generation
+  alternative_considered: Defaulting to null/empty name was rejected; would cause tracking issues in multi-model
+    algorithms
+- id: BD-007
+  type: M
+  content: SymbolData helper classes track per-security state
+  rationale: Prevents cross-contamination of indicator state between symbols in multi-symbol models. Each
+    security requires isolated state management for its rolling window, consolidator, and historical data.
+    Without per-symbol tracking, indicators would bleed data across different assets.
+  evidence: Algorithm.Framework/Alphas/RsiAlphaModel.cs:46(_rsiBySymbol)
+  stage: alpha_generation
+  alternative_considered: Static/global indicators were rejected; would produce wrong results in multi-symbol
+    strategies
+  _evidence_issues:
+  - 'SYMBOL_NOT_IN_WINDOW: _rsiBySymbol near Algorithm.Framework/Alphas/RsiAlphaModel.cs:46'
+- id: BD-008
+  type: BA
+  content: RebalanceOnSecurityChanges defaults to true
+  rationale: Universe changes require portfolio adjustment to maintain intended target exposure. When
+    securities are added/removed, rebalancing ensures portfolio weights remain consistent with strategy
+    design. Defaulting to true prevents unintended exposure drift after universe modifications.
+  evidence: Algorithm/Portfolio/PortfolioConstructionModel.cs:39(RebalanceOnSecurityChanges)
+  stage: portfolio_construction
+  alternative_considered: Defaulting to false required manual rebalancing and risked exposure drift
+- id: BD-009
+  type: BA
+  content: RebalanceOnInsightChanges defaults to true
+  rationale: New, updated, or expired insights should trigger target portfolio recalculation. This ensures
+    portfolio responds dynamically to alpha signals without manual intervention. Defaulting to true keeps
+    portfolio aligned with latest signal generation.
+  evidence: Algorithm/Portfolio/PortfolioConstructionModel.cs:44(RebalanceOnInsightChanges)
+  stage: portfolio_construction
+  alternative_considered: Defaulting to false required explicit rebalancing calls and reduced strategy
+    reactivity
+- id: BD-010
+  type: M
+  content: Func<DateTime, DateTime?> rebalancing func with null = immediate
+  rationale: Allows flexible time-based rebalancing scheduling (daily, resolution-based) while null return
+    value signals immediate rebalancing. This dual-mode design supports both scheduled and event-driven
+    portfolio updates without separate interfaces.
+  evidence: Algorithm/Portfolio/PortfolioConstructionModel.cs:64(rebalancingFunc)
+  stage: portfolio_construction
+  alternative_considered: Separate scheduled vs immediate interfaces were rejected; would increase API
+    complexity
+- id: BD-011
+  type: BA
+  content: PortfolioBias.LongShort is default for EqualWeighting
+  rationale: LongShort bias allows both long and short positions by default, maximizing strategy flexibility.
+    Users can restrict to long-only or short-only when needed, but the permissive default enables directional
+    strategies without configuration overhead.
+  evidence: Algorithm.Framework/Portfolio/EqualWeightingPortfolioConstructionModel.cs:55(PortfolioBias.LongShort)
+  stage: portfolio_construction
+  alternative_considered: Defaulting to long-only was rejected; would prevent short strategies without
+    configuration
+- id: BD-012
+  type: BA
+  content: FilterInvalidInsightMagnitude validates against algorithm settings
+  rationale: Prevents extreme position sizes from corrupting portfolio allocation. Insights with magnitudes
+    outside configured bounds (min/max) are filtered, preventing runaway leverage or negligible positions
+    that could destabilize backtesting or live execution.
+  evidence: Algorithm/Portfolio/PortfolioConstructionModel.cs:311(FilterInvalidInsightMagnitude)
+  stage: portfolio_construction
+  alternative_considered: Allowing unbounded magnitudes was rejected; would risk leverage explosions
+- id: BD-013
+  type: B/BA
+  content: Asynchronous order submission defaults to true
+  rationale: Non-blocking execution improves backtest throughput by allowing multiple orders to queue
+    without waiting for individual fills. Synchronous mode remains available for precise fill simulation
+    scenarios where order-level timing matters.
+  evidence: Algorithm/Execution/ExecutionModel.cs:37(asynchronous)
+  stage: execution
+  alternative_considered: Synchronous-only was rejected; would bottleneck backtests unnecessarily
+- id: BD-014
+  type: BA/DK
+  content: MaximumOrderQuantityPercentVolume defaults to 1% of bar volume
+  rationale: Prevents large orders from excessively moving markets in backtesting. Limiting orders to
+    1% of bar volume ensures realistic slippage estimates and prevents artificial price distortion that
+    would not occur in real execution.
+  evidence: Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.cs:42(MaximumOrderQuantityPercentVolume)
+  stage: execution
+  alternative_considered: Unlimited order sizing was rejected; would produce unrealistic backtest results
+- id: BD-015
+  type: B/DK
+  content: PriceIsFavorable uses BidPrice/VWAP for buys, AskPrice/VWAP for sells
+  rationale: Buy orders execute when price is below average cost basis (Bid < VWAP); sell orders execute
+    when above (Ask > VWAP). This reduces market impact by only trading when price favors the order direction
+    relative to recent average.
+  evidence: Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.cs:155(PriceIsFavorable)
+  stage: execution
+  alternative_considered: Market orders without price checks were rejected; would increase execution costs
+- id: BD-016
+  type: M/DK
+  content: SymbolData helper tracks VWAP per symbol with consolidator
+  rationale: Each security requires its own VWAP calculation and data consolidator to maintain accurate
+    volume-weighted pricing. Per-symbol tracking prevents cross-contamination and ensures VWAP reflects
+    symbol-specific trading activity.
+  evidence: Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.cs:176(SymbolData)
+  stage: execution
+  alternative_considered: Global VWAP was rejected; would produce wrong pricing for multi-symbol execution
+- id: BD-017
+  type: B/DK
+  content: TrailingStopRiskManagementModel tracks absolute holdings value per position
+  rationale: Long and short positions require separate high/low tracking to determine correct drawdown
+    reference. For longs, tracking the high watermark determines loss from peak; for shorts, tracking
+    the low watermark determines loss from trough. Unified tracking would miscalculate for one direction.
+  evidence: Algorithm.Framework/Risk/TrailingStopRiskManagementModel.cs:68(HoldingsState)
+  stage: risk_management
+  alternative_considered: Shared tracking was rejected; would cause incorrect stop triggers for shorts
+- id: BD-018
+  type: B/BA
+  content: _maximumDrawdownPercent uses Math.Abs for sign insensitivity
+  rationale: Both long and short positions use the same percentage threshold regardless of direction.
+    Using absolute value simplifies configuration (single threshold covers both directions) and ensures
+    consistent risk management across long/short strategies.
+  evidence: Algorithm.Framework/Risk/TrailingStopRiskManagementModel.cs:38(_maximumDrawdownPercent)
+  stage: risk_management
+  alternative_considered: Separate long/short thresholds were rejected; would complicate user configuration
+- id: BD-019
+  type: BA/M
+  content: Cancelled insights via algorithm.Insights.Cancel() on risk trigger
+  rationale: When risk management liquidates a position, active insights for that symbol must be cancelled
+    to prevent new entries. This stops the portfolio construction model from generating conflicting signals
+    while position is being unwound.
+  evidence: Algorithm.Framework/Risk/TrailingStopRiskManagementModel.cs:86(Cancel)
+  stage: risk_management
+  alternative_considered: Leaving insights active was rejected; would cause conflicting position building
+- id: BD-020
+  type: BA/M
+  content: Default maximumDrawdownPercent of 5% for TrailingStopRiskManagementModel
+  rationale: Conservative 5% default is suitable for most strategies without user configuration. This
+    balance protects capital while allowing normal volatility. Users can configure for higher volatility
+    strategies or tighter risk controls.
+  evidence: Algorithm.Framework/Risk/TrailingStopRiskManagementModel.cs:36(_maximumDrawdownPercent)
+  stage: risk_management
+  alternative_considered: Tighter 2% default was rejected; would trigger stops too frequently in volatile
+    assets
+- id: BD-021
+  type: M/DK
+  content: VolumeShareSlippageModel uses volume_share^2 * price_impact
+  rationale: Quadratic relationship models increasing market impact for larger orders. At small volume
+    shares, impact is minimal; as share grows, impact accelerates super-linearly, reflecting realistic
+    liquidity constraints in order execution.
+  evidence: Common/Orders/Slippage/VolumeShareSlippageModel.py:59(volume_share)
+  stage: order_lifecycle
+  alternative_considered: Linear impact model was rejected; would underestimate impact for large orders
+  _evidence_issues:
+  - 'FN_NOT_FOUND: volume_share in Common/Orders/Slippage/VolumeShareSlippageModel.py'
+- id: BD-022
+  type: BA
+  content: volume_limit caps slippage calculation at 2.5% volume share
+  rationale: Prevents infinite slippage estimates for extremely large orders by capping at 2.5% volume
+    share. This assumes very large orders still face some liquidity rather than becoming unbounded, producing
+    conservative but realistic slippage bounds.
+  evidence: Common/Orders/Slippage/VolumeShareSlippageModel.py:19(volume_limit)
+  stage: order_lifecycle
+  alternative_considered: Unbounded calculation was rejected; would produce unrealistic slippage for large
+    orders
+  _evidence_issues:
+  - 'FN_NOT_FOUND: volume_limit in Common/Orders/Slippage/VolumeShareSlippageModel.py'
+- id: BD-023
+  type: M
+  content: Option strategies batch multiple legs via OptionStrategies helper
+  rationale: Strategy-level orders ensure proper margin calculation and correlation handling across multiple
+    option legs. Batching prevents individual leg orders from causing margin fragmentation and ensures
+    positions are managed as cohesive units.
+  evidence: Algorithm.Python/OptionStrategyFactoryMethodsBaseAlgorithm.py:68(trade_strategy)
+  stage: order_lifecycle
+  alternative_considered: Individual leg orders were rejected; would cause incorrect margin requirements
+- id: BD-024
+  type: BA/DK
+  content: Forex/CFD volume not reported → zero slippage with warning
+  rationale: Continuous markets (Forex/CFD) lack volume bar data, making slippage estimation unreliable.
+    Zero slippage with warning acknowledges the limitation while preventing NaN/∞ values. Users should
+    rely on spread assumptions rather than volume-based impact.
+  evidence: Common/Orders/Slippage/VolumeShareSlippageModel.py:50(security_type check)
+  stage: order_lifecycle
+  alternative_considered: Raising error was rejected; would prevent backtesting of Forex/CFD strategies
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: security_type check in Common/Orders/Slippage/VolumeShareSlippageModel.py'
+- id: BD-025
+  type: BA
+  content: 'Framework pipeline order: Universe → Alpha → Portfolio → Risk → Execute'
+  rationale: 'Canonical Modern Portfolio Theory pipeline enforces correct sequence: select tradable universe,
+    generate alpha signals, size positions, manage risk, then execute. This order ensures each stage receives
+    appropriate inputs and risk management can override each prior decisions.'
+  evidence: Engine/AlgorithmManager.cs:562(OnFrameworkData)
+  stage: algorithm_manager
+  alternative_considered: Parallel processing was rejected; would violate risk management precedence
+  vague_rationale: true
+- id: BD-026
+  type: B
+  content: Margin call frequency of 5 minutes in backtest
+  rationale: 5-minute frequency balances prevention of cascade failures against backtest performance.
+    Margin calls are frequent enough to respond quickly to adverse moves but not so frequent as to significantly
+    slow historical simulation runs.
+  evidence: Engine/AlgorithmManager.cs:132(marginCallFrequency)
+  stage: algorithm_manager
+  alternative_considered: Shorter intervals (1 min) were rejected; would slow backtests unnecessarily
+- id: BD-027
+  type: BA
+  content: SecurityChanges filtered by default (custom/internal securities)
+  rationale: User algorithms do not need internal/custom securities in change notifications. Filtering
+    reduces noise in user callbacks and prevents confusion about which securities the algorithm should
+    track. Internal securities are managed separately by the engine.
+  evidence: Engine/AlgorithmManager.cs:405(FilterCustomSecurities)
+  stage: algorithm_manager
+  alternative_considered: Including each securities was rejected; would expose implementation details
+    to users
+- id: BD-028
+  type: B
+  content: Consolidator scan happens after each data pumped through
+  rationale: Consolidators must complete aggregation after each data points for the time step are processed.
+    This ensures each ticks/bars contribute to indicator values before scanning for events, preventing
+    missed consolidations and ensuring indicator consistency.
+  evidence: Engine/AlgorithmManager.cs:446(scan)
+  stage: algorithm_manager
+  alternative_considered: Interleaved processing was rejected; would cause consolidation gaps and indicator
+    errors
+- id: BD-029
+  type: B/DK
+  content: ProcessSynchronousEvents called after OnData for backtest
+  rationale: Simulates immediate fill for market orders in historical mode. Calling ProcessSynchronousEvents
+    after OnData ensures market orders fill at current bar prices rather than waiting for next bar, providing
+    more accurate backtest representation.
+  evidence: Engine/AlgorithmManager.cs:574(ProcessSynchronousEvents)
+  stage: algorithm_manager
+  alternative_considered: Deferred processing was rejected; would introduce unrealistic bar delays for
+    market orders
+- id: BD-030
+  type: B/DK
+  content: Use hourly resolution with RAW data normalization for framework regression testing
+  rationale: 'Hourly resolution with RAW normalization isolates framework behavior without market data
+    dependencies. Boundary: normalization must be consistent across each framework test runs to ensure
+    reproducibility.'
+  evidence: Algorithm.Python/BaseFrameworkRegressionAlgorithm.py:25-26(module)
+  stage: data_input
+  alternative_considered: Daily resolution was rejected due to insufficient data points for indicator
+    computation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/BaseFrameworkRegressionAlgorithm.py'
+- id: BD-031
+  type: B/RC
+  content: Use MINUTE resolution for option data feeds
+  rationale: 'Minute-level resolution is required for accurate Greeks calculation and options pricing.
+    Boundary: sufficient data density for IV and Greeks computation while avoiding excessive storage overhead.'
+  evidence: Algorithm.Python/AddOptionContractFromUniverseRegressionAlgorithm.py:35(module)
+  stage: data_input
+  alternative_considered: Hourly resolution was rejected due to insufficient granularity for option pricing
+    models
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/AddOptionContractFromUniverseRegressionAlgorithm.py'
+- id: BD-032
+  type: B/DK
+  content: Add American put option contract with specific strike and expiry date for AAPL
+  rationale: 'Specific option contract parameters test mirror contract generation for American-style options.
+    Boundary: strike and expiry must match existing market data for regression validation.'
+  evidence: Algorithm.Python/OptionIndicatorsMirrorContractsRegressionAlgorithm.py:25(module)
+  stage: data_input
+  alternative_considered: European options were already covered by other regression tests
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/OptionIndicatorsMirrorContractsRegressionAlgorithm.py'
+- id: BD-033
+  type: B/DK
+  content: Use 90-day history lookback for energy correlation analysis
+  rationale: '90-day lookback captures seasonal energy market patterns while avoiding stale data. Boundary:
+    sufficiently long to smooth short-term noise but short enough to reflect current market regime.'
+  evidence: Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py:76(module)
+  stage: data_input
+  alternative_considered: 180-day was rejected as too long for energy markets with seasonal volatility
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py'
+- id: BD-034
+  type: B/BA
+  content: Use Kendall tau correlation method for pair selection
+  rationale: 'Kendall tau measures rank-based association, more robust to outliers than Pearson for non-normal
+    financial returns. Boundary: assumes monotonic relationship between paired assets.'
+  evidence: Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py:107(module)
+  stage: processing
+  alternative_considered: Pearson correlation was rejected due to sensitivity to extreme values
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py'
+- id: BD-035
+  type: B
+  content: Use 5-period lookback for rate-of-change calculation
+  rationale: '5-period ROC identifies short-term momentum shifts without introducing excessive lag. Boundary:
+    sufficient responsiveness for energy price movements while filtering noise.'
+  evidence: Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py:77(module)
+  stage: processing
+  alternative_considered: 10-period was rejected as too slow for energy markets
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py'
+- id: BD-036
+  type: B
+  content: Update correlation pairs every 30 days
+  rationale: '30-day pair update frequency balances responsiveness to changing correlations against transaction
+    costs. Boundary: monthly refresh avoids excessive turnover while maintaining regime awareness.'
+  evidence: Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py:88(module)
+  stage: processing
+  alternative_considered: Daily updates were rejected due to excessive transaction costs
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py'
+- id: BD-037
+  type: B/BA
+  content: Use 0.75% threshold for triggering trading signals
+  rationale: '0.75% threshold filters weak spread deviations to minimize false signals in energy pair
+    trading. Boundary: calibrated to natural gas typical daily volatility to avoid overtrading.'
+  evidence: Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py:80(module)
+  stage: processing
+  alternative_considered: 0.5% was rejected as too sensitive to market noise
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py'
+- id: BD-038
+  type: B
+  content: Use 12-period fast EMA and 26-period slow EMA for cross signals
+  rationale: '12/26 EMA combination aligns with standard MACD parameters for trend detection. Boundary:
+    lookback ensures sufficient data for meaningful crossover signals without excessive lag.'
+  evidence: Algorithm.Framework/Alphas/EmaCrossAlphaModel.py:20-21(module)
+  stage: processing
+  alternative_considered: 5/20 EMA was rejected as too sensitive for this asset universe
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Alphas/EmaCrossAlphaModel.py'
+- id: BD-039
+  type: B/BA
+  content: Warm up indicators during initialization to prevent cold-start signals
+  rationale: 'Indicator warm-up prevents spurious signals during first trading days due to insufficient
+    history. Boundary: warm-up period must equal or exceed maximum indicator lookback to ensure valid
+    signals.'
+  evidence: Algorithm.Framework/Alphas/EmaCrossAlphaModel.py:102-103(module)
+  stage: processing
+  alternative_considered: No warm-up was rejected due to invalid initial signals
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Alphas/EmaCrossAlphaModel.py'
+- id: BD-040
+  type: B/BA
+  content: Use EqualWeightingPortfolioConstructionModel for framework algorithms
+  rationale: 'Equal weighting provides transparent, neutral baseline for framework regression testing.
+    Boundary: no parameter tuning required, making it ideal for comparing alpha model performance.'
+  evidence: Algorithm.Python/BaseFrameworkRegressionAlgorithm.py:41(module)
+  stage: portfolio_construction
+  alternative_considered: Optimized weights were rejected to avoid overfitting to historical data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/BaseFrameworkRegressionAlgorithm.py'
+- id: BD-041
+  type: B/BA
+  content: Use 63-period (approximately 3 months) lookback for variance optimization
+  rationale: '63-period lookback captures approximately 3 months of market data for variance estimation.
+    Boundary: balances historical stability with recency bias for mean-variance optimization.'
+  evidence: Algorithm.Framework/Portfolio/MeanVarianceOptimizationPortfolioConstructionModel.py:26(module)
+  stage: portfolio_construction
+  alternative_considered: 252-period was rejected as too long and slow to adapt to regime changes
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Portfolio/MeanVarianceOptimizationPortfolioConstructionModel.py'
+- id: BD-042
+  type: B
+  content: Use MinimumVariancePortfolioOptimizer with 0.02 (2%) target return
+  rationale: '2% target return with minimum variance optimization prioritizes risk-adjusted returns over
+    absolute performance. Boundary: achievable return target that doesn''t force excessive risk-taking.'
+  evidence: Algorithm.Framework/Portfolio/MeanVarianceOptimizationPortfolioConstructionModel.py:28(module)
+  stage: portfolio_construction
+  alternative_considered: Higher targets were rejected as they would require leverage
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Portfolio/MeanVarianceOptimizationPortfolioConstructionModel.py'
+- id: BD-043
+  type: B/DK
+  content: Limit maximum order size to 1% of current bar volume
+  rationale: '1% bar volume limit prevents significant market impact from large orders. Boundary: sufficiently
+    small to avoid price movement while allowing meaningful position sizing.'
+  evidence: Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.py:28(module)
+  stage: execution
+  alternative_considered: 5% was rejected as too aggressive for thinly traded securities
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.py'
+- id: BD-044
+  type: B
+  content: Execute buy orders when bid price < VWAP, sell orders when ask price > VWAP
+  rationale: 'VWAP timing logic ensures purchases below average price and sales above average price. Boundary:
+    execution logic accounts for bid/ask spread relative to VWAP benchmark.'
+  evidence: Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.py:83-89(module)
+  stage: execution
+  alternative_considered: Market orders were rejected due to unpredictable execution prices
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.py'
+- id: BD-045
+  type: B/BA
+  content: Use ImmediateExecutionModel with minimum order margin check
+  rationale: 'Immediate execution with margin verification ensures instant fills while preventing undercapitalized
+    positions. Boundary: margin check prevents orders exceeding available buying power.'
+  evidence: Algorithm/Execution/ImmediateExecutionModel.py:46-50(module)
+  stage: execution
+  alternative_considered: Delayed execution was rejected for time-sensitive alpha strategies
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm/Execution/ImmediateExecutionModel.py'
+- id: BD-046
+  type: B/BA
+  content: Use 5% maximum drawdown as default trailing stop threshold
+  rationale: '5% trailing stop balances loss protection with allowing positions to capture trend movements.
+    Boundary: sufficiently tight to limit losses but loose enough to avoid premature exits.'
+  evidence: Algorithm.Framework/Risk/TrailingStopRiskManagementModel.py:19(module)
+  stage: risk_management
+  alternative_considered: 10% was rejected as too wide for short-term strategies
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Risk/TrailingStopRiskManagementModel.py'
+- id: BD-047
+  type: B
+  content: Track absolute holdings value for both long and short positions
+  rationale: 'Absolute value tracking ensures both profitable longs and shorts contribute to trailing
+    high/low calculation. Boundary: handles asymmetric P&L between long and short positions correctly.'
+  evidence: Algorithm.Framework/Risk/TrailingStopRiskManagementModel.py:53-55(module)
+  stage: risk_management
+  alternative_considered: Separate tracking was rejected as complex and unnecessary
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Risk/TrailingStopRiskManagementModel.py'
+- id: BD-048
+  type: B
+  content: Cancel insights and liquidate when trailing stop is breached
+  rationale: 'Stop breach action closes positions and cancels directional forecasts to prevent compounding
+    losses. Boundary: ensures complete exit and removes conflicting signals after stop hit.'
+  evidence: Algorithm.Framework/Risk/TrailingStopRiskManagementModel.py:61-66(module)
+  stage: risk_management
+  alternative_considered: Partial liquidation was rejected for simplicity and consistency
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Risk/TrailingStopRiskManagementModel.py'
+- id: BD-049
+  type: B/DK
+  content: Select top 1000 stocks by dollar volume in coarse selection
+  rationale: 'Top 1000 by dollar volume ensures adequate liquidity and market representation. Boundary:
+    balances computational efficiency with universe coverage for fine selection.'
+  evidence: Algorithm.Framework/Selection/QC500UniverseSelectionModel.py:26(module)
+  stage: universe_selection
+  alternative_considered: 5000 was rejected as computationally expensive without liquidity benefit
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Selection/QC500UniverseSelectionModel.py'
+- id: BD-050
+  type: B/BA
+  content: 'Filter stocks requiring: USA country, NYSE/NASDAQ exchange, 6+ months since IPO, $500M+ market
+    cap'
+  rationale: 'Fundamental filters ensure quality universe: USA/NYSE-NASDAQ for liquidity, 6-month IPO
+    age for stability, $500M cap for institutional viability. Boundary: each filter independently justified.'
+  evidence: Algorithm.Framework/Selection/QC500UniverseSelectionModel.py:59-62(module)
+  stage: universe_selection
+  alternative_considered: Lower market cap was rejected as it includes illiquid small-caps
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Selection/QC500UniverseSelectionModel.py'
+- id: BD-051
+  type: B/RC
+  content: Select 500 stocks by taking top dollar-volume stocks within each sector
+  rationale: '500 stocks with sector balancing ensures diversification while maintaining liquidity focus.
+    Boundary: sector representation requires at least one stock per sector to avoid gaps.'
+  evidence: Algorithm.Framework/Selection/QC500UniverseSelectionModel.py:75-82(module)
+  stage: universe_selection
+  alternative_considered: Top-500 globally was rejected as it may concentrate in few sectors
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Selection/QC500UniverseSelectionModel.py'
+- id: BD-052
+  type: B/DK
+  content: Update universe selection monthly to reduce turnover
+  rationale: 'Monthly refresh balances data freshness with computational cost and turnover. Boundary:
+    minimum 1 day between refresh cycles prevents excessive rebalancing in thin markets.'
+  evidence: Algorithm.Framework/Selection/QC500UniverseSelectionModel.py:36-37(module)
+  stage: universe_selection
+  alternative_considered: Daily updates were rejected due to high turnover costs
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Selection/QC500UniverseSelectionModel.py'
+- id: BD-053
+  type: B
+  content: Use ManualUniverseSelectionModel for custom symbol lists
+  rationale: 'Manual universe enables custom pair inclusion for specialized energy strategies. Boundary:
+    requires manual maintenance of symbol lists for each strategy deployment.'
+  evidence: Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py:42(module)
+  stage: universe_selection
+  alternative_considered: Dynamic selection was rejected for pair trading's need for specific instruments
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py'
+- id: BD-054
+  type: B/BA
+  content: Use Kendall tau correlation for pair selection instead of Pearson
+  rationale: 'Kendall tau measures rank-based association, more robust to outliers than Pearson for non-normal
+    financial returns. Boundary: assumes monotonic relationship between paired assets.'
+  evidence: Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py:107(module)
+  stage: alpha_generation
+  alternative_considered: Pearson correlation was rejected due to sensitivity to extreme values
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py'
+- id: BD-055
+  type: B/BA
+  content: Emit UP insight when natural gas return > 0.75% threshold
+  rationale: '0.75% threshold for UP insight captures upward momentum while filtering noise. Boundary:
+    calibrated to natural gas typical daily volatility to avoid overtrading.'
+  evidence: Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py:93-94(module)
+  stage: alpha_generation
+  alternative_considered: Lower threshold was rejected as too sensitive to random fluctuations
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py'
+- id: BD-056
+  type: B
+  content: Liquidate previous pair positions when switching to new highest-correlation pair
+  rationale: 'Position liquidation when switching pairs avoids conflicting signals from multiple active
+    pairs. Boundary: ensures single active pair per asset to maintain directional clarity.'
+  evidence: Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py:213-215(module)
+  stage: alpha_generation
+  alternative_considered: Holding multiple pairs was rejected for complexity and correlation conflicts
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Alphas/GasAndCrudeOilEnergyCorrelationAlpha.py'
+- id: BD-057
+  type: B
+  content: Use SimpleMovingAverage(10) for mean reversion signal
+  rationale: 'SMA(10) calculates simple moving average over 10 periods for mean reversion detection. Boundary:
+    10-period lookback balances responsiveness and smoothness for share class arbitrage.'
+  evidence: Algorithm.Python/Alphas/ShareClassMeanReversionAlpha.py:65(module)
+  stage: alpha_generation
+  alternative_considered: 20-period was rejected as too slow for short-term mean reversion
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Alphas/ShareClassMeanReversionAlpha.py'
+- id: BD-058
+  type: B
+  content: Calculate alpha/beta weights to achieve 50/50 dollar weighting between share classes
+  rationale: '50/50 dollar weighting between share classes ensures balanced exposure in arbitrage strategy.
+    Boundary: alpha/beta weights recalculated daily to maintain target allocation.'
+  evidence: Algorithm.Python/Alphas/ShareClassMeanReversionAlpha.py:149-152(module)
+  stage: alpha_generation
+  alternative_considered: Dynamic weights were rejected as they introduce additional complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Alphas/ShareClassMeanReversionAlpha.py'
+- id: BD-059
+  type: B/DK
+  content: Trigger rebalancing at 14:15 (2:15 PM) with 105-minute insight horizon
+  rationale: 'Rebalancing at 14:15 ET captures end-of-day volatility while avoiding close auction period.
+    Boundary: 105-minute horizon extends through market close for extended trading opportunity.'
+  evidence: Algorithm.Python/Alphas/RebalancingLeveragedETFAlpha.py:90-97(module)
+  stage: alpha_generation
+  alternative_considered: Pre-market timing was rejected due to lower liquidity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Alphas/RebalancingLeveragedETFAlpha.py'
+- id: BD-060
+  type: B/BA
+  content: Use 1% return threshold for leveraged ETF rebalancing signal
+  rationale: '1% return threshold balances capturing meaningful price moves against false signal reduction.
+    Boundary: calibrated for leveraged ETF volatility profile to avoid whipsaw.'
+  evidence: Algorithm.Python/Alphas/RebalancingLeveragedETFAlpha.py:94-97(module)
+  stage: alpha_generation
+  alternative_considered: 0.5% was rejected as too sensitive for leveraged instruments
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Alphas/RebalancingLeveragedETFAlpha.py'
+- id: BD-061
+  type: B
+  content: Use 1-minute resolution for futures and leveraged ETF data
+  rationale: '1-minute resolution captures intraday price movements for accurate rebalancing signals.
+    Boundary: requires high-frequency data infrastructure but necessary for leveraged ETF tracking.'
+  evidence: Algorithm.Python/Alphas/RebalancingLeveragedETFAlpha.py:39-41(module)
+  stage: data_input
+  alternative_considered: 5-minute was rejected as too coarse for same-day rebalancing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Alphas/RebalancingLeveragedETFAlpha.py'
+- id: BD-062
+  type: B
+  content: Use Brentq root-finding with bounds [1e-7, 2.0] for implied volatility calculation
+  rationale: 'Brentq root-finding with bounds [1e-7, 2.0] ensures numerical stability for IV calculation.
+    Boundary: bounds prevent convergence issues in edge cases with extreme IV values.'
+  evidence: Algorithm.Python/OptionIndicatorsMirrorContractsRegressionAlgorithm.py:73(module)
+  stage: processing
+  alternative_considered: Newton-Raphson was rejected due to convergence issues with poor initial estimates
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/OptionIndicatorsMirrorContractsRegressionAlgorithm.py'
+- id: BD-063
+  type: B/BA
+  content: Apply smoothing function taking minimum IV from option and mirror contract
+  rationale: 'Minimum IV smoothing reduces estimation error by using conservative estimate from paired
+    contracts. Boundary: assumes both contracts have valid IV estimates to compare.'
+  evidence: Algorithm.Python/OptionIndicatorsMirrorContractsRegressionAlgorithm.py:46(module)
+  stage: processing
+  alternative_considered: Average IV was rejected as it could amplify estimation errors
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/OptionIndicatorsMirrorContractsRegressionAlgorithm.py'
+- id: BD-064
+  type: B/BA
+  content: Use put-call parity for implied volatility calculation
+  rationale: 'Put-call parity provides theoretical basis for IV calculation from observable prices. Boundary:
+    assumes no arbitrage and European option pricing for the underlying.'
+  evidence: Algorithm.Python/OptionIndicatorsMirrorContractsRegressionAlgorithm.py:79-84(module)
+  stage: processing
+  alternative_considered: Direct fitting was rejected as less theoretically grounded
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/OptionIndicatorsMirrorContractsRegressionAlgorithm.py'
+- id: BD-065
+  type: B/BA
+  content: Expect 1000+ data points per futures option contract during regression test
+  rationale: '1000+ data points expectation ensures statistical significance for Greeks validation. Boundary:
+    minimum data points for reliable computation across each option contracts.'
+  evidence: Algorithm.Python/AddFutureOptionContractDataStreamingRegressionAlgorithm.py:93(module)
+  stage: validation
+  alternative_considered: 500 was rejected as insufficient for Greeks statistical validation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/AddFutureOptionContractDataStreamingRegressionAlgorithm.py'
+- id: BD-066
+  type: B/DK
+  content: Set 0% fee model for HFT simulation to isolate alpha performance
+  rationale: '0% fee model isolates alpha performance from market impact and fee effects. Boundary: unrealistic
+    but necessary for pure alpha evaluation separate from execution costs.'
+  evidence: Algorithm.Python/Alphas/ShareClassMeanReversionAlpha.py:43(module)
+  stage: execution
+  alternative_considered: Realistic fees were rejected as they confound alpha measurement
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Alphas/ShareClassMeanReversionAlpha.py'
+- id: BD-067
+  type: B/RC
+  content: 'Verify Greeks have valid bounds: delta in [-1,1], rho sign matches option right, theta/vega/gamma
+    non-negative'
+  rationale: 'Greeks bounds validation catches theoretical inconsistencies in pricing model implementation.
+    Boundary: each bound is mathematically required for valid option prices.'
+  evidence: Algorithm.Python/OptionPriceModelForOptionStylesBaseRegressionAlgorithm.py:75-80(module)
+  stage: validation
+  alternative_considered: Percentage-based bounds were rejected as less theoretically grounded
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/OptionPriceModelForOptionStylesBaseRegressionAlgorithm.py'
+- id: BD-068
+  type: B/DK
+  content: Use 400 equity symbols for benchmark performance testing
+  rationale: '400 equity symbols provides adequate market breadth representation for benchmark testing.
+    Boundary: balances computational cost with statistical significance of results.'
+  evidence: Algorithm.Python/Benchmarks/EmptyMinute400EquityBenchmark.py:22(module)
+  stage: validation
+  alternative_considered: SPX 500 was rejected as too narrow; 1000 was rejected for cost
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Benchmarks/EmptyMinute400EquityBenchmark.py'
+- id: BD-069
+  type: B
+  content: Dropbox CSV URL determines live vs backtest mode data source
+  rationale: 'Dropbox CSV URL configuration enables consistent data access across backtest and live modes.
+    Boundary: URL must be accessible and properly formatted for both modes.'
+  evidence: Algorithm.Python/DropboxBaseDataUniverseSelectionAlgorithm.py:77-78(module)
+  stage: data_input
+  alternative_considered: File path-based switching was rejected for lack of cloud accessibility
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/DropboxBaseDataUniverseSelectionAlgorithm.py'
+- id: BD-070
+  type: B/BA
+  content: Use volume_share^2 * price_impact formula for slippage calculation
+  rationale: 'Squared volume share models non-linear market impact for large orders relative to daily
+    volume. Boundary: assumes continuous liquidity and proportional price impact.'
+  evidence: Common/Orders/Slippage/VolumeShareSlippageModel.py:57-59(module)
+  stage: execution
+  alternative_considered: Linear model was rejected as underestimating large order impact
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Common/Orders/Slippage/VolumeShareSlippageModel.py'
+- id: BD-071
+  type: B
+  content: Cap slippage at 2.5% of volume (volume_limit parameter)
+  rationale: '2.5% volume cap prevents unrealistic slippage estimates in illiquid or extreme conditions.
+    Boundary: sufficiently high to allow real impact modeling but low enough to prevent absurd values.'
+  evidence: Common/Orders/Slippage/VolumeShareSlippageModel.py:19(module)
+  stage: execution
+  alternative_considered: 10% cap was rejected as too permissive; 1% was too restrictive
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Common/Orders/Slippage/VolumeShareSlippageModel.py'
+- id: BD-072
+  type: B/DK
+  content: Use random partial fills with quantity between 0 and 2x order quantity
+  rationale: 'Random partial fills simulate market microstructure effects on order execution. Boundary:
+    0-2x range covers full fill, no fill, and over-fill scenarios for robust testing.'
+  evidence: Algorithm.Python/CustomModelsAlgorithm.py:72(module)
+  stage: execution
+  alternative_considered: Fixed 50% fill was rejected as less realistic than random variation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/CustomModelsAlgorithm.py'
+- id: BD-073
+  type: B
+  content: Use $0.00001 per share as custom fee rate (minimum $1 per trade)
+  rationale: 'Custom fee model of $0.00001/share with $1 minimum captures realistic brokerage pricing.
+    Boundary: minimum floor ensures fixed costs are accounted for in small trades.'
+  evidence: Algorithm.Python/CustomModelsAlgorithm.py:93-95(module)
+  stage: execution
+  alternative_considered: Zero fees were rejected as unrealistic for live trading
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/CustomModelsAlgorithm.py'
+- id: BD-074
+  type: B
+  content: Use 75 bins for backtest returns histogram, 25 bins for live
+  rationale: '75 bins for backtest provides detailed return distribution; 25 bins for live prevents overfitting.
+    Boundary: granularity calibrated to sample size differences between modes.'
+  evidence: Report/ReportCharts.py:100-101(module)
+  stage: reporting
+  alternative_considered: Equal bins were rejected as overfitting for live data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Report/ReportCharts.py'
+- id: BD-075
+  type: B
+  content: Filter weekly options only with strikes +1 to +1 ATM
+  rationale: 'ATM range filter (+1 to +1 strikes) provides consistent option chain subset for strategy
+    testing. Boundary: captures main Greeks sensitivity around at-the-money prices.'
+  evidence: Algorithm.Python/BasicTemplateOptionsFrameworkAlgorithm.py:56(module)
+  stage: universe_selection
+  alternative_considered: Wider range was rejected due to excessive option count
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/BasicTemplateOptionsFrameworkAlgorithm.py'
+- id: BD-076
+  type: B
+  content: Use 0.5-hour insight period for short-term option trades
+  rationale: '0.5-hour insight period matches weekly options theta decay profile for short-term trades.
+    Boundary: sufficiently short to capture theta while allowing signal execution.'
+  evidence: Algorithm.Python/BasicTemplateOptionsFrameworkAlgorithm.py:37(module)
+  stage: alpha_generation
+  alternative_considered: 1-hour was rejected as too long for weekly options theta decay
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/BasicTemplateOptionsFrameworkAlgorithm.py'
+- id: BD-077
+  type: B/BA
+  content: Set target quantity to +1 for UP insight, -1 for DOWN insight
+  rationale: 'Single-unit sizing (+1/-1) maps insight direction to discrete position sizing. Boundary:
+    simplified sizing appropriate for framework algorithm validation.'
+  evidence: Algorithm.Python/BasicTemplateOptionsFrameworkAlgorithm.py:82(module)
+  stage: portfolio_construction
+  alternative_considered: Fractional sizing was rejected for simplicity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/BasicTemplateOptionsFrameworkAlgorithm.py'
+  vague_rationale: true
+- id: BD-078
+  type: B
+  content: Calculate slippage as price * 0.0001 * log10(2*quantity)
+  rationale: 'Logarithmic slippage formula models order-size impact while preventing extreme values. Boundary:
+    log function prevents absurd slippage for very large orders.'
+  evidence: Algorithm.Python/CustomModelsAlgorithm.py:105(module)
+  stage: execution
+  alternative_considered: Linear slippage was rejected as unrealistic for large orders
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/CustomModelsAlgorithm.py'
+- id: BD-079
+  type: B/DK
+  content: Apply 5% maximum drawdown per security (not portfolio-wide)
+  rationale: '5% per-security drawdown limits loss per position independently of other holdings. Boundary:
+    allows diversification across multiple signals while constraining individual risk.'
+  evidence: Algorithm.Framework/Risk/MaximumDrawdownPercentPerSecurity.py:19(module)
+  stage: risk_management
+  alternative_considered: Portfolio-wide drawdown was rejected for allowing single-position concentration
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Risk/MaximumDrawdownPercentPerSecurity.py'
+- id: BD-080
+  type: B/BA
+  content: MACD signal normalization uses price normalization with bounce threshold
+  rationale: 'The MACD model normalizes signals using price normalization to ensure scale invariance across
+    different asset prices. A bounce threshold prevents false signals from minor price fluctuations. This
+    approach trades sensitivity for robustness—normalization enables cross-asset signal comparison while
+    the bounce threshold filters noise below the threshold. Alternative considered: Z-score normalization
+    was rejected due to sensitivity to outliers in volatile markets.'
+  evidence: MacdAlphaModel.py:60(normalized_signal)
+  stage: MacdAlphaModel
+  alternative_considered: Z-score normalization rejected due to outlier sensitivity
+  _evidence_issues:
+  - 'NOT_FOUND: MacdAlphaModel.py'
+  vague_rationale: true
+- id: BD-081
+  type: B/BA
+  content: Pearson correlation coefficient used for pair selection with log returns
+  rationale: 'Pair selection relies on Pearson correlation which measures linear relationship strength.
+    Log returns transform price series to ensure stationarity and make returns scale-independent. This
+    is critical for pairs trading where relationship stability determines strategy profitability. The
+    boundary is that Pearson only captures linear dependencies—nonlinear cointegration may be missed.
+    Alternative considered: Spearman rank correlation was rejected as it captures monotonic but not strictly
+    linear rel'
+  evidence: PearsonCorrelationPairsTradingAlphaModel.py:67(correlation_calc)
+  stage: PearsonCorrelationPairsTradingAlphaModel
+  alternative_considered: Spearman rank correlation rejected for linear-specific capture
+  _evidence_issues:
+  - 'NOT_FOUND: PearsonCorrelationPairsTradingAlphaModel.py'
+  vague_rationale: true
+- id: BD-082
+  type: B/BA
+  content: Black-Litterman model uses equilibrium returns from equal-weighted portfolio
+  rationale: 'Black-Litterman derives posterior expected returns by blending market equilibrium (from
+    equal-weighted portfolio) with investor views. The equal-weighted portfolio serves as the neutral
+    reference point representing no directional views. Tau parameter controls view weight relative to
+    equilibrium—larger tau means more trust in views. This approach balances subjective views with objective
+    market-implied expectations. Boundary: assumes markets are broadly efficient and equal weights approximate
+    fair'
+  evidence: BlackLittermanOptimizationPortfolioConstructionModel.py:199-221(get_equilibrium_return)
+  stage: BlackLittermanOptimizationPortfolioConstructionModel
+  alternative_considered: Market-cap weighting rejected for concentration risk
+  _evidence_issues:
+  - 'NOT_FOUND: BlackLittermanOptimizationPortfolioConstructionModel.py'
+- id: BD-083
+  type: B/RC
+  content: Maximum Sharpe Ratio optimization via SLSQP with equality constraints
+  rationale: 'Maximum Sharpe Ratio optimization maximizes risk-adjusted returns using SLSQP (Sequential
+    Least Squares Programming). SLSQP handles both equality constraints (weights sum to 1) and inequality
+    constraints (weight bounds, sector limits). The choice of SLSQP provides efficient constrained optimization
+    compared to penalty methods. Boundary: SLSQP is a local optimizer—it finds the nearest optimum which
+    may not be global. Convergence depends on starting point quality. Alternative considered: Genetic
+    a'
+  evidence: MaximumSharpeRatioPortfolioOptimizer.py:74(SLSQP_method)
+  stage: MaximumSharpeRatioPortfolioOptimizer
+  alternative_considered: Genetic algorithms rejected for computational expense
+  _evidence_issues:
+  - 'NOT_FOUND: MaximumSharpeRatioPortfolioOptimizer.py'
+  vague_rationale: true
+- id: BD-084
+  type: B/BA
+  content: Mean Variance optimization uses minimum variance optimizer with target return
+  rationale: 'Mean-variance optimization with a target return constraint finds the minimum-variance portfolio
+    that achieves at least the specified expected return. This provides the efficient frontier point at
+    the target return level. The target return becomes a hard constraint rather than an objective. Boundary:
+    if target return exceeds maximum achievable, optimization fails. This method explicitly trades off
+    variance against return at a fixed return target. Alternative considered: Equal-risk-contribution
+    wa'
+  evidence: MeanVarianceOptimizationPortfolioConstructionModel.py:28(target_return)
+  stage: MeanVarianceOptimizationPortfolioConstructionModel
+  alternative_considered: Equal-risk-contribution rejected for lack of return targeting
+  _evidence_issues:
+  - 'NOT_FOUND: MeanVarianceOptimizationPortfolioConstructionModel.py'
+  vague_rationale: true
+- id: BD-085
+  type: B/BA
+  content: Minimum variance portfolio with target return constraint and absolute weight normalization
+  rationale: 'Minimum variance optimization subject to target return uses absolute weight normalization
+    (weights sum to 1 in absolute terms) to ensure fully invested portfolio. The normalization prevents
+    degenerate solutions where gross exposure drifts. Boundary: absolute normalization may conflict with
+    long-short constraints—long positions must offset short positions exactly. This ensures risk is properly
+    measured relative to fully invested capital base. Alternative considered: Net normalization was rejected'
+  evidence: MinimumVariancePortfolioOptimizer.py:69-71(normalization)
+  stage: MinimumVariancePortfolioOptimizer
+  alternative_considered: Net normalization rejected for gross exposure drift risk
+  _evidence_issues:
+  - 'NOT_FOUND: MinimumVariancePortfolioOptimizer.py'
+  vague_rationale: true
+- id: BD-086
+  type: B
+  content: Risk parity uses Newton-CG with log-barrier objective for equal risk contribution
+  rationale: 'Risk parity aims for equal risk contribution from each asset using Newton-CG (Conjugate
+    Gradient) optimizer with log-barrier regularization. Newton-CG provides fast convergence for smooth
+    problems while log-barrier prevents boundary violations during optimization. The log-barrier specifically
+    handles the constraint that weights must remain positive. Boundary: Newton-CG requires positive definite
+    Hessian—attainable risk parity solutions may not exist for each correlation structures. Alternative
+    co'
+  evidence: RiskParityPortfolioOptimizer.py:56-59(objective_and_solver)
+  stage: RiskParityPortfolioOptimizer
+  alternative_considered: Sequential quadratic programming rejected for computational cost
+  _evidence_issues:
+  - 'NOT_FOUND: RiskParityPortfolioOptimizer.py'
+- id: BD-087
+  type: B/BA
+  content: Unconstrained mean-variance uses analytical solution via matrix inversion
+  rationale: 'Unconstrained mean-variance optimization has a closed-form solution obtained by inverting
+    the covariance matrix and multiplying by expected returns. This analytical approach is computationally
+    fast compared to numerical optimization. The boundary is that without constraints, solutions may produce
+    extreme long/short positions. This is primarily useful as a theoretical benchmark or for highly liquid
+    markets where constraints are less binding. Alternative considered: Long-only constraint was reject'
+  evidence: UnconstrainedMeanVariancePortfolioOptimizer.py:37(analytic_formula)
+  stage: UnconstrainedMeanVariancePortfolioOptimizer
+  alternative_considered: Long-only constraint rejected to preserve analytical solution
+  _evidence_issues:
+  - 'NOT_FOUND: UnconstrainedMeanVariancePortfolioOptimizer.py'
+  vague_rationale: true
+- id: BD-088
+  type: B/BA
+  content: Contingent Claims Analysis uses Black-Scholes Merton model for probability of default
+  rationale: 'Contingent Claims Analysis estimates default probability by treating equity as a call option
+    on firm assets using Black-Scholes Merton framework. The d2 parameter represents the standardized
+    distance to default—lower d2 indicates higher default probability. This links equity and credit risk
+    through a unified framework. Boundary: the model assumes firm assets follow GBM and debt is zero-coupon—violations
+    of these assumptions (stochastic interest rates,Jump defaults) reduce accuracy. Alternative c'
+  evidence: ContingentClaimsAnalysisDefaultPredictionAlpha.py:178(d2_formula)
+  stage: ContingentClaimsAnalysisDefaultPredictionAlpha
+  alternative_considered: Intensity models rejected for historical data dependency
+  _evidence_issues:
+  - 'NOT_FOUND: ContingentClaimsAnalysisDefaultPredictionAlpha.py'
+- id: BD-089
+  type: B/DK
+  content: Kendall tau correlation used for energy ETF pair selection
+  rationale: 'Kendall tau rank correlation is used for energy ETF pairs selection instead of Pearson.
+    Kendall tau measures rank correlation which is robust to outliers and nonlinear relationships common
+    in commodity markets. Energy ETFs often exhibit nonlinear dependencies due to contango/backwardation
+    dynamics. Boundary: Kendall tau is computationally more expensive O(n log n) vs O(n) for Pearson and
+    has lower statistical power for detecting linear relationships. Alternative considered: Spearman correlation '
+  evidence: GasAndCrudeOilEnergyCorrelationAlpha.py:107(corr_method_kendall)
+  stage: GasAndCrudeOilEnergyCorrelationAlpha
+  alternative_considered: Spearman correlation rejected for inferior tie handling
+  _evidence_issues:
+  - 'NOT_FOUND: GasAndCrudeOilEnergyCorrelationAlpha.py'
+  vague_rationale: true
+- id: BD-090
+  type: B/BA
+  content: Mortgage volatility uses 2-sigma bands around SMA for real estate signals
+  rationale: 'Mortgage rate volatility signals are generated using 2 standard deviation bands around a
+    Simple Moving Average. The 2-sigma threshold captures approximately 95% of normal price variation
+    under normal distribution assumptions. This balances signal sensitivity against false positive rate.
+    Boundary: 2-sigma is calibrated for typical volatility regimes—during crises, bands widen significantly
+    producing false signals. The SMA smooths noise but introduces lag proportional to the lookback period.
+    Alter'
+  evidence: MortgageRateVolatilityAlpha.py:80-81(deviation_calculation)
+  stage: MortgageRateVolatilityAlpha
+  alternative_considered: 1-sigma bands rejected for excessive signal noise
+  _evidence_issues:
+  - 'NOT_FOUND: MortgageRateVolatilityAlpha.py'
+- id: BD-091
+  type: B/BA
+  content: Price gap detection uses 3-sigma threshold from historical volatility
+  rationale: 'Price gap detection identifies mean-reversion opportunities using 3 standard deviation bands
+    calculated from historical volatility. The 3-sigma threshold (capturing ~99.7% under normal distribution)
+    is conservative to avoid false breakouts while still catching significant dislocations. Historical
+    volatility provides adaptive thresholds that respond to changing market conditions. Boundary: 3-sigma
+    still produces false signals in fat-tailed distributions where tail events are more common than norm'
+  evidence: PriceGapMeanReversionAlpha.py:139(3*volatility_threshold)
+  stage: PriceGapMeanReversionAlpha
+  alternative_considered: 2.5-sigma rejected as insufficient for volatility adaptation
+  _evidence_issues:
+  - 'NOT_FOUND: PriceGapMeanReversionAlpha.py'
+- id: BD-092
+  type: B/BA
+  content: Maximum drawdown per security triggers liquidation at threshold
+  rationale: 'Maximum drawdown risk management enforces per-security loss limits by liquidating positions
+    when cumulative drawdown exceeds the configured threshold. This protects against concentrated losses
+    in single positions that could threaten portfolio survival. Boundary: the threshold is static and
+    doesn''t adapt to volatility regimes—a 10% drawdown in low-volatility periods may be noise while same
+    drawdown in high-volatility may indicate systemic stress. Alternative considered: Volatility-adjusted
+    thresh'
+  evidence: MaximumDrawdownPercentPerSecurity.py:37-38(pnl_comparison)
+  stage: MaximumDrawdownPercentPerSecurity
+  alternative_considered: Volatility-adjusted thresholds rejected for complexity
+  _evidence_issues:
+  - 'NOT_FOUND: MaximumDrawdownPercentPerSecurity.py'
+  vague_rationale: true
+- id: BD-093
+  type: B/BA
+  content: Portfolio drawdown can be relative to initial value or trailing high
+  rationale: 'Portfolio drawdown calculation supports two methodologies: relative to initial value (simple
+    peak-to-trough) or relative to trailing high (rolling peak). The trailing high method allows recovery—drawdown
+    resets when new highs are achieved—while initial value method is more conservative and never recovers
+    until exceeding starting value. Boundary: the choice affects when risk management triggers and how
+    performance attribution works. Trailing high is more commonly used in practice for its psycholo'
+  evidence: MaximumDrawdownPercentPortfolio.py:63(formula)
+  stage: MaximumDrawdownPercentPortfolio
+  alternative_considered: High-water-mark rejected for performance fee complexity
+  _evidence_issues:
+  - 'NOT_FOUND: MaximumDrawdownPercentPortfolio.py'
+- id: BD-094
+  type: B/BA
+  content: Unrealized profit taking triggers at fixed percentage threshold
+  rationale: 'Unrealized profit taking locks in gains by closing positions when profit exceeds a fixed
+    percentage threshold. This prevents giving back profits in volatile markets and provides systematic
+    capital reallocation. Boundary: fixed thresholds don''t adapt to volatility—a 5% target in low-volatility
+    assets may be difficult to reach while in high-volatility assets it may be too conservative. The fixed
+    approach prioritizes simplicity and behavioral finance principles over optimization. Alternative consid'
+  evidence: MaximumUnrealizedProfitPercentPerSecurity.py:37-38(profit_comparison)
+  stage: MaximumUnrealizedProfitPercentPerSecurity
+  alternative_considered: Trailing stops rejected for backtesting complexity
+  _evidence_issues:
+  - 'NOT_FOUND: MaximumUnrealizedProfitPercentPerSecurity.py'
+- id: BD-095
+  type: B/BA
+  content: Keras neural network uses SGD optimizer with MSE loss for price prediction
+  rationale: 'Keras neural network for price prediction uses Stochastic Gradient Descent optimizer with
+    Mean Squared Error loss function. SGD is chosen for its simplicity and effectiveness in finding good
+    local minima for regression tasks. MSE loss penalizes large errors quadratically, appropriate when
+    the goal is to minimize prediction variance. Boundary: learning rate of 0.01 requires careful monitoring—too
+    high causes divergence, too low causes slow convergence. 200 training steps may be insufficient for
+    c'
+  evidence: KerasNeuralNetworkAlgorithm.py:92(mse_loss)
+  stage: KerasNeuralNetworkAlgorithm
+  alternative_considered: Adam optimizer rejected for unsuitable adaptive learning rate behavior
+  _evidence_issues:
+  - 'NOT_FOUND: KerasNeuralNetworkAlgorithm.py'
+  vague_rationale: true
+- id: BD-096
+  type: B/BA
+  content: PyTorch neural network uses SGD with MSE loss for trading signals
+  rationale: 'PyTorch neural network generates trading signals using SGD optimizer with learning rate
+    0.2 and Mean Squared Error loss. The higher learning rate (0.2 vs typical 0.01) accelerates convergence
+    but risks overshooting optimal weights. MSE loss is appropriate for regression to continuous signal
+    values. Boundary: the architecture at line 56 is not specified in evidence—this represents a gap in
+    documented design decisions. The high learning rate may cause instability in volatile market conditions.
+    Alt'
+  evidence: PytorchNeuralNetworkAlgorithm.py:58(MSELoss)
+  stage: PytorchNeuralNetworkAlgorithm
+  alternative_considered: Lower learning rates rejected for convergence speed
+  _evidence_issues:
+  - 'NOT_FOUND: PytorchNeuralNetworkAlgorithm.py'
+  vague_rationale: true
+- id: BD-097
+  type: B/BA
+  content: TensorFlow neural network uses GradientDescentOptimizer for price forecasting
+  rationale: 'TensorFlow neural network for price forecasting uses vanilla GradientDescentOptimizer with
+    0.1 learning rate and 200 training iterations. The choice of basic gradient descent (vs momentum or
+    adaptive methods) prioritizes stability and interpretability over raw convergence speed. 200 iterations
+    represents a fixed training budget—convergence is not verified. Boundary: 0.1 learning rate is relatively
+    aggressive for financial time series which often have low signal-to-noise ratios. 200 iterations ma'
+  evidence: TensorFlowNeuralNetworkAlgorithm.py:81(learning_rate)
+  stage: TensorFlowNeuralNetworkAlgorithm
+  alternative_considered: Adam optimizer rejected for overfitting risk
+  _evidence_issues:
+  - 'NOT_FOUND: TensorFlowNeuralNetworkAlgorithm.py'
+- id: BD-098
+  type: B/BA
+  content: Scikit-learn linear regression predicts price direction from time trend
+  rationale: 'Scikit-learn linear regression predicts price direction using time as the primary feature.
+    The slope coefficient captures trend direction and magnitude—positive slope suggests uptrend, negative
+    suggests downtrend. Feature matrix includes intercept term for proper regression fit. Boundary: linear
+    regression assumes linear relationships and stationary data—both assumptions are often violated in
+    financial time series which exhibit trends, mean reversion, and regime changes. This simple model
+    may un'
+  evidence: ScikitLearnLinearRegressionAlgorithm.py:72(slope_calculation)
+  stage: ScikitLearnLinearRegressionAlgorithm
+  alternative_considered: ARIMA rejected for parameter sensitivity
+  _evidence_issues:
+  - 'NOT_FOUND: ScikitLearnLinearRegressionAlgorithm.py'
+- id: BD-099
+  type: B/BA
+  content: Volume share slippage model uses square of volume ratio for price impact
+  rationale: 'Volume share slippage model estimates market impact using the square of volume ratio. The
+    quadratic relationship reflects empirical observation that impact grows more than proportionally with
+    order size—large orders move markets more. Volume share (order size / total volume) is the key input
+    determining slippage. Boundary: the square relationship is a simplification—the true relationship
+    may be asset-specific and vary with liquidity conditions. This model assumes constant market depth
+    which brea'
+  evidence: VolumeShareSlippageModel.py:59(slippage_formula)
+  stage: VolumeShareSlippageModel
+  alternative_considered: Linear impact models rejected for underestimating large order costs
+  _evidence_issues:
+  - 'NOT_FOUND: VolumeShareSlippageModel.py'
+- id: BD-100
+  type: B/RC
+  content: Implied volatility calculated via Brent root-finding on Black-Scholes prices
+  rationale: 'Implied volatility is extracted from option prices using Brent''s method to solve the Black-Scholes
+    pricing equation numerically. Brent''s method combines bisection, secant, and inverse quadratic interpolation
+    for robust and fast convergence. This is necessary because Black-Scholes cannot be inverted analytically
+    for volatility. Boundary: Brent requires bounds on volatility—this implementation must handle cases
+    where no solution exists (e.g., arbitrage-free prices). Convergence is not guaranteed f'
+  evidence: OptionIndicatorsMirrorContractsRegressionAlgorithm.py:73(brentq_call)
+  stage: OptionIndicatorsMirrorContractsRegressionAlgorithm
+  alternative_considered: Newton-Raphson rejected for divergence risk
+  _evidence_issues:
+  - 'NOT_FOUND: OptionIndicatorsMirrorContractsRegressionAlgorithm.py'
+- id: BD-101
+  type: B/BA
+  content: MACD momentum signal used for SPY entry/exit in bubble detection
+  rationale: 'MACD momentum signals drive entry and exit decisions for SPY in the bubble detection algorithm.
+    MACD crossover (signal line crossing) generates directional changes—bullish crossover triggers entry,
+    bearish triggers exit. Combined with RSI thresholds, this identifies regime changes during market
+    bubbles. Boundary: MACD is a lagging indicator by nature (based on moving averages)—it confirms trends
+    rather than predicting them. This creates systematic lag in entries and exits during rapidly changing'
+  evidence: BubbleAlgorithm.py:132,140(MACD_crossover)
+  stage: BubbleAlgorithm
+  alternative_considered: Price-based breakout rejected for false signal rate
+  _evidence_issues:
+  - 'NOT_FOUND: BubbleAlgorithm.py'
+- id: BD-102
+  type: B/BA
+  content: CAPE ratio quarter-low detection triggers regime change signals
+  rationale: 'CAPE (Shiller PE) ratio quarter-low detection identifies regime changes when CAPE reaches
+    multi-quarter lows. A bubble threshold of 20 distinguishes elevated from normal valuations. When CAPE
+    makes a new quarter-low below threshold, it signals potential bubble conditions. Boundary: CAPE is
+    a long-horizon valuation metric (10-year earnings)-quarterly signals introduce noise and may miss
+    rapid valuation changes. 20 threshold is arbitrary based on historical averages but may not hold in
+    structural '
+  evidence: BubbleAlgorithm.py:111-124(cape_rolling_window_logic)
+  stage: BubbleAlgorithm
+  alternative_considered: Trailing PE rejected for business cycle distortion
+  _evidence_issues:
+  - 'NOT_FOUND: BubbleAlgorithm.py'
+- id: BD-103
+  type: B/DK
+  content: Triple-leveraged ETF volatility decay prediction based on daily rebalancing
+  rationale: 'Triple-leveraged ETF pairs strategy exploits volatility decay from daily rebalancing. Triple-leveraged
+    ETFs reset exposure daily, causing path-dependent losses in volatile markets even if the underlying
+    index ends flat. The strategy generates DOWN insights for both ETFs in the pair, profiting from this
+    decay mechanism. Boundary: the decay magnitude varies with realized volatility—high volatility periods
+    produce larger decays but also increase uncertainty in pair convergence. This is purely a sho'
+  evidence: TripleLeverageETFPairVolatilityDecayAlpha.py:69,77-81(magnitude_and_DOWN_insight)
+  stage: TripleLeverageETFPairVolatilityDecayAlpha
+  alternative_considered: Static pair holding rejected for timing disadvantage
+  _evidence_issues:
+  - 'NOT_FOUND: TripleLeverageETFPairVolatilityDecayAlpha.py'
+- id: BD-104
+  type: B/BA
+  content: Bollinger Bands with 20-period SMA and 1 standard deviation for indicator suite
+  rationale: 'Bollinger Bands use 20-period Simple Moving Average with 1 standard deviation bands. The
+    20-period SMA represents medium-term trend while 1 SD captures typical price range. 1 SD is narrower
+    than the conventional 2 SD, making bands tighter and signals more frequent—this is a deliberate trade-off
+    for shorter-horizon strategies. Boundary: 1 SD produces more signals but also more false signals.
+    The 20-period lookback may be too slow for fast-moving markets. Alternative considered: 2 SD bands
+    were re'
+  evidence: IndicatorSuiteAlgorithm.py:45(BB_parameters)
+  stage: IndicatorSuiteAlgorithm
+  alternative_considered: 2 SD bands rejected for conservatism
+  _evidence_issues:
+  - 'NOT_FOUND: IndicatorSuiteAlgorithm.py'
+  vague_rationale: true
+- id: BD-105
+  type: B
+  content: RSI with 14-period using Simple Moving Average for momentum
+  rationale: 'Relative Strength Index uses 14-period lookback with Simple Moving Average smoothing. 14
+    periods is the standard Wilder RSI setting, balancing responsiveness with noise reduction. SMA (vs
+    EMA or Wilder''s smoothing) provides equal weight to each periods in the calculation. Boundary: SMA
+    gives equal weight to each periods while recent data may be more relevant for momentum—Wilder''s smoothed
+    RSI is often preferred in practice. 14 periods is calibrated for daily data; other frequencies may
+    require per'
+  evidence: IndicatorSuiteAlgorithm.py:46(RSI_period)
+  stage: IndicatorSuiteAlgorithm
+  alternative_considered: 7-period RSI rejected for excessive sensitivity
+  _evidence_issues:
+  - 'NOT_FOUND: IndicatorSuiteAlgorithm.py'
+- id: BD-106
+  type: B
+  content: ATR with 14-period Simple Moving Average for volatility measurement
+  rationale: 'Average True Range measures volatility using 14-period SMA of true range values. True Range
+    incorporates daily high-low range plus gaps from prior close, providing complete volatility picture.
+    14-period SMA smooths daily fluctuations to reveal underlying volatility trends. Boundary: ATR is
+    absolute (not relative) so values are not comparable across assets with different price levels. Normalized
+    ATR would enable cross-asset comparison but loses the volatility in dollar terms interpretation. Alter'
+  evidence: IndicatorSuiteAlgorithm.py:57(ATR_parameters)
+  stage: IndicatorSuiteAlgorithm
+  alternative_considered: Standard deviation rejected for gap information loss
+  _evidence_issues:
+  - 'NOT_FOUND: IndicatorSuiteAlgorithm.py'
+- id: BD-107
+  type: B/BA
+  content: PortfolioBias defaults to LONG_SHORT enabling short positions by default across each PortfolioConstructionModels
+  rationale: Setting PortfolioBias.LONG_SHORT as default enables short selling without explicit configuration,
+    allowing algorithms to hold negative positions by default. This shifts the risk boundary from conservative
+    (long-only) to permissive (long-short enabled) unless developers actively configure bias, potentially
+    exposing algorithms to short-side risks unintentionally.
+  evidence: Algorithm.Framework/Portfolio/EqualWeightingPortfolioConstructionModel.py:22(__init__)
+  stage: Algorithm.Framework.Portfolio
+  alternative_considered: Defaulting to LONG-only would prevent unintended short exposure but limit flexibility
+- id: BD-108
+  type: BA
+  content: RebalanceOnSecurityChanges and RebalanceOnInsightChanges both default to true, triggering rebalance
+    on any change
+  rationale: Both rebalance triggers defaulting to true creates aggressive rebalancing behavior requiring
+    any security or insight change to recalculate portfolio weights. This boundary condition increases
+    transaction costs and turnover unless explicitly disabled, making the system conservative by default
+    rather than efficient.
+  evidence: Algorithm/Portfolio/PortfolioConstructionModel.cs:39-44
+  stage: Algorithm.Portfolio
+  alternative_considered: Defaulting to false would reduce costs but delay response to market signals
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-109
+  type: B
+  content: VWAP execution price_is_favorable uses bid<VWAP for buys and ask>VWAP for sells - order direction
+    determines favorable price
+  rationale: 'The VWAP execution model enforces directional price favorability rules: buys only execute
+    when bid is below VWAP (cheaper entry), sells only execute when ask exceeds VWAP (better exit). This
+    ordering contract ensures execution at prices better than volume-weighted average, defining the favorable
+    price boundary per trade direction.'
+  evidence: Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.py:80-90(price_is_favorable)
+  stage: Algorithm.Framework.Execution
+  alternative_considered: Using mid-price or last-price for comparison would change favorable execution
+    boundary
+- id: BD-110
+  type: BA/DK
+  content: StandardDeviationExecutionModel maximum_order_value defaults to $20,000, capping single order
+    size
+  rationale: The $20,000 default maximum order value establishes a hard boundary on position sizing to
+    limit market impact and manage execution risk for large orders. This default protects against excessive
+    slippage in lower-liquidity scenarios but may require override for high-cap strategies or certain
+    asset classes.
+  evidence: Algorithm.Framework/Execution/StandardDeviationExecutionModel.py:41(module)
+  stage: Algorithm.Framework.Execution
+  alternative_considered: Dynamic sizing based on volatility or liquidity would be more adaptive but complex
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Execution/StandardDeviationExecutionModel.py'
+- id: BD-111
+  type: BA/M
+  content: TrailingStopRiskManagementModel maximum_drawdown_percent defaults to 5% (0.05) absolute value
+  rationale: The 5% default maximum drawdown threshold represents a conservative stop-loss boundary designed
+    to limit portfolio losses. This default protects capital from significant drawdowns while allowing
+    normal volatility, establishing risk management as a primary concern over maximizing returns in this
+    model.
+  evidence: Algorithm.Framework/Risk/TrailingStopRiskManagementModel.py:19(module)
+  stage: Algorithm.Framework.Risk
+  alternative_considered: Higher thresholds (10-15%) would reduce false stops in volatile markets but
+    increase exposure
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Risk/TrailingStopRiskManagementModel.py'
+- id: BD-112
+  type: B
+  content: Universe selection returns Universe.UNCHANGED to skip rebalancing - must be handled by universe
+    manager
+  rationale: When universe selection produces no changes, returning Universe.UNCHANGED signals the universe
+    manager to preserve existing holdings and skip rebalancing. This sentinel value establishes a contractual
+    boundary requiring explicit handling, preventing unintended portfolio churn during periods of no selection
+    changes.
+  evidence: Algorithm.Framework/Selection/QC500UniverseSelectionModel.py:37,47,70(module)
+  stage: Algorithm.Framework.Selection
+  alternative_considered: Returning null or empty universe would have different semantic meaning
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Selection/QC500UniverseSelectionModel.py'
+- id: BD-113
+  type: BA
+  content: minimum_order_margin_portfolio_percentage often set to 0 to disable order filtering across
+    algorithms
+  rationale: Setting minimum_order_margin_portfolio_percentage to 0 disables order filtering, allowing
+    even very small positions relative to portfolio value. This boundary choice removes friction for small
+    orders but may create excessive transaction costs if not managed, indicating that many algorithms
+    prioritize completeness over efficiency.
+  evidence: Algorithm.Python/PortfolioRebalanceOnDateRulesRegressionAlgorithm.py:32(module)
+  stage: Algorithm.Python.Portfolio
+  alternative_considered: Defaulting to a minimum threshold (0.1-1%) would filter noise but limit small
+    position entry
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/PortfolioRebalanceOnDateRulesRegressionAlgorithm.py'
+- id: BD-114
+  type: B/RC
+  content: Pairs trading state machine (SHORT_RATIO/FLAT_RATIO/LONG_RATIO) with enforced state transitions
+    prevents re-emitting same direction
+  rationale: The three-state pairs trading machine (SHORT→FLAT→LONG→FLAT→SHORT) enforces directional transitions
+    through FLAT as a mandatory intermediate state. This pattern prevents signal chattering by requiring
+    the ratio to neutralize before switching directions, establishing FLAT as a necessary boundary state
+    for each direction changes.
+  evidence: Algorithm.Framework/Alphas/BasePairsTradingAlphaModel.py:108-194(Pair.State)
+  stage: Algorithm.Framework.Alphas
+  alternative_considered: Direct transitions would be faster but risk signal oscillation
+- id: BD-115
+  type: B/BA
+  content: Equal weighting computes 1/N excluding FLAT direction insights - sum may not equal 100% if
+    bias excludes some
+  rationale: Equal weighting allocates 1/N to each non-FLAT insight, excluding FLAT directions from position
+    sizing. This creates a portfolio weight boundary where total may fall below 100% if PortfolioBias
+    filters some signals, potentially leaving capital unallocated unless explicitly handled by residual
+    allocation logic.
+  evidence: Algorithm.Framework/Portfolio/EqualWeightingPortfolioConstructionModel.py:51-52(module)
+  stage: Algorithm.Framework.Portfolio
+  alternative_considered: Redistributing excluded weight to remaining assets would maintain 100% allocation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Portfolio/EqualWeightingPortfolioConstructionModel.py'
+- id: BD-116
+  type: BA/M
+  content: InsightWeightingPortfolioConstructionModel normalizes weights to sum=1 if weight_sums > 1
+  rationale: Weight normalization to sum=1 establishes a portfolio constraint boundary ensuring full capital
+    deployment when individual weights exceed 1. This automatic scaling prevents over-allocation but may
+    dilute conviction signals, making normalization a key assumption for portfolio sizing consistency
+    across varying insight magnitudes.
+  evidence: Algorithm.Framework/Portfolio/InsightWeightingPortfolioConstructionModel.py:53-56(module)
+  stage: Algorithm.Framework.Portfolio
+  alternative_considered: Allowing weights >1 would amplify conviction but risk over-leverage
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Portfolio/InsightWeightingPortfolioConstructionModel.py'
+- id: BD-117
+  type: DK
+  content: Black-Litterman tau parameter (uncertainty of CAPM prior) defaults to 0.05 in optimizer
+  rationale: The tau=0.05 parameter in Black-Litterman represents uncertainty of the CAPM equilibrium
+    prior, controlling how much weight views receive versus historical data. This 5% uncertainty baseline
+    balances prior confidence with view influence, establishing a calibrated starting point for view-sensitive
+    portfolio construction.
+  evidence: Algorithm.Framework/Portfolio/BlackLittermanOptimizationPortfolioConstructionModel.py:38(module)
+  stage: Algorithm.Framework.Portfolio
+  alternative_considered: Lower tau increases view sensitivity; higher tau maintains stronger prior weighting
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Portfolio/BlackLittermanOptimizationPortfolioConstructionModel.py'
+- id: BD-118
+  type: B/BA
+  content: AccumulativeInsight inherits from EqualWeighting but uses percent-based (0.03 default) incremental
+    position sizing
+  rationale: AccumulativeInsightModel extends EqualWeighting but adds incremental position sizing using
+    3% default accumulation, diverging from equal weighting by building positions gradually. This inheritance
+    relationship establishes a design boundary where incremental sizing overrides base allocation logic,
+    enabling position building rather than immediate full allocation.
+  evidence: Algorithm.Framework/Portfolio/AccumulativeInsightPortfolioConstructionModel.py:29,44-72(module)
+  stage: Algorithm.Framework.Portfolio
+  alternative_considered: Full position sizing from insight would be faster but less adaptive
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Portfolio/AccumulativeInsightPortfolioConstructionModel.py'
+- id: BD-119
+  type: DK
+  content: Price gap mean reversion uses 3x volatility threshold to define outliers (abs(100*price_jump)
+    > 3*volatility)
+  rationale: The 3-sigma volatility threshold for price gap mean reversion establishes a statistical boundary
+    for outlier detection. Gaps exceeding 3 standard deviations are classified as mean-reversion candidates,
+    using standard deviation as the measure of normal price movement and defining the boundary beyond
+    which reversion is likely.
+  evidence: Algorithm.Python/Alphas/PriceGapMeanReversionAlpha.py:139(module)
+  stage: Algorithm.Python.Alphas
+  alternative_considered: 2-sigma threshold would capture more signals but increase false positives
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/Alphas/PriceGapMeanReversionAlpha.py'
+- id: BD-120
+  type: DK
+  content: Pairs trading EMA mean uses hardcoded period of 500 for ratio calculation
+  rationale: The hardcoded EMA period of 500 establishes a long-term lookback boundary for pairs ratio
+    smoothing. This 500-bar window creates a slow-moving average sensitive to extended trends rather than
+    short-term noise, defining the temporal horizon for identifying mean-reverting pairs relationships.
+  evidence: Algorithm.Framework/Alphas/BasePairsTradingAlphaModel.py:147(module)
+  stage: Algorithm.Framework.Alphas
+  alternative_considered: Shorter periods (50-200) would react faster but increase noise sensitivity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Alphas/BasePairsTradingAlphaModel.py'
+- id: BD-121
+  type: B
+  content: VWAP IntradayVwap resets on daily boundaries (midnight), not on algorithm time boundaries
+  rationale: VWAP resets at calendar midnight regardless of algorithm timezone or trading hours, establishing
+    a rigid temporal boundary for volume averaging. This creates a boundary condition where round-the-clock
+    algorithms may experience VWAP discontinuities at midnight, affecting execution quality across timezone
+    boundaries.
+  evidence: Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.py:128-132(module)
+  stage: Algorithm.Framework.Execution
+  alternative_considered: Resetting on session boundaries would align with trading hours but vary by asset
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.py'
+- id: BD-122
+  type: BA/DK
+  content: OptionIndicatorsMirrorContractsRegressionAlgorithm demonstrates put-call parity via mirror
+    contracts with smoothing
+  rationale: The regression algorithm demonstrates put-call parity using mirror strike contracts with
+    smoothing, establishing smoothing as a boundary technique for handling discrete strike pricing. This
+    demonstrates that parity relationships require smoothing to bridge gaps between available strikes,
+    acknowledging market microstructure discontinuities.
+  evidence: Algorithm.Python/OptionIndicatorsMirrorContractsRegressionAlgorithm.py:66-84(module)
+  stage: Algorithm.Python
+  alternative_considered: Using only exact-mirror strikes would avoid smoothing but limit available data
+    points
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Python/OptionIndicatorsMirrorContractsRegressionAlgorithm.py'
+- id: BD-123
+  type: B/DK
+  content: QC500 selects 500 symbols using dollar volume ranking within sectors, filtering USA/NYSE/NASDAQ
+    with >$500M cap
+  rationale: QC500 universe selection establishes a 500-symbol hard boundary using dollar volume ranking
+    and sector-balanced distribution. The $500M market cap floor filters liquidity, while USA exchange
+    filtering and sector ranking create a defined universe boundary affecting each downstream portfolio
+    construction decisions based on this selection.
+  evidence: Algorithm.Framework/Selection/QC500UniverseSelectionModel.py:59-85(module)
+  stage: Algorithm.Framework.Selection
+  alternative_considered: Using pure volume ranking without sector balancing would be simpler but may
+    concentrate in few sectors
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Selection/QC500UniverseSelectionModel.py'
+- id: BD-124
+  type: BA/DK
+  content: 'VolumeShareSlippageModel uses squared volume_share formula: slippage = volume_share² × price_impact'
+  rationale: The squared volume_share formula establishes non-linear slippage scaling where larger orders
+    face disproportionately higher costs. This mathematical boundary creates convex cost growth, making
+    volume_share a critical execution parameter where exceeding certain thresholds dramatically increases
+    market impact beyond linear expectations.
+  evidence: Common/Orders/Slippage/VolumeShareSlippageModel.py:59(module)
+  stage: Common.Orders.Slippage
+  alternative_considered: Linear volume_share would be simpler but underestimate impact of large orders
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Common/Orders/Slippage/VolumeShareSlippageModel.py'
+- id: BD-125
+  type: BA
+  content: MaximumDrawdownPercentPortfolio is_trailing flag changes drawdown calculation from initial
+    value vs trailing high
+  rationale: The is_trailing flag creates a fundamental boundary in drawdown calculation methodology.
+    When false, drawdown measures from initial peak requiring recovery to original value; when true, it
+    uses rolling high enabling earlier recovery recognition. This flag establishes whether drawdown is
+    measured against fixed or adaptive benchmarks.
+  evidence: Algorithm.Framework/Risk/MaximumDrawdownPercentPortfolio.py:19-44(module)
+  stage: Algorithm.Framework.Risk
+  alternative_considered: Forcing one methodology would simplify but remove useful flexibility
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Risk/MaximumDrawdownPercentPortfolio.py'
+- id: BD-126
+  type: BA/DK
+  content: VolumeWeightedAveragePriceExecutionModel maximum_order_quantity_percent_volume defaults to
+    1% of bar volume
+  rationale: The 1% volume participation default establishes a conservative market impact boundary limiting
+    orders to 1/100th of bar volume. This low participation rate balances execution efficiency against
+    price impact, creating a default boundary that favors price preservation over execution speed for
+    most trading scenarios.
+  evidence: Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.py:28(module)
+  stage: Algorithm.Framework.Execution
+  alternative_considered: Higher participation (5-10%) would execute faster but increase market impact
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in Algorithm.Framework/Execution/VolumeWeightedAveragePriceExecutionModel.py'
+- id: BD-127
+  type: BA/M
+  content: 'INTERACTION: BD-014 × BD-126 × BD-043 → Triple 1% volume limit amplification creates redundant
+    but inconsistent guardrails'
+  rationale: Three separate decisions (VWAP ExecutionModel default, VolumeWeightedAveragePriceExecutionModel
+    default, and explicit regression algorithm setting) each establish 1% volume limits. While providing
+    defense-in-depth, this redundancy suggests the boundary was not explicitly documented as a system-level
+    policy, creating maintenance risk if one location is changed without updating others.
+  evidence: BD-014,BD-043,BD-126
+  stage: global
+  alternative_considered: Centralizing volume limit policy in single configuration location was rejected
+    due to backward compatibility concerns
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-128
+  type: BA/DK
+  content: 'INTERACTION: BD-019 × BD-017 × BD-111 → Risk cascade: trailing stop trigger → insight cancellation
+    → portfolio reconstruction loop'
+  rationale: 'When TrailingStopRiskManagementModel triggers (BD-017, BD-111), it liquidates positions
+    AND cancels active insights (BD-019). This creates a cascade where: risk model fires → insights cancelled
+    → PortfolioConstructionModel receives cancelled insights → new portfolio weights generated → RebalanceOnInsightChanges
+    (default true) triggers rebalancing → new insights generated → potentially re-entering near the stop
+    price. This loop can amplify losses in volatile markets.'
+  evidence: BD-017,BD-019,BD-111
+  stage: global
+  alternative_considered: Cooldown period after stop trigger was rejected for complexity
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-129
+  type: B/BA
+  content: 'INTERACTION: BD-011 × BD-107 × BD-115 → Contradiction: LONG_SHORT bias with 1/N excluding
+    FLAT produces under-allocated portfolios'
+  rationale: EqualWeighting defaults to PortfolioBias.LONG_SHORT (BD-011, BD-107), but computes 1/N excluding
+    FLAT insights (BD-115). When some symbols have no direction (FLAT), the portfolio is under-allocated
+    below 100%. This contradicts the intent of LONG_SHORT bias which should maximize directional exposure.
+    Users expecting 100% allocation with LONG_SHORT may have hidden cash drag they don't anticipate.
+  evidence: BD-011,BD-107,BD-115
+  stage: global
+  alternative_considered: Redistributing FLAT-excluded weight to remaining symbols was rejected to preserve
+    insight signal integrity
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-130
+  type: B/BA
+  content: 'INTERACTION: BD-024 × BD-099 → Hidden dependency: Forex/CFD zero slippage bypasses volume_share²
+    model entirely'
+  rationale: Forex/CFD securities report no volume data (BD-024), causing zero slippage with warning.
+    However, the VolumeShareSlippageModel (BD-099) explicitly uses volume_share² formula for price impact.
+    When volume is zero or missing, the model silently returns zero rather than applying alternative cost
+    estimation (e.g., spread-based). Users may incorrectly assume slippage is properly modeled for Forex
+    strategies when it's effectively disabled.
+  evidence: BD-024,BD-099
+  stage: global
+  alternative_considered: Using spread-based fallback was rejected to maintain simple zero-slippage behavior
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-131
+  type: BA/M
+  content: 'INTERACTION: BD-051 × BD-040 → Amplification: sector-balanced QC500 universe + equal weighting
+    concentrates illiquid sectors'
+  rationale: QC500 selects 500 stocks by taking top dollar-volume within each sector (BD-051), ensuring
+    sector representation even if some sectors have few liquid stocks. EqualWeightingPortfolioConstructionModel
+    (BD-040) allocates 1/N to each symbol equally. Combined, sectors with few liquid stocks get equal
+    allocation as sectors with many, amplifying concentration in illiquid names. A sector with 5 stocks
+    gets same total weight as a sector with 50 stocks, concentrating risk in sparse sectors.
+  evidence: BD-040,BD-051
+  stage: global
+  alternative_considered: Liquidity-weighted allocation within sectors was rejected for complexity
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-132
+  type: B
+  content: 'INTERACTION: BD-121 × BD-030 → Hidden timezone dependency: VWAP midnight reset incompatible
+    with non-US hourly testing'
+  rationale: VWAP resets at calendar midnight regardless of timezone (BD-121), but framework regression
+    testing uses hourly resolution with RAW normalization (BD-030). Hourly bars naturally align with calendar
+    hours, masking the midnight reset issue during testing. Algorithms using different timezones or intraday
+    resolutions would experience VWAP discontinuities at midnight that regression tests never validate.
+  evidence: BD-030,BD-121
+  stage: global
+  alternative_considered: Session-based VWAP reset was rejected as session boundaries vary by asset class
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-GAP-001
+  type: M
+  content: 'Missing: Convergence criteria explicit declaration'
+  rationale: 'Audit finding: missing: convergence criteria explicit declaration. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: universe_selection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-002
+  type: M/DK
+  content: 'Missing: Day count convention'
+  rationale: 'Audit finding: missing: day count convention. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: universe_selection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-003
+  type: B
+  content: 'Missing: Day Count and Compounding Conventions'
+  rationale: 'Audit finding: missing: day count and compounding conventions. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: universe_selection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-004
+  type: B
+  content: 'Missing: Default Definition and IFRS 9 Stage Mapping'
+  rationale: 'Audit finding: missing: default definition and ifrs 9 stage mapping. Identified by audit
+    checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: universe_selection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-005
+  type: B
+  content: 'Missing: GHG Emission Scope Boundaries'
+  rationale: 'Audit finding: missing: ghg emission scope boundaries. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: universe_selection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-006
+  type: B
+  content: 'Missing: Emission Factor Version and Source'
+  rationale: 'Audit finding: missing: emission factor version and source. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: universe_selection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-007
+  type: B
+  content: 'Missing: RL Reward Function Transaction Cost Modeling'
+  rationale: 'Audit finding: missing: rl reward function transaction cost modeling. Identified by audit
+    checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: universe_selection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-008
+  content: 'Missing: Day count convention'
+  type: M/DK
+  rationale: 'Audit finding: missing: day count convention. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: universe_selection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-009
+  content: 'Missing: Day Count and Compounding Conventions'
+  type: B
+  rationale: 'Audit finding: missing: day count and compounding conventions. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: universe_selection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-010
+  content: 'Missing: RL Reward Function Transaction Cost Modeling'
+  type: B
+  rationale: 'Audit finding: missing: rl reward function transaction cost modeling. Identified by audit
+    checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: universe_selection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: C# QuantBook Research Environment Setup
+  source: Research/BasicCSharpQuantBookTemplate.ipynb
+  type: research_analysis
+  business_problem: Provides a foundational C# research environment template for loading QuantBook and
+    fetching historical data across multiple asset classes for analysis.
+  intent_keywords:
+  - C#
+  - QuantBook
+  - research environment
+  - historical data
+  - multi-asset
+  stage: data_collection
+  negative_keywords:
+  - Python
+  - backtesting
+  - live trading
+  - custom data
+  - indicators
+  disambiguation: Are you looking for C# specifically, or would a Python template work for your needs?
+  data_domain: mixed
+- id: UC-102
+  name: Python QuantBook Basic Research with Indicators
+  source: Research/BasicQuantBookTemplate.ipynb
+  type: research_analysis
+  business_problem: Provides a Python research environment template demonstrating QuantBook setup, historical
+    data fetching, price plotting, and Bollinger Bands indicator calculation.
+  intent_keywords:
+  - Python
+  - QuantBook
+  - Bollinger Bands
+  - research
+  - plotting
+  stage: data_collection
+  negative_keywords:
+  - C#
+  - backtesting
+  - live trading
+  - custom data
+  disambiguation: Do you need to see indicator calculations like Bollinger Bands, or just basic historical
+    data retrieval?
+  data_domain: market_data
+- id: UC-103
+  name: C# Comprehensive QuantBook API and Data Fetching
+  source: Research/KitchenSinkCSharpQuantBookTemplate.ipynb
+  type: research_analysis
+  business_problem: Comprehensive C# template demonstrating QuantBook API cloud connectivity, project
+    listing, and multiple methods for fetching historical data with different parameters and asset types.
+  intent_keywords:
+  - C#
+  - QuantBook
+  - API
+  - cloud
+  - historical data
+  - multiple methods
+  stage: data_collection
+  negative_keywords:
+  - Python
+  - backtesting
+  - live trading
+  - strategy
+  disambiguation: Do you need to connect to the QuantConnect cloud API and list projects, or just need
+    basic historical data fetching?
+  data_domain: mixed
+- id: UC-104
+  name: Python Kitchen Sink QuantBook with Options
+  source: Research/KitchenSinkQuantBookTemplate.ipynb
+  type: research_analysis
+  business_problem: Most comprehensive Python template showing QuantBook API connectivity, multi-asset
+    data (including options), option history filtering, multiple data fetching methods, and price plotting.
+  intent_keywords:
+  - Python
+  - QuantBook
+  - options
+  - multi-asset
+  - API
+  - plotting
+  stage: data_collection
+  negative_keywords:
+  - C#
+  - backtesting
+  - live trading
+  - custom data
+  disambiguation: Do you specifically need options data and option history filtering, or would equity/forex/crypto
+    historical data suffice?
+  data_domain: mixed
+- id: UC-105
+  name: C# Custom Data Type for Research
+  source: Tests/Research/RegressionTemplates/BasicTemplateCustomDataTypeHistoryResearchCSharp.ipynb
+  type: research_analysis
+  business_problem: Demonstrates how to create and implement a custom data type in C# extending DynamicData,
+    including custom source fetching from remote CSV files for research analysis.
+  intent_keywords:
+  - C#
+  - custom data
+  - DynamicData
+  - CSV
+  - remote file
+  stage: data_collection
+  negative_keywords:
+  - Python
+  - built-in data
+  - equity
+  - forex
+  - backtesting
+  disambiguation: Are you trying to load your own external CSV data source, or do you need standard market
+    data like equities or forex?
+  data_domain: financial_data
+- id: UC-106
+  name: Python Custom Data Type Implementation
+  source: Tests/Research/RegressionTemplates/BasicTemplateCustomDataTypeHistoryResearchPython.ipynb
+  type: research_analysis
+  business_problem: Shows how to implement a custom data type in Python using PythonData base class, defining
+    custom GetSource and Reader methods to fetch data from remote CSV for research.
+  intent_keywords:
+  - Python
+  - custom data
+  - PythonData
+  - CSV
+  - remote data
+  stage: data_collection
+  negative_keywords:
+  - C#
+  - built-in data
+  - equity
+  - forex
+  - backtesting
+  disambiguation: Do you need to load your own custom data from an external source, or are you looking
+    for standard market data feeds?
+  data_domain: financial_data
+- id: UC-107
+  name: C# Basic Date-Range Historical Data Research
+  source: Tests/Research/RegressionTemplates/BasicTemplateResearchCSharp.ipynb
+  type: research_analysis
+  business_problem: Minimal C# template demonstrating QuantBook setup with date-range based historical
+    data fetching for research analysis.
+  intent_keywords:
+  - C#
+  - QuantBook
+  - date range
+  - historical data
+  - research
+  stage: data_collection
+  negative_keywords:
+  - Python
+  - indicators
+  - options
+  - custom data
+  disambiguation: Do you need C# specifically, and only basic historical data fetching within a date range?
+  data_domain: market_data
+- id: UC-108
+  name: Python Basic Research with Indicator History
+  source: Tests/Research/RegressionTemplates/BasicTemplateResearchPython.ipynb
+  type: research_analysis
+  business_problem: Python research template showing QuantBook setup, date-range historical data fetching,
+    and Bollinger Bands indicator history retrieval for technical analysis.
+  intent_keywords:
+  - Python
+  - QuantBook
+  - indicator
+  - Bollinger Bands
+  - IndicatorHistory
+  - research
+  stage: factor_computation
+  negative_keywords:
+  - C#
+  - backtesting
+  - live trading
+  - options
+  disambiguation: Are you looking to calculate indicator history like Bollinger Bands, or do you just
+    need basic price data?
+  data_domain: market_data
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 29
+  evidence_invalid: 97
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.23015873015873015
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 9
+    warn: 8
+    fail: 3
+  subdomain_totals:
+    pass: 9
+    warn: 21
+    fail: 17
+  coverage: 67/67 (100%)
+  pass_rate: 18/67 (26%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: data_provider
+  description: Choose based on data source availability and cost; local files are free and sufficient
+    for most backtesting; brokerage downloader for broker-specific data
+  used_in_stages: []
+  options:
+  - name: SubscriptionDataReaderHistoryProvider (default)
+    traits:
+    - local_files_only
+    - no_api_cost
+    - offline_capable
+    fit_for:
+    - Backtesting with pre-downloaded Lean data files
+    not_fit_for:
+    - Live trading, real-time data, proprietary data feeds
+  - name: BrokerageDataDownloader
+    traits:
+    - live_data
+    - brokerage_required
+    - streaming_capable
+    fit_for:
+    - Downloading historical data from a brokerage for backtesting
+    not_fit_for:
+    - Backtesting without brokerage account
+  - name: Custom IDataProvider
+    traits:
+    - custom_data_source
+    - extensible
+    - any_format
+    fit_for:
+    - Proprietary data formats, third-party data providers
+    not_fit_for:
+    - Standard market data needs
+  default: SubscriptionDataReaderHistoryProvider
+  _source: worker_resource
+- id: slot-002
+  name: history_provider
+  description: Live trading uses BrokerageHistoryProvider; backtesting uses SubscriptionDataReaderHistoryProvider;
+    both can be chained
+  used_in_stages: []
+  options:
+  - name: SubscriptionDataReaderHistoryProvider (default)
+    traits:
+    - local_files
+    - warmup
+    - backtesting_only
+    fit_for:
+    - Backtesting and warmup with local data
+    not_fit_for:
+    - Live trading history requests
+  - name: BrokerageHistoryProvider
+    traits:
+    - live_data
+    - streaming
+    - real_time_requests
+    fit_for:
+    - Live trading with brokerage-provided historical data
+    not_fit_for:
+    - Offline/backtesting mode
+  default: SubscriptionDataReaderHistoryProvider, BrokerageHistoryProvider
+  _source: worker_resource
+- id: slot-003
+  name: brokerage
+  description: Select based on asset classes needed, geographic coverage, fee structure, and API capabilities
+  used_in_stages: []
+  options:
+  - name: Alpaca
+    traits:
+    - us_equities
+    - crypto
+    - websocket
+    - easy_setup
+    fit_for:
+    - Retail traders, US equities and crypto, API-first brokerage
+    not_fit_for:
+    - Options, futures, forex, international markets
+  - name: Interactive Brokers
+    traits:
+    - global_markets
+    - stocks
+    - options
+    - futures
+    - forex
+    - commodities
+    - ib_gateway
+    fit_for:
+    - Professional traders needing multi-asset coverage, global markets
+    not_fit_for:
+    - Crypto-only strategies, simplest setup needs
+  - name: Binance
+    traits:
+    - crypto
+    - spot
+    - websocket
+    - low_fees
+    fit_for:
+    - Crypto spot trading, high-volume strategies
+    not_fit_for:
+    - Stock/options strategies
+  - name: Binance Futures
+    traits:
+    - crypto
+    - futures
+    - leverage
+    - websocket
+    fit_for:
+    - Crypto derivatives trading, leveraged strategies
+    not_fit_for:
+    - Spot-only traders
+  - name: Bybit
+    traits:
+    - crypto
+    - derivatives
+    - websocket
+    fit_for:
+    - Crypto perpetual futures, derivatives
+    not_fit_for:
+    - Traditional securities
+  - name: TD Ameritrade (Tradier)
+    traits:
+    - us_equities
+    - options
+    - websocket
+    fit_for:
+    - US options traders, Tradier users
+    not_fit_for:
+    - Forex, futures, crypto
+  - name: OANDA
+    traits:
+    - forex
+    - cfd
+    - websocket
+    fit_for:
+    - Forex and CFD trading
+    not_fit_for:
+    - Stock trading
+  - name: Kraken
+    traits:
+    - crypto
+    - forex
+    - websocket
+    fit_for:
+    - Kraken users, crypto with margin
+    not_fit_for:
+    - US stocks
+  default: None (must be explicitly configured)
+  _source: worker_resource
+- id: slot-004
+  name: messaging_handler
+  description: Use built-in for standard operation; custom handler only for specialized result delivery
+  used_in_stages: []
+  options:
+  - name: QuantConnect.Messaging.Messaging (default)
+    traits:
+    - zero_mq
+    - tcp
+    - local_network
+    fit_for:
+    - Standard backtesting/live result delivery to Lean engine
+    not_fit_for:
+    - Cloud deployment, cross-datacenter communication
+  - name: Custom IMessagingHandler
+    traits:
+    - extensible
+    - any_transport
+    fit_for:
+    - Custom result delivery (Slack, email, database logging)
+    not_fit_for:
+    - Standard result handling
+  default: QuantConnect.Messaging.Messaging
+  _source: worker_resource
+- id: slot-005
+  name: result_handler
+  description: Automatically selected based on backtesting vs live mode
+  used_in_stages: []
+  options:
+  - name: BacktestingResultHandler (default for backtesting)
+    traits:
+    - file_output
+    - charts
+    - statistics
+    fit_for:
+    - Standard backtesting results
+    not_fit_for:
+    - Live trading
+  - name: LiveTradingResultHandler (default for live)
+    traits:
+    - real_time
+    - streaming
+    - live_charts
+    fit_for:
+    - Live trading monitoring
+    not_fit_for:
+    - Backtesting
+  - name: Custom IResultHandler
+    traits:
+    - extensible
+    fit_for:
+    - Custom result storage (database, cloud storage)
+    not_fit_for:
+    - Standard result handling
+  default: BacktestingResultHandler / LiveTradingResultHandler
+  _source: worker_resource
+- id: slot-006
+  name: job_queue_handler
+  description: Single instance deployments use default; distributed requires custom queue
+  used_in_stages: []
+  options:
+  - name: QuantConnect.Queues.JobQueue (default)
+    traits:
+    - local_queue
+    - file_based
+    fit_for:
+    - Standard local job processing
+    not_fit_for:
+    - Distributed backtesting
+  default: QuantConnect.Queues.JobQueue
+  _source: worker_resource
+- id: slot-007
+  name: object_store
+  description: Use default for local development; custom for cloud/multi-node deployments
+  used_in_stages: []
+  options:
+  - name: LocalObjectStore (default)
+    traits:
+    - local_disk
+    - file_based
+    - 10gb_limit
+    fit_for:
+    - Single-node deployments, algorithm data persistence
+    not_fit_for:
+    - Multi-node, cloud deployments, large files
+  - name: IObjectStore (custom implementation)
+    traits:
+    - extensible
+    - cloud_compatible
+    fit_for:
+    - Cloud deployment, S3-compatible storage, database-backed stores
+    not_fit_for:
+    - Simple single-node setups
+  default: LocalObjectStore
+  _source: worker_resource
+- id: slot-008
+  name: data_feed
+  description: Automatically selected based on backtesting vs live mode
+  used_in_stages: []
+  options:
+  - name: FileSystemDataFeed (default for backtesting)
+    traits:
+    - file_based
+    - historical_only
+    fit_for:
+    - Backtesting with local Lean data files
+    not_fit_for:
+    - Live trading
+  - name: LiveTradingDataFeed (default for live)
+    traits:
+    - streaming
+    - real_time
+    - brokerage_integrated
+    fit_for:
+    - Live trading data subscriptions
+    not_fit_for:
+    - Backtesting
+  - name: Custom IDataFeed
+    traits:
+    - extensible
+    fit_for:
+    - Custom data sources, alternative data feeds
+    not_fit_for:
+    - Standard market data needs
+  default: FileSystemDataFeed (backtesting) / LiveTradingDataFeed (live)
+  _source: worker_resource
+- id: slot-009
+  name: python_runtime
+  description: Use Foundation for research/ML work; custom environment only for specialized deployment
+    constraints
+  used_in_stages: []
+  options:
+  - name: Miniconda3 with Python 3.11 + quantconnect-stubs
+    traits:
+    - ide_support
+    - type_hints
+    - research_ready
+    fit_for:
+    - Standard Python algorithm development
+    not_fit_for:
+    - Minimal runtime environments
+  - name: Lean Foundation Docker image
+    traits:
+    - 300_plus_packages
+    - gpu_ready
+    - ml_complete
+    - research_ready
+    fit_for:
+    - Research notebooks with ML/statistical packages
+    not_fit_for:
+    - Production minimal deployments
+  - name: Custom Python environment
+    traits:
+    - minimal
+    - custom_packages
+    fit_for:
+    - Specific package requirements, air-gapped deployments
+    not_fit_for:
+    - ML research, standard development
+  default: quantconnect/lean:foundation
+  _source: worker_resource
+- id: slot-010
+  name: alpha_handler
+  description: Only needed for QuantConnect Alpha Marketplace or custom signal integration
+  used_in_stages: []
+  options:
+  - name: QuantConnectAlphaRuntimeSynchronizationManager
+    traits:
+    - alpha_messaging
+    - websocket
+    fit_for:
+    - QuantConnect Alpha Marketplace integration
+    not_fit_for:
+    - Standalone trading
+  - name: Custom IAlphaHandler
+    traits:
+    - extensible
+    fit_for:
+    - Proprietary alpha signals, third-party signal providers
+    not_fit_for:
+    - Standard backtesting
+  default: None (optional component)
+  _source: worker_resource
+- id: slot-011
+  name: map_file_provider
+  description: Default sufficient for US equities; custom provider for non-standard mappings
+  used_in_stages: []
+  options:
+  - name: LocalZipMapFileProvider (default)
+    traits:
+    - local_files
+    - us_equities
+    fit_for:
+    - Standard US equity trading
+    not_fit_for:
+    - International markets, frequently changing listings
+  default: LocalZipMapFileProvider
+  _source: worker_resource
+resources:
+- id: res-001
+  type: code_example
+  name: C# QuantBook Research Environment Setup
+  path: Research/BasicCSharpQuantBookTemplate.ipynb
+  description: Provides a foundational C# research environment template for loading QuantBook and fetching
+    historical data across multiple asset classes for analysis.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-002
+  type: code_example
+  name: Python QuantBook Basic Research with Indicators
+  path: Research/BasicQuantBookTemplate.ipynb
+  description: Provides a Python research environment template demonstrating QuantBook setup, historical
+    data fetching, price plotting, and Bollinger Bands indicator calculation.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-003
+  type: code_example
+  name: C# Comprehensive QuantBook API and Data Fetching
+  path: Research/KitchenSinkCSharpQuantBookTemplate.ipynb
+  description: Comprehensive C# template demonstrating QuantBook API cloud connectivity, project listing,
+    and multiple methods for fetching historical data with different parameters and asset types.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-004
+  type: code_example
+  name: Python Kitchen Sink QuantBook with Options
+  path: Research/KitchenSinkQuantBookTemplate.ipynb
+  description: Most comprehensive Python template showing QuantBook API connectivity, multi-asset data
+    (including options), option history filtering, multiple data fetching methods, and price plotting.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-005
+  type: code_example
+  name: C# Custom Data Type for Research
+  path: Tests/Research/RegressionTemplates/BasicTemplateCustomDataTypeHistoryResearchCSharp.ipynb
+  description: Demonstrates how to create and implement a custom data type in C# extending DynamicData,
+    including custom source fetching from remote CSV files for research analysis.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-006
+  type: code_example
+  name: Python Custom Data Type Implementation
+  path: Tests/Research/RegressionTemplates/BasicTemplateCustomDataTypeHistoryResearchPython.ipynb
+  description: Shows how to implement a custom data type in Python using PythonData base class, defining
+    custom GetSource and Reader methods to fetch data from remote CSV for research.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-007
+  type: code_example
+  name: C# Basic Date-Range Historical Data Research
+  path: Tests/Research/RegressionTemplates/BasicTemplateResearchCSharp.ipynb
+  description: Minimal C# template demonstrating QuantBook setup with date-range based historical data
+    fetching for research analysis.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-008
+  type: code_example
+  name: Python Basic Research with Indicator History
+  path: Tests/Research/RegressionTemplates/BasicTemplateResearchPython.ipynb
+  description: Python research template showing QuantBook setup, date-range historical data fetching,
+    and Bollinger Bands indicator history retrieval for technical analysis.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list

@@ -1,0 +1,2935 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-079
+name: AKShare
+stages:
+- id: http_request
+  name: HTTP Request Layer
+  order: 1
+  responsibility: Handles each outbound HTTP requests with retry logic, exponential backoff, and proxy
+    rotation to prevent IP blocking during data scraping operations.
+  interface:
+    inputs:
+    - url (string)
+    - params (dict)
+    - headers (dict)
+    - proxies (dict)
+    outputs:
+    - requests.Response object or parsed JSON/text
+  required_methods:
+  - name: AkshareConfig
+    description: Singleton configuration class storing global proxy settings used across each 400+ scraping
+      functions
+    evidence: akshare/utils/context.py:1
+  - name: ProxyContext
+    description: Context manager for temporarily changing proxy settings within a scoped block
+    evidence: akshare/utils/context.py:31
+  key_behaviors:
+  - behavior: Exponential backoff with random jitter
+    description: Retry delays increase exponentially (base_delay * 2^attempt) with random uniform jitter
+      added to prevent thundering herd on rate-limited APIs
+    evidence: akshare/utils/request.py:61(base_delay*(2**attempt)+random.uniform)
+  - behavior: Session-per-request with connection pool disabled
+    description: Creates new session for each request with pool_connections=1 to avoid connection reuse
+      causing stale state when sources use load balancers
+    evidence: akshare/utils/request.py:46(session with pool_connections=1)
+  replaceable_points:
+  - name: HTTP client
+    description: Could swap the underlying HTTP client library for alternatives
+    options:
+    - name: requests
+      traits:
+      - Synchronous
+      - Mature ecosystem
+      - Wide adoption
+      fit_for:
+      - Standard scraping
+      - Compatibility
+      not_fit_for:
+      - Async operations
+      - HTTP/2
+    - name: httpx
+      traits:
+      - Sync/async
+      - Modern API
+      - HTTP/2 support
+      fit_for:
+      - Async workflows
+      - Modern codebases
+      not_fit_for:
+      - Legacy Python 3.8 compatibility
+    - name: aiohttp
+      traits:
+      - Full async
+      - High performance
+      - Client/Server
+      fit_for:
+      - High concurrency
+      - Web scraping at scale
+      not_fit_for:
+      - Simple synchronous scripts
+    default: requests
+  design_decisions:
+  - 'Singleton for global proxy config: Single source of truth for proxies across 400+ scraping functions
+    (akshare/utils/context.py:4 __new__)'
+  acceptance_hints:
+  - Requests succeed with proper response for valid URLs
+  - Retries occur on connection failures with exponential delay
+  - Proxy settings are respected across each scraping functions
+- id: data_acquisition
+  name: Source-Specific Data Acquisition
+  order: 2
+  responsibility: Module-per-source scraping functions that call external APIs and websites (Sina, Eastmoney,
+    Jin10, THS) to fetch raw financial data.
+  interface:
+    inputs:
+    - symbol/date parameters
+    - time period filters
+    - source selection
+    outputs:
+    - raw JSON/text/HTML responses from external sources
+  required_methods:
+  - name: TLSAdapter
+    description: Custom SSL adapter for TLS connections to handle certificate verification for economic
+      data sources
+    evidence: akshare/economic/macro_china.py:26
+  - name: DataApi
+    description: Premium API client with token-based authentication for paid data access
+    evidence: akshare/pro/client.py:15
+  key_behaviors:
+  - behavior: Module-per-category organization
+    description: 400+ functions grouped by financial domain (stock, futures, forex) and data source, mirroring
+      the Chinese financial market structure
+    evidence: akshare/stock/, akshare/futures/, akshare/forex/
+  - behavior: Source-specific URL/param constants
+    description: Source URLs and API parameters hardcoded in cons.py files per module; requires code updates
+      when external APIs change
+    evidence: akshare/futures/requests_fun.py:16(requests_link)
+  - behavior: Symbol-to-market code mapping
+    description: Futures symbols mapped to Sina internal market codes required for API calls
+    evidence: akshare/futures/futures_zh_sina.py:100(_futures_symbol_mark_df)
+  replaceable_points:
+  - name: Data source
+    description: Could add alternative sources for the same asset class when primary source becomes unavailable
+    options:
+    - name: Sina
+      traits:
+      - Real-time quotes
+      - Widely used
+      - Good coverage
+      fit_for:
+      - Chinese stocks
+      - Futures
+      not_fit_for:
+      - US markets
+      - Historical bulk data
+    - name: Eastmoney
+      traits:
+      - Comprehensive
+      - Official data
+      - Fund data
+      fit_for:
+      - Fund data
+      - Market statistics
+      not_fit_for:
+      - Real-time intraday
+    - name: Jin10
+      traits:
+      - Futures focused
+      - Commodities
+      - Quick updates
+      fit_for:
+      - Commodity futures
+      - Quick quotes
+      not_fit_for:
+      - Stock data
+      - Historical analysis
+    - name: THS
+      traits:
+      - Stock data
+      - Factor calculations
+      fit_for:
+      - Stock factors
+      - Technical indicators
+      not_fit_for:
+      - Futures
+      - Forex
+    default: Sina/Eastmoney
+  design_decisions:
+  - Module-per-category organization mirrors financial domain structure; 400+ functions grouped by data
+    source (akshare/stock/, akshare/futures/, akshare/forex/)
+  acceptance_hints:
+  - Scraping functions return raw responses from external sources
+  - Symbol parameters are correctly mapped to source-specific formats
+  - Source constants resolve to valid URLs
+- id: html_table_extraction
+  name: HTML Table Extraction
+  order: 3
+  responsibility: Parses HTML tables from web pages containing structured financial data into pandas DataFrames
+    using pandas.read_html or BeautifulSoup.
+  interface:
+    inputs:
+    - HTML text response from web scraping
+    outputs:
+    - List of DataFrames or single DataFrame containing table data
+  required_methods:
+  - name: N/A
+    description: No user-facing methods identified by assembly
+    evidence: N/A
+  key_behaviors:
+  - behavior: 20-retry loop with 5-second sleep
+    description: Web scraping is unreliable; 20 retries ensures data retrieval even with transient failures
+      from Chinese websites
+    evidence: akshare/futures/requests_fun.py:33(while True)
+  - behavior: Encoding auto-detection fallback
+    description: Chinese websites use mixed encodings (utf-8, gbk, gb2312); automatic detection with fallback
+      parameters
+    evidence: akshare/futures/requests_fun.py:36(encoding parameter)
+  replaceable_points:
+  - name: HTML parser
+    description: Could swap the HTML parsing engine for different performance/feature tradeoffs
+    options:
+    - name: pandas.read_html
+      traits:
+      - Built on lxml
+      - Simple API
+      - Returns DataFrames directly
+      fit_for:
+      - Simple tables
+      - Quick prototyping
+      not_fit_for:
+      - Complex HTML
+      - Dynamic content
+    - name: beautifulsoup
+      traits:
+      - Flexible
+      - Feature-rich
+      - Multiple parsers
+      fit_for:
+      - Complex HTML
+      - Custom extraction
+      not_fit_for:
+      - Simple tables
+      - Performance critical
+    - name: lxml
+      traits:
+      - Fast C-based
+      - Low memory
+      - XPath support
+      fit_for:
+      - Large scale
+      - Performance
+      not_fit_for:
+      - Quick scripts
+      - Complex navigation
+    default: pandas.read_html
+  design_decisions:
+  - 20-retry loop with 5-second sleep ensures data retrieval reliability from unreliable web sources (akshare/futures/requests_fun.py:33)
+  - Encoding auto-detection fallback handles mixed Chinese website encodings (akshare/futures/requests_fun.py:36)
+  acceptance_hints:
+  - HTML tables are correctly parsed into DataFrames
+  - Encoding errors are handled gracefully
+  - Failed parsing attempts trigger retries
+- id: json_parsing
+  name: JSON Response Parsing
+  order: 4
+  responsibility: Parses JSON API responses from HTTP requests into Python dicts/lists for downstream
+    data processing.
+  interface:
+    inputs:
+    - JSON string/bytes from HTTP response body
+    outputs:
+    - Python dict/list representing parsed JSON structure
+  required_methods:
+  - name: N/A
+    description: No user-facing methods identified by assembly
+    evidence: N/A
+  key_behaviors:
+  - behavior: Empty JSON raises DataParsingError
+    description: Distinguishes empty responses from actual data failures to enable proper error handling
+    evidence: akshare/request.py:34(raise DataParsingError)
+  - behavior: Rate limit status code 429 triggers RateLimitError
+    description: Enables callers to handle rate limits explicitly rather than treating as generic failure
+    evidence: akshare/request.py:39(raise RateLimitError)
+  replaceable_points: []
+  design_decisions:
+  - Empty JSON raises DataParsingError to distinguish empty responses from actual data failures (akshare/request.py:34)
+  - Rate limit status code 429 triggers RateLimitError for explicit handling by callers (akshare/request.py:39)
+  acceptance_hints:
+  - Valid JSON responses are correctly parsed into Python objects
+  - Empty responses raise DataParsingError
+  - Rate-limited responses raise RateLimitError
+- id: column_mapping
+  name: Column Name Standardization
+  order: 5
+  responsibility: Maps raw source field names (f1, f2, f12) to meaningful Chinese column names (最新价, 涨跌幅)
+    for consistent output across different data sources.
+  interface:
+    inputs:
+    - Raw DataFrame with source-specific column names
+    outputs:
+    - DataFrame with standardized Chinese column names
+  required_methods:
+  - name: set_df_columns
+    description: Applies column name mapping with fallback to return empty DataFrame with proper column
+      names when input is empty
+    evidence: akshare/utils/func.py:63
+  key_behaviors:
+  - behavior: Chinese column names as standard
+    description: Output uses Chinese column names as standard since target users are Chinese-speaking
+      and source APIs also use Chinese field names
+    evidence: akshare/stock_feature/stock_hist_em.py:254(columns)
+  - behavior: Empty dataframe returns named columns
+    description: Prevents downstream errors when data unavailable; maintains schema consistency by returning
+      DataFrame with column names but zero rows
+    evidence: akshare/utils/func.py:73(if df.shape==(0,0))
+  replaceable_points:
+  - name: Column naming convention
+    description: Could add English column aliases for international users
+    options:
+    - name: Chinese
+      traits:
+      - Default
+      - Native speakers
+      - Source-compatible
+      fit_for:
+      - Chinese users
+      - Documentation consistency
+      not_fit_for:
+      - International users
+      - English-only codebases
+    - name: English
+      traits:
+      - International standard
+      - Programming convention
+      fit_for:
+      - English speakers
+      - Integration with English code
+      not_fit_for:
+      - Chinese documentation
+      - Legacy data compatibility
+    - name: Both
+      traits:
+      - Maximum compatibility
+      - Bilingual support
+      fit_for:
+      - Mixed teams
+      - Transitioning codebases
+      not_fit_for:
+      - Increased maintenance
+      - Larger output
+    default: Chinese
+  design_decisions:
+  - Chinese column names as standard targets Chinese-speaking users; source APIs also use Chinese field
+    names (akshare/stock_feature/stock_hist_em.py:254)
+  - Empty dataframe returns named columns to prevent downstream errors while maintaining schema consistency
+    (akshare/utils/func.py:73)
+  acceptance_hints:
+  - Raw column names (f1, f12) are mapped to meaningful Chinese names (最新价, 涨跌幅)
+  - Empty DataFrames have correct column schema
+  - Unmapped columns are either preserved or handled consistently
+- id: type_conversion
+  name: Data Type Conversion
+  order: 6
+  responsibility: Converts string columns to numeric types (float/int) to enable numerical analysis on
+    financial data that arrives as strings from web sources.
+  interface:
+    inputs:
+    - DataFrame with string/object columns
+    outputs:
+    - DataFrame with numeric columns (float64, int64)
+  required_methods:
+  - name: N/A
+    description: No user-facing methods identified by assembly
+    evidence: N/A
+  key_behaviors:
+  - behavior: Coerce errors to NaN
+    description: Handles missing or corrupted values gracefully using errors='coerce' without failing
+      the entire parse operation
+    evidence: akshare/stock_feature/stock_hist_em.py:315(pd.to_numeric(...,errors='coerce'))
+  replaceable_points: []
+  design_decisions:
+  - Coerce errors to NaN handles missing/corrupted values gracefully without failing entire parse (akshare/stock_feature/stock_hist_em.py:315)
+  acceptance_hints:
+  - String numeric values (e.g., '123.45') are converted to float64
+  - Invalid values become NaN rather than raising errors
+  - Non-numeric columns remain unchanged
+- id: pagination
+  name: Paginated Data Fetching
+  order: 7
+  responsibility: Iterates through multiple pages of API/web results and combines them into a single DataFrame
+    for bulk data downloads.
+  interface:
+    inputs:
+    - url with base_params including page number
+    outputs:
+    - Combined DataFrame across each pages
+  required_methods:
+  - name: fetch_paginated_data
+    description: Handles pagination with progress bar display for user feedback during large downloads
+    evidence: akshare/utils/func.py:18
+  key_behaviors:
+  - behavior: Random delay between page requests
+    description: Reduces server load and avoids triggering anti-scraping measures with 0.5-1.5 second
+      random delays
+    evidence: akshare/utils/func.py:49(time.sleep(random.uniform(0.5,1.5)))
+  replaceable_points: []
+  design_decisions:
+  - Random delay between page requests reduces server load and avoids anti-scraping measures (akshare/utils/func.py:49)
+  acceptance_hints:
+  - Multi-page requests are combined into single DataFrame
+  - Progress bar shows pagination progress
+  - Random delays prevent rate limiting
+- id: trading_calendar
+  name: Trading Calendar Validation
+  order: 8
+  responsibility: Validates date parameters against exchange trading calendars to skip non-trading days
+    and normalize date formats for Chinese markets.
+  interface:
+    inputs:
+    - date string (YYYYMMDD/YYYY-MM-DD/date object)
+    outputs:
+    - Normalized date object or list of trading dates
+  required_methods:
+  - name: get_rank_sum_daily
+    description: Iterates trading days with calendar check to ensure only valid trading dates are processed
+    evidence: akshare/futures/cot.py:56
+  key_behaviors:
+  - behavior: Triple date format acceptance
+    description: Users provide dates in various formats; normalized to single internal format to simplify
+      downstream processing
+    evidence: akshare/futures/cot.py:85(convert_date())
+  - behavior: Warn on non-trading day, continue
+    description: Non-trading day encounters are non-fatal warnings for bulk downloads; user can filter
+      warnings to see issues
+    evidence: akshare/futures/cot.py:104(warnings.warn)
+  replaceable_points:
+  - name: Calendar source
+    description: Could integrate external exchange calendar library for more accurate trading day calculations
+    options:
+    - name: builtin
+      traits:
+      - No dependencies
+      - Maintained with library
+      fit_for:
+      - Standard use
+      - Basic coverage
+      not_fit_for:
+      - Holiday edge cases
+      - International exchanges
+    - name: exchange_calendar
+      traits:
+      - Comprehensive
+      - Actively maintained
+      - Multiple exchanges
+      fit_for:
+      - Accurate calendars
+      - US markets
+      not_fit_for:
+      - Added dependency
+      - Chinese-specific holidays
+    - name: trading_calendars
+      tasks:
+      - Zipline-based
+      - Institutional grade
+      fit_for:
+      - Quant workflows
+      - Backtesting
+      not_fit_for:
+      - Simple scripts
+      - Lightweight needs
+    default: builtin
+  design_decisions:
+  - Triple date format acceptance normalizes YYYYMMDD/YYYY-MM-DD/datetime.date to internal format (akshare/futures/cot.py:85)
+  - Warn on non-trading day but continue processing for bulk downloads (akshare/futures/cot.py:104)
+  acceptance_hints:
+  - Date parameters are correctly normalized to single format
+  - Non-trading days are detected and warned
+  - Trading date iteration respects calendar
+- id: adjustment_processing
+  name: Price Adjustment Processing
+  order: 9
+  responsibility: Handles forward/backward price adjustment factors for historical stock data to enable
+    accurate return calculations across different adjustment methods.
+  interface:
+    inputs:
+    - raw price data DataFrame
+    - adjust parameter (qfq/hfq/'')
+    outputs:
+    - Adjusted price DataFrame based on adjustment mode
+  required_methods:
+  - name: stock_zh_a_daily
+    description: Supports qfq (forward) and hfq (backward) adjustment modes for historical stock prices
+    evidence: akshare/stock/stock_zh_a_sina.py:127
+  key_behaviors:
+  - behavior: Adjustment factor embedded in URL params
+    description: Source API handles adjustment calculation; akshare passes the adjustment parameter through
+      to the source
+    evidence: akshare/stock_feature/stock_hist_em.py:952(adjust parameter)
+  - behavior: Three adjustment modes
+    description: qfq=forward adjustment, hfq=backward adjustment, ''=no adjustment; covers each common
+      use cases for returns analysis
+    evidence: 'akshare/stock_feature/stock_hist_em.py:952(adjust: str='''')'
+  replaceable_points: []
+  design_decisions:
+  - Adjustment factor embedded in URL params lets source API handle calculation (akshare/stock_feature/stock_hist_em.py:952)
+  - Three adjustment modes (qfq/hfq/none) cover each common use cases (akshare/stock_feature/stock_hist_em.py:952)
+  acceptance_hints:
+  - qfq mode returns forward-adjusted prices
+  - hfq mode returns backward-adjusted prices
+  - Empty adjust parameter returns unadjusted prices
+- id: volatility_calculation
+  name: Realized Volatility Calculation
+  order: 10
+  responsibility: Mathematical computation of Yang-Zhang realized volatility from minute-level high-frequency
+    price data for risk management and strategy development.
+  interface:
+    inputs:
+    - minute-level price DataFrame (open/high/low/close/volume)
+    outputs:
+    - Realized volatility series
+  required_methods:
+  - name: volatility_yz_rv
+    description: Yang-Zhang realized volatility algorithm implementing open-close, overnight, and continuous
+      volatility components
+    evidence: akshare/cal/rv.py:92
+  key_behaviors:
+  - behavior: Yang-Zhang formula specifically
+    description: Implements open-close volatility plus overnight plus continuous components; considered
+      academic standard for realized volatility
+    evidence: akshare/cal/rv.py:92(volatility_yz_rv)
+  - behavior: Wraps data fetching internally
+    description: Convenience wrapper rv_from_stock_zh_a_hist_min_em hides data acquisition complexity
+      from calculation logic
+    evidence: akshare/cal/rv.py:13(rv_from_stock_zh_a_hist_min_em)
+  replaceable_points:
+  - name: Volatility estimator
+    description: Could add other volatility estimators for different characteristics and use cases
+    options:
+    - name: Yang-Zhang
+      traits:
+      - Open-close decomposition
+      - Academic standard
+      - Overnight adjustment
+      fit_for:
+      - Daily vol estimation
+      - Risk models
+      not_fit_for:
+      - Ultra-high frequency
+      - Jump detection
+    - name: Realized Kernel
+      traits:
+      - Noise-robust
+      - Smooth
+      - ' microstructure aware'
+      fit_for:
+      - High-frequency data
+      - Noise-rich data
+      not_fit_for:
+      - Daily data
+      - Simple use cases
+    - name: Bipower Variation
+      traits:
+      - Jump-robust
+      - Leverage-robust
+      - Efficient
+      fit_for:
+      - Jump detection
+      - Crash analysis
+      not_fit_for:
+      - Low-frequency data
+      - Smooth vol only
+    default: Yang-Zhang
+  design_decisions:
+  - Yang-Zhang formula specifically implements open-close plus overnight plus continuous volatility components
+    (akshare/cal/rv.py:92)
+  - Wraps data fetching internally via convenience wrapper hides complexity from calculation (akshare/cal/rv.py:13)
+  acceptance_hints:
+  - Yang-Zhang volatility is correctly computed from minute data
+  - Output volatility series has proper index alignment
+  - Wrapper function correctly fetches and processes data
+source:
+  commit_hash: e47f1ad65fd497258cbf4c6d0a722bbdb6519ab4
+  extraction_methods:
+  - semi_auto
+  projects:
+  - akshare
+sop_version: '3.6'
+business_decisions:
+- id: BD-001
+  type: B
+  content: Session created per request with pool_connections=1
+  rationale: A new session is created for each HTTP request with pool_connections=1 to prevent connection
+    pool reuse issues and avoid failures from servers that close idle connections. This avoids stale connection
+    errors at the cost of not benefiting from TCP keep-alive optimization.
+  evidence: akshare/utils/request.py:15(request_with_retry)
+  stage: pagination
+  alternative_considered: Connection pooling with periodic health checks and connection refresh
+- id: BD-002
+  type: B
+  content: Exponential backoff with random jitter
+  rationale: Exponential backoff with random jitter distributes retry load across clients and prevents
+    thundering herd problems when a server recovers from outage. The jitter prevents synchronized retries
+    from overwhelming the recovering server at exactly the same moment.
+  evidence: akshare/utils/request.py:15(request_with_retry)
+  stage: pagination
+  alternative_considered: Fixed interval retry, linear backoff, or circuit breaker pattern
+- id: BD-003
+  type: BA
+  content: TLSAdapter lowers SECLEVEL=1 for legacy server compatibility
+  rationale: The TLSAdapter is configured to lower SSL SECLEVEL from default 2 to 1 to enable connections
+    with legacy Chinese financial data servers that use deprecated ciphers. This compatibility trade-off
+    weakens security guarantees by accepting weaker cipher suites including those vulnerable to POODLE
+    and other attacks.
+  evidence: akshare/economic/macro_china.py:26(tlsadapter)
+  stage: pagination
+  alternative_considered: Per-domain exception list, dedicated SSL context for known legacy servers only
+  _evidence_issues:
+  - 'FN_NOT_FOUND: tlsadapter in akshare/economic/macro_china.py'
+- id: BD-004
+  type: BA
+  content: demjson used instead of json module for parsing
+  rationale: demjson library is used instead of the standard json module because Sina and similar Chinese
+    financial data sources return malformed JavaScript-style JSON that stdlib json rejects. demjson tolerates
+    unquoted keys, single quotes, and trailing commas at the cost of slower parsing performance and maintenance
+    burden of an additional dependency.
+  evidence: akshare/utils/demjson.py:1(module)
+  stage: pagination
+  alternative_considered: Preprocessing string normalization, or using the faster ijson for streaming
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/utils/demjson.py'
+- id: BD-005
+  type: M/DK
+  content: Column names in Chinese (e.g., 代码, 名称, 最新价)
+  rationale: DataFrame columns use Chinese character names to match the target audience expectations and
+    source data conventions. Chinese users find familiar naming like 代码 (code), 名称 (name), and 最新价 (latest
+    price) more intuitive, and this approach avoids translation ambiguity in domain-specific financial
+    terminology.
+  evidence: akshare/stock/stock_zh_a_sina.py:45(stock_zh_a_spot)
+  stage: json_parsing
+  alternative_considered: Dual-language column names or configurable column naming
+- id: BD-006
+  type: B
+  content: pd.to_numeric with errors='coerce' for data cleaning
+  rationale: pd.to_numeric with errors='coerce' is used to convert string values to numeric types, turning
+    invalid values like empty strings or text into NaN instead of raising exceptions. This prevents crashes
+    from malformed data and defers error handling to analysis time rather than collection time.
+  evidence: akshare/fund/fund_em.py:32(fund_purchase_em)
+  stage: json_parsing
+  alternative_considered: Strict validation with exception raising, or logging invalid entries
+- id: BD-007
+  type: BA
+  content: demjson.decode handles non-standard JSON from Sina API
+  rationale: demjson.decode is called in the stock data fetching function because Sina API returns JavaScript-like
+    format with features that Python stdlib json cannot parse, such as trailing commas and unquoted property
+    names. This tolerance allows successful data extraction from the non-compliant API response format.
+  evidence: akshare/stock/stock_zh_a_sina.py:45(stock_zh_a_spot)
+  stage: json_parsing
+  alternative_considered: String preprocessing to normalize JSON, or requesting proper JSON format from
+    source
+- id: BD-008
+  type: M/BA
+  content: One file per data source architecture
+  rationale: Each financial data source (exchange) is implemented as a separate Python file following
+    the principle of separation of concerns. This modular structure enables independent updates when source
+    APIs change, easier testing, and clear ownership. It also facilitates parallel development and reduces
+    merge conflicts.
+  evidence: akshare/stock/stock_zh_a_sina.py:45(stock_zh_a_spot)
+  stage: type_conversion
+  alternative_considered: Class-based source abstraction, or plugin architecture for adding new sources
+- id: BD-009
+  type: M
+  content: URLs as module-level constants
+  rationale: API endpoints and data source URLs are stored as module-level constants in a dedicated cons.py
+    file, separating configuration from implementation logic. This design enables updating endpoints without
+    modifying function code and provides a single location for URL maintenance across the entire data
+    provider.
+  evidence: akshare/stock/cons.py:10(zh_sina_kcb_stock_url)
+  stage: type_conversion
+  alternative_considered: External configuration file, environment variables, or configuration management
+    system
+  _evidence_issues:
+  - 'FN_NOT_FOUND: zh_sina_kcb_stock_url in akshare/stock/cons.py'
+- id: BD-010
+  type: B
+  content: Date format conversion in each function accepts multiple formats
+  rationale: Each data fetching function implements date format conversion to accept user inputs in various
+    formats including YYYY-MM-DD strings, YYYYMMDD compact strings, and date objects. This flexibility
+    reduces friction for users who may have dates in different formats from various data sources, but
+    requires conversion logic duplication across functions.
+  evidence: akshare/futures/cot.py:56(get_rank_sum_daily)
+  stage: type_conversion
+  alternative_considered: Shared date utility function, or standardized date input validation
+- id: BD-011
+  type: M/DK
+  content: Yang-Zhang volatility separates overnight and intraday components
+  rationale: Yang-Zhang volatility estimator is used instead of simple close-to-close variance because
+    it separately models overnight returns (close-to-open gaps) and intraday returns (open-to-close moves).
+    This academic standard reduces bias from overnight price jumps common in Asian markets and provides
+    more accurate realized volatility estimates for trading applications.
+  evidence: akshare/cal/rv.py:92(volatility_yz_rv)
+  stage: advanced_analytics
+  alternative_considered: Simple close-to-close, Garman-Klass, or Parkinson volatility estimators
+- id: BD-012
+  type: M
+  content: DateTime index required for time-aware calculations
+  rationale: Realized volatility and similar time-series analytics functions require pandas DataFrames
+    with DateTimeIndex for proper calculation. This explicit requirement ensures time-aware computations
+    (gaps, intervals, rolling windows) work correctly. The requirement documents the data structure contract
+    that calling code must satisfy.
+  evidence: akshare/cal/rv.py:13(rv_from_stock_zh_a_hist_min_em)
+  stage: advanced_analytics
+  alternative_considered: Automatic datetime parsing from column data, or flexible index handling
+- id: BD-013
+  type: M
+  content: __getattr__ enables dynamic method binding for Pro API
+  rationale: DataApi class implements __getattr__ to enable dynamic method binding, allowing users to
+    call pro.variety_all() and similar methods without explicit method definitions for each API endpoint.
+    This design avoids massive if/elif chains for each API and enables dynamic discovery of available
+    methods from the underlying data source.
+  evidence: akshare/pro/client.py:69(__getattr__)
+  stage: pro_api_client
+  alternative_considered: Explicit method definitions, or method factory pattern with registration
+- id: BD-014
+  type: M
+  content: Token stored in singleton config for Pro API
+  rationale: Pro API authentication token is stored in a singleton configuration object, allowing users
+    to set it once via set_token() and have it automatically retrieved on each subsequent API calls. This
+    pattern provides convenience while maintaining separation between configuration and API usage, enabling
+    token persistence across function calls.
+  evidence: akshare/pro/data_pro.py:16(pro_api)
+  stage: pro_api_client
+  alternative_considered: Environment variable storage, encrypted file storage, or re-authentication per
+    session
+- id: BD-015
+  type: B/DK
+  content: 'Basis calculation formula: spot_price - futures_settlement_price'
+  rationale: 'Implements the industry-standard basis calculation where basis = spot - futures. This captures
+    the cost-of-carry relationship between cash and derivatives markets. Boundary: Applied to each futures
+    contracts where both spot and settlement prices are available.'
+  evidence: akshare/futures/futures_basis.py:276-277(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/futures/futures_basis.py'
+- id: BD-016
+  type: B
+  content: 'Basis rate calculation: (price / spot - 1) percentage form'
+  rationale: 'Expresses basis as a normalized percentage to enable comparison across different price levels
+    and contract months. Essential for cross-commodity basis analysis. Boundary: Results normalized to
+    percentage; spot price must be non-zero.'
+  evidence: akshare/futures/futures_basis.py:278-282(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/futures/futures_basis.py'
+- id: BD-017
+  type: B/BA
+  content: 'Unit conversions for commodity basis: JD*500, FG*80, LH*1000'
+  rationale: 'Implements exchange-mandated unit standardization where each commodity futures contract
+    has specific multiplier requirements. JD (鸡蛋), FG (玻璃), LH (生猪) use different lot sizes to normalize
+    pricing. Boundary: Applies only to these three commodities; other contracts use default units.'
+  evidence: akshare/futures/futures_basis.py:202-213(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/futures/futures_basis.py'
+- id: BD-018
+  type: B
+  content: 'Roll yield formula: log(price2/price1) / months_diff * 12'
+  rationale: 'Computes annualized roll return using logarithmic returns to account for continuous compounding.
+    Normalizes to annual basis regardless of contract tenor. Boundary: months_diff > 0; price1 and price2
+    must be positive.'
+  evidence: akshare/futures/futures_roll_yield.py:66-71(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/futures/futures_roll_yield.py'
+- id: BD-019
+  type: B/DK
+  content: Dominant contract identified by highest open_interest
+  rationale: 'Liquidity-based contract selection ensures roll yield calculations reflect actual market
+    participation. Open interest indicates where smart money concentrates. Boundary: Requires at least
+    one contract with non-zero open interest; ties broken arbitrarily.'
+  evidence: akshare/futures/futures_roll_yield.py:48(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/futures/futures_roll_yield.py'
+- id: BD-020
+  type: B/DK
+  content: Filter out EFP contracts from roll yield calculation
+  rationale: 'EFP (Exchange for Physical) trades are bilateral OTC transactions that distort spot-futures
+    spread analysis. Excluding them ensures pure exchange-traded price discovery. Boundary: Applied before
+    any roll yield computation; EFP identified by contract suffix or exchange flag.'
+  evidence: akshare/futures/futures_roll_yield.py:45-47(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/futures/futures_roll_yield.py'
+- id: BD-021
+  type: B/DK
+  content: Multiple warehouse receipt parsers for different exchange periods
+  rationale: 'Exchange data formats evolved over time requiring version-specific parsers. Maintains backward
+    compatibility while supporting current formats. Boundary: Each parser handles specific date ranges;
+    transition dates mark boundaries.'
+  evidence: akshare/futures/receipt.py:82-266(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/futures/receipt.py'
+- id: BD-022
+  type: B/DK
+  content: 'Hardcoded receipt data for problematic dates: 20100126, 20101029'
+  rationale: 'Specific exchange system failures on these dates produced corrupted or missing data requiring
+    manual correction. Preserves data integrity for backtesting. Boundary: Only applies to these two specific
+    dates; other dates use normal parsing.'
+  evidence: akshare/futures/receipt.py:23-34(module)
+  stage: error_handling
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/futures/receipt.py'
+- id: BD-023
+  type: B
+  content: 'Stock adjustment options: none, qfq (前复权), hfq (后复权)'
+  rationale: 'Provides backward and forward price adjustment for corporate actions (dividends, splits).
+    Different analysts prefer different adjustment methods for return calculations. Boundary: qfq adjusts
+    past prices; hfq adjusts future prices; none uses raw prices.'
+  evidence: akshare/stock/stock_zh_a_sina.py:127-303(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/stock/stock_zh_a_sina.py'
+- id: BD-024
+  type: B
+  content: Forward-fill (ffill) for adjustment factor gaps
+  rationale: 'Corporate action factors change infrequently but affect each historical prices. Forward-fill
+    ensures adjustment factors apply to each subsequent prices until next change. Boundary: Applied within
+    each factor''s valid date range; gaps > 1 day use last known factor.'
+  evidence: akshare/stock/stock_zh_a_sina.py:205,248,284(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/stock/stock_zh_a_sina.py'
+- id: BD-025
+  type: B
+  content: Uses py_mini_racer for JavaScript decryption of Sina data
+  rationale: 'Sina encrypts stock data in JavaScript requiring browser engine execution. py_mini_racer
+    provides V8 engine for server-side decryption without Selenium. Boundary: Requires Node.js dependencies;
+    falls back to direct API calls if decryption fails.'
+  evidence: akshare/stock/stock_zh_a_sina.py:178-182(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/stock/stock_zh_a_sina.py'
+- id: BD-026
+  type: B
+  content: Convertible bond dual-low indicator (price + premium*100)
+  rationale: 'Dual-low strategy combines bond price and conversion premium to identify undervalued convertibles.
+    The premium*100 scaling normalizes the two metrics for comparable magnitude. Boundary: Premium must
+    be computed from conversion price vs stock price.'
+  evidence: akshare/bond/bond_convert.py:103(module)
+  stage: volatility_calculation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/bond/bond_convert.py'
+- id: BD-027
+  type: B/BA
+  content: 'Force redemption trigger: typically 130% of conversion price'
+  rationale: 'Issuers can force redemption when stock price exceeds conversion price by threshold. This
+    130% rule balances issuer and holder interests per CBRC regulations. Boundary: Exact threshold varies
+    by bond; some use 125% or 120%; check bond prospectus.'
+  evidence: akshare/bond/bond_convert.py:106,257(module)
+  stage: trading_calendar
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/bond/bond_convert.py'
+- id: BD-028
+  type: B
+  content: 'Yang-Zhang volatility formula: RV² = Vo + k*Vc + (1-k)*Vrs'
+  rationale: 'Combines overnight (Vo), close-to-open (Vc), and open-to-close (Vrs) volatility components
+    for more accurate realized volatility estimation. Industry-standard estimator. Boundary: Requires
+    intraday tick data; k parameter varies with n (trading days).'
+  evidence: akshare/cal/rv.py:92-157(module)
+  stage: volatility_calculation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/cal/rv.py'
+- id: BD-029
+  type: B
+  content: 'k weight: 0.34/(1.34+(n+1)/(n-1)) for Yang-Zhang'
+  rationale: 'Optimal k minimizes Yang-Zhang estimation error by weighting overnight vs intraday volatility.
+    Formula approaches 0.34 as n increases. Boundary: k ∈ (0, 0.34); minimum n = 2; converges to 0.34
+    for large n.'
+  evidence: akshare/cal/rv.py:148(module)
+  stage: volatility_calculation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/cal/rv.py'
+- id: BD-030
+  type: B/DK
+  content: Return empty DataFrame when trading day data unavailable
+  rationale: 'Graceful handling of non-trading days prevents downstream errors. Empty DataFrame allows
+    consistent return types without exception handling. Boundary: Applied when exchange calendar indicates
+    non-trading day; weekends and holidays.'
+  evidence: akshare/futures/futures_basis.py:108,315-316(module)
+  stage: error_handling
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/futures/futures_basis.py'
+- id: BD-031
+  type: B/BA
+  content: Warn (not error) for non-trading days
+  rationale: 'Non-trading days are expected behavior, not exceptions. Warning-level logging allows monitoring
+    without breaking pipelines. Boundary: Triggers on weekends, holidays, and emergency exchange closures.'
+  evidence: akshare/futures/futures_basis.py:107(module)
+  stage: error_handling
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/futures/futures_basis.py'
+- id: BD-032
+  type: B/RC
+  content: Max 5 retries for web scraping with 3-second sleep
+  rationale: 'Network requests fail transiently; retries improve reliability without infinite loops. 5
+    attempts balances persistence vs timeout. 3-second backoff prevents server overload. Boundary: Total
+    max wait ~15 seconds; retry on HTTP 429/5xx only.'
+  evidence: akshare/futures/futures_basis.py:112-142(module)
+  stage: error_handling
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/futures/futures_basis.py'
+- id: BD-033
+  type: B/RC
+  content: TLSv1.2 with reduced cipher security (SECLEVEL=1)
+  rationale: 'Legacy government servers may not support modern TLS/cipher suites. SECLEVEL=1 allows compatibility
+    with older endpoints while maintaining TLSv1.2 encryption. Boundary: Security trade-off acceptable
+    for public economic data; never use SECLEVEL=0.'
+  evidence: akshare/economic/macro_china.py:26-41(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/economic/macro_china.py'
+- id: BD-034
+  type: B/BA
+  content: 'Supports multiple exchange types: ETF, Index futures, Stock options'
+  rationale: 'Unified options interface across asset classes simplifies cross-product analysis. Same calculation
+    methods apply regardless of underlying. Boundary: Each type has specific expiration and multiplier
+    rules; index options use cash settlement.'
+  evidence: akshare/option/option_finance.py:34-306(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/option/option_finance.py'
+- id: BD-035
+  type: B
+  content: Air quality AQI levels 1-6 with health impact descriptions
+  rationale: 'Standardized AQI classification enables health-based filtering and alerting. Six levels
+    provide sufficient granularity without overcomplicating. Boundary: Levels 1-6 map to specific PM2.5/PM10
+    ranges per Chinese HJ633-2011 standard.'
+  evidence: akshare/air/air_hebei.py:9-14(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/air/air_hebei.py'
+- id: BD-036
+  type: B/BA
+  content: 'Date format: YYYYMMDD string default, datetime.date fallback'
+  rationale: 'String dates ensure cross-platform compatibility; datetime fallback enables Python datetime
+    operations. Aligns with Chinese financial data conventions. Boundary: String parsing handles edge
+    cases like 20200101 vs 2020-01-01.'
+  evidence: akshare/futures/futures_basis.py:57-64(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/futures/futures_basis.py'
+- id: BD-037
+  type: B
+  content: Use pd.to_numeric with errors='coerce' for type conversion
+  rationale: 'Coercing invalid values to NaN prevents type errors while preserving valid data. Essential
+    for handling missing/corrupted web data gracefully. Boundary: Returns NaN for non-numeric strings;
+    empty strings treated as NaN.'
+  evidence: akshare/fund/fund_em.py:252-263(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/fund/fund_em.py'
+- id: BD-038
+  type: B
+  content: Page-based pagination with tqdm progress display
+  rationale: 'Pagination enables complete data retrieval from paginated APIs. tqdm provides user feedback
+    for long-running operations. Boundary: Progress bar shown only when total pages > 1; API may return
+    fewer records than page size.'
+  evidence: akshare/stock/stock_zh_a_sina.py:52-62(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/stock/stock_zh_a_sina.py'
+- id: BD-039
+  type: B/DK
+  content: Crypto holding data from Jin10 API with app headers
+  rationale: 'Jin10 requires app-specific headers for API authentication. App headers identify data source
+    and may affect rate limits. Boundary: Header values must match registered app; different apps may
+    return different data granularity.'
+  evidence: akshare/crypto/crypto_hold.py:20-26(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/crypto/crypto_hold.py'
+- id: BD-040
+  type: B/BA
+  content: 'Realized volatility indices: medrv, rk_th2, bv, rv5, rv10'
+  rationale: 'Multiple RV estimators capture different volatility dynamics. medrv (median), rk_th2 (threshold),
+    bv (bipower), rv5/rv10 (5/10-day) serve different use cases. Boundary: Every require tick-level data;
+    rolling windows of 5 or 10 days.'
+  evidence: akshare/article/risk_rv.py:21-22(module)
+  stage: indicator_selection
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/article/risk_rv.py'
+- id: BD-041
+  type: B/DK
+  content: Carbon trading data from 8 regional Chinese exchanges
+  rationale: 'China''s carbon market operates regionally; comprehensive coverage requires aggregating
+    each pilot exchanges. Each exchange has distinct contract specs. Boundary: 8 pilot exchanges covered;
+    national ETS (launched 2021) may require separate handling.'
+  evidence: akshare/energy/energy_carbon.py:33-306(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/energy/energy_carbon.py'
+- id: BD-042
+  type: B
+  content: fx_spot_em returns 100 records per page with pagination
+  rationale: 'Fixed page size enables predictable pagination behavior and memory management. 100 records
+    balances API efficiency vs transmission overhead. Boundary: Page size fixed at 100; last page may
+    have fewer records; requires loop for total count.'
+  evidence: akshare/forex/forex_em.py:31-37(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/forex/forex_em.py'
+- id: BD-043
+  type: B/DK
+  content: 'Stock turnover calculation: volume / outstanding_share'
+  rationale: 'Turnover rate measures trading activity relative to floating shares. Essential for liquidity
+    analysis and market microstructure studies. Boundary: outstanding_share must be > 0; shares may be
+    adjusted for corporate actions.'
+  evidence: akshare/stock/stock_zh_a_sina.py:208(module)
+  stage: volatility_calculation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/stock/stock_zh_a_sina.py'
+- id: BD-044
+  type: B
+  content: Outstanding shares multiplied by 10000 (unit conversion)
+  rationale: 'Chinese stock data reports shares in 万 (10,000s) units. Converting to actual shares enables
+    standard financial calculations. Boundary: Applied to outstanding shares only; not to trading volume
+    which is already in shares.'
+  evidence: akshare/stock/stock_zh_a_sina.py:207(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/stock/stock_zh_a_sina.py'
+- id: BD-045
+  type: B
+  content: 'Decimal precision: round prices to 2 decimal places'
+  rationale: 'CNY prices trade in 0.01 increments (分). Rounding to 2 decimals removes floating-point noise.
+    Boundary: Only affects display and storage; internal calculations use full precision before rounding.'
+  evidence: akshare/stock/stock_zh_a_sina.py:224-227(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/stock/stock_zh_a_sina.py'
+- id: BD-046
+  type: B/RC
+  content: 'PTA/MA warehouse receipts: sum of taxable + bonded'
+  rationale: 'PTA (精对苯二甲酸) and MA (甲醇) warehouses track two inventory types. Total supply = taxable +
+    bonded (保税). Critical for commodity fundamental analysis. Boundary: Applies only to PTA/MA; other
+    commodities may have different inventory categories.'
+  evidence: akshare/futures/receipt.py:459-478(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/futures/receipt.py'
+- id: BD-047
+  type: B
+  content: HTTP POST for Jisilu convertible bond data (requires cookie)
+  rationale: 'Jisilu requires authenticated POST requests for CB data. Cookie-based auth prevents unauthorized
+    scraping. Boundary: Cookie expires; requires browser login; POST body contains filter parameters.'
+  evidence: akshare/bond/bond_convert.py:86(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/bond/bond_convert.py'
+- id: BD-048
+  type: B/DK
+  content: 'Bank penalty table: variable column count (7-11 cols)'
+  rationale: 'Regulatory penalty data has inconsistent structure across years and enforcement types. Dynamic
+    column handling preserves each available information. Boundary: Minimum 7 columns always present;
+    8-11 columns depend on penalty type.'
+  evidence: akshare/bank/bank_cbirc_2020.py:137-153(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/bank/bank_cbirc_2020.py'
+- id: BD-049
+  type: B
+  content: Remove duplicates by [open,high,low,close,volume,amount]
+  rationale: 'OHLCVA uniquely identifies each price bar. Deduplication ensures clean time series without
+    repeated records. Boundary: Every 6 columns must match; keeps first occurrence; order matters for
+    determinism.'
+  evidence: akshare/stock/stock_zh_a_sina.py:221-222(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/stock/stock_zh_a_sina.py'
+- id: BD-050
+  type: B/BA
+  content: 'Function naming: verb_noun format (stock_zh_a_daily)'
+  rationale: 'Consistent naming convention improves API discoverability and maintainability. verb_noun
+    pattern clearly indicates function action. Boundary: Verb indicates action type (get, fetch, calculate);
+    noun identifies data domain.'
+  evidence: akshare/stock/stock_zh_a_sina.py:127(module)
+  stage: pro_api_client
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/stock/stock_zh_a_sina.py'
+- id: BD-051
+  type: B/RC
+  content: Uses demjson for parsing JavaScript-like data structures
+  rationale: 'Some APIs return non-standard JSON with JavaScript syntax (trailing commas, unquoted keys).
+    demjson handles these edge cases better than standard json module. Boundary: demjson is slow; use
+    standard json for well-formed responses.'
+  evidence: akshare/stock/stock_zh_a_sina.py:61(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/stock/stock_zh_a_sina.py'
+- id: BD-052
+  type: B/BA
+  content: MAC timestamp (ms) converted to Shanghai timezone
+  rationale: 'MAC provides millisecond timestamps in UTC. Converting to Asia/Shanghai aligns with Chinese
+    market data conventions. Essential for accurate trading time analysis. Boundary: Offset may change
+    during DST; verify during holiday trading.'
+  evidence: akshare/fund/fund_em.py:363-366(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/fund/fund_em.py'
+- id: BD-053
+  type: B/DK
+  content: Filter out financial options (IO, MO, HO) from commodity roll yield
+  rationale: 'Financial options (index, mini, Hong Kong) have different roll dynamics than commodity futures.
+    Mixing asset classes distorts commodity-specific roll analysis. Boundary: Identified by exchange code
+    or contract symbol prefix; applies to roll_yield module only.'
+  evidence: akshare/futures/futures_roll_yield.py:120-122(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/futures/futures_roll_yield.py'
+- id: BD-054
+  type: B/BA
+  content: CZCE URL format changes after 20251101 (xlsx vs xls)
+  rationale: 'CZCE (郑州商品交易所) transitioned from xls to xlsx format after November 2025. Version-aware URL
+    construction prevents 404 errors. Boundary: Date threshold 20251101; xls for older dates, xlsx for
+    newer.'
+  evidence: akshare/futures/receipt.py:411-414(module)
+  stage: json_parsing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/futures/receipt.py'
+- id: BD-055
+  type: B
+  content: Yang-Zhang Realized Volatility combines overnight, close, and Rogers-Satchell volatility with
+    adaptive weighting
+  rationale: Combines three volatility estimators (overnight, close-to-close, Rogers-Satchell) to reduce
+    estimation bias in the presence of intraday price movements and overnight gaps. The adaptive weighting
+    coefficient k adjusts based on sample size to maintain statistical efficiency across different data
+    availability scenarios.
+  evidence: akshare/cal/rv.py:92(volatility_yz_rv)
+  stage: akshare.cal.rv
+  alternative_considered: Single Garman-Glasser or Parkinson estimator was rejected due to higher estimation
+    error in presence of jumps
+- id: BD-056
+  type: B/BA
+  content: Overnight volatility calculated as sample variance of normalized open prices
+  rationale: Uses sample variance on normalized open-to-open log returns to isolate overnight price discovery
+    risk from intraday trading activity. Normalization prevents scale bias across securities with different
+    price levels.
+  evidence: akshare/cal/rv.py:145-146(module)
+  stage: akshare.cal.rv
+  alternative_considered: Range-based overnight estimator rejected due to requiring high-low data which
+    may be unavailable
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/cal/rv.py'
+- id: BD-057
+  type: B/BA
+  content: Rogers-Satchell volatility proxy using high-low-open-close log returns
+  rationale: Rogers-Satchell estimator uses high-low-open-close prices to capture the full range of intraday
+    price movement without requiring overnight return data, making it suitable for markets with irregular
+    trading hours.
+  evidence: akshare/cal/rv.py:137-144(module)
+  stage: akshare.cal.rv
+  alternative_considered: Yang-Zhang alone rejected; combination with other estimators needed for robustness
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/cal/rv.py'
+- id: BD-058
+  type: B/BA
+  content: Logarithmic returns for volatility calculation to ensure scale invariance
+  rationale: Log returns provide additive properties across time periods and ensure volatility estimates
+    are comparable across securities with different price scales, which is essential for cross-sectional
+    analysis in portfolio construction.
+  evidence: akshare/cal/rv.py:137-140(module)
+  stage: akshare.cal.rv
+  alternative_considered: Simple percentage returns rejected due to non-additivity across different price
+    bases
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/cal/rv.py'
+- id: BD-059
+  type: B
+  content: Daily aggregation of minute-level volatility using mean grouping
+  rationale: Aggregates intraday realized variance to daily frequency using mean grouping to prevent double-counting
+    of volatility contributions across overlapping time intervals, ensuring temporal consistency in risk
+    metrics.
+  evidence: akshare/cal/rv.py:145(module)
+  stage: akshare.cal.rv
+  alternative_considered: Sum aggregation rejected as it would overcount volatility across overlapping
+    periods
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/cal/rv.py'
+- id: BD-060
+  type: B
+  content: Weight coefficient k adapts based on sample size n
+  rationale: Adaptive weighting compensates for small sample bias by reducing the overnight volatility
+    weight when fewer observations are available, improving statistical reliability of estimates in data-sparse
+    conditions.
+  evidence: akshare/cal/rv.py:148(module)
+  stage: akshare.cal.rv
+  alternative_considered: Fixed weight rejected due to suboptimal performance across varying sample sizes
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/cal/rv.py'
+- id: BD-061
+  type: B/RC
+  content: Open=0 filter removes invalid trading data from volatility calculation
+  rationale: Filters out records where open price equals zero (indicating halted trading, data errors,
+    or delisted securities) to prevent infinite or undefined log returns from corrupting volatility estimates.
+  evidence: akshare/cal/rv.py:55(module)
+  stage: akshare.cal.rv
+  alternative_considered: Soft imputation rejected; strict filtering ensures data integrity for downstream
+    risk models
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/cal/rv.py'
+- id: BD-062
+  type: B
+  content: Minute-level period options for capturing intraday volatility patterns
+  rationale: Supports configurable minute-level periods (e.g., 1, 5, 15, 30, 60) to capture different
+    intraday volatility regimes, enabling analysis of volatility term structure and intraday momentum
+    patterns.
+  evidence: akshare/cal/rv.py:29(module)
+  stage: akshare.cal.rv
+  alternative_considered: Fixed period rejected; user requirements demand flexibility across different
+    trading strategies
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/cal/rv.py'
+- id: BD-063
+  type: B
+  content: Back-adjustment (hfq) for stock splits and dividends to ensure price continuity
+  rationale: Historical price adjustment ensures continuous return series across corporate actions, preventing
+    artificial volatility spikes from nominal price changes that don't reflect actual wealth changes.
+  evidence: akshare/cal/rv.py:31,55(module)
+  stage: akshare.cal.rv
+  alternative_considered: Unadjusted prices rejected; split-adjusted series required for meaningful volatility
+    comparison
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/cal/rv.py'
+- id: BD-064
+  type: B
+  content: API pagination uses date decrement by 1 day until empty results
+  rationale: Sequential day-by-day pagination ensures complete data retrieval when API imposes result
+    size limits, preventing data gaps that would occur with weekly/monthly jumps for historical economic
+    time series.
+  evidence: akshare/economic/macro_china.py:74-75(module)
+  stage: akshare.economic.macro_china
+  alternative_considered: Week/month jumps rejected due to potential missing daily data points in release
+    schedules
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/economic/macro_china.py'
+- id: BD-065
+  type: B/BA
+  content: Timestamp cache-busting uses millisecond precision for API requests
+  rationale: Millisecond timestamp prevents CDN/proxy caching of frequently-updated economic data, ensuring
+    consumers receive the latest released values rather than stale cached responses.
+  evidence: akshare/economic/macro_china.py:386(module)
+  stage: akshare.economic.macro_china
+  alternative_considered: Second precision rejected; high-frequency economic releases require finer granularity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/economic/macro_china.py'
+- id: BD-066
+  type: B
+  content: Multiple timeframe change rates (1D, 3M, 6M, 1Y, 2Y, 3Y) for momentum analysis
+  rationale: Multi-horizon momentum rates capture both short-term sentiment and long-term trend changes
+    in economic indicators, enabling macroeconomic regime detection and factor-based trading strategies.
+  evidence: akshare/economic/macro_china.py:1246-1247(module)
+  stage: akshare.economic.macro_china
+  alternative_considered: Single timeframe rejected; different horizons reveal distinct economic dynamics
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/economic/macro_china.py'
+- id: BD-067
+  type: B
+  content: NaN conversion via errors='coerce' handles missing/invalid economic data
+  rationale: Gracefully handles missing economic releases and data quality issues without failing the
+    entire pipeline, ensuring robust data ingestion when source systems have gaps or delays.
+  evidence: akshare/economic/macro_china.py:97-100(module)
+  stage: akshare.economic.macro_china
+  alternative_considered: Hard failure rejected; economic data often has legitimate gaps during holidays
+    or revisions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/economic/macro_china.py'
+- id: BD-068
+  type: B
+  content: YoY (BASE_SAME) and QoQ (BASE_SEQUENTIAL) growth rates for economic indicators
+  rationale: Provides both year-over-year (seasonally-adjusted trend) and quarter-over-quarter (sequential
+    momentum) metrics to distinguish cyclical from trend economic movements for policy and trading applications.
+  evidence: akshare/economic/macro_china.py:138-139(module)
+  stage: akshare.economic.macro_china
+  alternative_considered: Single growth rate rejected; both metrics required for complete economic cycle
+    analysis
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/economic/macro_china.py'
+- id: BD-069
+  type: B/DK
+  content: SSL cipher level lowered to SECLEVEL=1 for backward compatibility
+  rationale: Reduces TLS security level to connect with legacy economic data servers that haven't upgraded
+    cipher suites, ensuring data access at the cost of accepting older but still secure cryptographic
+    protocols.
+  evidence: akshare/economic/macro_china.py:30(module)
+  stage: akshare.economic.macro_china
+  alternative_considered: Strict SSL rejected; would prevent access to legitimate historical data sources
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/economic/macro_china.py'
+- id: BD-070
+  type: B
+  content: Duplicate removal ensures unique economic data records across pagination
+  rationale: Deduplicates records that span pagination boundaries to prevent double-counting of economic
+    observations, ensuring statistical integrity for indicator calculations and model inputs.
+  evidence: akshare/economic/macro_china.py:1402(module)
+  stage: akshare.economic.macro_china
+  alternative_considered: No deduplication rejected; API pagination overlaps can cause inflated indicator
+    values
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/economic/macro_china.py'
+- id: BD-071
+  type: B/DK
+  content: Date string reformatted from YYYYMMDD to YYYY-MM-DD for API query
+  rationale: ISO date format conversion ensures compatibility with futures exchange API requirements,
+    which mandate standardized date strings for query parameter parsing.
+  evidence: akshare/futures/futures_comm_js.py:32(module)
+  stage: akshare.futures.futures_comm_js
+  alternative_considered: YYYYMMDD format rejected; API specification requires ISO-8601 compliance
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/futures/futures_comm_js.py'
+- id: BD-072
+  type: B/DK
+  content: Period-over-period change calculated via diff() for index movements
+  rationale: Discrete difference calculation captures absolute index level changes between consecutive
+    periods, providing raw momentum signals for market regime detection and technical analysis.
+  evidence: akshare/index/index_kq_ss.py:69(module)
+  stage: akshare.index.index_kq_ss
+  alternative_considered: Continuous return rejected; discrete changes preferred for index-level analysis
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/index/index_kq_ss.py'
+- id: BD-073
+  type: B/BA
+  content: Percentage change via pct_change() for normalized index comparison
+  rationale: Normalized percentage returns enable meaningful cross-index comparison regardless of absolute
+    price levels, essential for comparative momentum analysis across different market capitalization segments.
+  evidence: akshare/index/index_kq_ss.py:70(module)
+  stage: akshare.index.index_kq_ss
+  alternative_considered: Absolute changes rejected; percentage basis required for cross-index momentum
+    comparison
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in akshare/index/index_kq_ss.py'
+- id: BD-074
+  type: BA/DK
+  content: Multiple HTTPAdapter subclasses for data source-specific SSL/TLS requirements
+  rationale: 'Multiple adapter subclasses (TLSAdapter, LegacySSLAdapter) represent different SSL/TLS handling
+    strategies across data sources. The variation suggests no unified approach to TLS configuration, leading
+    to maintenance burden and potential security inconsistencies when different adapters handle certificate
+    validation differently. BOUNDARY: This pattern choice affects each HTTP communication for specific
+    source types.'
+  evidence: akshare/economic/macro_china.py:26(TLSAdapter); akshare/fx/fx_c_swap_cm.py:16(LegacySSLAdapter)
+  stage: pattern_choice
+  alternative_considered: Unified SSL context configuration via request session factory
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: TLSAdapter); akshare/fx/fx_c_swap_cm.py:16(LegacySSLAdapter in akshare/economic/macro_china.py'
+- id: BD-075
+  type: BA/DK
+  content: Singleton proxy config with global scope affecting each HTTP requests
+  rationale: 'Global proxy configuration via AkshareConfig singleton means each HTTP requests share identical
+    proxy settings. This creates implicit coupling between modules and prevents per-source proxy customization.
+    BOUNDARY: Any module importing config.proxies inherits global state that may conflict with source-specific
+    requirements.'
+  evidence: akshare/utils/context.py:1(akshareconfig); akshare/request.py:25(config.proxies)
+  stage: default_value
+  alternative_considered: Context-based proxy configuration per request/session
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: akshareconfig); akshare/request.py:25(config.proxies in akshare/utils/context.py'
+- id: BD-076
+  type: BA
+  content: 'Conflicting retry mechanisms: old vs new request utilities'
+  rationale: 'Two different retry mechanisms coexist: make_request_with_retry_json in request.py and request_with_retry
+    in utils/request.py. This creates ambiguity about which utility should be used and may lead to inconsistent
+    retry behavior across the codebase. BOUNDARY: Both utilities may be called for similar purposes but
+    have different retry policies.'
+  evidence: akshare/request.py:10(make_request_with_retry_json); akshare/utils/request.py:15(request_with_retry)
+  stage: default_value
+  alternative_considered: Consolidate to single retry utility with configurable policies
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: make_request_with_retry_json); akshare/utils/request.py:15(request_with_retry
+    in akshare/request.py'
+- id: BD-077
+  type: B
+  content: Global warnings suppression in function scope can mask real issues
+  rationale: 'warnings.filterwarnings called in function scope suppresses warnings globally, not just
+    for the specific operation. This can hide legitimate warnings from other code executing in the same
+    session, making debugging difficult. BOUNDARY: Once filterwarnings is applied, it persists for the
+    remainder of the session unless explicitly reset.'
+  evidence: akshare/economic/macro_china.py:53(warnings.filterwarnings); akshare/cal/rv.py:135(warnings.filterwarnings)
+  stage: invariant
+  alternative_considered: warnings.catch_warnings context manager for scoped suppression
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: warnings.filterwarnings); akshare/cal/rv.py:135(warnings.filterwarnings in akshare/economic/macro_china.py'
+- id: BD-078
+  type: B/BA
+  content: 'Adjust parameter defaults vary: '''' vs ''hfq'' vs ''qfq'' across similar functions'
+  rationale: 'The adjust parameter (controlling price adjustment for splits/dividends) defaults to different
+    values across similar financial data functions: '''' in stock_zh_a_sina, ''hfq'' in cal/rv.py, and
+    '''' in bond_zh_cov.py. Users expecting consistent behavior will get unexpected results. BOUNDARY:
+    Every three functions retrieve historical price data but default to different adjustment strategies.'
+  evidence: akshare/stock/stock_zh_a_sina.py:127(stock_zh_a_daily adjust=''); akshare/cal/rv.py:18(adjust='hfq');
+    akshare/bond/bond_zh_cov.py:134(adjust='')
+  stage: default_value
+  alternative_considered: Standardize to 'qfq' as default with explicit documentation
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: stock_zh_a_daily adjust=''''); akshare/cal/rv.py:18(adjust=''hfq''); akshare/bond/bond_zh_cov.py:134(adjust=''''
+    in akshare/stock/stock_zh_a_sina.py'
+- id: BD-079
+  type: B/BA
+  content: 'Period parameter defaults inconsistent: ''1'' vs ''5'' for similar minute data'
+  rationale: 'stock_hist_em and index_zh_em both retrieve minute-level data but default to different periods:
+    ''5'' vs ''1''. This inconsistency suggests either unclear parameter meaning or missing standardization.
+    BOUNDARY: Both functions accept period parameter for minute data but interpret ''default'' differently.'
+  evidence: akshare/stock_feature/stock_hist_em.py:1046(period='5'); akshare/index/index_zh_em.py:180(period='1')
+  stage: default_value
+  alternative_considered: Standardize period defaults or document module-specific meanings
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: period=''5''); akshare/index/index_zh_em.py:180(period=''1'' in akshare/stock_feature/stock_hist_em.py'
+- id: BD-080
+  type: B/BA
+  content: 'Timeout defaults inconsistent: 10s vs 15s vs 30s across modules'
+  rationale: 'Request timeout defaults vary significantly across modules: 10s in pro/client.py, 15s in
+    utils/request.py, and 30s in multi_decrypt.py. This creates unpredictable behavior when switching
+    between APIs. BOUNDARY: Every three modules perform HTTP requests but use different timeout thresholds.'
+  evidence: akshare/pro/client.py:19(timeout=10); akshare/utils/request.py:18(timeout=15); akshare/utils/multi_decrypt.py:32(timeout=30)
+  stage: default_value
+  alternative_considered: Centralized timeout configuration with source-specific overrides
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: timeout=10); akshare/utils/request.py:18(timeout=15); akshare/utils/multi_decrypt.py:32(timeout=30
+    in akshare/pro/client.py'
+- id: BD-081
+  type: DK/B
+  content: DataApi uses partial() for dynamic method generation from query()
+  rationale: 'The DataAPI client uses __getattr__ with partial() to dynamically generate methods from
+    query(). This is a design pattern choice that creates implicit API surface. BOUNDARY: Users can call
+    any method matching a source code without explicit method signatures or documentation.'
+  evidence: akshare/pro/client.py:69(__getattr__); akshare/pro/client.py:30(query)
+  stage: pattern_choice
+  alternative_considered: Explicitly defined methods with documentation per source
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: __getattr__); akshare/pro/client.py:30(query in akshare/pro/client.py'
+- id: BD-082
+  type: B/DK
+  content: Heavy dependency on embedded JavaScript files for data parsing
+  rationale: 'akshare embeds JavaScript files (crypto.js, cninfo.js) for data parsing, requiring embedded
+    execution capability. This creates security surface, deployment complexity, and maintenance burden.
+    BOUNDARY: The air_zhenqi.py module depends on external JS execution for data retrieval.'
+  evidence: akshare/air/crypto.js:1; akshare/data/cninfo.js:1; akshare/air/air_zhenqi.py:38(_get_file_content)
+  stage: pattern_choice
+  alternative_considered: Native Python implementation of crypto/parsing logic; external service for JS
+    execution
+  _evidence_issues:
+  - 'NOT_FOUND: akshare/air/crypto.js:1; akshare/data/cninfo.js:1; akshare/air/air_zhenqi.py'
+- id: BD-083
+  type: B/RC
+  content: Hardcoded API tokens and URLs in cons.py files
+  rationale: 'API tokens (xq_a_token) and URLs are hardcoded directly in cons.py files rather than being
+    configurable via environment variables or config files. This creates security risk and prevents configuration
+    without code changes. BOUNDARY: Every code referencing these constants embeds credential values directly.'
+  evidence: akshare/stock/cons.py:8(xq_a_token); akshare/futures/cons.py:15(futures_inventory_em_symbol_dict)
+  stage: invariant
+  alternative_considered: Environment variables; secure vault integration; config file with .gitignore
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: xq_a_token); akshare/futures/cons.py:15(futures_inventory_em_symbol_dict in akshare/stock/cons.py'
+- id: BD-084
+  type: DK
+  content: demjson library (250KB) included for legacy JSON parsing edge cases
+  rationale: 'demjson library (250KB) is included specifically for handling legacy JSON parsing edge cases.
+    This represents a significant code size increase for a specialized utility. BOUNDARY: The library
+    is imported in macro_china.py but the actual usage frequency vs code size trade-off is unclear.'
+  evidence: akshare/utils/demjson.py:30(_get_pyver); akshare/economic/macro_china.py:22(import demjson)
+  stage: default_value
+  alternative_considered: Standard json library with fallback; targeted edge case handling only
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: _get_pyver); akshare/economic/macro_china.py:22(import demjson in akshare/utils/demjson.py'
+- id: BD-085
+  type: B/BA
+  content: Cal/rv.py volatility functions require specific DataFrame column names
+  rationale: 'The volatility_yz_rv function and rv_from_stock_zh_a_hist_min_em require specific DataFrame
+    column names as input. This creates implicit interface contracts that are not enforced or documented,
+    leading to cryptic errors when columns are missing. BOUNDARY: These functions assume specific column
+    names without validation or clear error messages.'
+  evidence: akshare/cal/rv.py:92(volatility_yz_rv); akshare/cal/rv.py:13(rv_from_stock_zh_a_hist_min_em)
+  stage: ordering_contract
+  alternative_considered: Explicit column mapping with validation; typed DataFrame interfaces
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: volatility_yz_rv); akshare/cal/rv.py:13(rv_from_stock_zh_a_hist_min_em in akshare/cal/rv.py'
+- id: BD-086
+  type: DK
+  content: 'Session mounting pattern varies: some mount to prefix, others mount to scheme'
+  rationale: 'Session mounting patterns vary across modules: some mount to URL prefixes, others to schemes.
+    This inconsistency suggests evolving understanding of the pattern without standardization. BOUNDARY:
+    Both approaches are valid but create maintenance confusion when developers encounter different patterns.'
+  evidence: akshare/economic/macro_china.py:265(session.mount); akshare/utils/request.py:49(session.mount)
+  stage: pattern_choice
+  alternative_considered: Standardized mounting pattern with clear documentation
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: session.mount); akshare/utils/request.py:49(session.mount in akshare/economic/macro_china.py'
+- id: BD-087
+  type: B
+  content: Exception hierarchy with AkshareException base for each library errors
+  rationale: 'AkshareException serves as the base for each library errors, with APIError as a specific
+    child. This hierarchy enables broad exception catching but may be too coarse-grained for precise error
+    handling. BOUNDARY: Users can catch each library errors with a single exception type but cannot easily
+    distinguish between error categories.'
+  evidence: akshare/exceptions.py:6(akshareexception); akshare/exceptions.py:14(APIError)
+  stage: inheritance
+  alternative_considered: More granular exception hierarchy with specific error categories
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: akshareexception); akshare/exceptions.py:14(APIError in akshare/exceptions.py'
+- id: BD-088
+  type: B/BA
+  content: External API key requirements not enforced consistently
+  rationale: 'API key requirements are enforced inconsistently: currency.py defaults api_key to empty
+    string without validation, while pro/client.py uses token. Some sources may silently fail without
+    keys while others raise errors. BOUNDARY: Users may not receive clear feedback about missing required
+    credentials until runtime.'
+  evidence: akshare/currency/currency.py:15(api_key=''); akshare/pro/client.py:19(token)
+  stage: default_value
+  alternative_considered: Centralized credential validation; explicit key requirements documented per
+    source
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: api_key=''''); akshare/pro/client.py:19(token in akshare/currency/currency.py'
+- id: BD-089
+  type: BA/DK
+  content: 'INTERACTION: [BD-003] × [BD-069] → Compound security reduction from dual TLS adapter implementations
+    with SECLEVEL=1'
+  rationale: 'BD-003 (TLSAdapter in macro_china.py) and BD-069 (SECLEVEL=1 in macro_china.py) both reduce
+    TLS security for legacy compatibility. BD-074 identifies multiple HTTPAdapter subclasses. Together
+    they compound security risk: the weakening is applied in TWO separate locations with potentially different
+    scopes, creating inconsistent security posture across data sources. When security posture differs
+    per source, attackers can potentially identify weaker endpoints as attack vectors.'
+  evidence: BD-003:akshare/economic/macro_china.py:30; BD-069:akshare/economic/macro_china.py:30; BD-074:akshare/fx/fx_c_swap_cm.py:16
+  stage: global
+  alternative_considered: Unified SSL context factory with per-domain security policy
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-003:akshare/economic/macro_china.py:30; BD-069:akshare/economic/macro_china.py:30;
+    BD-074:akshare/fx/fx_c_swap_cm.py'
+- id: BD-090
+  type: BA
+  content: 'INTERACTION: [BD-004] × [BD-007] × [BD-051] × [BD-084] → demjson proliferation amplifies performance
+    cost across multiple modules'
+  rationale: demjson is used in FOUR separate locations (BD-004, BD-007, BD-051, BD-084) for handling
+    non-standard JSON. BD-084 identifies the 250KB cost. Each module importing demjson contributes to
+    slow parsing performance. The more modules depend on demjson, the harder it becomes to remove or replace.
+    This creates a lock-in effect where the 'temporary' compatibility solution becomes architectural debt.
+  evidence: BD-004:akshare/utils/demjson.py:1; BD-007:akshare/stock/stock_zh_a_sina.py:61; BD-051:akshare/stock/stock_zh_a_sina.py:61;
+    BD-084:akshare/economic/macro_china.py:22
+  stage: global
+  alternative_considered: Centralized JSON normalization utility with single demjson dependency point
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-004:akshare/utils/demjson.py:1; BD-007:akshare/stock/stock_zh_a_sina.py:61; BD-051:akshare/stock/stock_zh_a_sina.py:61;
+    BD-084:akshare/economic/macro_china.py'
+- id: BD-091
+  type: B
+  content: 'INTERACTION: [BD-006] × [BD-037] × [BD-067] → Silent NaN propagation from errors=''coerce''
+    creates hidden data quality failures'
+  rationale: 'BD-006, BD-037, and BD-067 each use errors=''coerce'' to silently convert invalid values
+    to NaN. Combined with BD-061 (Open=0 filter) and BD-030 (empty DataFrame for non-trading days), this
+    creates a cascade of silent failures: malformed data → NaN → NaN propagates → analysis proceeds with
+    gaps → incorrect conclusions. The ''silent'' nature means users never know how much data was silently
+    discarded.'
+  evidence: BD-006:akshare/fund/fund_em.py:87; BD-037:akshare/fund/fund_em.py:252-263; BD-067:akshare/economic/macro_china.py:97-100
+  stage: global
+  alternative_considered: Explicit error logging with configurable threshold alerts for coercion rates
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-006:akshare/fund/fund_em.py:87; BD-037:akshare/fund/fund_em.py:252-263; BD-067:akshare/economic/macro_china.py'
+- id: BD-092
+  type: BA/DK
+  content: 'INTERACTION: [BD-076] × [BD-002] × [BD-032] → Contradiction: multiple retry mechanisms undermine
+    backoff strategy effectiveness'
+  rationale: 'BD-076 identifies two conflicting retry mechanisms. BD-002 specifies exponential backoff
+    with jitter as the retry strategy. But when BD-076''s ''old vs new request utilities'' coexist, the
+    jitter strategy from BD-002 may not apply to both implementations. BD-032 specifies ''Max 5 retries
+    with 3-second sleep'' but this policy only applies where that specific utility is used. Result: some
+    requests get proper backoff, others get whatever the deprecated utility does. This contradiction creates
+    unpredicta'
+  evidence: BD-076:akshare/request.py:10,akshare/utils/request.py:15; BD-002:akshare/utils/request.py:61;
+    BD-032:akshare/futures/futures_basis.py:112-142
+  stage: global
+  alternative_considered: Consolidate to single configurable retry policy with consistent backoff
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-076:akshare/request.py:10,akshare/utils/request.py:15; BD-002:akshare/utils/request.py:61;
+    BD-032:akshare/futures/futures_basis.py'
+- id: BD-093
+  type: B/BA
+  content: 'INTERACTION: [BD-078] × [BD-063] × [BD-023] × [BD-024] → Contradiction: inconsistent adjustment
+    defaults undermine price continuity guarantees'
+  rationale: 'BD-063 guarantees ''Back-adjustment (hfq) for stock splits and dividends to ensure price
+    continuity.'' But BD-078 reveals that adjust parameter defaults vary: '''' vs ''hfq'' vs ''qfq'' across
+    similar functions. BD-023 specifies qfq/hfq/none options. BD-024 uses forward-fill for adjustment
+    gaps. The contradiction: volatility calculations assume hfq (BD-063) but stock data fetching defaults
+    may return unadjusted prices (BD-078: '''' default). Users calling volatility_yz_rv with data from
+    stock_zh_a_sina ma'
+  evidence: BD-078:akshare/stock/stock_zh_a_sina.py:131; BD-063:akshare/cal/rv.py:31,55; BD-023:akshare/stock/stock_zh_a_sina.py:127-303;
+    BD-024:akshare/stock/stock_zh_a_sina.py:205,248,284
+  stage: global
+  alternative_considered: Standardize adjust parameter with explicit hfq default for each historical price
+    functions
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-078:akshare/stock/stock_zh_a_sina.py:131; BD-063:akshare/cal/rv.py:31,55; BD-023:akshare/stock/stock_zh_a_sina.py:127-303;
+    BD-024:akshare/stock/stock_zh_a_sina.py'
+- id: BD-094
+  type: BA
+  content: 'INTERACTION: [BD-077] × [BD-076] × [BD-069] → Risk cascade: global warning suppression masks
+    security and reliability issues'
+  rationale: 'BD-077 applies warnings.filterwarnings in function scope, affecting ALL code execution.
+    BD-076''s conflicting retry mechanisms may produce warnings about deprecation or inconsistency. BD-069''s
+    TLS SECLEVEL=1 may produce SSL security warnings. When BD-077 suppresses warnings globally, these
+    important signals disappear. The cascade: security degradation (BD-069) + retry confusion (BD-076)
+    + global suppression (BD-077) = systemic issues that go undetected. Users never see that their TLS
+    connections '
+  evidence: BD-077:akshare/economic/macro_china.py:53,akshare/cal/rv.py:135; BD-076:akshare/request.py:10;
+    BD-069:akshare/economic/macro_china.py:30
+  stage: global
+  alternative_considered: warnings.catch_warnings context manager for scoped suppression
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-077:akshare/economic/macro_china.py:53,akshare/cal/rv.py:135; BD-076:akshare/request.py:10;
+    BD-069:akshare/economic/macro_china.py'
+- id: BD-095
+  type: B/BA
+  content: 'INTERACTION: [BD-083] × [BD-014] × [BD-088] → Amplification: hardcoded tokens combine with
+    singleton storage and inconsistent validation'
+  rationale: 'BD-083 hardcodes API tokens in cons.py files. BD-014 stores Pro API token in singleton config.
+    BD-088 shows inconsistent API key enforcement: some default to empty string. Combined effect: (1)
+    tokens in source code get committed to version control (BD-083), (2) singleton config means each code
+    accesses same token (BD-014), (3) no validation means empty tokens silently fail (BD-088). The amplification:
+    exposure risk from hardcoding × no validation = credentials potentially leaked AND no error feed'
+  evidence: BD-083:akshare/stock/cons.py:8; BD-014:akshare/pro/data_pro.py:16; BD-088:akshare/currency/currency.py:15
+  stage: global
+  alternative_considered: Environment variables with validation, secure vault integration
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-083:akshare/stock/cons.py:8; BD-014:akshare/pro/data_pro.py:16; BD-088:akshare/currency/currency.py'
+- id: BD-096
+  type: B/RC
+  content: 'INTERACTION: [BD-001] × [BD-032] × [BD-080] → Risk cascade: per-request sessions undermine
+    connection efficiency and timeout consistency'
+  rationale: 'BD-001 creates new session per request with pool_connections=1. BD-032 implements retry
+    with 3-second sleep. BD-080 shows inconsistent timeouts (10s/15s/30s). Risk cascade: (1) BD-001 prevents
+    connection reuse, so each retry in BD-032 establishes a NEW session (costly), (2) BD-080''s inconsistent
+    timeouts mean some retries may timeout before the 3-second backoff completes, (3) high-frequency retry
+    scenarios hit servers repeatedly with new connections, potentially triggering rate limits. This crea'
+  evidence: BD-001:akshare/utils/request.py:48; BD-032:akshare/futures/futures_basis.py:112-142; BD-080:akshare/pro/client.py:19,akshare/utils/request.py:18
+  stage: global
+  alternative_considered: Connection pooling with health checks and session reuse for retries
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-001:akshare/utils/request.py:48; BD-032:akshare/futures/futures_basis.py:112-142; BD-080:akshare/pro/client.py:19,akshare/utils/request.py'
+- id: BD-097
+  type: DK
+  content: 'INTERACTION: [BD-074] × [BD-086] → Contradiction: multiple adapter classes with inconsistent
+    mounting patterns create maintenance burden'
+  rationale: 'BD-074 identifies multiple HTTPAdapter subclasses (TLSAdapter, LegacySSLAdapter) with different
+    SSL handling. BD-086 reveals inconsistent session.mount usage patterns: some mount to URL prefixes,
+    others to schemes. Together they create a maintenance nightmare: developers must understand which
+    adapter applies where AND which mounting pattern is correct. New adapters likely inherit both inconsistencies.
+    This contradiction means code that works in one module may fail in another due to undocumented '
+  evidence: BD-074:akshare/economic/macro_china.py:26,akshare/fx/fx_c_swap_cm.py:16; BD-086:akshare/economic/macro_china.py:265,akshare/utils/request.py:49
+  stage: global
+  alternative_considered: Unified adapter factory with standardized mounting convention
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-074:akshare/economic/macro_china.py:26,akshare/fx/fx_c_swap_cm.py:16; BD-086:akshare/economic/macro_china.py:265,akshare/utils/request.py'
+- id: BD-098
+  type: B/BA
+  content: 'INTERACTION: [BD-012] × [BD-085] × [BD-059] → Hidden dependency: DateTime index requirement
+    cascades through analytics pipeline'
+  rationale: 'BD-012 requires DateTimeIndex for time-aware calculations. BD-085 reveals brittle column
+    name contracts in rv.py functions. BD-059 aggregates minute-level data using pd.Grouper. The hidden
+    dependency chain: (1) User fetches data from any source, (2) Data may lack DateTimeIndex, (3) volatility
+    functions fail silently or with cryptic errors, (4) BD-059''s aggregation depends on proper index.
+    Users expecting ''just fetch and calculate'' must understand the data structure contract that isn''t
+    enforced o'
+  evidence: BD-012:akshare/cal/rv.py:56; BD-085:akshare/cal/rv.py:92,13; BD-059:akshare/cal/rv.py:145
+  stage: global
+  alternative_considered: Automatic datetime parsing and explicit column mapping with validation
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-012:akshare/cal/rv.py:56; BD-085:akshare/cal/rv.py:92,13; BD-059:akshare/cal/rv.py'
+- id: BD-GAP-001
+  type: B
+  content: Baidu Migration API returns only top100 results per area-indicator combination, with a fallback
+    to return each results if fewer than 100 exist
+  rationale: Baidu's public migration API caps responses at 100 records to limit data exposure; the code
+    silently handles the <100 case by returning whatever exists rather than raising an error. This boundary
+    means migration flow analysis for small regions may be incomplete.
+  evidence: akshare/event/migration.py:16(migration_area_baidu)
+  stage: json_parsing
+  alternative_considered: Could query multiple dates or use different indicator types to accumulate more
+    data
+- id: BD-GAP-002
+  type: B/BA
+  content: Area parameter requires full official names (e.g., '重庆市', '广州市') rather than abbreviations
+    or codes
+  rationale: Baidu API expects standardized Chinese administrative names; using abbreviations or English
+    names causes silent failures. This constraint forces users to know the exact naming convention or
+    results in empty datasets without error messages.
+  evidence: akshare/event/migration.py:56(migration_scale_baidu)
+  stage: json_parsing
+  alternative_considered: Could provide a name normalization layer or list valid area names
+- id: BD-GAP-003
+  type: B/DK
+  content: Fortune 500 rankings start from 1996; earlier years are unavailable through the scraping interface
+  rationale: Fortune China only archives rankings from 1996 onward on their website; attempting to query
+    earlier years returns empty or error results. This historical boundary limits long-term trend analysis.
+  evidence: akshare/fortune/fortune_500.py:40(fortune_rank)
+  stage: json_parsing
+  alternative_considered: Could integrate with archived sources like Wayback Machine for pre-1996 data
+- id: BD-GAP-004
+  type: BA
+  content: Hurun ranking supports 9 distinct indicator types with different result structures and year
+    availability
+  rationale: Each Hurun ranking type (百富榜, 全球富豪榜, 独角兽榜, etc.) has different publication years and data
+    schemas. The function accepts any indicator string but returns whatever structure the source provides,
+    creating inconsistent DataFrames across ranking types.
+  evidence: akshare/fortune/fortune_hurun.py:16(hurun_rank)
+  stage: json_parsing
+  alternative_considered: Could normalize outputs to a common schema with nullable columns
+- id: BD-GAP-005
+  type: B
+  content: Bloomberg Billionaires Index historical data only available for select years (2018, 2019, 2021)
+  rationale: The archived source (areppim.com) only maintains snapshots for specific years, not a continuous
+    series. This gaps the data for 2020 and most of 2022+, making time-series analysis incomplete.
+  evidence: akshare/fortune/fortune_bloomberg.py:14(index_bloomberg_billionaires_hist)
+  stage: json_parsing
+  alternative_considered: Could scrape Bloomberg directly or use the present-day API
+- id: BD-GAP-006
+  type: BA/DK
+  content: Each futures exchange has a dedicated module with identical function signatures but different
+    date validation rules
+  rationale: SHFE, DCE, CZCE, CFFEX, INE, and GFEX each require trade dates, but only some validate that
+    the date is actually a trading day. CZCE and CFFEX require explicit YYYYMMDD dates while DCE works
+    without dates. This inconsistency causes confusing failures when switching between exchanges.
+  evidence: akshare/futures_derivative/futures_contract_info_shfe.py:13(futures_contract_info_shfe)
+  stage: json_parsing
+  alternative_considered: Could create a unified interface with automatic trading day detection
+- id: BD-GAP-007
+  type: BA/DK
+  content: 'HOG (hog futures) module uses symbol-based categorization: 三元/外三元/内三元 for pig type, separate
+    functions for cost/supply dimensions'
+  rationale: Pig market data is intentionally separated into Core (价格), Cost (成本), and Supply (供应) dimensions
+    with different symbol vocabularies. This models the real agricultural commodity structure but creates
+    3 separate function families that users must navigate.
+  evidence: akshare/futures_derivative/futures_hog.py:13(futures_hog_core)
+  stage: json_parsing
+  alternative_considered: Could provide a single function with dimension parameter
+- id: BD-GAP-008
+  type: BA/DK
+  content: Sina futures main contract uses pseudo-symbol 'V0' for the default/latest contract, with actual
+    symbols fetched from futures_display_main_sina
+  rationale: V0 is a convention representing 'latest main contract' without a specific expiry. This requires
+    a discovery step (futures_display_main_sina) before historical queries. The 22220101 end date default
+    is an artificial far-future bound.
+  evidence: akshare/futures_derivative/futures_index_sina.py:103(futures_main_sina)
+  stage: json_parsing
+  alternative_considered: Could auto-resolve V0 on function entry
+- id: BD-GAP-009
+  type: B/BA
+  content: LegacySSLAdapter implements custom pool manager initialization to handle outdated SSL configurations
+    on chinamoney.com.cn
+  rationale: The China Foreign Exchange Trade System website uses legacy SSL configurations incompatible
+    with modern Python SSL defaults. The custom HTTPAdapter subclass patches this by overriding init_poolmanager
+    to use legacy TLS settings. This is a known compatibility hack that may become a security liability.
+  evidence: akshare/fx/fx_c_swap_cm.py:16(LegacySSLAdapter)
+  stage: Infrastructure
+  alternative_considered: Could use requests Session with configured SSL context or negotiate with source
+    to update SSL
+- id: BD-GAP-010
+  type: B
+  content: 'Movie box office date constraints enforce natural calendar boundaries: daily only previous
+    day, weekly only complete weeks, monthly only complete months'
+  rationale: ENData API enforces these constraints presumably for data consistency (finalized numbers).
+    The code passes these constraints through directly rather than validating or explaining them. Users
+    cannot easily query 'today's incomplete data'.
+  evidence: akshare/movie/movie_yien.py:112(movie_boxoffice_daily)
+  stage: json_parsing
+  alternative_considered: Could add a 'realtime' flag or proxy endpoint
+- id: BD-GAP-011
+  type: M
+  content: JS decryption code is bundled within the module files (jm.js embedded) rather than fetched
+    dynamically
+  rationale: The decryption algorithm for ENData's encrypted responses is stored as a JavaScript file
+    alongside the Python code. This creates a tight coupling where any API encryption changes require
+    module updates. The file is read from disk at runtime.
+  evidence: akshare/movie/movie_yien.py:33(_get_file_content)
+  stage: json_parsing
+  alternative_considered: Could use Selenium/Playwright to execute JS in browser context, or maintain
+    decryption separately
+- id: BD-GAP-012
+  type: T
+  content: get_current_week calculates Monday of the week containing a given date, used to align weekly
+    box office queries
+  rationale: Week-based票房 queries require the Monday date to align with the API's week definition. The
+    function converts any YYYYMMDD date to its week's Monday. This enforces a specific week-start convention
+    (Monday) that may differ from user expectations.
+  evidence: akshare/movie/movie_yien.py:48(get_current_week)
+  stage: json_parsing
+  alternative_considered: Could accept week identifier or allow week-start customization
+- id: BD-GAP-013
+  type: B/RC
+  content: Baidu Finance calendar requires secure cookie acquisition before each session, raising ConnectionError
+    on failure
+  rationale: Baidu Finance calendar data is behind authentication that requires valid cookies. The _get_baidu_cookie
+    function fetches and validates cookies, raising ConnectionError if the network request fails. This
+    means any network issue blocks each calendar data retrieval.
+  evidence: akshare/news/news_baidu.py:16(_get_baidu_cookie)
+  stage: json_parsing
+  alternative_considered: Could cache cookies with expiry or accept user-provided tokens
+- id: BD-GAP-014
+  type: B
+  content: CCTV news data available from 20160203 onward; attempting earlier dates returns empty results
+  rationale: The source (CCTV) only archives text content from February 3, 2016. No validation prevents
+    querying earlier dates, leading to silent empty returns. This historical boundary limits news sentiment
+    analysis for earlier periods.
+  evidence: akshare/news/news_cctv.py:17(news_cctv)
+  stage: json_parsing
+  alternative_considered: Could scrape alternative archives or official transcripts
+- id: BD-GAP-015
+  type: B
+  content: East Money individual stock news limited to most recent 100 items per symbol
+  rationale: The East Money API returns only the 100 most recent news items for a given stock. Historical
+    news beyond 100 items is inaccessible through this interface, limiting historical sentiment analysis
+    and event backtesting.
+  evidence: akshare/news/news_stock.py:15(stock_news_em)
+  stage: json_parsing
+  alternative_considered: Could use East Money's search API with date filters
+- id: BD-GAP-016
+  type: BA/DK
+  content: CPCA car market data separates 批发 (wholesale) and 零售 (retail) indicators with different data
+    retrieval paths (pifa vs lingshou)
+  rationale: China Passenger Car Association data requires different endpoints for wholesale vs retail
+    metrics, leading to duplicated function logic (__car_market_man_rank_cpca_pifa and __car_market_man_rank_cpca_lingshou).
+    This reflects the real two-channel nature of Chinese auto sales reporting.
+  evidence: akshare/other/other_car_cpca.py:163(__car_market_man_rank_cpca_pifa)
+  stage: json_parsing
+  alternative_considered: Could create a unified function with indicator parameter
+- id: BD-GAP-017
+  type: BA/DK
+  content: 'CPCA fuel market data uses nested categorization: 整体市场, 销量占比-PHEV-BEV, 销量占比-ICE-NEV'
+  rationale: Electric vs combustion vehicle market share is modeled with specific category names reflecting
+    China's EV classification (BEV, PHEV as new energy vehicles vs ICE). The symbol vocabulary encodes
+    policy-relevant categories that may change with regulation updates.
+  evidence: akshare/other/other_car_cpca.py:722(car_market_fuel_cpca)
+  stage: json_parsing
+  alternative_considered: Could fetch valid categories from API at runtime
+- id: BD-GAP-018
+  type: B/DK
+  content: QHKC data period bounded to 2016-10-10:2019-09-30 with datetime.date type for date parameters
+  rationale: The proprietary '奇货可查' platform only maintains fund position data within a specific historical
+    window. Using datetime.date type enforces this constraint at the type level, but no runtime validation
+    prevents querying outside the window.
+  evidence: akshare/qhkc_web/qhkc_fund.py:23(get_qhkc_fund_bs)
+  stage: json_parsing
+  alternative_considered: Could deprecate module or integrate live alternatives
+- id: BD-GAP-019
+  type: B
+  content: QHKC tools (foreign ratios, GDP data) only provide real-time data with no historical query
+    capability
+  rationale: The external ratio and GDP comparison tools on QHKC are real-time only. The docstring explicitly
+    states '暂不能查询历史数据' (historical queries not possible). This limits trend analysis use cases.
+  evidence: akshare/qhkc_web/qhkc_tool.py:17(qhkc_tool_foreign)
+  stage: json_parsing
+  alternative_considered: Could implement local caching of daily snapshots
+- id: BD-GAP-020
+  type: BA/DK
+  content: SGE spot gold/silver data uses specific contract codes (Au99.99, Au(T+D), Ag(T+D)) with different
+    settlement behaviors
+  rationale: Shanghai Gold Exchange offers multiple contract types with different delivery windows and
+    settlement rules. The symbol selection determines whether you're looking at spot (immediate) or deferred
+    (T+D) contracts. This affects price and basis calculations.
+  evidence: akshare/spot/spot_sge.py:50(spot_quotations_sge)
+  stage: json_parsing
+  alternative_considered: Could separate spot and deferred into distinct functions
+- id: BD-GAP-021
+  type: B
+  content: Xueqiu data requires valid token authentication with no public endpoint, raising ValueError
+    on missing token
+  rationale: Xueqiu requires authentication tokens that users must obtain manually. The function accepts
+    token=None but will fail. This creates a barrier for automation and suggests token sharing practices
+    that may violate terms of service.
+  evidence: akshare/stock_fundamental/stock_basic_info_xq.py:15(stock_individual_basic_info_xq)
+  stage: Infrastructure
+  alternative_considered: Could use official API with proper OAuth or deprecate scraping
+- id: BD-GAP-022
+  type: BA/DK
+  content: IPO data is segmented by board (科创板, 创业板, 北交所, 上海主板, 深圳主板) with separate functions for each
+  rationale: China's multi-board IPO system requires separate endpoints for each exchange/board. The code
+    mirrors this structure with 6+ functions for IPO registration data. This reflects regulatory boundaries
+    but creates API complexity.
+  evidence: akshare/stock_fundamental/stock_register_em.py:89(stock_register_kcb)
+  stage: json_parsing
+  alternative_considered: Could create board-agnostic function with board parameter
+- id: BD-GAP-023
+  type: BA
+  content: 'Quarter format encoding combines year and quarter number: ''20191'' for 2019 Q1, ''20194''
+    for 2019 annual'
+  rationale: Institution holdings data uses a non-standard string encoding where the last digit indicates
+    quarter (1-4) and '4' means annual report. This encoding started in 2005 and requires string manipulation
+    rather than date parsing. Error-prone for users.
+  evidence: akshare/stock_fundamental/stock_hold.py:17(stock_institute_hold)
+  stage: json_parsing
+  alternative_considered: Could use (year, quarter) tuple or standardized date format
+- id: BD-GAP-024
+  type: BA
+  content: 'THS financial data uses dual API paths: old endpoints under /new/ and new endpoints under
+    /astockpc/, returning different schemas'
+  rationale: 同花顺 migrated their financial API from /new/ to /astockpc/ structure, but both remain functional.
+    The old API (stock_financial_xxx_ths) and new API (stock_financial_xxx_new_ths) have different response
+    formats. This creates a migration burden for users.
+  evidence: akshare/stock_fundamental/stock_finance_ths.py:18(stock_financial_abstract_ths)
+  stage: json_parsing
+  alternative_considered: Could deprecate old endpoints and migrate each users
+- id: BD-GAP-025
+  type: BA/DK
+  content: US stock financial data from East Money requires market detection step before report fetching
+  rationale: US stocks on East Money require first determining the market (NASDAQ, NYSE, etc.) before
+    constructing the correct report URL. The internal function __stock_financial_us_report_query_market_em
+    handles this but adds an extra network round-trip per query.
+  evidence: akshare/stock_fundamental/stock_finance_us_em.py:15(__stock_financial_us_report_query_market_em)
+  stage: json_parsing
+  alternative_considered: Could encode market in symbol (e.g., NASDAQ:TSLA)
+- id: BD-GAP-026
+  type: BA/DK
+  content: Hong Kong stock financial data uses different symbol format (numeric without market prefix)
+    compared to A-shares
+  rationale: HK stocks use codes like '00700' while A-shares use 'SH600600' or 'SZ000001'. The different
+    conventions require users to know market context. The code embeds this assumption without validation.
+  evidence: akshare/stock_fundamental/stock_finance_hk_em.py:13(stock_financial_hk_report_em)
+  stage: json_parsing
+  alternative_considered: Could prefix HK symbols with 'HK'
+- id: BD-GAP-027
+  type: M
+  content: 'Missing: Convergence criteria explicit declaration'
+  rationale: 'Audit finding: missing: convergence criteria explicit declaration. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-028
+  type: M
+  content: 'Missing: Matrix ill-conditioning and stability'
+  rationale: 'Audit finding: missing: matrix ill-conditioning and stability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-029
+  type: B
+  content: 'Missing: PnL conservation'
+  rationale: 'Audit finding: missing: pnl conservation. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-030
+  type: B
+  content: 'Missing: Train/test time split integrity'
+  rationale: 'Audit finding: missing: train/test time split integrity. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-031
+  type: DK
+  content: 'Missing: Random seed full coverage'
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-032
+  type: M/DK
+  content: 'Missing: Day count convention'
+  rationale: 'Audit finding: missing: day count convention. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-033
+  type: B
+  content: 'Missing: 信号-执行时序（Bar Execution Timing）'
+  rationale: 'Audit finding: missing: 信号-执行时序（bar execution timing）. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-034
+  type: B
+  content: 'Missing: 资金成本建模（Carry/Funding）'
+  rationale: 'Audit finding: missing: 资金成本建模（carry/funding）. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-035
+  type: B
+  content: 'Missing: 回测过拟合防护'
+  rationale: 'Audit finding: missing: 回测过拟合防护. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-036
+  type: B
+  content: 'Missing: 填单假设（市价单全量成交）'
+  rationale: 'Audit finding: missing: 填单假设（市价单全量成交）. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-037
+  type: B
+  content: 'Missing: 先卖后买 vs 先买后卖'
+  rationale: 'Audit finding: missing: 先卖后买 vs 先买后卖. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-038
+  type: B
+  content: 'Missing: 波动率曲面插值方案'
+  rationale: 'Audit finding: missing: 波动率曲面插值方案. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-039
+  type: B
+  content: 'Missing: 隐含波动率求解器'
+  rationale: 'Audit finding: missing: 隐含波动率求解器. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-040
+  type: B
+  content: 'Missing: 模型校准残差与收敛诊断'
+  rationale: 'Audit finding: missing: 模型校准残差与收敛诊断. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-041
+  type: M
+  content: 'Missing: 有限差分网格稳定性'
+  rationale: 'Audit finding: missing: 有限差分网格稳定性. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-042
+  type: B
+  content: 'Missing: 无套利约束验证'
+  rationale: 'Audit finding: missing: 无套利约束验证. PRC Score: 1/8 (12.5%). This gap affects production reliability
+    and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: 'PRC Score: 1/8 (12.5%)'
+- id: BD-GAP-043
+  type: M
+  content: 'Missing: 协方差矩阵 PSD 修复策略'
+  rationale: 'Audit finding: missing: 协方差矩阵 psd 修复策略. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-044
+  type: B
+  content: 'Missing: 协方差估计量选择与收缩'
+  rationale: 'Audit finding: missing: 协方差估计量选择与收缩. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-045
+  type: B
+  content: 'Missing: VaR/CVaR 置信水平与窗口'
+  rationale: 'Audit finding: missing: var/cvar 置信水平与窗口. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-046
+  type: B
+  content: 'Missing: 再平衡触发机制'
+  rationale: 'Audit finding: missing: 再平衡触发机制. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-047
+  type: RC
+  content: 'Missing: 事件类型与税务规则绑定'
+  rationale: 'Audit finding: missing: 事件类型与税务规则绑定. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-048
+  type: B
+  content: 'Missing: 排放因子版本与来源'
+  rationale: 'Audit finding: missing: 排放因子版本与来源. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-049
+  type: B
+  content: 'Missing: PCAF 数据质量评分'
+  rationale: 'Audit finding: missing: pcaf 数据质量评分. CMP Score: 1/6 (16.7%). This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: 'CMP Score: 1/6 (16.7%)'
+- id: BD-GAP-050
+  type: B
+  content: 'Missing: 版本化写入与快照语义'
+  rationale: 'Audit finding: missing: 版本化写入与快照语义. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-051
+  type: B
+  content: 'Missing: RL 奖励函数交易成本建模'
+  rationale: 'Audit finding: missing: rl 奖励函数交易成本建模. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-052
+  type: B
+  content: 'Missing: Covariates 时间可用性约束'
+  rationale: 'Audit finding: missing: covariates 时间可用性约束. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-053
+  type: B
+  content: 'Missing: 多智能体决策共识与风险否决权'
+  rationale: 'Audit finding: missing: 多智能体决策共识与风险否决权. AIL Score: 0/6 (0%)** — *Not applicable: AKShare
+    is a data library, not an AI/ML system. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: 'AIL Score: 0/6 (0%)** — *Not applicable: AKShare is a data library, not an AI/ML system'
+- id: BD-GAP-054
+  type: M
+  content: 'Missing: Implement convergence tolerance and max_iter parameters for numerical methods (volatility
+    surface interpolation, implied vol solver)'
+  rationale: 'Audit finding: missing: implement convergence tolerance and max_iter parameters for numerical
+    methods (volatility surface interpolation, implied vol solver). Numerical methods may run indefinitely
+    or use implicit defaults leading to inconsistent results. This gap affects production reliability
+    and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: pagination
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Numerical methods may run indefinitely or use implicit defaults leading to inconsistent results
+- id: BD-GAP-055
+  content: 'Missing: Matrix ill-conditioning and stability'
+  type: M
+  rationale: 'Audit finding: missing: matrix ill-conditioning and stability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: http_request
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-056
+  content: 'Missing: PnL conservation'
+  type: B
+  rationale: 'Audit finding: missing: pnl conservation. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: http_request
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-057
+  content: 'Missing: Day count convention'
+  type: M/DK
+  rationale: 'Audit finding: missing: day count convention. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: http_request
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-058
+  content: 'Missing: 模型校准残差与收敛诊断'
+  type: B
+  rationale: 'Audit finding: missing: 模型校准残差与收敛诊断. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: http_request
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-059
+  content: 'Missing: 无套利约束验证'
+  type: B
+  rationale: 'Audit finding: missing: 无套利约束验证. PRC Score: 1/8 (12.5%). This gap affects production reliability
+    and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: http_request
+  status: missing
+  severity: high
+  impact: 'PRC Score: 1/8 (12.5%)'
+  known_gap: true
+- id: BD-GAP-060
+  content: 'Missing: 版本化写入与快照语义'
+  type: B
+  rationale: 'Audit finding: missing: 版本化写入与快照语义. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: http_request
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 38
+  evidence_invalid: 86
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.3064516129032258
+known_use_cases:
+- id: UC-101
+  name: Sphinx Documentation Configuration for Akshare
+  source: docs/conf.py
+  type: extension_example
+  business_problem: Sets up the Sphinx documentation builder with Chinese language support (via ctex),
+    Markdown parsing via recommonmark, and automatic version string extraction from the akshare package
+    for consistent documentation.
+  intent_keywords:
+  - documentation
+  - sphinx
+  - docs build
+  - chinese documentation
+  - readthedocs
+  stage: documentation
+  negative_keywords:
+  - trading strategy
+  - screening
+  - market data
+  - factor computation
+  - backtesting
+  disambiguation: Are you looking to configure documentation builds and setup, or are you trying to implement
+    a trading strategy, screen stocks, or analyze market data?
+  data_domain: mixed
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+applicability:
+  domain: finance
+  task_type: Financial data acquisition and normalization library for Chinese markets
+  description: Python library that simplifies fetching financial data from Chinese sources (stocks, futures,
+    forex, macroeconomics) by providing 400+ functions that scrape, parse, and normalize data into standardized
+    pandas DataFrames.
+  prerequisites: Python 3.9+ required; basic understanding of pandas DataFrames; knowledge of Chinese
+    financial market data sources
+  not_suitable_for: Real-time trading systems requiring sub-second latency; non-Chinese market data; high-frequency
+    trading; production systems requiring cached data; projects needing type-safe interfaces
+global_contracts:
+- 'Every functions return pandas.DataFrame as primary output (akshare/futures/cot.py:73 :rtype: pandas.DataFrame)'
+- Date parameters accept YYYYMMDD, YYYY-MM-DD, or datetime.date format for user convenience (akshare/futures/cot.py:67
+  format：YYYY-MM-DD 或 YYYYMMDD 或 datetime.date对象)
+- Empty results return DataFrame with column names but zero rows to maintain schema consistency (akshare/utils/func.py:73
+  if df.shape==(0,0):return DataFrame(columns=cols))
+- Proxy settings stored in global singleton config ensuring single source of truth across each functions
+  (akshare/utils/context.py:19 config=AkshareConfig())
+- Numeric columns use errors='coerce' for invalid values to handle missing/corrupted data gracefully (akshare/stock_feature/stock_hist_em.py:315
+  pd.to_numeric(...,errors='coerce'))
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 0
+    warn: 0
+    fail: 0
+  subdomain_totals:
+    pass: 6
+    warn: 25
+    fail: 41
+  coverage: 72/72 (100%)
+  pass_rate: 6/72 (8%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: realtime_stock_data
+  description: Use Sina for A/H/US stocks; East Money for fundamentals and funds; Tencent as backup
+  used_in_stages: []
+  options:
+  - name: Sina Finance
+    traits:
+    - real-time
+    - China-A-HK-US
+    - free
+    - rate-limited
+    fit_for:
+    - Basic A-share and HK stock real-time data needs
+    not_fit_for:
+    - High-frequency trading, millisecond latency requirements
+  - name: East Money
+    traits:
+    - real-time
+    - China-focused
+    - free
+    - rate-limited
+    fit_for:
+    - A-share fundamental data, fund data
+    not_fit_for:
+    - International markets
+  - name: Tencent Finance
+    traits:
+    - real-time
+    - HK-focused
+    - free
+    fit_for:
+    - HK stock data
+    not_fit_for:
+    - A-share, US markets
+  default: Sina Finance
+  _source: worker_resource
+- id: slot-002
+  name: futures_historical_data
+  description: Use exchange sites for official data; QHKCH for premium analytics
+  used_in_stages: []
+  options:
+  - name: Exchange official sites
+    traits:
+    - official
+    - authoritative
+    - daily
+    - free
+    fit_for:
+    - Official settlement prices, warehouse receipts
+    not_fit_for:
+    - Minute-level data, real-time
+  - name: Sina Finance
+    traits:
+    - daily
+    - free
+    - Chinese markets
+    fit_for:
+    - Continuous contract data, historical bars
+    not_fit_for:
+    - International futures
+  - name: QHKCH Pro
+    traits:
+    - premium
+    - institutional
+    - requires-token
+    fit_for:
+    - Professional futures analytics
+    not_fit_for:
+    - Free users, casual analysis
+  default: Exchange official sites
+  _source: worker_resource
+- id: slot-003
+  name: macro_economic_data
+  description: Jin10 for global macro; China Money for CNY/FX specific
+  used_in_stages: []
+  options:
+  - name: Jin10 (金十数据)
+    traits:
+    - real-time
+    - global
+    - comprehensive
+    - free
+    fit_for:
+    - Global macro data (US, EU, China)
+    not_fit_for:
+    - Deep historical data
+  - name: China Money (中国货币网)
+    traits:
+    - China-focused
+    - FX
+    - rates
+    - free
+    fit_for:
+    - Chinese FX, SHIBOR, repo rates
+    not_fit_for:
+    - International macro
+  default: Jin10
+  _source: worker_resource
+- id: slot-004
+  name: javascript_decoding
+  description: Use py-mini-racer for general use; curl_cffi for anti-bot bypass
+  used_in_stages: []
+  options:
+  - name: py-mini-racer
+    traits:
+    - V8-based
+    - full-js-support
+    fit_for:
+    - Standard environments, complex JS
+    not_fit_for:
+    - Memory-constrained environments
+  - name: akracer
+    traits:
+    - Linux-optimized
+    - pre-compiled
+    fit_for:
+    - Linux servers, Docker containers
+    not_fit_for:
+    - Windows/macOS
+  - name: curl_cffi
+    traits:
+    - browser-emulation
+    - no-js-engine
+    fit_for:
+    - Bypassing anti-bot detection
+    not_fit_for:
+    - Actual JavaScript execution
+  default: py-mini-racer/akracer
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: Sina Finance (新浪财经)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: East Money (东方财富)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: Tencent Finance (腾讯财经)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: Jin10 (金十数据)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: QHKCH (奇货可查 Pro API)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: SSE (上海证券交易所)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: SZSE (深圳证券交易所)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-008
+  type: external_service
+  name: CFFEX (中国金融期货交易所)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-009
+  type: external_service
+  name: SHFE (上海期货交易所)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-010
+  type: external_service
+  name: DCE (大连商品交易所)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-011
+  type: external_service
+  name: CZCE (郑州商品交易所)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-012
+  type: external_service
+  name: GFEX (广州期货交易所)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-013
+  type: external_service
+  name: INE (上海国际能源交易中心)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-014
+  type: external_service
+  name: Xueqiu (雪球财经)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-015
+  type: external_service
+  name: Tushare 同花顺
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-016
+  type: external_service
+  name: China Money (中国货币网)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-017
+  type: external_service
+  name: Investing.com China (英为财情)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-018
+  type: external_service
+  name: SW Index (申万指数)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-019
+  type: external_service
+  name: 99 Futures (99期货)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-020
+  type: external_service
+  name: SGE (上海黄金交易所)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-021
+  type: external_service
+  name: Endata (艺恩数据)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-022
+  type: external_service
+  name: Etnet (经济通)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-023
+  type: external_service
+  name: Jisilu (集思录)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-024
+  type: external_service
+  name: Hexun (和讯)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-025
+  type: external_service
+  name: CNINFO (巨潮资讯)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-026
+  type: external_service
+  name: AKShare Pro API
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-027
+  type: external_service
+  name: Xueqiu (雪球)
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-028
+  type: external_service
+  name: Jin10 Data API
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-029
+  type: external_service
+  name: East Money Futures API
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-030
+  type: external_service
+  name: AKTools HTTP API
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-031
+  type: python_package
+  name: pandas>=2.0.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-032
+  type: python_package
+  name: requests>=2.22.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-033
+  type: python_package
+  name: beautifulsoup4>=4.9.1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-034
+  type: python_package
+  name: lxml>=4.2.1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-035
+  type: python_package
+  name: html5lib>=1.0.1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-036
+  type: python_package
+  name: openpyxl>=3.0.3
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-037
+  type: python_package
+  name: xlrd>=1.2.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-038
+  type: python_package
+  name: urllib3>=1.25.8
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-039
+  type: python_package
+  name: tqdm>=4.43.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-040
+  type: python_package
+  name: tabulate>=0.8.6
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-041
+  type: code_example
+  name: Sphinx Documentation Configuration for Akshare
+  path: docs/conf.py
+  description: Sets up the Sphinx documentation builder with Chinese language support (via ctex), Markdown
+    parsing via recommonmark, and automatic version string extraction from the akshare package for consistent
+    documentation.
+  used_in_stages:
+  - documentation
+  _source: uc_list

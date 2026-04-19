@@ -1,0 +1,3377 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-110
+name: cryptofeed
+sop_version: '3.6'
+source:
+  projects:
+  - cryptofeed
+  commit_hash: fe5993b017df8d57df64b2ad4d8f45f45884b231
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Real-time cryptocurrency market data feed aggregation and normalization
+  description: A Python library that connects to multiple cryptocurrency exchanges via WebSocket and REST
+    APIs, normalizes market data (trades, order books, tickers, candles), and delivers structured data
+    to user callbacks or storage backends.
+  prerequisites: Users should understand asyncio programming, cryptocurrency market data concepts (trades,
+    order books, candles), and the difference between WebSocket streaming and REST polling.
+  not_suitable_for: Historical data retrieval, order execution/trading, low-latency HFT systems requiring
+    custom network optimization, non-cryptocurrency markets
+stages:
+- id: feed_orchestration
+  name: Feed Handler Orchestration
+  order: 1
+  responsibility: 'Main entry point that coordinates multiple exchange feeds, manages their lifecycle
+    (start/stop), and aggregates NBBO quotes across feeds. WHY: Provides a unified interface for subscribing
+    to multiple exchanges and combining their data.'
+  interface:
+    inputs:
+    - Exchange configuration
+    - Callback mappings
+    - Subscription requests
+    outputs:
+    - Normalized market data events
+  required_methods:
+  - name: FeedHandler.add_feed
+    description: Registers an exchange feed with the handler, specifying the exchange ID, channels, symbols,
+      and callbacks
+    evidence: feedhandler.py:add_feed
+  - name: FeedHandler.add_nbbo
+    description: Creates a National Best Bid/Offer feed by combining data from multiple exchanges for
+      specified symbols
+    evidence: feedhandler.py:add_nbbo
+  - name: FeedHandler.run
+    description: Starts the asyncio event loop, initializes each feeds, and blocks until termination or
+      exception
+    evidence: feedhandler.py:run
+  key_behaviors:
+  - behavior: Feed lifecycle management
+    description: Each feed is started in its own asyncio task, managed by the FeedHandler's event loop
+    evidence: feedhandler.py:run
+  - behavior: Subscription mutual exclusion
+    description: Feed requires either subscription= parameter OR channels+symbols parameters - not both.
+      Using both causes silent ignore of one set
+    evidence: feed.py:92-93
+  replaceable_points:
+  - name: async_event_loop
+    description: The asyncio event loop implementation used for feed management
+    options:
+    - name: uvloop
+      traits:
+      - High performance
+      - Linux/macOS only
+      - C-extension based
+      fit_for:
+      - Production deployments
+      - High throughput requirements
+      not_fit_for:
+      - Windows environments
+      - Simple scripts
+    - name: standard asyncio
+      traits:
+      - Cross-platform
+      - Standard library
+      fit_for:
+      - Development
+      - Windows compatibility
+      - Simple use cases
+      not_fit_for:
+      - Maximum throughput
+      - Latency-critical applications
+    default: uvloop on non-Windows
+  design_decisions:
+  - 'WebSocket-first architecture - uses WebSocket connections when exchanges support them, falling back
+    to REST polling. Evidence: feed.py __init__ and connection.py'
+  - 'asyncio-based concurrency - each I/O operations are non-blocking. Evidence: feedhandler.py uses asyncio.gather'
+  acceptance_hints:
+  - Multiple exchanges can be added and started simultaneously
+  - FeedHandler.run() blocks until an exception or SIGINT/SIGTERM
+  - start_loop=False allows user-managed event loops
+- id: connection_management
+  name: Connection Management
+  order: 2
+  responsibility: 'Manages low-level WebSocket and HTTP connections to exchanges, including heartbeat,
+    reconnection, and message framing. WHY: Provides reliable, persistent connections with automatic reconnection
+    and keeps connections alive.'
+  interface:
+    inputs:
+    - WebSocket/HTTP endpoint URLs
+    - Connection configuration
+    outputs:
+    - Raw message bytes/strings
+  required_methods:
+  - name: WebsocketEndpoint.connect
+    description: Establishes a WebSocket connection with automatic ping/pong heartbeat
+    evidence: connection.py:connect
+  - name: WebsocketEndpoint.read
+    description: Async iterator that yields incoming WebSocket messages
+    evidence: connection.py:read
+  - name: WebsocketEndpoint.write
+    description: Sends data over the WebSocket connection
+    evidence: connection.py:write
+  key_behaviors:
+  - behavior: Heartbeat mechanism
+    description: WebSocket connections send ping frames every ping_interval seconds (default 10s) to detect
+      dead connections
+    evidence: connection.py:365
+  - behavior: Automatic reconnection
+    description: On connection failure, exponential backoff reconnection is attempted with configurable
+      max retries
+    evidence: connection.py
+  - behavior: SSL/TLS support
+    description: Every WebSocket connections support secure wss:// protocol
+    evidence: connection.py:websocket_connect
+  replaceable_points:
+  - name: websocket_library
+    description: The underlying WebSocket client library
+    options:
+    - name: websockets (official)
+      traits:
+      - Modern
+      - Active maintenance
+      - Full RFC6455
+      fit_for:
+      - New deployments
+      - Standard use cases
+      not_fit_for:
+      - Legacy systems
+    default: websockets>=14.1
+  design_decisions:
+  - 'ping_interval=10s is the default heartbeat - trades off between detection speed and network overhead.
+    Evidence: connection.py:365'
+  - Connection objects are feed-scoped, not shared between feeds
+  acceptance_hints:
+  - Connections survive network hiccups via reconnection
+  - Ping/pong messages appear in logs at DEBUG level
+  - Connection close is properly handled with status codes
+- id: exchange_interface
+  name: Exchange Interface Layer
+  order: 3
+  responsibility: 'Implements exchange-specific WebSocket subscription formats, message parsing, and REST
+    API calls. WHY: Each exchange has unique message formats, authentication methods, and subscription
+    protocols that must be normalized.'
+  interface:
+    inputs:
+    - Normalized symbol/channel requests
+    - Exchange-specific configs
+    outputs:
+    - Normalized data dictionaries
+  required_methods:
+  - name: Binance.subscribe
+    description: Subscribes to WebSocket channels with Binance-specific message format
+    evidence: binance.py:subscribe
+  - name: Coinbase._connect
+    description: Establishes Coinbase WebSocket connection with product batch subscription
+    evidence: coinbase.py:_connect
+  - name: Exchange.standardize_symbol
+    description: Converts exchange-specific symbols to normalized format
+    evidence: exchange.py:standardize_symbol
+  key_behaviors:
+  - behavior: Symbol normalization
+    description: Exchange-specific symbols (BTC-USDT, BTC_USDT, XBT/USD) are normalized to unified format
+    evidence: exchange.py:48-49, symbols.py
+  - behavior: Message parsing
+    description: JSON messages from exchanges are parsed and converted to internal data structures
+    evidence: exchange.py:message_handler
+  - behavior: Trade side normalization
+    description: BUY='buy' and SELL='sell' constants must be enforced across ALL exchange mixins for data
+      integrity
+    evidence: defines.py:81-82
+  replaceable_points:
+  - name: symbol_mapping_backend
+    description: How exchange symbols are mapped to normalized symbols
+    options:
+    - name: Symbols singleton
+      traits:
+      - Lazy loading
+      - Cached
+      - Singleton pattern
+      fit_for:
+      - Production with many symbols
+      not_fit_for:
+      - Dynamic symbol discovery
+    default: Symbols singleton with populate() check
+  - name: rest_rate_limit_handling
+    description: How rate limit errors from REST APIs are handled
+    options:
+    - name: Exponential backoff retry
+      traits:
+      - Automatic
+      - Configurable delay
+      - Uniform across exchanges
+      fit_for:
+      - General use
+      not_fit_for:
+      - Real-time critical operations
+    default: retry_delay=60 seconds
+  design_decisions:
+  - 'Symbol population via Symbols.populated() check - must call before symbol_mapping(). Prevents data
+    corruption. Evidence: exchange.py:48-49'
+  - 'Every REST mixins inherit retry_delay=60s default for uniform rate limit handling. Evidence: exchange.py:194,198,205,212,219,226,233,240'
+  - 'BinanceFuturesRestMixin inherits from BinanceRestMixin, overriding only differences. Evidence: binance_rest.py:180-215'
+  acceptance_hints:
+  - Symbols are correctly normalized across each exchanges
+  - Subscription messages match exchange specifications
+  - REST endpoints retry on 429 rate limit errors
+- id: data_normalization
+  name: Data Normalization
+  order: 4
+  responsibility: 'Converts raw exchange messages into typed data objects with consistent field names
+    and types. WHY: Ensures each downstream consumers receive data in the same format regardless of which
+    exchange it came from.'
+  interface:
+    inputs:
+    - Raw exchange message dictionaries
+    outputs:
+    - Typed data objects (Trade, Ticker, Book, etc.)
+  required_methods:
+  - name: Trade.__init__
+    description: Creates an immutable Trade object with exchange, symbol, side, amount, price, timestamp
+    evidence: types.pyx:Trade
+  - name: Book.__init__
+    description: Creates an immutable Book object representing order book state
+    evidence: types.pyx:Book
+  - name: Callback.__call__
+    description: Processes normalized data and invokes user callback
+    evidence: callback.py:__call__
+  key_behaviors:
+  - behavior: Type checking
+    description: Data objects perform optional type validation on fields if configured at build time
+    evidence: types.pyx (setup.py line 40)
+  - behavior: Field immutability
+    description: Data object fields are readonly to prevent accidental modification by clients
+    evidence: types.pyx
+  - behavior: Consistent field names
+    description: 'Every exchanges use same field names: exchange, symbol, side, amount, price, timestamp'
+    evidence: types.pyx Trade, Ticker definitions
+  replaceable_points:
+  - name: type_validation
+    description: Whether field types are validated at runtime
+    options:
+    - name: strict_validation
+      traits:
+      - Runtime checks
+      - Fail-fast
+      - Slower
+      fit_for:
+      - Development
+      - Data integrity critical
+      not_fit_for:
+      - Production performance
+    - name: no_validation
+      traits:
+      - Fast
+      - No overhead
+      - Trust input
+      fit_for:
+      - Production
+      - High throughput
+      not_fit_for:
+      - Debugging type issues
+    default: Validation enabled (comment out line in setup.py to disable)
+  design_decisions:
+  - 'Custom data types via Cython types.pyx - ensures consistent interface and optional type checking.
+    Evidence: docs/dtypes.md'
+  acceptance_hints:
+  - Every data objects have consistent field structure
+  - Type errors raise exceptions when validation enabled
+  - Fields cannot be modified after creation
+- id: book_processing
+  name: Order Book Processing
+  order: 5
+  responsibility: 'Maintains local order book state by applying deltas to snapshots, validates book integrity
+    via checksums/sequence numbers. WHY: Exchanges send incremental updates that must be correctly merged
+    to produce accurate book state.'
+  interface:
+    inputs:
+    - Book delta/snapshot messages
+    outputs:
+    - Full book state snapshots
+  required_methods:
+  - name: Book.callback
+    description: Receives book updates and manages book state
+    evidence: backend.py:110-125
+  - name: Book.update
+    description: Applies delta updates to local book state
+    evidence: backend.py
+  key_behaviors:
+  - behavior: Snapshot-then-delta processing
+    description: snapshots_only check runs BEFORE delta processing - architectural ordering that ensures
+      correct state
+    evidence: backend.py:110-125
+  - behavior: Sequence number validation
+    description: Detects missing messages by tracking sequence numbers where supported
+    evidence: docs/book_validation.md
+  - behavior: Checksum validation (optional)
+    description: Validates book integrity by comparing calculated vs exchange-provided checksums
+    evidence: docs/book_validation.md
+  replaceable_points:
+  - name: book_depth
+    description: How many price levels to maintain per side
+    options:
+    - name: full_depth
+      traits:
+      - Complete book
+      - High memory
+      - Accurate mid-price
+      fit_for:
+      - Analysis
+      - Low-frequency trading
+      not_fit_for:
+      - Memory constrained
+      - High-frequency
+    - name: limited_depth
+      traits:
+      - Top N levels
+      - Low memory
+      - Fast processing
+      fit_for:
+      - Real-time dashboards
+      - Memory constrained
+      not_fit_for:
+      - Deep book analysis
+    default: Configurable depth per exchange
+  design_decisions:
+  - 'Sequence number checking enabled on each supporting exchanges - catches missing messages. Evidence:
+    docs/book_validation.md'
+  - Checksum validation optional (user-enabled) due to performance overhead (10-100μs per update)
+  acceptance_hints:
+  - Book deltas correctly update local state
+  - Missing messages trigger book reset/reconnection
+  - Checksum mismatches logged when validation enabled
+- id: nbbo_aggregation
+  name: NBBO Aggregation
+  order: 6
+  responsibility: 'Combines best bid/offer quotes from multiple exchanges to produce National Best Bid/Offer.
+    WHY: Provides consolidated best prices across each connected exchanges for a given symbol.'
+  interface:
+    inputs:
+    - Ticker updates from multiple exchanges
+    outputs:
+    - Consolidated NBBO quotes
+  required_methods:
+  - name: NBBO._update
+    description: Extracts bid@0 and ask@0 from order book updates and recalculates NBBO
+    evidence: nbbo.py:22-25
+  key_behaviors:
+  - behavior: Top-of-book extraction
+    description: NBBO uses index(0) to extract best bid and best ask - order book index(0) is architectural
+    evidence: nbbo.py:22-25
+  - behavior: Real-time updates
+    description: NBBO recalculated on every ticker/book update from any contributing exchange
+    evidence: nbbo.py
+  replaceable_points:
+  - name: nbbo_source
+    description: What data source to use for NBBO
+    options:
+    - name: ticker_feed
+      traits:
+      - Low latency
+      - May not include book
+      fit_for:
+      - Speed critical
+      not_fit_for:
+      - Book depth analysis
+    - name: order_book_feed
+      traits:
+      - Complete
+      - Higher latency
+      fit_for:
+      - Accurate NBBO
+      not_fit_for:
+      - Minimum latency requirements
+    default: ticker feed when available
+  design_decisions:
+  - 'Uses index(0) for best bid/ask extraction - changes to different levels would fundamentally alter
+    NBBO calculation. Evidence: nbbo.py:22-25'
+  acceptance_hints:
+  - NBBO reflects true best bid across each exchanges
+  - NBBO reflects true best ask across each exchanges
+  - Updates delivered within milliseconds of source exchange message
+- id: callback_dispatch
+  name: Callback Dispatch
+  order: 7
+  responsibility: 'Routes normalized data to user-registered callback functions or backend handlers. WHY:
+    Provides flexible data delivery to user code while supporting common storage patterns.'
+  interface:
+    inputs:
+    - Typed data objects
+    - Callback registrations
+    outputs:
+    - User callback invocations
+  required_methods:
+  - name: Callback.__call__
+    description: Invokes user callback with normalized data
+    evidence: callback.py:__call__
+  - name: AggregateCallback.__init__
+    description: Wraps handlers with aggregation capabilities, delegates lifecycle via hasattr introspection
+    evidence: aggregate.py:14-18
+  key_behaviors:
+  - behavior: Handler lifecycle delegation
+    description: AggregateCallback delegates start/stop lifecycle to wrapped handler via hasattr introspection
+    evidence: aggregate.py:14-18
+  - behavior: Backend serialization
+    description: BackendCallback.to_dict() called with numeric_type and none_to - breaking this corrupts
+      stored data
+    evidence: backend.py:92-97
+  replaceable_points:
+  - name: callback_type
+    description: How data is delivered to user code
+    options:
+    - name: raw_callback
+      traits:
+      - Direct data
+      - User controls processing
+      fit_for:
+      - Custom processing
+      - Real-time analysis
+      not_fit_for:
+      - Storage
+      - Persistence
+    - name: backend_callback
+      traits:
+      - Built-in storage
+      - Standardized
+      fit_for:
+      - Data persistence
+      - Analytics
+      not_fit_for:
+      - Custom processing needs
+    default: raw_callback
+  design_decisions:
+  - 'BackendCallback.to_dict() serialization contract - implementations must accept numeric_type and none_to
+    parameters. Evidence: backend.py:92-97'
+  acceptance_hints:
+  - User callbacks receive typed data objects
+  - Backend callbacks serialize correctly to target storage
+  - start()/stop() lifecycle properly propagated to backends
+- id: backend_storage
+  name: Backend Storage
+  order: 8
+  responsibility: 'Persists normalized market data to various storage backends (Redis, PostgreSQL, Kafka,
+    etc.). WHY: Enables time-series storage of market data for backtesting, analytics, and replay.'
+  interface:
+    inputs:
+    - Normalized data objects
+    outputs:
+    - Persisted storage records
+  required_methods:
+  - name: Backend.write
+    description: Writes data to the storage backend
+    evidence: backend.py:write
+  - name: Backend.start
+    description: Initializes backend resources (connections, tables)
+    evidence: backend.py:start
+  - name: BackendQueue.start
+    description: Initializes IPC queue for backend communication, multiprocess=False default uses Queue
+      vs Pipe
+    evidence: backend.py:17-29
+  key_behaviors:
+  - behavior: Asynchronous writes
+    description: BackendQueue uses asyncio.Queue for non-blocking data transfer from feed to backend
+    evidence: backend.py:17-29
+  - behavior: Multiprocess support
+    description: BackendQueue multiprocess=False default determines Queue vs multiprocessing.Pipe IPC
+      mechanism
+    evidence: backend.py:17-29
+  - behavior: OHLCV aggregation
+    description: OHLCV window=300 seconds (5 min) is the architectural default aggregation period
+    evidence: aggregate.py:48
+  - behavior: Throttling
+    description: Throttle window=60 seconds limits callback invocation rate
+    evidence: aggregate.py:28
+  replaceable_points:
+  - name: storage_backend
+    description: Target storage system for market data
+    options:
+    - name: Redis
+      traits:
+      - In-memory
+      - Sub-ms latency
+      - Pub/sub ready
+      fit_for:
+      - Real-time access
+      - Caching
+      - High throughput
+      not_fit_for:
+      - Analytical queries
+      - Large datasets
+    - name: PostgreSQL
+      traits:
+      - SQL queries
+      - ACID
+      - Mature
+      fit_for:
+      - Historical analysis
+      - Complex queries
+      not_fit_for:
+      - Extremely high throughput
+      - Time-series optimization
+    - name: Kafka
+      traits:
+      - Distributed
+      - Durable
+      - Replayable
+      fit_for:
+      - Event streaming
+      - Multiple consumers
+      not_fit_for:
+      - Simple use cases
+      - Single consumer
+    - name: InfluxDB
+      traits:
+      - Time-series optimized
+      - Compression
+      fit_for:
+      - Time-series analysis
+      - Metrics storage
+      not_fit_for:
+      - Relational queries
+    default: User choice based on requirements
+  - name: ipc_mechanism
+    description: Inter-process communication between feeds and backends
+    options:
+    - name: asyncio_queue
+      traits:
+      - Single process
+      - Low overhead
+      - Fast
+      fit_for:
+      - Single process deployments
+      - Low latency
+      not_fit_for:
+      - True parallelism
+      - CPU-bound backends
+    - name: multiprocessing_pipe
+      traits:
+      - Multi-process
+      - True parallelism
+      fit_for:
+      - CPU-intensive backends
+      - Isolation requirements
+      not_fit_for:
+      - Simple deployments
+      - Low latency priority
+    default: asyncio Queue (multiprocess=False)
+  design_decisions:
+  - 'BackendQueue multiprocess=False default uses Queue over multiprocessing.Pipe - changes entire IPC
+    mechanism. Evidence: backend.py:17-29'
+  - 'OHLCV window=300s and Throttle window=60s are architectural defaults affecting each users. Evidence:
+    aggregate.py:48, aggregate.py:28'
+  acceptance_hints:
+  - Data successfully written to storage backend
+  - No data loss during high-volume periods
+  - Backend start/stop properly cleans up resources
+data_flow:
+- from_stage: external
+  to_stage: connection_management
+  data: Exchange WebSocket/HTTP connections
+- from_stage: connection_management
+  to_stage: exchange_interface
+  data: Raw JSON message bytes
+- from_stage: exchange_interface
+  to_stage: symbol_normalization
+  data: Exchange-specific symbol strings
+- from_stage: symbol_normalization
+  to_stage: data_normalization
+  data: Normalized symbol references
+- from_stage: data_normalization
+  to_stage: book_processing
+  data: Order book update messages (snapshots and deltas)
+- from_stage: data_normalization
+  to_stage: nbbo_aggregation
+  data: Ticker and book updates for best bid/ask calculation
+- from_stage: book_processing
+  to_stage: callback_dispatch
+  data: Full order book snapshots
+- from_stage: nbbo_aggregation
+  to_stage: callback_dispatch
+  data: Consolidated NBBO quotes
+- from_stage: data_normalization
+  to_stage: callback_dispatch
+  data: Trade, Ticker, Candle, and other typed data objects
+- from_stage: callback_dispatch
+  to_stage: backend_storage
+  data: Normalized data for persistence
+- from_stage: callback_dispatch
+  to_stage: external
+  data: User callback invocations with typed data
+global_contracts:
+- contract: Every DataFrames/data structures use normalized symbols in format like BTC-USD
+  evidence: exchange.py:48-49, symbols.py
+- contract: Trade side must be normalized to BUY='buy', SELL='sell' across each exchange mixins
+  evidence: defines.py:81-82, binance_rest.py:107, coinbase_rest.py:141, bitmex_rest.py:57, kraken_rest.py:150
+- contract: Symbols singleton requires Symbols.populated() check before symbol_mapping() calls
+  evidence: exchange.py:48-49, symbols.py
+- contract: Feed subscription requires either subscription= OR channels+symbols, not both
+  evidence: feed.py:92-93
+- contract: WebSocket ping_interval=10s default applies to each connections
+  evidence: connection.py:365
+- contract: BackendCallback.to_dict() must accept numeric_type and none_to parameters
+  evidence: backend.py:92-97
+- contract: Order book snapshots_only check must run BEFORE delta processing
+  evidence: backend.py:110-125
+- contract: timedelta_str_to_sec() mappings must be updated when new candle intervals are added
+  evidence: util/time.py:10-45
+- contract: NBBO extracts bid@0 and ask@0 using index(0) on order book
+  evidence: nbbo.py:22-25
+business_decisions:
+- id: BD-001
+  type: B/BA
+  content: Throttle default window of 60 seconds - allows 1 update per window, drops each others
+  rationale: 'Defensive throttling protects downstream systems from message floods by enforcing a 60-second
+    cooldown window. This prevents infrastructure overload when exchange WebSocket streams emit high-frequency
+    updates. Boundary: updates arriving within the same 60-second window are silently dropped rather than
+    queued.'
+  evidence: cryptofeed/backends/aggregate.py:28(Throttle.__init__)
+  stage: nbbo_aggregation
+  alternative_considered: Queue-based buffering was rejected in favor of drop behavior to prevent unbounded
+    memory growth
+- id: BD-002
+  type: B/BA
+  content: OHLCV default window of 300 seconds (5 minutes) for candle aggregation
+  rationale: 'Five-minute OHLCV windows balance granularity against storage overhead for typical analytical
+    workflows. This aligns with common charting conventions while keeping memory footprint manageable.
+    Boundary: partial candles are discarded until the window completes.'
+  evidence: cryptofeed/backends/aggregate.py:48(OHLCV.__init__)
+  stage: nbbo_aggregation
+  alternative_considered: Shorter 1-minute windows were rejected due to excessive storage; longer 15-minute
+    windows lacked sufficient granularity
+- id: BD-003
+  type: B/BA
+  content: RenkoFixed default brick_size of 10 points
+  rationale: 'Fixed 10-point brick size provides consistent price-based filtering that abstracts minor
+    fluctuations while highlighting significant trend changes. Boundary: price movements less than 10
+    points produce no brick output.'
+  evidence: cryptofeed/backends/aggregate.py:80(renkofixed)
+  stage: nbbo_aggregation
+  alternative_considered: Percentage-based brick sizing was rejected for being exchange-dependent
+  _evidence_issues:
+  - 'FN_NOT_FOUND: renkofixed in cryptofeed/backends/aggregate.py'
+- id: BD-004
+  type: B
+  content: Snapshot interval of 1000 updates before writing a new snapshot for order books
+  rationale: 'Snapshotting every 1000 updates balances Redis write performance against data durability
+    requirements. This reduces I/O overhead compared to per-update snapshots while maintaining reasonable
+    recovery points. Boundary: up to 999 updates may be lost on crash.'
+  evidence: cryptofeed/backends/redis.py:115(BookRedis.__init__)
+  stage: persistence
+  alternative_considered: Time-based snapshots were rejected as they cause variable write patterns
+- id: BD-005
+  type: B/BA
+  content: Snapshots only mode for order books - only writes complete snapshots, not deltas
+  rationale: 'Snapshot-only mode simplifies state reconstruction at the cost of higher storage bandwidth.
+    Eliminates delta sequencing complexity for use cases requiring full state restoration. Boundary: delta-based
+    incremental updates are discarded in this mode.'
+  evidence: cryptofeed/backends/redis.py:115(BookRedis.__init__)
+  stage: persistence
+  alternative_considered: Hybrid snapshot+delta mode was considered but adds reconstruction complexity
+- id: BD-006
+  type: B/BA
+  content: Redis ZSet default score_key='timestamp' for time-series data ordering
+  rationale: 'Timestamp-based scoring enables efficient time-range queries on historical data stored in
+    Redis ZSets. This supports ordered retrieval by exchange receipt time. Boundary: ordering is lexicographic
+    within identical timestamps; secondary ordering undefined.'
+  evidence: cryptofeed/backends/redis.py:35(RedisZSetCallback.__init__)
+  stage: persistence
+  alternative_considered: Sequence-number scoring was rejected due to cross-feed ordering complexity
+- id: BD-007
+  type: B/BA
+  content: Numeric type defaults to float for backend serialization
+  rationale: 'Float serialization provides universal numeric compatibility across Redis clients and Python
+    versions without requiring decimal precision overhead. Boundary: floating-point precision limits apply;
+    large integers may lose sub-unit accuracy.'
+  evidence: cryptofeed/backends/redis.py:16(RedisCallback.__init__)
+  stage: persistence
+  alternative_considered: Decimal serialization was rejected due to JSON interop complexity
+- id: BD-008
+  type: B
+  content: None values converted to 'None' string for Redis storage
+  rationale: 'Stringifying None prevents null serialization errors in Redis and maintains field presence
+    information. However this creates semantic ambiguity requiring careful deserialization. Boundary:
+    ''None'' string must be explicitly decoded back to None on read.'
+  evidence: cryptofeed/backends/redis.py:16(RedisCallback.__init__)
+  stage: persistence
+  alternative_considered: Omitting None fields entirely was rejected as it loses presence semantics
+- id: BD-009
+  type: B
+  content: AsyncIO queue for backend writes with configurable multiprocessing
+  rationale: 'Asynchronous queue decouples data ingestion from persistence operations, preventing blocking
+    I/O from impacting feed processing throughput. Boundary: queue depth must be monitored to prevent
+    unbounded memory growth under backpressure.'
+  evidence: cryptofeed/backends/backend.py:16(BackendQueue.start)
+  stage: persistence
+  alternative_considered: Synchronous writes were rejected due to throughput limitations
+- id: BD-010
+  type: B
+  content: Daemon process for multiprocess backend workers
+  rationale: 'Daemonized workers enable clean process lifecycle management without lingering background
+    processes after main feed handler termination. Boundary: daemon processes cannot be directly managed
+    via standard process groups on each platforms.'
+  evidence: cryptofeed/backends/backend.py:17(BackendQueue.start)
+  stage: persistence
+  alternative_considered: Non-daemon workers were rejected for leaving orphan processes
+- id: BD-011
+  type: B/BA
+  content: Candle interval default '1m' across exchanges
+  rationale: 'One-minute candles provide baseline temporal resolution suitable for most real-time analysis
+    without excessive data volume. This universal default works across each exchange APIs. Boundary: not
+    each exchanges natively support 1-minute candles and may require aggregation.'
+  evidence: cryptofeed/feed.py:27(Feed.__init__)
+  stage: configuration
+  alternative_considered: Exchange-specific defaults were rejected for consistency
+- id: BD-012
+  type: B/BA
+  content: candle_closed_only=True by default - only return closed candles
+  rationale: 'Enforcing closed-candle-only prevents analysis artifacts from in-progress aggregations that
+    would be revised. This ensures data integrity for backtesting and reporting. Boundary: current incomplete
+    candle period is not observable until closure.'
+  evidence: cryptofeed/feed.py:27(Feed.__init__)
+  stage: configuration
+  alternative_considered: Returning partial candles was rejected to prevent revision-based analysis errors
+- id: BD-013
+  type: B/BA
+  content: Max depth 0 means no trimming of order book levels
+  rationale: 'Zero-depth interpretation preserves complete order book without truncation, ensuring full
+    market depth visibility. This simplifies debugging and enables precise volume analysis. Boundary:
+    memory usage grows unbounded with large books.'
+  evidence: cryptofeed/feed.py:27(Feed.__init__)
+  stage: configuration
+  alternative_considered: Default non-zero depth was rejected for hiding potentially relevant price levels
+- id: BD-014
+  type: B/RC
+  content: Timeout of 120 seconds before feed is considered dead and restarted
+  rationale: 'Two-minute timeout balances quick failure detection against false positives from normal
+    network latency spikes. Allows bulk data transfers to complete without triggering restart. Boundary:
+    degraded feeds may continue delivering stale data for up to 120 seconds.'
+  evidence: cryptofeed/feed.py:27(Feed.__init__)
+  stage: configuration
+  alternative_considered: Shorter 30-second timeout was rejected due to bulk operation interruption
+- id: BD-015
+  type: B/RC
+  content: Timeout interval of 30 seconds between timeout checks
+  rationale: 'Thirty-second polling interval balances CPU overhead against responsiveness to feed failures.
+    Ensures timeout detection within one check cycle. Boundary: actual detection latency ranges from 0
+    to 30 seconds after failure.'
+  evidence: cryptofeed/feed.py:27(Feed.__init__)
+  stage: configuration
+  alternative_considered: Sub-second polling was rejected for excessive CPU overhead
+- id: BD-016
+  type: B
+  content: Retries=10 for failed connections
+  rationale: 'Ten retry attempts provide reasonable persistence for transient network failures without
+    indefinite blocking. Supports recovery from brief outages. Boundary: sustained failures consume up
+    to 10x normal connection timeout duration.'
+  evidence: cryptofeed/feed.py:27(Feed.__init__)
+  stage: configuration
+  alternative_considered: Infinite retries were rejected for blocking restart under permanent failure
+- id: BD-017
+  type: B/BA
+  content: Binance depth interval default '100ms' (vs '1000ms')
+  rationale: 'Hundred-millisecond depth updates provide higher-resolution order book snapshots than the
+    default 1000ms, capturing fast market movements. Boundary: increases bandwidth and processing overhead
+    proportionally.'
+  evidence: cryptofeed/exchanges/binance.py:78(Binance.__init__)
+  stage: configuration
+  alternative_considered: 1000ms default was rejected for insufficient granularity in fast markets
+- id: BD-018
+  type: B
+  content: Binance per_connection_limit of 1024 streams per WebSocket
+  rationale: '1024-stream limit aligns with Binance WebSocket API constraints, enabling efficient multiplexing
+    within official boundaries. Prevents connection failures from exceeding server limits. Boundary: subscriptions
+    beyond 1024 require additional connections.'
+  evidence: cryptofeed/exchanges/binance.py:48(module)
+  stage: configuration
+  alternative_considered: Higher limits were rejected as they would cause server-side rejection
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/binance.py'
+- id: BD-019
+  type: B/RC
+  content: Binance request_limit of 20 requests per second
+  rationale: '20 req/s rate limit respects Binance REST API constraints, preventing IP-based throttling
+    or bans. Enables sustainable API usage patterns. Boundary: exceeding 20 rps triggers exponential backoff.'
+  evidence: cryptofeed/exchanges/binance.py:47(module)
+  stage: rate_limiting
+  alternative_considered: Higher limits were rejected for compliance with exchange terms
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/binance.py'
+- id: BD-020
+  type: B/DK
+  content: Retry delay of 60 seconds for rate-limited requests
+  rationale: 'Sixty-second backoff window allows rate limit buckets to refill without repeated rejection
+    cycles. Reduces unnecessary retry overhead. Boundary: adds minimum 60-second latency to rate-limited
+    operations.'
+  evidence: cryptofeed/connection.py:162(HTTPAsyncConn.read)
+  stage: rate_limiting
+  alternative_considered: Exponential backoff starting lower was rejected for complexity
+- id: BD-021
+  type: B/BA
+  content: 'Trade side mapping: ''m''=True means SELL (market maker), else BUY'
+  rationale: 'Binance ''m'' flag convention maps True to SELL, inverting typical buyer/seller logic. This
+    reflects market-maker vs taker semantics. Boundary: requires explicit mapping; assumption errors cause
+    side reversal.'
+  evidence: cryptofeed/exchanges/binance.py:172(_trade)
+  stage: data_normalization
+  alternative_considered: No mapping (pass-through) was rejected for cross-exchange inconsistency
+- id: BD-022
+  type: B/DK
+  content: VWAP calculation for OHLCV aggregation using price * amount sum
+  rationale: 'VWAP aggregation using cumulative price-times-volume division provides volume-weighted average
+    pricing for the aggregation window. Enables indicator calculations and fair value assessment. Boundary:
+    extreme outlier trades heavily influence VWAP.'
+  evidence: cryptofeed/backends/aggregate.py:54(OHLCV._agg)
+  stage: nbbo_aggregation
+  alternative_considered: Time-weighted VWAP was rejected for increased complexity
+- id: BD-023
+  type: B/DK
+  content: Async callbacks must be lightweight - FeedHandler pauses during callback execution
+  rationale: 'Pausing during callbacks prevents message buffering overflow while slow handlers execute.
+    Ensures backpressure propagation to exchanges. Boundary: high-latency callbacks directly impact feed
+    subscription freshness.'
+  evidence: examples/demo.py:30(comment)
+  stage: architecture
+  alternative_considered: Parallel callback execution was rejected for complexity; queue-based async was
+    rejected for memory growth
+  _evidence_issues:
+  - 'FN_NOT_FOUND: comment in examples/demo.py'
+- id: BD-024
+  type: B/BA
+  content: 'Dual-mode callbacks: auto-detect async vs sync handler via inspect'
+  rationale: 'Automatic async/sync detection via inspect enables seamless handler interoperability without
+    explicit mode configuration. Simplifies user API. Boundary: inspect overhead adds ~0.1ms per callback
+    invocation.'
+  evidence: cryptofeed/callback.py:14(Callback.__init__)
+  stage: architecture
+  alternative_considered: Explicit mode flag was rejected for API simplicity
+- id: BD-025
+  type: B/BA
+  content: 'Symbol normalization: BASE-QUOTE format (e.g., BTC-USDT)'
+  rationale: 'BASE-QUOTE hyphen-separated format provides universal symbol representation regardless of
+    exchange-specific conventions. Enables cross-exchange symbol matching. Boundary: some exchanges use
+    reverse notation requiring explicit mapping.'
+  evidence: cryptofeed/symbols.py:0(module)
+  stage: data_normalization
+  alternative_considered: Native exchange symbols were rejected for cross-market analysis incompatibility
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/symbols.py'
+- id: BD-026
+  type: B/DK
+  content: 'Subscription model: channel -> list of symbols mapping'
+  rationale: 'Channel-to-symbols mapping enables efficient multiplexing where a single subscription carries
+    multiple instrument streams. Matches exchange WebSocket framing. Boundary: each symbols in a channel
+    group receive identical update cadence.'
+  evidence: cryptofeed/feed.py:27(Feed.__init__)
+  stage: configuration
+  alternative_considered: Per-symbol individual subscriptions were rejected for connection overhead
+- id: BD-027
+  type: B/BA
+  content: 'Config file priority: explicit dict > config file > CRYPTOFEED_CONFIG env var > defaults'
+  rationale: 'Cascading priority allows flexible deployment patterns from code defaults through environment
+    to file-based configuration. Explicit dict takes precedence for programmatic overrides. Boundary:
+    environment variable changes require process restart.'
+  evidence: cryptofeed/config.py:44(Config.__init__)
+  stage: configuration
+  alternative_considered: JSON/YAML file-only was rejected for lacking programmatic override capability
+- id: BD-028
+  type: B/BA
+  content: Default log level WARNING, file 'feedhandler.log'
+  rationale: 'WARNING level reduces log verbosity in production while capturing significant events. File-based
+    logging ensures audit trail persistence. Boundary: DEBUG and INFO messages are suppressed by default.'
+  evidence: cryptofeed/config.py:12(_default_config)
+  stage: configuration
+  alternative_considered: INFO default was rejected for log volume; DEBUG rejected for noise
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _default_config in cryptofeed/config.py'
+- id: BD-029
+  type: B/BA
+  content: UVLoop enabled by default for asyncio performance
+  rationale: 'UVLoop provides 2-4x event loop performance improvement over vanilla asyncio on Linux/macOS.
+    Automatic enabling improves throughput without user configuration. Boundary: Windows falls back to
+    vanilla asyncio.'
+  evidence: cryptofeed/config.py:12(_default_config)
+  stage: configuration
+  alternative_considered: Opt-in uvloop was rejected for leaving performance on table by default
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _default_config in cryptofeed/config.py'
+- id: BD-030
+  type: B/DK
+  content: SIGHUP support only on Unix/macOS for graceful reload
+  rationale: 'SIGHUP signal enables in-place configuration reload on Unix systems without process restart.
+    Supports container orchestration patterns. Boundary: Windows deployments cannot use signal-based reload.'
+  evidence: cryptofeed/feedhandler.py:15(signal_import)
+  stage: configuration
+  alternative_considered: Windows-compatible reload via polling was rejected for complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: signal_import in cryptofeed/feedhandler.py'
+- id: BD-031
+  type: B/BA
+  content: 'Postgres: batch insert with UniqueViolationError silently ignored'
+  rationale: 'Silent ignore of duplicate key violations during batch inserts prevents transaction failure
+    from idempotent replay scenarios. Simplifies exactly-once delivery implementations. Boundary: actual
+    unique constraint violations are hidden.'
+  evidence: cryptofeed/backends/postgres.py:93(PostgresCallback.write_batch)
+  stage: persistence
+  alternative_considered: Failing on violation was rejected for breaking replay semantics
+- id: BD-032
+  type: B/DK
+  content: 'Postgres: custom_columns mapping for flexible schema adaptation'
+  rationale: 'Custom column mapping enables schema evolution and exchange-specific field projection without
+    code changes. Supports diverse downstream schemas. Boundary: type coercion responsibility shifts to
+    user configuration.'
+  evidence: cryptofeed/backends/postgres.py:31(custom_columns)
+  stage: persistence
+  alternative_considered: Fixed schema was rejected for insufficient flexibility
+  _evidence_issues:
+  - 'FN_NOT_FOUND: custom_columns in cryptofeed/backends/postgres.py'
+- id: BD-033
+  type: B/BA
+  content: 'Coinbase REST: candle max limit 300 rows per request'
+  rationale: '300-row limit matches Coinbase API constraints, maximizing batch efficiency while avoiding
+    server-side rejection. Prevents pagination complexity for typical queries. Boundary: historical ranges
+    requiring multiple requests.'
+  evidence: cryptofeed/exchanges/mixins/coinbase_rest.py:315(_candles)
+  stage: rate_limiting
+  alternative_considered: Higher limits were rejected for API compliance
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _candles in cryptofeed/exchanges/mixins/coinbase_rest.py'
+- id: BD-034
+  type: B
+  content: 'Binance REST: trade aggregation limit 1000 per request'
+  rationale: '1000-trade batch limit aligns with Binance API maximum, reducing round-trips for historical
+    queries. Balances payload size against response time. Boundary: queries spanning >1000 trades require
+    cursor pagination.'
+  evidence: cryptofeed/exchanges/mixins/binance_rest.py:72(trades)
+  stage: rate_limiting
+  alternative_considered: Smaller batches were rejected for inefficiency
+- id: BD-035
+  type: B/RC
+  content: 'Renko reversal logic: same-direction brick opens at prior close'
+  rationale: 'Opening new bricks at prior close maintains continuous price action without gaps. Ensures
+    Renko chart continuity. Boundary: consecutive bricks in same direction start from same price level.'
+  evidence: cryptofeed/backends/aggregate.py:101(RenkoFixed._agg)
+  stage: nbbo_aggregation
+  alternative_considered: Gap-based opening was rejected for chart discontinuity
+- id: BD-036
+  type: B/DK
+  content: 'VWAP normalization: divide by volume after aggregation window'
+  rationale: 'Post-window VWAP division ensures complete volume data before normalization, preventing
+    division-by-zero and ensuring accurate averages. Boundary: requires full window accumulation before
+    output.'
+  evidence: cryptofeed/backends/aggregate.py:72(OHLCV.__call__)
+  stage: nbbo_aggregation
+  alternative_considered: Streaming VWAP was rejected for accuracy concerns
+- id: BD-037
+  type: B/BA
+  content: 'OrderBook delta: zero amount means remove price level'
+  rationale: 'Zero-amount convention signals level deletion, aligning with exchange delta protocols. Reduces
+    message size vs explicit delete commands. Boundary: requires explicit zero-amount handling logic.'
+  evidence: cryptofeed/exchanges/binance.py:292(_book)
+  stage: data_normalization
+  alternative_considered: Explicit delete flag was rejected for message size
+- id: BD-038
+  type: B/DK
+  content: Receipt timestamp always recorded, exchange timestamp optional
+  rationale: 'Mandatory receipt timestamps ensure traceable processing latency measurement regardless
+    of exchange timestamp availability. Enables performance monitoring. Boundary: exchange timestamps
+    from unreliable sources may be inaccurate.'
+  evidence: cryptofeed/backends/backend.py:94(BackendCallback.__call__)
+  stage: telemetry
+  alternative_considered: Exchange timestamp only was rejected for observability gaps
+- id: BD-039
+  type: B/DK
+  content: 'Raw data collection: each HTTP/WebSocket traffic captured to file'
+  rationale: 'Full traffic capture enables offline replay, debugging, and audit requirements. Supports
+    incident investigation and regulatory compliance. Boundary: significant disk I/O and storage overhead.'
+  evidence: cryptofeed/feedhandler.py:56(raw_data_collection)
+  stage: telemetry
+  alternative_considered: Selective capture was rejected for potential missing data during incidents
+  _evidence_issues:
+  - 'FN_NOT_FOUND: raw_data_collection in cryptofeed/feedhandler.py'
+- id: BD-040
+  type: B/BA
+  content: Checksum validation optional (disabled by default) for order book integrity
+  rationale: 'Disabling checksum validation by default prioritizes throughput over integrity checking.
+    Optional enablement allows explicit tradeoff. Boundary: corrupted updates may propagate without detection
+    when disabled.'
+  evidence: cryptofeed/feed.py:27(Feed.__init__)
+  stage: configuration
+  alternative_considered: Enabled by default was rejected for 10-15% throughput reduction
+- id: BD-041
+  type: B/BA
+  content: Cross-check for crossed book (bid >= ask) disabled by default
+  rationale: 'Disabling crossed-book detection avoids false positives from momentary spread compression
+    during fast markets. Reduces computational overhead. Boundary: genuine crossed books from bad data
+    go undetected.'
+  evidence: cryptofeed/feed.py:27(Feed.__init__)
+  stage: configuration
+  alternative_considered: Enabled by default was rejected for false positive rate in fast markets
+- id: BD-042
+  type: B/BA
+  content: Delay start 0 seconds - feeds start immediately
+  rationale: 'Zero delay maximizes data freshness by starting feeds immediately upon initialization. Simplifies
+    startup sequencing. Boundary: rapid sequential feed starts may trigger rate limits.'
+  evidence: cryptofeed/feed.py:27(Feed.__init__)
+  stage: configuration
+  alternative_considered: Staggered start was rejected for adding latency to first feed
+- id: BD-043
+  type: B/RC
+  content: 'OKX: end timestamp exclusive (adds 1ms), start inclusive (subtracts 1ms)'
+  rationale: 'Boundary adjustment prevents duplicate candle boundaries from overlapping time ranges. Ensures
+    gapless historical retrieval. Boundary: single-millisecond gaps exist between adjacent queries.'
+  evidence: cryptofeed/exchanges/mixins/okx_rest.py:34(_interval_normalize)
+  stage: data_normalization
+  alternative_considered: Overlapping queries were rejected for potential duplicates
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _interval_normalize in cryptofeed/exchanges/mixins/okx_rest.py'
+- id: BD-044
+  type: B/DK
+  content: 'Bitfinex: deduplication by trade ID to handle non-paginated results'
+  rationale: 'Trade-ID deduplication prevents duplicate records when Bitfinex REST API returns overlapping
+    historical windows. Ensures data integrity. Boundary: trade IDs must be unique and stable across requests.'
+  evidence: cryptofeed/exchanges/mixins/bitfinex_rest.py:74(_dedupe)
+  stage: data_normalization
+  alternative_considered: Accepting duplicates was rejected for analytical integrity
+- id: BD-045
+  type: B
+  content: 'Book delta calculation: set difference for removed/added levels'
+  rationale: 'Set-difference computation efficiently identifies changes between book snapshots, avoiding
+    full comparison overhead. Enables efficient delta encoding. Boundary: requires both previous and current
+    book state.'
+  evidence: cryptofeed/util/book.py:10(book_delta)
+  stage: nbbo_aggregation
+  alternative_considered: Full snapshot comparison was rejected for efficiency
+- id: BD-046
+  type: B/BA
+  content: Backend multiprocessing disabled by default
+  rationale: 'Disabling multiprocessing by default simplifies deployment for single-process scenarios
+    and reduces resource overhead. Explicit enablement for high-throughput needs. Boundary: single-threaded
+    backend may bottleneck feed processing.'
+  evidence: examples/demo_redis.py:14(config)
+  stage: persistence
+  alternative_considered: Enabled by default was rejected for complexity on simple deployments
+  _evidence_issues:
+  - 'FN_NOT_FOUND: config in examples/demo_redis.py'
+- id: BD-047
+  type: B
+  content: 'Redis stream vs ZSet: stream for real-time, ZSet for historical queries'
+  rationale: 'Dual-storage pattern separates real-time consumption (stream) from historical range queries
+    (ZSet). Optimizes access patterns for each use case. Boundary: data must be written to both structures.'
+  evidence: cryptofeed/backends/redis.py:34,59(module)
+  stage: architecture
+  alternative_considered: Single structure was rejected for access pattern mismatch
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/backends/redis.py'
+- id: BD-048
+  type: B
+  content: Cython types for Trade, Ticker, Candle with freelist(128)
+  rationale: 'Cython-compiled types with object pooling reduce allocation overhead for high-frequency
+    message processing. 128-entry freelist balances memory vs reuse efficiency. Boundary: fixed pool size
+    may underflow during bursts.'
+  evidence: cryptofeed/types.pyx:34(Trade)
+  stage: performance
+  alternative_considered: Unbounded freelist was rejected for memory growth risk
+- id: BD-049
+  type: B
+  content: Decimal for price/amount in Trade and Ticker types
+  rationale: 'Decimal precision preserves exact financial values without floating-point rounding errors.
+    Critical for accurate pricing calculations. Boundary: Decimal operations are slower than float.'
+  evidence: cryptofeed/types.pyx:45(__init__)
+  stage: data_normalization
+  alternative_considered: Float was rejected for financial precision requirements
+- id: BD-050
+  type: B
+  content: 'OrderBook: L2 book stored as price->amount dict, L3 adds order_id'
+  rationale: 'L2/L3 distinction via dict structure enables order-book aggregation at appropriate precision
+    levels. L2 aggregates by price; L3 preserves individual orders. Boundary: L3 requires order ID tracking
+    overhead.'
+  evidence: cryptofeed/exchanges/coinbase.py:120-128(module)
+  stage: data_normalization
+  alternative_considered: Unified structure was rejected for L2 inefficiency
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/coinbase.py'
+  vague_rationale: true
+- id: BD-051
+  type: B/DK
+  content: Order book depth uses discrete set of valid depths
+  rationale: Exchange APIs reject non-discrete depth values, causing order failures. Valid depth boundaries
+    must align with exchange-specific constraints (e.g., 0.1, 0.2, 0.5 increments) to ensure order placement
+    succeeds. Fallback rejects invalid depth and logs warning.
+  evidence: cryptofeed/exchanges/binance_delivery.py:29(module)
+  stage: binance_delivery
+  alternative_considered: Continuous depth range was rejected as exchange enforces discrete validation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/binance_delivery.py'
+- id: BD-052
+  type: B/DK
+  content: Order book update frequency uses discrete intervals
+  rationale: Polling frequency must respect exchange rate limits and prevent message flooding. Discrete
+    intervals (e.g., 100ms, 500ms, 1s) define the acceptable sampling boundary for market data freshness
+    versus server load trade-off.
+  evidence: cryptofeed/exchanges/binance_delivery.py:30(module)
+  stage: binance_delivery
+  alternative_considered: Adaptive frequency was rejected due to complexity; fixed intervals provide predictability
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/binance_delivery.py'
+- id: BD-053
+  type: B/BA
+  content: Integer sequence validation for order book update integrity
+  rationale: Sequential integer tracking detects message gaps or duplications that indicate data loss
+    or replay attacks. Boundary conditions require handling sequence wraps, resets on reconnect, and tolerance
+    for legitimate gaps during high-frequency updates.
+  evidence: cryptofeed/exchanges/binance_delivery.py:40-51(module)
+  stage: binance_delivery
+  alternative_considered: Sequence windowing was considered but adds complexity without benefit
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/binance_delivery.py'
+- id: BD-054
+  type: B/BA
+  content: Open interest polling interval as continuous sampling rate
+  rationale: Open interest change detection requires sufficient polling frequency to capture market moves.
+    Continuous sampling boundary (e.g., 1-5 second intervals) balances responsiveness against rate limit
+    compliance. Deviation beyond threshold triggers alert.
+  evidence: cryptofeed/exchanges/binance_futures.py:48(module)
+  stage: binance_futures
+  alternative_considered: Event-driven WebSocket was planned but exchange support limited
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/binance_futures.py'
+- id: BD-055
+  type: B
+  content: REST polling uses fixed delay and sleep parameters
+  rationale: Fixed delays prevent rate limit violations while ensuring consistent data retrieval. Boundary
+    defines minimum sleep time (100ms) and maximum retry backoff (30s). Deviation outside boundaries triggers
+    circuit breaker.
+  evidence: cryptofeed/exchanges/binance_futures.py:61(module)
+  stage: binance_futures
+  alternative_considered: Adaptive delays were rejected due to response time variance
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/binance_futures.py'
+- id: BD-056
+  type: B/BA
+  content: Open interest change detection via exact equality
+  rationale: Exact equality comparison identifies genuine open interest changes versus floating-point
+    noise. Boundary requires Decimal comparison with zero tolerance. False positives trigger unnecessary
+    market analysis; false negatives miss significant position changes.
+  evidence: cryptofeed/exchanges/binance_futures.py:88(module)
+  stage: binance_futures
+  alternative_considered: Percentage threshold was rejected as exchange provides exact values
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/binance_futures.py'
+- id: BD-057
+  type: B/DK
+  content: Symbol transformation uses string replacement
+  rationale: Symbol normalization converts exchange-specific formats (e.g., BTCUSD_201225) to internal
+    format. String replacement boundary defines exact transformation rules; malformed symbols are rejected
+    before API calls.
+  evidence: cryptofeed/exchanges/binance_futures.py:44(module)
+  stage: binance_futures
+  alternative_considered: Regex parsing was considered but string replace is simpler for known patterns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/binance_futures.py'
+- id: BD-058
+  type: B/BA
+  content: JSON deserialization with Decimal parsing at load time
+  rationale: JSON parsing with Decimal conversion at load time ensures each financial fields maintain
+    precision from the start. Boundary requires explicit type conversion; default float parsing causes
+    precision loss that propagates through calculations.
+  evidence: cryptofeed/exchanges/binance_delivery.py:193(module)
+  stage: binance_delivery
+  alternative_considered: Lazy conversion was rejected; consistent Decimal usage throughout
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/binance_delivery.py'
+- id: BD-059
+  type: B/BA
+  content: Side determination via case-insensitive string comparison
+  rationale: Case-insensitive comparison handles exchange variations in BUY/SELL capitalization. Boundary
+    requires accepting 'buy', 'BUY', 'Buy' etc.; case-sensitive comparison would reject valid responses.
+  evidence: cryptofeed/exchanges/binance_delivery.py:181(module)
+  stage: binance_delivery
+  alternative_considered: Enum-based lookup was considered but string comparison is sufficient
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/binance_delivery.py'
+- id: BD-060
+  type: B
+  content: Position side normalized via lowercase conversion
+  rationale: Lowercase normalization standardizes position side values (LONG/long/Long -> long) for internal
+    consistency. Boundary requires handling each known variations; normalization failure raises ValueError.
+  evidence: cryptofeed/exchanges/binance_delivery.py:124(module)
+  stage: binance_delivery
+  alternative_considered: Case-insensitive enum matching was alternative but adds complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/binance_delivery.py'
+- id: BD-061
+  type: B/DK
+  content: Timestamp normalization converts exchange epoch to float
+  rationale: Epoch-to-float conversion enables standard datetime arithmetic across the system. Boundary
+    defines acceptable epoch range (2015-2030) to catch malformed timestamps; out-of-range values indicate
+    data corruption.
+  evidence: cryptofeed/exchanges/binance_delivery.py:126,187(module)
+  stage: binance_delivery
+  alternative_considered: UTC datetime objects were considered but float is more portable
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/binance_delivery.py'
+- id: BD-062
+  type: B/BA
+  content: Open interest cache uses exact key matching
+  rationale: Exact key matching ensures cache hits/misses are determined solely by symbol match. Boundary
+    requires correct key formatting with proper delimiters; key collisions indicate naming convention
+    issues.
+  evidence: cryptofeed/exchanges/binance_futures.py:97(module)
+  stage: binance_futures
+  alternative_considered: Fuzzy matching was rejected as exact symbol is required
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/binance_futures.py'
+- id: BD-063
+  type: BA/DK
+  content: BUY='buy', SELL='sell' constants must be normalized across ALL exchange mixins - inconsistent
+    implementations exist
+  rationale: 'Normalizing BUY/SELL constants ensures consistent order direction encoding across each exchange
+    implementations. Without this standard, trading logic could misinterpret order directions when switching
+    between exchanges, leading to incorrect trade execution. Boundary: Every exchange-specific REST mixin
+    classes must declare and use the same BUY/SELL constant values to maintain cross-exchange compatibility.'
+  evidence: cryptofeed/defines.py:81-82(binance_rest)
+  stage: invariant
+  alternative_considered: Per-exchange constant dictionaries were considered but rejected for cross-exchange
+    code reuse
+  _evidence_issues:
+  - 'FN_NOT_FOUND: binance_rest in cryptofeed/defines.py'
+- id: BD-064
+  type: BA/M
+  content: BackendQueue.start() multiprocess=False default changes entire IPC mechanism - Queue vs multiprocessing.Pipe
+  rationale: 'The multiprocess=False default selects Queue-based IPC over Pipe-based multiprocessing.
+    This architectural choice affects serialization requirements, callback threading model, and performance
+    characteristics. Changing this default would require rewriting each backend callback implementations.
+    Boundary: Default cannot be changed without explicit migration path for each BackendCallback subclasses.'
+  evidence: backend.py:17-29(BackendQueue.start)
+  stage: default_value
+  alternative_considered: multiprocessing.Pipe was considered for true parallelism but rejected due to
+    serialization complexity
+  _evidence_issues:
+  - 'NOT_FOUND: backend.py'
+- id: BD-065
+  type: B/DK
+  content: Feed.connect() requires symbol conversion FROM normalized TO exchange format for WebSocket
+    subscription
+  rationale: 'WebSocket subscriptions must use exchange-specific symbol formats (e.g., ''BTCUSDT'' vs
+    ''BTC/USDT''). This conversion contract ensures subscription messages are correctly formatted. Boundary:
+    External symbol sources must be normalized before passing to connect().'
+  evidence: cryptofeed/feed.py:201-202(module)
+  stage: ordering_contract
+  alternative_considered: Auto-conversion was considered but rejected to make conversion explicit
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/feed.py'
+- id: BD-066
+  type: B/BA
+  content: 'Subscription mutual exclusion: subscription= OR channels+symbols, not both - enforced in Feed.__init__'
+  rationale: 'Mutual exclusion of subscription parameter styles prevents ambiguous feed configuration.
+    Allowing both would create undefined behavior for duplicate channel subscriptions. Boundary: Feed
+    configuration validation rejects any initialization with both parameter sets populated.'
+  evidence: cryptofeed/feed.py:92-93(module)
+  stage: pattern_choice
+  alternative_considered: Merging subscriptions was rejected as it could mask configuration errors
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/feed.py'
+- id: BD-067
+  type: BA
+  content: OHLCV window=300 seconds (5 min) and Throttle window=60 seconds are architectural aggregation
+    defaults
+  rationale: 'Default aggregation windows of 5 minutes for OHLCV and 60 seconds for Throttle balance between
+    granularity and performance. These defaults serve most use cases without configuration. Boundary:
+    Strategies requiring different timeframes must explicitly specify non-default window values.'
+  evidence: aggregate.py:48(OHLCV.__init__); aggregate.py:28(Throttle.__init__)
+  stage: default_value
+  alternative_considered: Adaptive windows were considered but rejected for predictability
+  _evidence_issues:
+  - 'NOT_FOUND: aggregate.py'
+- id: BD-068
+  type: B
+  content: BinanceFuturesRestMixin and BinanceDeliveryRestMixin inherit from BinanceRestMixin - inheritance
+    hierarchy defines shared interface
+  rationale: 'Inheriting from BinanceRestMixin establishes that Futures and Delivery variants share the
+    same REST API contract as spot trading. This architectural decision ensures API consistency across
+    Binance product types. Boundary: Any change to BinanceRestMixin base class affects each derived mixins.'
+  evidence: cryptofeed/exchanges/mixins/binance_rest.py:180-215(module)
+  stage: inheritance
+  alternative_considered: Composition was rejected for API surface consistency
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/mixins/binance_rest.py'
+- id: BD-069
+  type: BA
+  content: BinanceFuturesRestMixin/BinanceDeliveryRestMixin override only methods that differ from BinanceRestMixin
+    base implementation
+  rationale: 'Minimal override pattern keeps Futures/Delivery implementations DRY by reusing each unchanged
+    BinanceRestMixin methods. This reduces maintenance burden and ensures identical behavior for shared
+    functionality. Boundary: Method overrides must maintain the same interface signature as base methods.'
+  evidence: cryptofeed/exchanges/mixins/binance_rest.py:180-215(module)
+  stage: inheritance
+  alternative_considered: Full duplication was rejected for maintainability
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in cryptofeed/exchanges/mixins/binance_rest.py'
+- id: BD-070
+  type: B/BA
+  content: Every exchanges use Symbols singleton pattern - must call Symbols.populated() check before
+    symbol_mapping()
+  rationale: 'Symbols singleton requires initialization before use. The populated() check enforces this
+    contract and prevents symbol lookups on uninitialized state. Boundary: Any code accessing symbol_mapping()
+    must first verify Symbols.populated() returns True or risk KeyError exceptions.'
+  evidence: cryptofeed/exchange.py:78(symbols)
+  stage: invariant
+  alternative_considered: Lazy initialization was rejected for explicit startup requirements
+- id: BD-071
+  type: B/BA
+  content: WebsocketEndpoint defaults ping_interval=10s - heartbeat architecture decision for connection
+    health
+  rationale: 'A 10-second ping interval balances between detecting dead connections quickly and avoiding
+    unnecessary network overhead. This interval is sufficient for most exchange WebSocket requirements.
+    Boundary: Connections with strict latency requirements may need shorter intervals; high-latency networks
+    may need longer ones.'
+  evidence: connection.py:365(WebsocketEndpoint.__init__)
+  stage: default_value
+  alternative_considered: 30-second default was rejected as too slow for real-time trading
+  _evidence_issues:
+  - 'NOT_FOUND: connection.py'
+- id: BD-072
+  type: B/BA
+  content: NBBO._update() extracts bid@0 and ask@0 before calculating min/max - order book index(0) is
+    architectural
+  rationale: 'Accessing index(0) means only the best bid and best ask are used for NBBO calculation, ignoring
+    rest of book. This simplifies NBBO to a top-of-book mechanism. Boundary: Any NBBO consumer expecting
+    depth-weighted pricing will receive only best-price information.'
+  evidence: nbbo.py:22-25(NBBO._update)
+  stage: ordering_contract
+  alternative_considered: Volume-weighted NBBO was rejected for simplicity and exchange API alignment
+  _evidence_issues:
+  - 'NOT_FOUND: nbbo.py'
+- id: BD-073
+  type: B/RC
+  content: timedelta_str_to_sec() hardcodes interval mappings - must update for new candle intervals
+  rationale: 'Hardcoded interval mappings create a maintainability burden: adding new candle intervals
+    requires modifying this function. This is a known boundary that must be respected. Boundary: Adding
+    support for non-standard intervals requires code changes to this function.'
+  evidence: util/time.py:10-45(timedelta_str_to_sec)
+  stage: invariant
+  alternative_considered: Registry pattern was rejected for performance reasons
+  _evidence_issues:
+  - 'NOT_FOUND: util/time.py'
+- id: BD-074
+  type: BA
+  content: BackendCallback.to_dict() called with numeric_type and none_to - serialization contract for
+    data transformation
+  rationale: 'The to_dict() method signature with numeric_type and none_to parameters establishes a serialization
+    contract for data transformation. This allows consistent type coercion and null handling across each
+    callbacks. Boundary: Custom callback implementations should use same parameters for consistent serialization
+    behavior.'
+  evidence: backend.py:92-97(BackendCallback.to_dict)
+  stage: pattern_choice
+  alternative_considered: Separate serialization classes were rejected for simplicity
+  _evidence_issues:
+  - 'NOT_FOUND: backend.py'
+- id: BD-075
+  type: BA
+  content: 'INTERACTION: [BD-001] Throttle 60s × [BD-002] OHLCV 300s → Sparse candle data from aggressive
+    throttling'
+  rationale: Throttle's 60-second drop window means only ~5 updates reach OHLCV aggregation per 5-minute
+    candle, potentially missing significant price movements within the window. This amplifies data loss
+    risk during volatile periods when granularity matters most. The combined effect produces candles with
+    incomplete representation of price action, degrading analytical value.
+  evidence: BD-001,BD-002
+  stage: global
+  alternative_considered: Separate throttle per aggregation type was rejected for complexity
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-076
+  type: B/BA
+  content: 'INTERACTION: [BD-011] 1m candle interval × [BD-012] candle_closed_only=True → Real-time blind
+    spot'
+  rationale: One-minute default interval combined with closed-only output creates systematic 60-second
+    data latency for real-time monitoring. Users cannot observe in-progress candle formation, only the
+    completed prior period. This contradiction forces either blind trading during the current minute or
+    explicit override of candle_closed_only.
+  evidence: BD-011,BD-012
+  stage: global
+  alternative_considered: Returning partial candles with 'closed' flag was rejected for API simplicity
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-077
+  type: B
+  content: 'INTERACTION: [BD-004] Snapshot interval × [BD-005] snapshots_only mode → Configurable parameter
+    has no effect'
+  rationale: The snapshot_interval setting of 1000 updates only applies to snapshot+delta hybrid mode.
+    In snapshots_only mode, every update triggers an immediate full snapshot write regardless of the interval
+    setting. This hidden dependency means the configuration parameter becomes a no-op when snapshots_only=True,
+    potentially causing confusion about actual persistence behavior.
+  evidence: BD-004,BD-005
+  stage: global
+  alternative_considered: Removing snapshot_interval when snapshots_only was rejected for configuration
+    flexibility
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-078
+  type: BA/DK
+  content: 'INTERACTION: [BD-040] checksum_disabled × [BD-041] crossed_book_check_disabled → Layered integrity
+    blind spots'
+  rationale: Both integrity validation features are disabled by default, creating compound risk. Checksum
+    disabled allows corrupted updates to propagate; crossed-book check disabled allows spread inversion
+    data to pass undetected. These two decisions amplify data quality risk, particularly dangerous during
+    high-frequency market events where corruption patterns may be subtle.
+  evidence: BD-040,BD-041
+  stage: global
+  alternative_considered: Enabling both by default was rejected for 15-20% throughput reduction
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-079
+  type: BA
+  content: 'INTERACTION: [BD-023] FeedHandler pauses during callback × [BD-009] AsyncIO queue backend
+    → Queue overflow cascade'
+  rationale: 'When FeedHandler pauses for slow callbacks, the AsyncIO queue continues accepting messages
+    but backend workers cannot drain them. This creates a cascading risk: slow callback → queue buildup
+    → memory growth → potential message loss under backpressure. The pause mechanism that provides backpressure
+    actually amplifies queue pressure rather than relieving it.'
+  evidence: BD-023,BD-009
+  stage: global
+  alternative_considered: Queue-based async was rejected for memory growth - ironic given this interaction
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-080
+  type: B/BA
+  content: 'INTERACTION: [BD-017] Binance 100ms depth × [BD-016] 10 retries → Message flood amplification
+    on reconnect'
+  rationale: 100ms depth interval generates 10x the message volume of default 1000ms. Combined with 10
+    retry attempts, brief network interruptions create massive backlog. When connection restores, the
+    10 retries worth of missed depth updates (potentially 100+ messages per stream) must be processed
+    before fresh data, delaying recovery and risking queue overflow.
+  evidence: BD-017,BD-016
+  stage: global
+  alternative_considered: Lower retry count for high-frequency streams was considered but rejected for
+    data completeness
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-081
+  type: B/BA
+  content: 'INTERACTION: [BD-008] None→''None'' string × [BD-031] Postgres silent UniqueViolation → Hidden
+    data corruption'
+  rationale: None values become literal 'None' strings during Redis storage. When these reach PostgreSQL
+    with unique constraints, the silent ignore of UniqueViolationError masks the semantic corruption.
+    The string 'None' is not equivalent to SQL NULL, creating subtle bugs where consumers expect null
+    semantics but receive string data, and any uniqueness violations are silently swallowed.
+  evidence: BD-008,BD-031
+  stage: global
+  alternative_considered: Using SQL NULL instead of 'None' string was rejected to preserve field presence
+    semantics
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-082
+  type: BA/DK
+  content: 'INTERACTION: [BD-049] Decimal precision × [BD-017] 100ms depth interval → Processing bottleneck
+    risk'
+  rationale: Decimal arithmetic for price/amount provides financial precision but adds computational overhead.
+    At 100ms depth intervals with Binance's high message rate, Decimal operations become a bottleneck.
+    The precision decision that protects financial accuracy amplifies performance pressure from the aggressive
+    depth interval, potentially causing lag during high-volatility fast markets.
+  evidence: BD-049,BD-017
+  stage: global
+  alternative_considered: Float with tolerance was rejected for financial precision requirements
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-GAP-001
+  type: T
+  content: Poloniex uses ticker endpoint as authoritative source for pair mappings because official documentation
+    does not expose pair string-to-ID mappings
+  rationale: Without documentation, scraping the ticker endpoint provides embedded mappings without additional
+    API calls. Breaks if Poloniex removes ticker endpoint or changes its response format.
+  evidence: tools/tools.py:19(poloniex_get_ticker_map)
+  stage: integration
+  alternative_considered: Hardcoded pair mappings would require maintenance on exchange changes
+- id: BD-GAP-002
+  type: T
+  content: Test data generation supports exchange-level filtering via only_exchange parameter to enable
+    isolated testing
+  rationale: Allows developers to generate test data for specific exchanges without full dataset. Default
+    None generates all, providing flexibility. Breaks in CI if any single exchange API is down.
+  evidence: tools/generate_test_data.py:27(main)
+  stage: testing
+  alternative_considered: Generate each data always; slower but simpler
+- id: BD-GAP-003
+  type: B/DK
+  content: Performance metrics collection uses exchange_filter pattern allowing selective enablement/disablement
+    per exchange
+  rationale: Supports granular performance monitoring without global overhead. on() and off() imply stateful
+    toggling, suggesting metrics can be dynamically controlled at runtime. Breaks if exchanges are added/removed
+    dynamically without updating filters.
+  evidence: tools/performance_metrics.py:12(on)
+  stage: observability
+  alternative_considered: Always-on metrics would add overhead; file-based config less flexible
+- id: BD-GAP-004
+  type: T
+  content: Raw dump validation requires custom bytes_string_to_bytes conversion, indicating binary data
+    is serialized as strings in storage
+  rationale: Choosing string representation for binary data in dumps simplifies storage and debugging
+    at cost of parsing overhead. Breaks if dump format changes to actual binary serialization.
+  evidence: tools/check_raw_dump.py:14(bytes_string_to_bytes)
+  stage: backend_storage
+  alternative_considered: Direct binary storage would be faster but harder to inspect
+- id: BD-GAP-005
+  type: BA
+  content: Order book testing tracks both message timestamp and receipt_timestamp to measure latency through
+    the system
+  rationale: Distinguishing between when an event occurred (timestamp) vs when it was received/processed
+    (receipt_timestamp) enables latency analysis. Breaks if clock synchronization issues exist between
+    feed sources.
+  evidence: tools/run_profiler.py:15(book)
+  stage: observability
+  alternative_considered: Single timestamp would lose latency visibility
+- id: BD-GAP-006
+  type: BA/DK
+  content: Book depth test separates level count tracking from volume tracking, indicating depth analysis
+    requires both dimensions
+  rationale: Price level count and volume aggregation provide different market structure insights. Breaks
+    if exchanges change how they report depth (L2 vs L3).
+  evidence: tools/book_depth_test.py:19(book)
+  stage: analysis
+  alternative_considered: Single depth metric would lose information fidelity
+- id: BD-GAP-007
+  type: B
+  content: WebSocket testing reuses same callback signatures as other book/trade handlers, enforcing consistent
+    event interface across transport layers
+  rationale: Uniform callback signatures allow swapping between WebSocket and REST feeds without changing
+    consumer logic. Breaks if WebSocket protocol introduces fields not present in REST responses.
+  evidence: tools/websockets_test.py:24(main)
+  stage: transport
+  alternative_considered: Protocol-specific handlers would allow optimization but reduce portability
+- id: BD-GAP-008
+  type: M
+  content: 'Missing: Convergence criteria explicit declaration'
+  rationale: 'Audit finding: missing: convergence criteria explicit declaration. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: feed_orchestration
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-009
+  type: M
+  content: 'Missing: Matrix ill-conditioning and stability'
+  rationale: 'Audit finding: missing: matrix ill-conditioning and stability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: feed_orchestration
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-010
+  type: RC
+  content: 'Missing: Point-in-Time data availability'
+  rationale: 'Audit finding: missing: point-in-time data availability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: feed_orchestration
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-011
+  type: DK
+  content: 'Missing: Stale data detection and expiry policy'
+  rationale: 'Audit finding: missing: stale data detection and expiry policy. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: feed_orchestration
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-012
+  type: B
+  content: 'Missing: PnL conservation (realized + unrealized = total)'
+  rationale: 'Audit finding: missing: pnl conservation (realized + unrealized = total). Identified by
+    audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: feed_orchestration
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-013
+  type: B
+  content: 'Missing: Train/test time split integrity'
+  rationale: 'Audit finding: missing: train/test time split integrity. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: feed_orchestration
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-014
+  type: DK
+  content: 'Missing: Random seed full coverage'
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: feed_orchestration
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-015
+  type: B
+  content: 'Missing: Backtest Overfitting Protection'
+  rationale: 'Audit finding: missing: backtest overfitting protection. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: feed_orchestration
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-016
+  type: M
+  content: 'Missing: Transition Matrix Time-Homogeneity'
+  rationale: 'Audit finding: missing: transition matrix time-homogeneity. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: feed_orchestration
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-017
+  content: 'Missing: Default Definition & IFRS 9 Staging'
+  type: B
+  rationale: 'Audit finding: missing: default definition & ifrs 9 staging. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: feed_orchestration
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-018
+  content: 'Missing: PD/LGD/EAD Estimation Methods'
+  type: B
+  rationale: 'Audit finding: missing: pd/lgd/ead estimation methods. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: feed_orchestration
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-019
+  content: 'Missing: Vasicek Single Factor Correlation'
+  type: B
+  rationale: 'Audit finding: missing: vasicek single factor correlation. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: feed_orchestration
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-020
+  content: 'Missing: Stress Test Scenario Macro Variables'
+  type: B
+  rationale: 'Audit finding: missing: stress test scenario macro variables. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: feed_orchestration
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-021
+  content: 'Missing: NPL Portfolio EBA Field Completeness'
+  type: B
+  rationale: 'Audit finding: missing: npl portfolio eba field completeness. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: feed_orchestration
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: General Callback Handler Demo
+  source: examples/demo.py
+  type: data_pipeline
+  business_problem: Demonstrates how to define and use async callback handlers for receiving real-time
+    market data updates from cryptocurrency exchanges.
+  intent_keywords:
+  - callback handler
+  - ticker callback
+  - async handler
+  - market data subscription
+  - exchange data
+  stage: data_collection
+  negative_keywords:
+  - authenticated
+  - trading
+  - database storage
+  - backtesting
+  disambiguation: Are you looking to receive real-time market data (tickers, trades, order books) or do
+    you need to store/analysis this data?
+  data_domain: market_data
+- id: UC-102
+  name: ArcticDB Data Storage
+  source: examples/demo_arctic.py
+  type: data_pipeline
+  business_problem: Stores cryptocurrency trade, funding, and ticker data to ArcticDB (Arctic) time-series
+    database for persistence and later analysis.
+  intent_keywords:
+  - ArcticDB
+  - arctic storage
+  - time series database
+  - persist market data
+  - database backend
+  stage: data_collection
+  negative_keywords:
+  - real-time display
+  - trading strategy
+  - backtesting
+  - data screening
+  disambiguation: Do you want to store data to a time-series database, or do you need real-time data display
+    or analysis?
+  data_domain: market_data
+- id: UC-103
+  name: Bequant/HitBTC Exchange Features
+  source: examples/demo_bequant_bitcoincom_hitbtc.py
+  type: data_pipeline
+  business_problem: Demonstrates each supported features (ticker, trades, order book, candles) for Bequant
+    and HitBTC exchanges which share the same API.
+  intent_keywords:
+  - Bequant
+  - HitBTC
+  - Bitcoin.com exchange
+  - multiple exchanges
+  - shared API
+  stage: data_collection
+  negative_keywords:
+  - Binance
+  - Coinbase
+  - Bitfinex
+  - authenticated trading
+  - database storage
+  disambiguation: Are you specifically looking for Bequant/HitBTC exchange data, or do you need data from
+    other exchanges like Binance or Coinbase?
+  data_domain: market_data
+- id: UC-104
+  name: Binance Authenticated Trading
+  source: examples/demo_binance_authenticated.py
+  type: live_trading
+  business_problem: Demonstrates authenticated access to Binance, Binance Delivery, and Binance Futures
+    for receiving account balances, positions, and order updates in real-time.
+  intent_keywords:
+  - Binance authenticated
+  - account balance
+  - position tracking
+  - order updates
+  - binance futures
+  stage: data_collection
+  negative_keywords:
+  - public market data
+  - backtesting
+  - strategy testing
+  - database storage
+  disambiguation: Do you need access to your personal trading account data (balances, positions, orders)
+    or public market data (prices, order books)?
+  data_domain: holding_data
+- id: UC-105
+  name: Binance Delivery Exchange
+  source: examples/demo_binance_delivery.py
+  type: data_pipeline
+  business_problem: Shows data subscription for Binance Delivery perpetual futures including order book,
+    ticker, and trade data.
+  intent_keywords:
+  - Binance Delivery
+  - perpetual futures
+  - delivery exchange
+  - order book
+  - ticker data
+  stage: data_collection
+  negative_keywords:
+  - Binance spot
+  - Binance futures
+  - authenticated trading
+  - trading strategy
+  disambiguation: Are you interested in Binance Delivery perpetual futures data or Binance spot/standard
+    futures?
+  data_domain: market_data
+- id: UC-106
+  name: Binance TR Exchange
+  source: examples/demo_binancetr.py
+  type: data_pipeline
+  business_problem: Demonstrates data subscription for Binance TR exchange including ticker, trades, order
+    book with delta updates, and candle data.
+  intent_keywords:
+  - Binance TR
+  - Turkish exchange
+  - ticker
+  - order book delta
+  - candles
+  stage: data_collection
+  negative_keywords:
+  - Binance global
+  - Binance US
+  - authenticated trading
+  - strategy
+  disambiguation: Are you specifically looking for Binance TR (Turkish) exchange data or other Binance
+    variants?
+  data_domain: market_data
+- id: UC-107
+  name: Bitfinex Authenticated Trading
+  source: examples/demo_bitfinex_authenticated.py
+  type: live_trading
+  business_problem: Demonstrates synchronous authenticated Bitfinex trading operations including balance
+    queries, order management, and trade execution.
+  intent_keywords:
+  - Bitfinex
+  - authenticated
+  - sync trading
+  - place order
+  - cancel order
+  stage: data_collection
+  negative_keywords:
+  - public data
+  - async trading
+  - strategy backtesting
+  - database
+  disambiguation: Do you need to execute trades on Bitfinex synchronously, or are you looking for public
+    market data or async operations?
+  data_domain: trading_data
+- id: UC-108
+  name: Bybit Authenticated Trading
+  source: examples/demo_bybit_authenticated.py
+  type: live_trading
+  business_problem: Demonstrates Bybit authenticated feeds for receiving order updates and trade fills
+    in real-time for account monitoring.
+  intent_keywords:
+  - Bybit
+  - authenticated
+  - order info
+  - fills
+  - trade updates
+  stage: data_collection
+  negative_keywords:
+  - public market data
+  - backtesting
+  - database storage
+  - strategy
+  disambiguation: Are you monitoring your Bybit account (orders/fills) or looking for public Bybit market
+    data?
+  data_domain: trading_data
+- id: UC-109
+  name: Trade Timestamp Consistency Checker
+  source: examples/demo_check_trade_timestamps.py
+  type: monitoring
+  business_problem: Monitors and compares trade timestamps across multiple exchanges to verify timestamp
+    consistency and identify potential synchronization issues.
+  intent_keywords:
+  - timestamp
+  - consistency
+  - exchange comparison
+  - data quality
+  - timestamp verification
+  stage: data_collection
+  negative_keywords:
+  - trading strategy
+  - data storage
+  - order book
+  - OHLCV
+  disambiguation: Are you investigating timestamp accuracy across exchanges, or do you need to build trading
+    strategies or store data?
+  data_domain: market_data
+- id: UC-110
+  name: HTTP Proxy for Rate Limit Bypass
+  source: examples/demo_concurrent_proxy.py
+  type: data_pipeline
+  business_problem: Demonstrates using HTTP proxy to bypass exchange rate limits when subscribing to many
+    symbols, enabling concurrent order book and open interest data collection.
+  intent_keywords:
+  - proxy
+  - rate limit
+  - concurrent
+  - http proxy
+  - bypass limits
+  stage: data_collection
+  negative_keywords:
+  - authenticated trading
+  - database storage
+  - strategy
+  - backtesting
+  disambiguation: Are you hitting rate limits when subscribing to many symbols, or do you need authenticated
+    trading or data storage?
+  data_domain: market_data
+- id: UC-111
+  name: Custom Data Aggregation
+  source: examples/demo_custom_agg.py
+  type: data_pipeline
+  business_problem: Demonstrates custom aggregation of trade data over time windows, tracking min/max
+    prices for each symbol within the aggregation period.
+  intent_keywords:
+  - custom aggregation
+  - window function
+  - min max price
+  - trade aggregation
+  - time window
+  stage: data_collection
+  negative_keywords:
+  - database storage
+  - trading
+  - backtesting
+  - screening
+  disambiguation: Do you need to aggregate data over custom time windows, or do you need raw data storage,
+    trading, or screening?
+  data_domain: market_data
+- id: UC-112
+  name: Deribit Authenticated Trading
+  source: examples/demo_deribit_authenticated.py
+  type: live_trading
+  business_problem: Demonstrates Deribit authenticated feeds for order info, trade fills, and balance
+    updates for comprehensive account monitoring.
+  intent_keywords:
+  - Deribit
+  - authenticated
+  - order info
+  - fills
+  - balances
+  - options
+  stage: data_collection
+  negative_keywords:
+  - public market data
+  - database storage
+  - backtesting
+  - strategy
+  disambiguation: Are you monitoring your Deribit account or looking for public Deribit market data?
+  data_domain: trading_data
+- id: UC-113
+  name: Elasticsearch Data Storage
+  source: examples/demo_elastic.py
+  type: data_pipeline
+  business_problem: Stores order book, funding, and trade data to Elasticsearch for search and analytics
+    capabilities.
+  intent_keywords:
+  - Elasticsearch
+  - elastic
+  - search
+  - persist data
+  - analytics database
+  stage: data_collection
+  negative_keywords:
+  - real-time display
+  - trading
+  - backtesting
+  - screening
+  disambiguation: Do you want to store data in Elasticsearch for search/analytics, or do you need real-time
+    display, trading, or screening?
+  data_domain: market_data
+- id: UC-114
+  name: Existing Event Loop Integration
+  source: examples/demo_existing_loop.py
+  type: data_pipeline
+  business_problem: Demonstrates integrating cryptofeed with an existing asyncio event loop, allowing
+    concurrent execution with other async tasks.
+  intent_keywords:
+  - existing loop
+  - asyncio
+  - event loop
+  - integration
+  - concurrent async
+  stage: data_collection
+  negative_keywords:
+  - new event loop
+  - trading
+  - database
+  - strategy
+  disambiguation: Do you need to integrate with an existing asyncio event loop, or are you starting fresh?
+  data_domain: market_data
+- id: UC-115
+  name: Gate.io Futures Exchange
+  source: examples/demo_gateiofutures.py
+  type: data_pipeline
+  business_problem: Demonstrates subscription to Gate.io futures exchange for ticker, trades, order book,
+    funding, and candle data.
+  intent_keywords:
+  - Gate.io
+  - Gateio Futures
+  - futures data
+  - funding
+  - candles
+  stage: data_collection
+  negative_keywords:
+  - Gate.io spot
+  - authenticated trading
+  - database storage
+  - strategy
+  disambiguation: Are you looking for Gate.io futures data or Gate.io spot trading?
+  data_domain: market_data
+- id: UC-116
+  name: GCP Pub/Sub Publishing
+  source: examples/demo_gcppubsub.py
+  type: data_pipeline
+  business_problem: Publishes trade data to Google Cloud Platform Pub/Sub for event-driven architectures
+    and cloud-based processing.
+  intent_keywords:
+  - GCP
+  - Pub/Sub
+  - Google Cloud
+  - publish
+  - cloud messaging
+  stage: data_collection
+  negative_keywords:
+  - local storage
+  - real-time display
+  - trading
+  - backtesting
+  disambiguation: Do you want to publish data to Google Cloud Pub/Sub, or do you need local storage, display,
+    or trading?
+  data_domain: market_data
+- id: UC-117
+  name: InfluxDB Time Series Storage
+  source: examples/demo_influxdb.py
+  type: data_pipeline
+  business_problem: Stores funding, order book, trades, ticker, and candles to InfluxDB time-series database
+    for monitoring and analysis.
+  intent_keywords:
+  - InfluxDB
+  - time series
+  - database
+  - monitoring
+  - metrics storage
+  stage: data_collection
+  negative_keywords:
+  - real-time display
+  - trading
+  - strategy
+  - screening
+  disambiguation: Do you want to store time-series data in InfluxDB, or do you need real-time display,
+    trading, or screening?
+  data_domain: market_data
+- id: UC-118
+  name: Kafka Message Streaming
+  source: examples/demo_kafka.py
+  type: data_pipeline
+  business_problem: Streams order book and trade data to Apache Kafka with custom topic and partition
+    routing for scalable event processing.
+  intent_keywords:
+  - Kafka
+  - streaming
+  - message queue
+  - topic routing
+  - partition
+  stage: data_collection
+  negative_keywords:
+  - local storage
+  - real-time display
+  - trading
+  - backtesting
+  disambiguation: Do you want to stream data to Kafka for distributed processing, or do you need local
+    storage, display, or trading?
+  data_domain: market_data
+- id: UC-119
+  name: Liquidation Data Monitor
+  source: examples/demo_liquidations.py
+  type: monitoring
+  business_problem: Monitors and displays liquidations across each exchanges that support this channel,
+    useful for identifying market stress and volatility.
+  intent_keywords:
+  - liquidations
+  - forced liquidation
+  - leverage
+  - margin call
+  - volatility
+  stage: data_collection
+  negative_keywords:
+  - trading
+  - backtesting
+  - database storage
+  - screening
+  disambiguation: Are you monitoring liquidations for market stress signals, or do you need trading, backtesting,
+    or data storage?
+  data_domain: market_data
+- id: UC-120
+  name: Dynamic Feed Management
+  source: examples/demo_loop.py
+  type: data_pipeline
+  business_problem: Demonstrates dynamic addition of feeds to a running event loop and scheduled callbacks
+    for adding/removing feeds over time.
+  intent_keywords:
+  - dynamic feed
+  - add feed
+  - event loop
+  - scheduled
+  - runtime modification
+  stage: data_collection
+  negative_keywords:
+  - static subscription
+  - trading
+  - database
+  - strategy
+  disambiguation: Do you need to dynamically add/remove feeds at runtime, or do you have static feed requirements?
+  data_domain: market_data
+- id: UC-121
+  name: MongoDB Document Storage
+  source: examples/demo_mongo.py
+  type: data_pipeline
+  business_problem: Stores order book, trades, and ticker data to MongoDB document database with flexible
+    schema for JSON storage.
+  intent_keywords:
+  - MongoDB
+  - document database
+  - NoSQL
+  - JSON storage
+  - flexible schema
+  stage: data_collection
+  negative_keywords:
+  - relational database
+  - time series
+  - real-time display
+  - trading
+  disambiguation: Do you want to store data in MongoDB (NoSQL/document), or do you need a relational/timeseries
+    database, real-time display, or trading?
+  data_domain: market_data
+- id: UC-122
+  name: Multiple Callbacks Per Channel
+  source: examples/demo_multicb.py
+  type: data_pipeline
+  business_problem: Demonstrates registering multiple callback handlers for a single data channel, enabling
+    parallel processing of the same data.
+  intent_keywords:
+  - multiple callbacks
+  - parallel processing
+  - callback chain
+  - multi handler
+  stage: data_collection
+  negative_keywords:
+  - single callback
+  - trading
+  - database
+  - strategy
+  disambiguation: Do you need to process data through multiple handlers in parallel, or do you have a
+    single processing requirement?
+  data_domain: market_data
+- id: UC-123
+  name: NBBO Best Bid Offer Aggregation
+  source: examples/demo_nbbo.py
+  type: monitoring
+  business_problem: Calculates National Best Bid and Offer (NBBO) by aggregating best bid/ask prices across
+    Coinbase, Gemini, and Kraken for a given symbol.
+  intent_keywords:
+  - NBBO
+  - best bid ask
+  - aggregation
+  - cross exchange
+  - best price
+  stage: data_collection
+  negative_keywords:
+  - single exchange
+  - trading
+  - database
+  - strategy
+  disambiguation: Are you comparing best prices across multiple exchanges, or do you need single exchange
+    data or trading functionality?
+  data_domain: market_data
+- id: UC-124
+  name: OHLCV Candle Aggregation
+  source: examples/demo_ohlcv.py
+  type: data_pipeline
+  business_problem: Aggregates trade data into OHLCV (Open, High, Low, Close, Volume) candles over configurable
+    time windows for charting.
+  intent_keywords:
+  - OHLCV
+  - candles
+  - aggregation
+  - charting
+  - time bars
+  stage: data_collection
+  negative_keywords:
+  - tick data
+  - raw trades
+  - trading
+  - database storage
+  disambiguation: Do you need OHLCV candle data for charting, or do you need raw tick data, trading, or
+    database storage?
+  data_domain: market_data
+- id: UC-125
+  name: OKX Authenticated Trading
+  source: examples/demo_okx_authenticated.py
+  type: live_trading
+  business_problem: Demonstrates authenticated OKX exchange for receiving real-time order updates for
+    account monitoring.
+  intent_keywords:
+  - OKX
+  - authenticated
+  - order info
+  - OKX trading
+  - account updates
+  stage: data_collection
+  negative_keywords:
+  - public market data
+  - backtesting
+  - database storage
+  - strategy
+  disambiguation: Are you monitoring your OKX account for order updates, or looking for public OKX market
+    data?
+  data_domain: trading_data
+- id: UC-126
+  name: Historical Playback from PCAP
+  source: examples/demo_playback.py
+  type: data_pipeline
+  business_problem: Plays back historical market data from captured PCAP files through the callback system
+    for backtesting and analysis.
+  intent_keywords:
+  - playback
+  - pcap
+  - historical data
+  - backtesting
+  - replay
+  stage: data_collection
+  negative_keywords:
+  - live data
+  - real-time
+  - trading
+  - database storage
+  disambiguation: Are you replaying historical data from PCAP files for backtesting, or do you need live
+    real-time data?
+  data_domain: market_data
+- id: UC-127
+  name: PostgreSQL Relational Storage
+  source: examples/demo_postgres.py
+  type: data_pipeline
+  business_problem: Stores comprehensive market data (candles, index, ticker, trades, open interest, liquidations,
+    funding, order books) to PostgreSQL with custom column mapping.
+  intent_keywords:
+  - PostgreSQL
+  - postgres
+  - relational database
+  - SQL storage
+  - custom columns
+  stage: data_collection
+  negative_keywords:
+  - NoSQL
+  - time series database
+  - real-time display
+  - trading
+  disambiguation: Do you want to store data in PostgreSQL (relational), or do you need a NoSQL/timeseries
+    database, real-time display, or trading?
+  data_domain: market_data
+- id: UC-128
+  name: QuasarDB Time Series Storage
+  source: examples/demo_quasardb.py
+  type: data_pipeline
+  business_problem: Stores ticker, trades, candles, open interest, index, and liquidation data to QuasarDB
+    for high-performance time-series analytics.
+  intent_keywords:
+  - QuasarDB
+  - quasar
+  - time series
+  - high performance
+  - analytics
+  stage: data_collection
+  negative_keywords:
+  - other databases
+  - real-time display
+  - trading
+  - strategy
+  disambiguation: Do you want to store data in QuasarDB specifically, or do you need another database,
+    real-time display, or trading?
+  data_domain: market_data
+- id: UC-129
+  name: QuestDB Time Series Storage
+  source: examples/demo_questdb.py
+  type: data_pipeline
+  business_problem: Stores order book, candles, funding, ticker, and trade data to QuestDB for high-performance
+    time-series database operations.
+  intent_keywords:
+  - QuestDB
+  - quest
+  - time series
+  - high performance
+  - SQL
+  stage: data_collection
+  negative_keywords:
+  - other databases
+  - real-time display
+  - trading
+  - strategy
+  disambiguation: Do you want to store data in QuestDB specifically, or do you need another database,
+    real-time display, or trading?
+  data_domain: market_data
+- id: UC-130
+  name: RabbitMQ Exchange Publishing
+  source: examples/demo_rabbitmq_exchange.py
+  type: data_pipeline
+  business_problem: Publishes order book data to RabbitMQ using topic exchange routing for flexible message
+    filtering and distribution.
+  intent_keywords:
+  - RabbitMQ
+  - exchange
+  - topic routing
+  - message queue
+  - pub/sub
+  stage: data_collection
+  negative_keywords:
+  - RabbitMQ queue
+  - Kafka
+  - local storage
+  - trading
+  disambiguation: Are you using RabbitMQ with topic exchange routing, or RabbitMQ queue, or another message
+    system?
+  data_domain: market_data
+- id: UC-131
+  name: RabbitMQ Queue Publishing
+  source: examples/demo_rabbitmq_queue.py
+  type: data_pipeline
+  business_problem: Publishes order book data to RabbitMQ using queue-based delivery for point-to-point
+    message distribution.
+  intent_keywords:
+  - RabbitMQ
+  - queue
+  - message queue
+  - point to point
+  - worker
+  stage: data_collection
+  negative_keywords:
+  - RabbitMQ exchange
+  - Kafka
+  - local storage
+  - trading
+  disambiguation: Are you using RabbitMQ with queue delivery, or RabbitMQ exchange, or another message
+    system?
+  data_domain: market_data
+- id: UC-132
+  name: Raw WebSocket Data Collection
+  source: examples/demo_raw_data.py
+  type: data_pipeline
+  business_problem: Collects raw WebSocket data to files for offline analysis, debugging, or historical
+    data preservation.
+  intent_keywords:
+  - raw data
+  - pcap
+  - websocket capture
+  - offline analysis
+  - debugging
+  stage: data_collection
+  negative_keywords:
+  - parsed data
+  - database
+  - real-time processing
+  - trading
+  disambiguation: Are you capturing raw WebSocket data for analysis/debugging, or do you need parsed data,
+    database storage, or real-time processing?
+  data_domain: market_data
+- id: UC-133
+  name: Redis Pub/Sub and Storage
+  source: examples/demo_redis.py
+  type: data_pipeline
+  business_problem: Stores trades, funding, candles, order books, open interest, and ticker data to Redis
+    with both pub/sub and persistent storage backends.
+  intent_keywords:
+  - Redis
+  - pub/sub
+  - stream
+  - in-memory database
+  - real-time cache
+  stage: data_collection
+  negative_keywords:
+  - persistent database
+  - file storage
+  - trading
+  - strategy
+  disambiguation: Do you want to use Redis (in-memory pub/sub/cache), or do you need persistent storage,
+    file storage, or trading?
+  data_domain: market_data
+- id: UC-134
+  name: Renko Chart Brick Generation
+  source: examples/demo_renko.py
+  type: data_pipeline
+  business_problem: Transforms trade data into Renko chart bricks based on fixed price movements for trend
+    visualization independent of time.
+  intent_keywords:
+  - Renko
+  - brick chart
+  - price bricks
+  - trend
+  - charting
+  stage: data_collection
+  negative_keywords:
+  - candlestick
+  - OHLCV
+  - time bars
+  - trading
+  - database
+  disambiguation: Are you creating Renko brick charts, or do you need candlestick/OHLCV charts, trading,
+    or database storage?
+  data_domain: market_data
+- id: UC-135
+  name: TCP Socket Streaming
+  source: examples/demo_tcp.py
+  type: data_pipeline
+  business_problem: Streams trade data over TCP sockets for network-based data distribution to remote
+    systems or applications.
+  intent_keywords:
+  - TCP
+  - socket
+  - network streaming
+  - remote
+  - server
+  stage: data_collection
+  negative_keywords:
+  - UDP
+  - file storage
+  - database
+  - trading
+  - local display
+  disambiguation: Are you streaming data over TCP sockets, or UDP, file storage, database, or local display?
+  data_domain: market_data
+- id: UC-136
+  name: Callback Throttling
+  source: examples/demo_throttle.py
+  type: data_pipeline
+  business_problem: Limits the rate of order book callbacks to a specified number per time window, useful
+    for managing downstream system load.
+  intent_keywords:
+  - throttle
+  - rate limit
+  - callback
+  - reduce frequency
+  - load management
+  stage: data_collection
+  negative_keywords:
+  - each callbacks
+  - trading
+  - database storage
+  - strategy
+  disambiguation: Do you need to throttle/reduce callback frequency, or do you want each callbacks at
+    full speed?
+  data_domain: market_data
+- id: UC-137
+  name: UDP Datagram Streaming
+  source: examples/demo_udp.py
+  type: data_pipeline
+  business_problem: Streams order book and trade data over UDP datagrams for low-latency network distribution
+    to remote systems.
+  intent_keywords:
+  - UDP
+  - datagram
+  - network streaming
+  - low latency
+  - fast delivery
+  stage: data_collection
+  negative_keywords:
+  - TCP
+  - file storage
+  - database
+  - trading
+  - reliable delivery
+  disambiguation: Are you streaming data over UDP (low latency), or TCP (reliable), file storage, or database?
+  data_domain: market_data
+- id: UC-138
+  name: Unix Domain Socket Streaming
+  source: examples/demo_uds.py
+  type: data_pipeline
+  business_problem: Streams ticker and trade data over Unix domain sockets for high-performance inter-process
+    communication on the same host.
+  intent_keywords:
+  - Unix domain socket
+  - UDS
+  - IPC
+  - inter-process
+  - local streaming
+  stage: data_collection
+  negative_keywords:
+  - TCP
+  - UDP
+  - network
+  - file storage
+  - trading
+  disambiguation: Are you using Unix domain sockets for local IPC, or network sockets (TCP/UDP), file
+    storage, or trading?
+  data_domain: market_data
+- id: UC-139
+  name: VictoriaMetrics Time Series Storage
+  source: examples/demo_victoriametrics.py
+  type: data_pipeline
+  business_problem: Stores trade, ticker, order book, and candle data to VictoriaMetrics for Prometheus-compatible
+    time-series monitoring and analytics.
+  intent_keywords:
+  - VictoriaMetrics
+  - Victoria
+  - Prometheus
+  - monitoring
+  - metrics
+  stage: data_collection
+  negative_keywords:
+  - other databases
+  - real-time display
+  - trading
+  - strategy
+  disambiguation: Do you want to store data in VictoriaMetrics specifically, or another database, real-time
+    display, or trading?
+  data_domain: market_data
+- id: UC-140
+  name: ZeroMQ Pub/Sub Streaming
+  source: examples/demo_zmq.py
+  type: data_pipeline
+  business_problem: Publishes order book and ticker data over ZeroMQ pub/sub for lightweight message distribution
+    to multiple subscribers.
+  intent_keywords:
+  - ZeroMQ
+  - ZMQ
+  - pub/sub
+  - messaging
+  - lightweight
+  stage: data_collection
+  negative_keywords:
+  - Kafka
+  - RabbitMQ
+  - database
+  - trading
+  - reliable queuing
+  disambiguation: Are you using ZeroMQ for pub/sub messaging, or Kafka/RabbitMQ, database, or trading?
+  data_domain: market_data
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 43
+  evidence_invalid: 38
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.5308641975308642
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 4
+    warn: 7
+    fail: 9
+  subdomain_totals:
+    pass: 2
+    warn: 8
+    fail: 9
+  coverage: 39/39 (100%)
+  pass_rate: 6/39 (15%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: websocket_client
+  description: Use default websockets for most cases; aiohttp when integrating with existing aiohttp infrastructure
+  used_in_stages: []
+  options:
+  - name: websockets (default)
+    traits:
+    - async
+    - standard library compatible
+    - well-maintained
+    fit_for:
+    - General use cases, standard exchange connections
+    not_fit_for:
+    - Maximum performance scenarios requiring C-level optimization
+  - name: aiohttp WebSocket
+    traits:
+    - async
+    - integrated with aiohttp HTTP client
+    - battle-tested
+    fit_for:
+    - When HTTP and WebSocket share connection pool
+    not_fit_for:
+    - Simple WebSocket-only use cases
+  default: websockets
+  _source: worker_resource
+- id: slot-002
+  name: event_loop
+  description: Use uvloop for performance; asyncio for cross-platform compatibility or debugging
+  used_in_stages: []
+  options:
+  - name: uvloop (default on Linux/macOS)
+    traits:
+    - C-level implementation
+    - up to 4x faster than asyncio
+    fit_for:
+    - Production deployments, low-latency requirements
+    not_fit_for:
+    - Windows (not supported), simple scripts
+  - name: standard asyncio
+    traits:
+    - cross-platform
+    - sufficient for basic use
+    fit_for:
+    - Windows, development, debugging
+    not_fit_for:
+    - High-throughput production workloads
+  default: uvloop (non-Windows)
+  _source: worker_resource
+- id: slot-003
+  name: time_series_database
+  description: Choose InfluxDB/QuestDB for pure time-series; Arctic for research/batch; QuasarDB for maximum
+    performance
+  used_in_stages: []
+  options:
+  - name: InfluxDB
+    traits:
+    - Time-series optimized
+    - HTTP API
+    - Cloud offering available
+    fit_for:
+    - Metrics, monitoring, financial time-series with retention policies
+    not_fit_for:
+    - Complex relational queries, transactional workloads
+  - name: QuestDB
+    traits:
+    - High performance
+    - SQL-like queries
+    - InfluxDB protocol compatible
+    fit_for:
+    - High-frequency time-series, real-time analytics
+    not_fit_for:
+    - Distributed deployments (single-node only in OSS)
+  - name: Arctic
+    traits:
+    - MongoDB backend
+    - Versioned data
+    - Pandas integration
+    fit_for:
+    - Batch data storage, research workflows, versioned datasets
+    not_fit_for:
+    - High-frequency real-time writes (README explicitly warns against this)
+  - name: QuasarDB
+    traits:
+    - High-performance
+    - Cluster support
+    - Column-oriented
+    fit_for:
+    - Ultra-low latency requirements, clustered deployments
+    not_fit_for:
+    - Simple use cases, single-node only for free tier
+  default: Redis (for streams/sets)
+  _source: worker_resource
+- id: slot-004
+  name: message_queue
+  description: Use Kafka for distributed pipelines; RabbitMQ for flexibility; GCP Pub/Sub for GCP workloads;
+    Redis for simplicity
+  used_in_stages: []
+  options:
+  - name: Kafka
+    traits:
+    - Distributed
+    - Durable
+    - Topic partitioning
+    - Consumer groups
+    fit_for:
+    - Data pipelines, event streaming, microservice architectures
+    not_fit_for:
+    - Simple single-consumer use cases (overkill)
+  - name: RabbitMQ
+    traits:
+    - Flexible routing
+    - Multiple exchange types
+    - Lightweight
+    fit_for:
+    - Traditional message queuing, complex routing requirements
+    not_fit_for:
+    - Very high throughput (Kafka better)
+  - name: GCP Pub/Sub
+    traits:
+    - Managed service
+    - Cloud-native
+    - Global availability
+    fit_for:
+    - GCP infrastructure, serverless integration, managed services
+    not_fit_for:
+    - On-premise deployments, strict data residency requirements
+  - name: Redis Streams
+    traits:
+    - In-memory
+    - Low latency
+    - Consumer groups
+    fit_for:
+    - Simple queuing, caching, low-latency requirements
+    not_fit_for:
+    - Durability-critical data (data loss on crash)
+  default: Redis Streams
+  _source: worker_resource
+- id: slot-005
+  name: document_store
+  description: MongoDB is the only document store option in cryptofeed
+  used_in_stages: []
+  options:
+  - name: MongoDB
+    traits:
+    - Document-oriented
+    - Flexible schema
+    - Async driver
+    fit_for:
+    - Flexible data structures, prototyping, varied market data formats
+    not_fit_for:
+    - Strict schema requirements, complex joins
+  default: MongoDB (if document store selected)
+  _source: worker_resource
+- id: slot-006
+  name: relational_database
+  description: PostgreSQL is the only relational DB option in cryptofeed
+  used_in_stages: []
+  options:
+  - name: PostgreSQL
+    traits:
+    - ACID compliance
+    - JSONB support
+    - Custom column mapping
+    fit_for:
+    - Structured market data, custom schemas, SQL analytics
+    not_fit_for:
+    - Simple key-value needs (overkill)
+  default: PostgreSQL (if relational DB selected)
+  _source: worker_resource
+- id: slot-007
+  name: json_parser
+  description: Use yapic.json for production; stdlib json only if avoiding dependencies
+  used_in_stages: []
+  options:
+  - name: yapic.json (default)
+    traits:
+    - C-accelerated
+    - High performance
+    - datetime support
+    fit_for:
+    - Production use with performance requirements
+    not_fit_for:
+    - Debugging (harder to inspect)
+  - name: standard json
+    traits:
+    - Standard library
+    - No dependencies
+    fit_for:
+    - Debugging, minimal dependencies, simple scripts
+    not_fit_for:
+    - High-throughput production (10x slower than yapic.json)
+  default: yapic.json
+  _source: worker_resource
+- id: slot-008
+  name: http_client
+  description: aiohttp for async/concurrent needs; requests for simple sync operations
+  used_in_stages: []
+  options:
+  - name: aiohttp (default async)
+    traits:
+    - Async
+    - Session management
+    - Connection pooling
+    fit_for:
+    - Async applications, concurrent HTTP requests
+    not_fit_for:
+    - Simple synchronous scripts
+  - name: requests (sync)
+    traits:
+    - Synchronous
+    - Simple API
+    - Wide adoption
+    fit_for:
+    - Sync operations, simple scripts, backward compatibility
+    not_fit_for:
+    - Concurrent operations
+  default: aiohttp for async, requests for sync
+  _source: worker_resource
+resources:
+- id: res-001
+  type: python_package
+  name: requests
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-002
+  type: python_package
+  name: websockets
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-003
+  type: python_package
+  name: pyyaml
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-004
+  type: python_package
+  name: aiohttp
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-005
+  type: python_package
+  name: aiofile
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-006
+  type: python_package
+  name: yapic.json
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-007
+  type: python_package
+  name: uvloop
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-008
+  type: python_package
+  name: order_book
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: python_package
+  name: aiodns
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: python_package
+  name: arctic
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: code_example
+  name: General Callback Handler Demo
+  path: examples/demo.py
+  description: Demonstrates how to define and use async callback handlers for receiving real-time market
+    data updates from cryptocurrency exchanges.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-012
+  type: code_example
+  name: ArcticDB Data Storage
+  path: examples/demo_arctic.py
+  description: Stores cryptocurrency trade, funding, and ticker data to ArcticDB (Arctic) time-series
+    database for persistence and later analysis.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-013
+  type: code_example
+  name: Bequant/HitBTC Exchange Features
+  path: examples/demo_bequant_bitcoincom_hitbtc.py
+  description: Demonstrates each supported features (ticker, trades, order book, candles) for Bequant
+    and HitBTC exchanges which share the same API.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-014
+  type: code_example
+  name: Binance Authenticated Trading
+  path: examples/demo_binance_authenticated.py
+  description: Demonstrates authenticated access to Binance, Binance Delivery, and Binance Futures for
+    receiving account balances, positions, and order updates in real-time.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-015
+  type: code_example
+  name: Binance Delivery Exchange
+  path: examples/demo_binance_delivery.py
+  description: Shows data subscription for Binance Delivery perpetual futures including order book, ticker,
+    and trade data.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-016
+  type: code_example
+  name: Binance TR Exchange
+  path: examples/demo_binancetr.py
+  description: Demonstrates data subscription for Binance TR exchange including ticker, trades, order
+    book with delta updates, and candle data.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-017
+  type: code_example
+  name: Bitfinex Authenticated Trading
+  path: examples/demo_bitfinex_authenticated.py
+  description: Demonstrates synchronous authenticated Bitfinex trading operations including balance queries,
+    order management, and trade execution.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-018
+  type: code_example
+  name: Bybit Authenticated Trading
+  path: examples/demo_bybit_authenticated.py
+  description: Demonstrates Bybit authenticated feeds for receiving order updates and trade fills in real-time
+    for account monitoring.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-019
+  type: code_example
+  name: Trade Timestamp Consistency Checker
+  path: examples/demo_check_trade_timestamps.py
+  description: Monitors and compares trade timestamps across multiple exchanges to verify timestamp consistency
+    and identify potential synchronization issues.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-020
+  type: code_example
+  name: HTTP Proxy for Rate Limit Bypass
+  path: examples/demo_concurrent_proxy.py
+  description: Demonstrates using HTTP proxy to bypass exchange rate limits when subscribing to many symbols,
+    enabling concurrent order book and open interest data collection.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-021
+  type: code_example
+  name: Custom Data Aggregation
+  path: examples/demo_custom_agg.py
+  description: Demonstrates custom aggregation of trade data over time windows, tracking min/max prices
+    for each symbol within the aggregation period.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-022
+  type: code_example
+  name: Deribit Authenticated Trading
+  path: examples/demo_deribit_authenticated.py
+  description: Demonstrates Deribit authenticated feeds for order info, trade fills, and balance updates
+    for comprehensive account monitoring.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-023
+  type: code_example
+  name: Elasticsearch Data Storage
+  path: examples/demo_elastic.py
+  description: Stores order book, funding, and trade data to Elasticsearch for search and analytics capabilities.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-024
+  type: code_example
+  name: Existing Event Loop Integration
+  path: examples/demo_existing_loop.py
+  description: Demonstrates integrating cryptofeed with an existing asyncio event loop, allowing concurrent
+    execution with other async tasks.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-025
+  type: code_example
+  name: Gate.io Futures Exchange
+  path: examples/demo_gateiofutures.py
+  description: Demonstrates subscription to Gate.io futures exchange for ticker, trades, order book, funding,
+    and candle data.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-026
+  type: code_example
+  name: GCP Pub/Sub Publishing
+  path: examples/demo_gcppubsub.py
+  description: Publishes trade data to Google Cloud Platform Pub/Sub for event-driven architectures and
+    cloud-based processing.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-027
+  type: code_example
+  name: InfluxDB Time Series Storage
+  path: examples/demo_influxdb.py
+  description: Stores funding, order book, trades, ticker, and candles to InfluxDB time-series database
+    for monitoring and analysis.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-028
+  type: code_example
+  name: Kafka Message Streaming
+  path: examples/demo_kafka.py
+  description: Streams order book and trade data to Apache Kafka with custom topic and partition routing
+    for scalable event processing.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-029
+  type: code_example
+  name: Liquidation Data Monitor
+  path: examples/demo_liquidations.py
+  description: Monitors and displays liquidations across each exchanges that support this channel, useful
+    for identifying market stress and volatility.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-030
+  type: code_example
+  name: Dynamic Feed Management
+  path: examples/demo_loop.py
+  description: Demonstrates dynamic addition of feeds to a running event loop and scheduled callbacks
+    for adding/removing feeds over time.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-031
+  type: code_example
+  name: MongoDB Document Storage
+  path: examples/demo_mongo.py
+  description: Stores order book, trades, and ticker data to MongoDB document database with flexible schema
+    for JSON storage.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-032
+  type: code_example
+  name: Multiple Callbacks Per Channel
+  path: examples/demo_multicb.py
+  description: Demonstrates registering multiple callback handlers for a single data channel, enabling
+    parallel processing of the same data.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-033
+  type: code_example
+  name: NBBO Best Bid Offer Aggregation
+  path: examples/demo_nbbo.py
+  description: Calculates National Best Bid and Offer (NBBO) by aggregating best bid/ask prices across
+    Coinbase, Gemini, and Kraken for a given symbol.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-034
+  type: code_example
+  name: OHLCV Candle Aggregation
+  path: examples/demo_ohlcv.py
+  description: Aggregates trade data into OHLCV (Open, High, Low, Close, Volume) candles over configurable
+    time windows for charting.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-035
+  type: code_example
+  name: OKX Authenticated Trading
+  path: examples/demo_okx_authenticated.py
+  description: Demonstrates authenticated OKX exchange for receiving real-time order updates for account
+    monitoring.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-036
+  type: code_example
+  name: Historical Playback from PCAP
+  path: examples/demo_playback.py
+  description: Plays back historical market data from captured PCAP files through the callback system
+    for backtesting and analysis.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-037
+  type: code_example
+  name: PostgreSQL Relational Storage
+  path: examples/demo_postgres.py
+  description: Stores comprehensive market data (candles, index, ticker, trades, open interest, liquidations,
+    funding, order books) to PostgreSQL with custom column mapping.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-038
+  type: code_example
+  name: QuasarDB Time Series Storage
+  path: examples/demo_quasardb.py
+  description: Stores ticker, trades, candles, open interest, index, and liquidation data to QuasarDB
+    for high-performance time-series analytics.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-039
+  type: code_example
+  name: QuestDB Time Series Storage
+  path: examples/demo_questdb.py
+  description: Stores order book, candles, funding, ticker, and trade data to QuestDB for high-performance
+    time-series database operations.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-040
+  type: code_example
+  name: RabbitMQ Exchange Publishing
+  path: examples/demo_rabbitmq_exchange.py
+  description: Publishes order book data to RabbitMQ using topic exchange routing for flexible message
+    filtering and distribution.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-041
+  type: code_example
+  name: RabbitMQ Queue Publishing
+  path: examples/demo_rabbitmq_queue.py
+  description: Publishes order book data to RabbitMQ using queue-based delivery for point-to-point message
+    distribution.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-042
+  type: code_example
+  name: Raw WebSocket Data Collection
+  path: examples/demo_raw_data.py
+  description: Collects raw WebSocket data to files for offline analysis, debugging, or historical data
+    preservation.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-043
+  type: code_example
+  name: Redis Pub/Sub and Storage
+  path: examples/demo_redis.py
+  description: Stores trades, funding, candles, order books, open interest, and ticker data to Redis with
+    both pub/sub and persistent storage backends.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-044
+  type: code_example
+  name: Renko Chart Brick Generation
+  path: examples/demo_renko.py
+  description: Transforms trade data into Renko chart bricks based on fixed price movements for trend
+    visualization independent of time.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-045
+  type: code_example
+  name: TCP Socket Streaming
+  path: examples/demo_tcp.py
+  description: Streams trade data over TCP sockets for network-based data distribution to remote systems
+    or applications.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-046
+  type: code_example
+  name: Callback Throttling
+  path: examples/demo_throttle.py
+  description: Limits the rate of order book callbacks to a specified number per time window, useful for
+    managing downstream system load.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-047
+  type: code_example
+  name: UDP Datagram Streaming
+  path: examples/demo_udp.py
+  description: Streams order book and trade data over UDP datagrams for low-latency network distribution
+    to remote systems.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-048
+  type: code_example
+  name: Unix Domain Socket Streaming
+  path: examples/demo_uds.py
+  description: Streams ticker and trade data over Unix domain sockets for high-performance inter-process
+    communication on the same host.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-049
+  type: code_example
+  name: VictoriaMetrics Time Series Storage
+  path: examples/demo_victoriametrics.py
+  description: Stores trade, ticker, order book, and candle data to VictoriaMetrics for Prometheus-compatible
+    time-series monitoring and analytics.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-050
+  type: code_example
+  name: ZeroMQ Pub/Sub Streaming
+  path: examples/demo_zmq.py
+  description: Publishes order book and ticker data over ZeroMQ pub/sub for lightweight message distribution
+    to multiple subscribers.
+  used_in_stages:
+  - data_collection
+  _source: uc_list

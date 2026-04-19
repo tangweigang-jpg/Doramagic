@@ -1,0 +1,2721 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-094
+name: easytrader
+sop_version: '3.6'
+source:
+  projects:
+  - easytrader
+  commit_hash: def5a8edc5ebd7d49bf92a9f39e9e30c9bf47101
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: automated stock trading with multi-broker support and trade mirroring
+  description: Python library for automated stock trading via Chinese brokers (同花顺 clients, MiniQMT, XueQiu),
+    supporting both direct order execution and mirroring simulated trades from JoinQuant/RiceQuant platforms
+  prerequisites: Understanding of Chinese A-share market rules (100-share lot sizes, T+1 settlement),
+    basic Python programming, Windows environment for GUI-based brokers (pywinauto), optional tesseract
+    for captcha recognition
+  not_suitable_for: Non-Chinese markets, high-frequency trading requiring sub-second execution, production
+    environments without proper error handling for broker disconnections
+stages:
+- id: authentication
+  name: Authentication & Connection
+  order: 1
+  responsibility: 'Establish authenticated sessions with trading systems using broker-specific mechanisms.
+    WHY: Different brokers require different auth implementations (Windows GUI automation, web cookies,
+    API tokens) which necessitates abstraction to provide a unified interface'
+  interface:
+    inputs:
+    - credentials (user/password/config_path)
+    - broker identifier
+    - client executable path (for auto-login)
+    outputs:
+    - authenticated trader session object with UI handles or API connections
+  required_methods:
+  - name: BaseLoginClientTrader.prepare
+    description: Authenticates user via config file or direct parameters, initializing the trader session
+    evidence: easytrader/clienttrader.py:586(prepare)
+  - name: BaseLoginClientTrader.connect
+    description: Connects to an already-running broker client without auto-login
+    evidence: easytrader/clienttrader.py:580(BaseLoginClientTrader)
+  - name: WebTrader.check_login
+    description: Verifies session validity for web-based traders
+    evidence: easytrader/webtrader.py:86-109(send_heartbeat, check_login)
+  - name: MiniqmtTrader.connect
+    description: Connects to MiniQMT terminal via XtQuant SDK callbacks
+    evidence: easytrader/miniqmt/miniqmt_trader.py:199(MiniqmtTrader)
+  key_behaviors:
+  - behavior: Heartbeat thread for web sessions
+    description: Background thread sends heartbeat every 30 seconds to maintain token validity for web-based
+      traders like XueQiu
+    evidence: easytrader/webtrader.py:85(send_heartbeat)
+  - behavior: Config file credential storage
+    description: Credentials stored in JSON config files rather than command line arguments for security,
+      with optional programmatic parameter passing
+    evidence: easytrader/clienttrader.py:586(prepare)
+  - behavior: Callback-based async handling for MiniQMT
+    description: MiniQMT uses XtQuantTraderCallback pattern for receiving order/trade events asynchronously
+    evidence: easytrader/miniqmt/miniqmt_trader.py:119-196(DefaultXtQuantTraderCallback)
+  replaceable_points:
+  - name: login_implementation
+    description: Each broker implements its own login automation method
+    options:
+    - name: YHClientTrader
+      traits:
+      - Xls grid strategy
+      - specific balance grid control
+      fit_for:
+      - 银河证券 clients with clipboard restrictions
+      not_fit_for:
+      - Other broker clients
+    - name: HTClientTrader
+      traits:
+      - Inherits Xls grid
+      - 核新交易 system
+      fit_for:
+      - 海通/华泰 clients
+      not_fit_for:
+      - 银河 or 国金 clients
+    - name: MinIqmtTrader
+      traits:
+      - Official API
+      - callback-based async
+      fit_for:
+      - Brokers with QMT support
+      - Low-latency requirements
+      not_fit_for:
+      - Brokers without QMT
+    default: ClientTrader
+  design_decisions:
+  - 'Separate BaseLoginClientTrader for auto-login vs connect-only (evidence: easytrader/clienttrader.py:580(BaseLoginClientTrader))
+    — Allows reuse of connect() for already-logged-in clients while supporting automated login'
+  - 'Heartbeat thread for web sessions to maintain token validity (evidence: easytrader/webtrader.py:85(send_heartbeat))
+    — Web sessions expire without keepalive; background thread every 30s prevents logout'
+  - 'Config file or direct params for login (evidence: easytrader/clienttrader.py:586(prepare)) — Config
+    file keeps credentials off command line; params enable programmatic use'
+  - 'Callback pattern for MiniQMT async events (evidence: easytrader/miniqmt/miniqmt_trader.py:119-196(DefaultXtQuantTraderCallback))
+    — Official QMT SDK uses callbacks; wrapper must register DefaultXtQuantTraderCallback to receive order
+    fills/cancels'
+  acceptance_hints:
+  - Login succeeds without ElementNotFoundError
+  - Web session maintains valid token (check_login returns True)
+  - MiniQMT callback receives order confirmations
+- id: account_query
+  name: Account Query
+  order: 2
+  responsibility: 'Retrieve account state including balance, positions, and entrusts. WHY: Unified interface
+    over heterogeneous trading system responses requires strategy pattern for data extraction'
+  interface:
+    inputs:
+    - trader session
+    outputs:
+    - balance dict
+    - position list (DataFrame)
+    - entrusts list (DataFrame)
+  required_methods:
+  - name: ClientTrader.balance
+    description: Returns current account balance including available and frozen funds
+    evidence: easytrader/clienttrader.py:134(_get_balance_from_statics)
+  - name: ClientTrader.position
+    description: Returns current holdings with security codes, quantities, costs
+    evidence: easytrader/clienttrader.py:62(position property)
+  - name: ClientTrader.entrust
+    description: Returns pending orders (entrusts) in the trading system
+    evidence: easytrader/clienttrader.py:62(entrust property)
+  - name: XueQiuTrader.balance
+    description: Web-based balance query via XueQiu API
+    evidence: easytrader/xqtrader.py:16(XueQiuTrader)
+  key_behaviors:
+  - behavior: Grid Strategy Pattern for data extraction
+    description: Different brokers require different grid extraction methods (Copy/clipboard, WMCopy/WM_COMMAND,
+      Xls/save-as-file); strategy allows per-broker selection
+    evidence: easytrader/clienttrader.py:65(grid_strategy)
+  - behavior: Balance from Static controls, not grid
+    description: Static controls show pre-formatted balance data separately from the grid; only positions
+      and entrusts come from grid data
+    evidence: easytrader/clienttrader.py:134(_get_balance_from_statics)
+  - behavior: Broker-specific GRID_DTYPE mappings
+    description: Chinese column names and numeric formats vary by broker; dtype mapping ensures correct
+      CSV parsing for grid data
+    evidence: easytrader/config/client.py:61(GRID_DTYPE)
+  - behavior: Refresh Strategy Pattern
+    description: UI data must be refreshed before reading; default uses F5 shortcut (Switch), but configurable
+      to toolbar button click
+    evidence: easytrader/clienttrader.py:67(refresh_strategy=Switch)
+  replaceable_points:
+  - name: refresh_strategy
+    description: How to refresh UI data in client traders before querying
+    options:
+    - name: Switch (F5)
+      traits:
+      - Keyboard shortcut
+      - Default
+      - Fast
+      fit_for:
+      - Most broker clients
+      not_fit_for:
+      - Clients with disabled F5
+    - name: Toolbar (button click)
+      traits:
+      - Mouse click
+      - More reliable
+      fit_for:
+      - Clients with custom keyboard bindings
+      not_fit_for:
+      - Clients without visible toolbar
+    default: Switch
+  - name: grid_strategy
+    description: How to extract grid data from broker UI
+    options:
+    - name: Copy (clipboard)
+      traits:
+      - Default
+      - Fast
+      - Requires clipboard
+      fit_for:
+      - Standard clients
+      not_fit_for:
+      - YHClientTrader (clipboard disabled)
+    - name: WMCopy (WM_COMMAND)
+      traits:
+      - Low-level message
+      - No clipboard
+      fit_for:
+      - Clients with clipboard restrictions
+      not_fit_for:
+      - Standard clients
+    - name: Xls (save-as file)
+      traits:
+      - File-based
+      - Slow but reliable
+      fit_for:
+      - 银河 clients
+      - Clipboard-disabled environments
+      not_fit_for:
+      - Standard clients (overhead)
+    default: Copy
+  design_decisions:
+  - 'Grid data via strategy pattern (Copy/WMCopy/Xls) (evidence: easytrader/clienttrader.py:65(grid_strategy))
+    — Different brokers require different grid extraction methods; strategy allows per-broker selection'
+  - 'Balance from Static controls, not grid (evidence: easytrader/clienttrader.py:134(_get_balance_from_statics))
+    — Static controls show pre-formatted balance; grid only for positions/entrusts'
+  - 'GRID_DTYPE per broker for proper CSV parsing (evidence: easytrader/config/client.py:61(GRID_DTYPE))
+    — Chinese column names and numeric formats vary by broker; dtype mapping ensures correct parsing'
+  - 'Security code uses last 6 digits internally (evidence: easytrader/clienttrader.py:450(_set_trade_params))
+    — Accepts sh/sz prefixes but strips to 6 digits for internal processing consistency'
+  acceptance_hints:
+  - balance() returns dict with available, frozen, asset keys
+  - position() returns DataFrame with security, amount columns
+  - entrust() returns DataFrame with status column
+  - No ElementNotFoundError during grid reads
+- id: order_execution
+  name: Order Execution
+  order: 3
+  responsibility: 'Submit buy/sell/market orders and handle confirmations with popup dialogs. WHY: Trading
+    requires precise UI interaction or API calls with confirmation dialog handling to ensure order integrity'
+  interface:
+    inputs:
+    - security code (6 digits)
+    - price (float)
+    - amount (multiple of 100)
+    - order type (limit/market)
+    outputs:
+    - entrust_no (string) or error dict with TradeError
+  required_methods:
+  - name: ClientTrader.buy
+    description: Submit a buy order for specified security at given price and amount
+    evidence: easytrader/clienttrader.py:414(buy)
+  - name: ClientTrader.sell
+    description: Submit a sell order for specified security at given price and amount
+    evidence: easytrader/clienttrader.py:414(sell)
+  - name: TradePopDialogHandler.handle
+    description: Process order confirmation/error dialogs, extracting entrust_no or raising TradeError
+    evidence: easytrader/pop_dialog_handler.py:60(TradePopDialogHandler)
+  - name: XueQiuTrader.rebalance
+    description: Weight-based portfolio rebalancing for XueQiu portfolios
+    evidence: easytrader/xqtrader.py:404(rebalance)
+  key_behaviors:
+  - behavior: Popup dialog handler pattern
+    description: Each order may trigger confirmation/error dialogs; TradePopDialogHandler extracts entrust_no
+      from success dialog or raises TradeError on rejection
+    evidence: easytrader/clienttrader.py:565(_handle_pop_dialogs)
+  - behavior: Market order type selection via ComboBox iteration
+    description: Different brokers have different market order type names in dropdown; regex matching
+      allows flexible selection
+    evidence: easytrader/clienttrader.py:288(_set_market_trade_type)
+  - behavior: Amount rounded to nearest 100 (lot size)
+    description: A-share trading requires 100-share lots; rounding enforces this requirement to prevent
+      order rejection
+    evidence: easytrader/xq_follower.py:186(project_transactions)
+  replaceable_points:
+  - name: entrust_prop
+    description: Order type parameter for execution
+    options:
+    - name: limit
+      traits:
+      - Specified price
+      - Default
+      - Most common
+      fit_for:
+      - Normal trading
+      - Controlled entry/exit
+      not_fit_for:
+      - Fast-moving markets requiring immediate fill
+    - name: market
+      traits:
+      - Best available price
+      - May have slippage
+      fit_for:
+      - Urgent fills
+      - Illiquid securities
+      not_fit_for:
+      - Volatile markets
+      - Large orders
+    default: limit
+  - name: adjust_sell
+    description: Whether to adjust sell amount to available position
+    options:
+    - name: 'true'
+      traits:
+      - Auto-adjust
+      - Safe
+      fit_for:
+      - Following strategies with position changes
+      not_fit_for:
+      - Manual precise control
+    - name: 'false'
+      traits:
+      - Exact amount
+      - Default
+      fit_for:
+      - Explicit control
+      not_fit_for:
+      - Automated following
+    default: 'false'
+  design_decisions:
+  - 'Popup dialog handler pattern (evidence: easytrader/clienttrader.py:565(_handle_pop_dialogs)) — Each
+    order may trigger confirmation/error dialogs; handler extracts entrust_no or raises TradeError'
+  - 'Slippage adjustment: buy × (1+slip), sell × (1-slip) (evidence: easytrader/follower.py:115(_calculate_price_by_slippage))
+    — Asymmetric slippage: buys get higher price (safer), sells get lower price (safer)'
+  - 'Amount rounded to nearest 100 (lot size) (evidence: easytrader/xq_follower.py:186(project_transactions))
+    — A-share trading requires 100-share lots; round(-2) enforces this'
+  - 'Market order type selection via ComboBox iteration (evidence: easytrader/clienttrader.py:288(_set_market_trade_type))
+    — Different brokers have different market order types; regex matching allows flexible selection'
+  acceptance_hints:
+  - buy/sell returns valid entrust_no string
+  - TradeError raised with meaningful message on rejection
+  - Amount is always multiple of 100
+  - Popup dialogs properly handled (no hanging dialogs)
+- id: trade_following
+  name: Trade Following
+  order: 4
+  responsibility: 'Mirror simulated trades from external platforms (JoinQuant, RiceQuant, XueQiu) to real
+    accounts. WHY: Enables portfolio replication with slippage control, command deduplication, and T+0
+    fund safety through sell-first ordering'
+  interface:
+    inputs:
+    - users (list of trader sessions)
+    - strategies (platform-specific URLs/IDs)
+    - slippage (float)
+    - track_interval (seconds)
+    outputs:
+    - trade queue with buy/sell commands executed against real accounts
+  required_methods:
+  - name: BaseFollower.follow
+    description: Start following a simulated strategy, polling for new signals and executing trades
+    evidence: easytrader/follower.py:18(BaseFollower)
+  - name: JoinQuantFollower.login
+    description: Authenticate to JoinQuant platform
+    evidence: easytrader/joinquant_follower.py:10(JoinQuantFollower)
+  - name: RiceQuantFollower.login
+    description: Authenticate to RiceQuant platform
+    evidence: easytrader/ricequant_follower.py:10(RiceQuantFollower)
+  - name: XueQiuFollower.follow
+    description: Start following XueQiu portfolio with periodic position sync
+    evidence: easytrader/xq_follower.py:15(XueQiuFollower)
+  key_behaviors:
+  - behavior: Command cache via pickle for idempotent restarts
+    description: Prevents re-executing trades after program restart; cmd key = strategy+stock+action+amount+price+datetime,
+      stored in cmd_cache.pk
+    evidence: easytrader/follower.py:128(load_expired_cmd_cache)
+  - behavior: Trade command expiration (default 120s)
+    description: Stale signals should not execute; timestamp comparison enforces this to prevent stale
+      order execution
+    evidence: easytrader/follower.py:250(_execute_trade_cmd)
+  - behavior: Thread-based worker for trade execution
+    description: 'Queue-based decoupling: polling threads produce signals, worker thread consumes and
+      executes trades sequentially'
+    evidence: easytrader/follower.py:345(trade_worker)
+  - behavior: Sell-first transaction ordering
+    description: 'Prevents insufficient funds: selling first frees up capital before buying, critical
+      for T+0 operations'
+    evidence: easytrader/follower.py:400(order_transactions_sell_first)
+  - behavior: send_interval for sell-then-buy sequencing
+    description: Delay between sell completion and buy start ensures sell orders settle before buy credit
+      arrives
+    evidence: easytrader/follower.py:345(trade_worker)
+  replaceable_points:
+  - name: cmd_cache
+    description: Persist executed commands to disk for idempotent restarts
+    options:
+    - name: 'true'
+      traits:
+      - Idempotent
+      - Default
+      - Persisted
+      fit_for:
+      - Production deployments
+      - Long-running processes
+      not_fit_for:
+      - Testing
+      - One-off executions
+    - name: 'false'
+      traits:
+      - No persistence
+      - Fresh start
+      fit_for:
+      - Testing
+      - Manual execution
+      not_fit_for:
+      - Production (may duplicate trades on restart)
+    default: 'true'
+  - name: platform
+    description: Simulation platform to follow for trade signals
+    options:
+    - name: joinquant
+      traits:
+      - XSHG/XSHE format
+      - URL-based following
+      fit_for:
+      - Most common Chinese quant platform
+      not_fit_for:
+      - RiceQuant/XueQiu users
+    - name: ricequant
+      traits:
+      - rq/ricequant prefix
+      - API-based
+      fit_for:
+      - RiceQuant users
+      not_fit_for:
+      - JoinQuant/XueQiu users
+    - name: xueqiu
+      traits:
+      - sh/sz prefix
+      - Portfolio-based
+      fit_for:
+      - XueQiu portfolio followers
+      not_fit_for:
+      - Other platforms
+    default: joinquant
+  design_decisions:
+  - 'Command cache via pickle for idempotent restarts (evidence: easytrader/follower.py:128(load_expired_cmd_cache))
+    — Prevents re-executing trades after program restart; cmd key = strategy+stock+action+amount+price+datetime'
+  - 'Trade command expiration (default 120s) (evidence: easytrader/follower.py:250(_execute_trade_cmd))
+    — Stale signals should not execute; timestamp comparison enforces this'
+  - 'Thread-based worker for trade execution (evidence: easytrader/follower.py:345(trade_worker)) — Queue-based
+    decoupling: polling threads produce, worker thread consumes'
+  - 'send_interval for sell-then-buy sequencing (evidence: easytrader/follower.py:345(trade_worker)) —
+    Delay between sells and buys ensures sell orders complete before buy credit arrives'
+  - 'Slippage asymmetry: buy × (1+slip), sell × (1-slip) (evidence: easytrader/follower.py:122(_calculate_price_by_slippage))
+    — Asymmetric slippage: buys get higher price (safer), sells get lower price (safer)'
+  - 'Dynamic asset calculation from net_value × initial_assets (evidence: easytrader/xq_follower.py:123(calculate_assets))
+    — XueQiu portfolios scale; net value changes affect position sizing'
+  acceptance_hints:
+  - Signals within 120s window are executed
+  - Signals older than 120s are silently discarded
+  - Sell orders execute before buy orders
+  - Duplicate signals on restart are not re-executed (cmd_cache=true)
+  - send_interval delay properly sequences sell-to-buy
+- id: remote_service
+  name: Remote Service Layer
+  order: 5
+  responsibility: 'Expose trader API over HTTP for remote/headless access. WHY: Allows trading from non-Windows
+    machines or as a microservice, decoupling strategy execution from broker connectivity'
+  interface:
+    inputs:
+    - HTTP requests (POST /buy, /sell, etc.)
+    - broker identifier
+    - JSON payload with trade parameters
+    outputs:
+    - JSON responses with results or errors
+  required_methods:
+  - name: server.run
+    description: Start Flask server exposing trader API endpoints
+    evidence: easytrader/server.py:8(server)
+  - name: RemoteClient.buy
+    description: HTTP wrapper for buy operation, forwarding to remote server
+    evidence: easytrader/remoteclient.py:92(buy)
+  - name: RemoteClient.sell
+    description: HTTP wrapper for sell operation, forwarding to remote server
+    evidence: easytrader/remoteclient.py:92(sell)
+  - name: RemoteClient.balance
+    description: HTTP wrapper for balance query
+    evidence: easytrader/remoteclient.py:92(balance)
+  key_behaviors:
+  - behavior: Flask server wraps ClientTrader for remote access
+    description: Windows-only pywinauto requires server on Windows box; clients on any platform connect
+      via HTTP
+    evidence: easytrader/server.py:27(post_prepare)
+  - behavior: RemoteClient mirrors trader interface identically
+    description: Drop-in replacement for local traders via transparent HTTP forwarding; same method signatures
+    evidence: easytrader/remoteclient.py:92(buy)
+  - behavior: Optional auth (BasicAuth or custom)
+    description: Security for internet-facing deployment; defaults to none for localhost-only usage
+    evidence: easytrader/remoteclient.py:15(auth)
+  replaceable_points:
+  - name: ssl
+    description: Use HTTPS for remote connection encryption
+    options:
+    - name: 'true'
+      traits:
+      - Encrypted
+      - Production recommended
+      fit_for:
+      - Internet-facing deployments
+      not_fit_for:
+      - Localhost only
+      - Development
+    - name: 'false'
+      traits:
+      - Unencrypted
+      - Default
+      - Fast
+      fit_for:
+      - Localhost
+      - Isolated networks
+      not_fit_for:
+      - Internet-facing production
+    default: 'false'
+  design_decisions:
+  - 'Flask server wraps ClientTrader for remote access (evidence: easytrader/server.py:27(post_prepare))
+    — Windows-only pywinauto requires server on Windows box; clients connect via HTTP'
+  - 'RemoteClient mirrors trader interface identically (evidence: easytrader/remoteclient.py:92(buy))
+    — Drop-in replacement for local traders via transparent HTTP forwarding'
+  - 'Optional auth (BasicAuth or custom) (evidence: easytrader/remoteclient.py:15(auth)) — Security for
+    internet-facing deployment; defaults to none for localhost'
+  acceptance_hints:
+  - Server starts on specified port (default 1430)
+  - RemoteClient methods return same format as local trader
+  - HTTP errors properly converted to TradeError exceptions
+  - Authentication enforced when configured
+data_flow:
+- from_stage: authentication
+  to_stage: account_query
+  data: Authenticated session with broker config containing window handles, control IDs, and field mappings
+- from_stage: authentication
+  to_stage: order_execution
+  data: Authenticated session with UI/API handles for submitting trades
+- from_stage: account_query
+  to_stage: trade_following
+  data: Position data (current holdings) for adjust_sell calculation and available balance checks
+- from_stage: trade_following
+  to_stage: order_execution
+  data: Trade commands (security code, price, amount, action) generated from external platform signals
+- from_stage: remote_service
+  to_stage: authentication
+  data: Login credentials via JSON payload forwarded to local trader
+- from_stage: remote_service
+  to_stage: order_execution
+  data: Trade parameters (buy/sell/balance) via HTTP POST routed to appropriate trader method
+global_contracts:
+- contract: Security codes normalized to 6-digit strings internally
+  evidence: easytrader/clienttrader.py:450(_set_trade_params)
+- contract: Stock amount must be multiple of 100 (lot size) for A-share market
+  evidence: easytrader/xq_follower.py:186(project_transactions), easytrader/clienttrader.py:470(_type_edit_control_keys)
+- contract: Market order types differ by exchange (sh/sz) and must be mapped per broker
+  evidence: easytrader/miniqmt/miniqmt_trader.py:10(MARKET_ORDER_TYPE_NAME_MAP)
+- contract: 'Slippage is asymmetric: buy price multiplied by (1+slippage), sell price by (1-slippage)'
+  evidence: easytrader/follower.py:122(_calculate_price_by_slippage)
+- contract: Trade commands keyed by strategy_name+stock+action+amount+price+datetime for deduplication
+  evidence: easytrader/follower.py:221(generate_expired_cmd_key)
+- contract: Every follower transactions ordered SELL before BUY to ensure cash availability
+  evidence: easytrader/follower.py:400-408(order_transactions_sell_first)
+- contract: Login must precede config loading in prepare() method flow
+  evidence: easytrader/clienttrader.py:586-616(prepare)
+- contract: Broker-specific control IDs and TITLE strings required for UI automation
+  evidence: easytrader/config/client.py:24(TITLE), easytrader/config/client.py:87(BALANCE_GRID_CONTROL_ID)
+- contract: 'Stock code format varies by platform: XSHG/XSHE suffixes (JoinQuant) vs sh/sz prefixes (XueQiu)'
+  evidence: easytrader/joinquant_follower.py:109-119(stock_shuffle_to_prefix)
+- contract: Command cache stored as cmd_cache.pk in current working directory
+  evidence: easytrader/follower.py:26(CMD_CACHE_FILE)
+business_decisions:
+- id: BD-001
+  type: B
+  content: Separate BaseLoginClientTrader for auto-login vs connect-only
+  rationale: 'Distinguishing between automated login flow and pre-authenticated connection allows flexible
+    reuse of connect() for already-authenticated sessions. This separation prevents re-authentication
+    overhead and enables connect-only mode for clients managing their own credentials externally. Boundary:
+    specifically applies to BaseLoginClientTrader subclass hierarchy where login state varies.'
+  evidence: easytrader/clienttrader.py:580(BaseLoginClientTrader)
+  stage: authentication
+  alternative_considered: Single unified login method with boolean flag; rejected due to interface pollution
+- id: BD-002
+  type: B/RC
+  content: Heartbeat thread for web sessions to maintain token validity
+  rationale: 'Web trading sessions require periodic keepalive signals to prevent server-side token expiration
+    and forced logout. A dedicated background thread sending heartbeats every 30 seconds maintains session
+    continuity for long-running automated trading operations. Boundary: applies only to web-based traders;
+    desktop traders use different keepalive mechanisms.'
+  evidence: easytrader/webtrader.py:85(send_heartbeat)
+  stage: authentication
+  alternative_considered: Session refresh on demand; rejected due to unpredictable timing gaps
+- id: BD-003
+  type: BA
+  content: Config file or direct params for login
+  rationale: 'Dual authentication modes serve distinct use cases: config file keeps credentials out of
+    command-line history and process listings (security boundary), while direct parameters enable programmatic
+    instantiation without file I/O dependency. Supports both human operators and automated systems. Boundary:
+    config file uses prepare() method with optional parameter override.'
+  evidence: easytrader/clienttrader.py:586(prepare)
+  stage: authentication
+  alternative_considered: Environment variables only; rejected due to cross-platform complexity
+- id: BD-004
+  type: B/DK
+  content: Grid data via strategy pattern (Copy/WMCopy/Xls)
+  rationale: 'Different broker terminals use distinct clipboard and data export mechanisms (plain Copy,
+    Windows Metafile Copy, or Excel export). Strategy pattern encapsulates extraction logic per broker,
+    allowing runtime selection without conditional branching. Boundary: strategy factory instantiates
+    appropriate handler based on broker configuration.'
+  evidence: easytrader/clienttrader.py:65(grid_strategy)
+  stage: account_query
+  alternative_considered: Per-broker subclasses with overridden methods; rejected due to code duplication
+  _evidence_issues:
+  - 'FN_NOT_FOUND: grid_strategy in easytrader/clienttrader.py'
+  vague_rationale: true
+- id: BD-005
+  type: B
+  content: Balance from Static controls, not grid
+  rationale: 'Terminal UI separates balance display (static controls show pre-formatted current balance)
+    from transactional data (grid shows positions and entrusts). Extracting balance from statics ensures
+    accuracy without grid parsing complexity. Boundary: applies to account balance only; positions and
+    entrusts still use grid extraction.'
+  evidence: easytrader/clienttrader.py:134(_get_balance_from_statics)
+  stage: account_query
+  alternative_considered: Balance from grid; rejected due to inconsistent grid formatting
+- id: BD-006
+  type: BA/DK
+  content: GRID_DTYPE per broker for proper CSV parsing
+  rationale: 'Chinese column headers and numeric formats (decimal separators, thousands notation) vary
+    significantly between broker data exports. Broker-specific dtype mapping ensures pandas correctly
+    interprets CSV data without parsing errors. Boundary: applies to grid-to-DataFrame conversion only;
+    API responses use separate parsing.'
+  evidence: easytrader/config/client.py:61(GRID_DTYPE)
+  stage: account_query
+  alternative_considered: Runtime type inference; rejected due to inconsistent sample data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: GRID_DTYPE in easytrader/config/client.py'
+- id: BD-007
+  type: B/DK
+  content: Security code uses last 6 digits
+  rationale: 'Chinese stock codes use sh/SZ prefixes for exchange identification but internal trading
+    systems require numeric-only codes. Stripping to 6 digits normalizes input while preserving uniqueness.
+    Boundary: applies during parameter setting; original prefixed format preserved for display and logging.'
+  evidence: easytrader/clienttrader.py:450(_set_trade_params)
+  stage: account_query
+  alternative_considered: Require numeric-only input; rejected due to user experience impact
+- id: BD-008
+  type: B/BA
+  content: Sell-first transaction ordering
+  rationale: 'For sell-then-buy transactions (closing and re-entering positions), executing sells first
+    releases locked capital before buys consume new funds. This ordering prevents insufficient funds errors
+    and ensures regulatory compliance with settlement requirements. Boundary: applies to sell-then-buy
+    sequences only; buy-then-sell uses different ordering.'
+  evidence: easytrader/follower.py:400(order_transactions_sell_first)
+  stage: order_execution
+  alternative_considered: Parallel execution; rejected due to capital management requirements
+- id: BD-009
+  type: B
+  content: Popup dialog handler pattern
+  rationale: 'Every order submission may trigger confirmation dialogs (accept/reject) or error dialogs
+    (insufficient funds, price limit). Handler pattern centralizes dialog detection, extracts entrust_no
+    for success cases, and raises TradeError for failures. Boundary: applies to modal dialogs only; non-blocking
+    notifications use separate handling.'
+  evidence: easytrader/clienttrader.py:565(_handle_pop_dialogs)
+  stage: order_execution
+  alternative_considered: Blocking modal waits; rejected due to thread deadlock risks
+- id: BD-010
+  type: B/BA
+  content: 'Slippage adjustment: buy × (1+slip), sell × (1-slip)'
+  rationale: 'Asymmetric slippage handling provides safety margins: buy orders use higher adjusted price
+    (prevents buying at unfavorable spikes), sell orders use lower adjusted price (prevents selling at
+    unfavorable dips). This conservative approach protects follower capital. Boundary: default slippage=0;
+    configurable per strategy or broker.'
+  evidence: easytrader/follower.py:115(_calculate_price_by_slippage)
+  stage: order_execution
+  alternative_considered: Symmetric slippage; rejected due to directional risk asymmetry
+- id: BD-011
+  type: B/DK
+  content: Amount rounded to nearest 100 (lot size)
+  rationale: 'A-share market regulations mandate 100-share trading lots; orders not divisible by 100 are
+    rejected by exchanges. Round(-2) enforces this constraint by snapping fractional lots to valid boundaries.
+    Boundary: applies to equity orders only; derivatives and bonds use different lot requirements.'
+  evidence: easytrader/xq_follower.py:170(project_transactions)
+  stage: order_execution
+  alternative_considered: Reject fractional lots; rejected due to user experience impact
+- id: BD-012
+  type: B/DK
+  content: Market order type selection via ComboBox iteration
+  rationale: 'Brokers implement market order types inconsistently (Shanghai Fanwei, Shenzhen Jijin, etc.).
+    Iterating available ComboBox options with regex matching identifies compatible market order types
+    without hardcoding broker-specific mappings. Boundary: applies to market order type selection only;
+    limit orders use separate logic.'
+  evidence: easytrader/clienttrader.py:288(_set_market_trade_type)
+  stage: order_execution
+  alternative_considered: Hardcoded broker-specific type mapping; rejected due to maintenance burden
+- id: BD-013
+  type: B
+  content: Command cache via pickle for idempotent restarts
+  rationale: 'Program restarts should not cause duplicate trade execution. Command cache with composite
+    key (strategy+stock+action+amount+price+datetime) enables idempotent recovery by skipping already-executed
+    commands. Boundary: cache persists across restarts; cleared after successful execution or manual intervention.'
+  evidence: easytrader/follower.py:128(load_expired_cmd_cache)
+  stage: trade_following
+  alternative_considered: Database-based deduplication; rejected due to infrastructure complexity
+- id: BD-014
+  type: BA/DK
+  content: Trade command expiration (default 120s)
+  rationale: 'Stale trading signals from delayed market data should not execute, as conditions may have
+    changed significantly. Timestamp-based expiration prevents outdated commands from capturing unfavorable
+    prices. Boundary: applies to signal-based following only; manual commands bypass expiration checks.'
+  evidence: easytrader/follower.py:250(_execute_trade_cmd)
+  stage: trade_following
+  alternative_considered: Infinite TTL with stale price warning; rejected due to silent failure risk
+- id: BD-015
+  type: B
+  content: Thread-based worker for trade execution
+  rationale: 'Trade signal polling (producer threads) and order execution (consumer thread) operate at
+    different rates. Queue-based decoupling prevents blocking and enables batch processing of multiple
+    signals. Boundary: single consumer thread; parallel execution handled via separate trade workers.'
+  evidence: easytrader/follower.py:345(trade_worker)
+  stage: trade_following
+  alternative_considered: AsyncIO-based execution; rejected due to pywinauto compatibility requirements
+- id: BD-016
+  type: BA
+  content: send_interval for sell-then-buy sequencing
+  rationale: 'Sell orders must complete and settle before buy orders consume released capital. Configurable
+    interval between sell and buy phases ensures sell proceeds are credited before new purchases execute.
+    Boundary: applies to sell-then-buy mode only; single-direction following bypasses interval.'
+  evidence: easytrader/follower.py:345(trade_worker)
+  stage: trade_following
+  alternative_considered: Blocking wait for sell confirmation; rejected due to latency impact
+- id: BD-017
+  type: BA/DK
+  content: Dynamic asset calculation from net_value × initial_assets
+  rationale: 'XueQiu portfolio net value fluctuates with market conditions, affecting position sizing
+    calculations. Current assets = net_value × initial_assets provides real-time capital tracking for
+    accurate trade proportioning. Boundary: applies to XueQiu-based following only; direct account balance
+    used for other sources.'
+  evidence: easytrader/xq_follower.py:123(calculate_assets)
+  stage: trade_following
+  alternative_considered: Static initial assets only; rejected due to growth/loss untracking
+- id: BD-018
+  type: B/DK
+  content: Flask server wraps ClientTrader for remote access
+  rationale: 'pywinauto requires Windows environment for GUI automation, but trading systems may run on
+    Linux/macOS. Flask server on Windows host exposes ClientTrader via HTTP, enabling cross-platform client
+    access. Boundary: server must run on Windows with broker terminal open; clients connect via HTTP only.'
+  evidence: easytrader/server.py:27(post_prepare)
+  stage: remote_service
+  alternative_considered: Virtual Windows environments; rejected due to licensing and performance costs
+- id: BD-019
+  type: B
+  content: RemoteClient mirrors trader interface identically
+  rationale: 'Drop-in replacement compatibility allows switching between local and remote traders without
+    code changes. Transparent HTTP forwarding preserves method signatures and return types. Boundary:
+    requires network connectivity; latency-sensitive operations may prefer local execution.'
+  evidence: easytrader/remoteclient.py:92(buy)
+  stage: remote_service
+  alternative_considered: Wrapper with different interface; rejected due to migration complexity
+- id: BD-020
+  type: BA/DK
+  content: Optional auth (BasicAuth or custom)
+  rationale: 'Internet-facing deployments require authentication to prevent unauthorized trading; localhost
+    development benefits from auth-free access. Pluggable auth handler allows BasicAuth, token-based,
+    or custom schemes. Boundary: defaults to no auth; users must explicitly configure authentication for
+    production deployments.'
+  evidence: easytrader/remoteclient.py:15(auth)
+  stage: remote_service
+  alternative_considered: Mandatory auth with localhost bypass; rejected due to configuration complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: auth in easytrader/remoteclient.py'
+- id: BD-021
+  type: B/DK
+  content: Security code extraction uses last 6 characters, stripping any prefix
+  rationale: Stock codes in Chinese markets are 6-digit identifiers (e.g., 000001, 600000). Some broker
+    systems prefix codes with exchange identifiers (SH/SZ). Extracting the last 6 characters ensures consistent
+    code format regardless of input prefix, enabling correct security lookup across each broker interfaces.
+    This boundary prevents lookup failures when codes include exchange prefixes.
+  evidence: easytrader/clienttrader.py:449(_set_trade_params)
+  stage: trade_following
+- id: BD-022
+  type: B/DK
+  content: 'Slippage is asymmetric: buy price multiplied by (1+slippage), sell price by (1-slippage)'
+  rationale: Asymmetric slippage accounts for adverse price movement during order execution. When buying,
+    paying more (higher price) protects against execution shortfalls. When selling, receiving less (lower
+    price) similarly protects. This directional adjustment reflects market microstructure reality where
+    immediate execution may occur at worse prices. The boundary prevents orders from being rejected due
+    to brief price movements between decision and execution.
+  evidence: easytrader/follower.py:115(_calculate_price_by_slippage)
+  stage: price_calculation
+- id: BD-023
+  type: B/BA
+  content: Transaction order prioritizes sells before buys to prevent insufficient funds
+  rationale: Selling first releases capital before purchasing new positions. This ordering ensures sufficient
+    funds are available for buy orders when both are processed together. The boundary prevents rejected
+    buy orders due to cash insufficiency and ensures portfolio rebalancing executes correctly. Without
+    this ordering, a mix of sells and buys could fail if buys are processed first.
+  evidence: easytrader/follower.py:400(order_transactions_sell_first)
+  stage: order_execution
+- id: BD-024
+  type: B/BA
+  content: Grid data retrieval uses clipboard copy (Ctrl+A, Ctrl+C) method as default
+  rationale: Clipboard-based extraction works across different GUI frameworks without requiring specific
+    API access. Ctrl+A selects each grid content, Ctrl+C copies to clipboard, which is a universal Windows
+    automation pattern. This method is reliable for tabular data extraction where direct API access is
+    unavailable. The boundary ensures data extraction succeeds even when broker client interfaces lack
+    programmatic data access.
+  evidence: easytrader/grid_strategies.py:78(Copy.get)
+  stage: data_extraction
+- id: BD-025
+  type: B/BA
+  content: Auto IPO selects each stocks then deselects those with zero allocation
+  rationale: IPO systems typically default to selecting each available stocks. By selecting each first
+    and then deselecting invalid entries (zero allocation, already subscribed), the system handles both
+    positive and zero allocations in a single pass. This approach is more efficient than iterating through
+    each valid stock individually. The boundary prevents duplicate subscription attempts and ensures only
+    eligible stocks are included.
+  evidence: easytrader/clienttrader.py:323(auto_ipo)
+  stage: ipo_processing
+- id: BD-026
+  type: B
+  content: Cancel entrust matches by contract number field defined per broker config
+  rationale: Different brokers use different field names for contract/entrust numbers (合同编号 vs other identifiers).
+    Broker-specific configuration allows flexible mapping to the correct field. This design boundary allows
+    the same cancel logic to work across each supported brokers without code changes. The system cannot
+    cancel entrusts correctly without knowing the broker-specific field name.
+  evidence: easytrader/clienttrader.py:173(cancel_entrust)
+  stage: cancel_operation
+- id: BD-027
+  type: B/DK
+  content: Dialog handling uses Alt+Y shortcut for confirmations
+  rationale: Alt+key combinations are standard Windows dialog shortcuts where Alt underlines the accelerator
+    key. Y is the confirmation shortcut in Chinese brokerage interfaces. Using keyboard shortcuts instead
+    of mouse clicks is faster and more reliable for automation. This boundary ensures consistent dialog
+    handling across different dialog implementations.
+  evidence: easytrader/pop_dialog_handler.py:54(_submit_by_shortcut)
+  stage: ui_interaction
+- id: BD-028
+  type: B/DK
+  content: Stock exchange type detection based on code prefix rules (BJ/SH/SZ)
+  rationale: Chinese A-shares trade on Shanghai (SH prefix 5/6/7/9), Shenzhen (SZ prefix 0/1/2/3), or
+    Beijing (BJ prefix 4/8/9). Exchange routing depends on correct identification since different exchanges
+    have different trading rules. This boundary ensures orders are routed to the correct exchange for
+    execution. Incorrect exchange detection results in order rejection.
+  evidence: easytrader/utils/stock.py:9(get_stock_type)
+  stage: market_detection
+- id: BD-029
+  type: B/DK
+  content: Amount input requires integer conversion, truncating decimals
+  rationale: Stock trading in China uses integer share quantities (no fractional shares). Truncating decimals
+    (not rounding) ensures the entered amount does not exceed the requested amount. This boundary prevents
+    order rejection due to decimal quantities. The system errs on the side of executing less rather than
+    more than requested.
+  evidence: easytrader/clienttrader.py:449(_set_trade_params)
+  stage: trade_following
+- id: BD-030
+  type: B/BA
+  content: Slippage defaults to 0.0 (no slippage) when not specified
+  rationale: A zero slippage default means orders execute at exact specified prices without adjustment.
+    This conservative default prevents unexpected price differences for users who don't configure slippage.
+    The boundary allows users to opt-in to slippage protection when needed, rather than having it imposed
+    by default.
+  evidence: easytrader/follower.py:30(__init__)
+  stage: configuration
+- id: BD-031
+  type: B
+  content: Trade command cache stored in pickle file for idempotent replay
+  rationale: Pickle serialization allows Python objects to persist across process restarts. Caching trade
+    commands enables idempotent replay if the follower process crashes and restarts. This boundary ensures
+    the system can resume trading from the correct state without duplicating orders. Without caching,
+    replaying trades after restart would be unreliable.
+  evidence: easytrader/follower.py:26(CMD_CACHE_FILE)
+  stage: state_management
+  _evidence_issues:
+  - 'FN_NOT_FOUND: CMD_CACHE_FILE in easytrader/follower.py'
+- id: BD-032
+  type: B/BA
+  content: Command expiration uses 120 seconds default threshold
+  rationale: Trade commands become stale if not executed within 120 seconds due to changing market conditions.
+    Expired commands could execute at outdated prices, causing losses. This boundary defines when a command
+    is considered too old to execute reliably. The 2-minute threshold balances allowing execution time
+    against preventing stale order execution.
+  evidence: easytrader/follower.py:94(follow)
+  stage: trade_following
+  vague_rationale: true
+- id: BD-033
+  type: B/DK
+  content: Price validation requires positive numbers, zero or negative rejected
+  rationale: Market prices must be positive values. Zero or negative prices indicate invalid data and
+    cannot be valid market orders. Rejecting these values prevents erroneous order submissions. This boundary
+    ensures only valid prices proceed to execution, protecting against data corruption or programming
+    errors.
+  evidence: easytrader/follower.py:250(_execute_trade_cmd)
+  stage: trade_following
+- id: BD-034
+  type: B/DK
+  content: XueQiu stock symbol uses lowercase format (sz162411 vs SZ162411)
+  rationale: XueQiu API requires lowercase exchange prefixes (sz/sh) followed by stock code. This lowercase
+    format is an API requirement. Converting to lowercase before API calls ensures compatibility. This
+    boundary prevents API authentication failures or incorrect data retrieval due to case mismatches.
+  evidence: easytrader/xq_follower.py:170(project_transactions)
+  stage: symbol_conversion
+- id: BD-035
+  type: B/BA
+  content: XueQiu portfolio net value multiplied by initial assets to calculate total
+  rationale: Net value represents the ratio of current portfolio value to initial investment (e.g., 1.5
+    means 50% gain). Multiplying initial assets by net value derives the current total assets. This is
+    the standard portfolio valuation formula. The boundary ensures correct asset calculation for position
+    sizing and risk management.
+  evidence: easytrader/xq_follower.py:127(calculate_assets)
+  stage: asset_calculation
+- id: BD-036
+  type: B/DK
+  content: Adjust sell amount rounds down to nearest 100-share multiple
+  rationale: Chinese stocks trade in 100-share lots (hand). Rounding down ensures the sell amount doesn't
+    exceed available holdings. Selling one share more than owned would cause a rejection. The boundary
+    prevents order rejections and ensures only tradable quantities are submitted.
+  evidence: easytrader/xq_follower.py:192(_adjust_sell_amount)
+  stage: position_adjustment
+- id: BD-037
+  type: B/BA
+  content: XueQiu minimum total assets threshold is 1000 CNY
+  rationale: Portfolios below 1000 CNY are considered negligible or invalid. This threshold filters out
+    accounts with minimal holdings that aren't meaningful for tracking. The boundary prevents calculations
+    based on accounts with essentially zero balance.
+  evidence: easytrader/xq_follower.py:123(calculate_assets)
+  stage: validation
+  vague_rationale: true
+- id: BD-038
+  type: B/BA
+  content: Captcha recognition uses threshold 200 for image binarization
+  rationale: 'Binarization threshold 200 converts grayscale images to black/white (0-199 = black, 200-255
+    = white). This threshold is calibrated for typical captcha contrast levels. The boundary affects recognition
+    accuracy: too low produces too much noise, too high loses detail. This specific value balances noise
+    reduction against character preservation.'
+  evidence: easytrader/utils/captcha.py:14(captcha_recognize)
+  stage: image_processing
+- id: BD-039
+  type: B/BA
+  content: Heartbeat interval is 30 seconds for login session maintenance
+  rationale: Broker servers timeout inactive sessions after a certain period (typically 30-60 seconds).
+    Heartbeat at 30-second intervals keeps the session alive without excessive server load. This boundary
+    balances session reliability against server resource usage. Longer intervals risk session timeout;
+    shorter intervals add unnecessary overhead.
+  evidence: easytrader/webtrader.py:85(send_heartbeat)
+  stage: session_management
+- id: BD-040
+  type: B/BA
+  content: Refresh strategy uses F5 key shortcut by default
+  rationale: F5 is the standard Windows refresh shortcut, equivalent to pressing the refresh button. Using
+    keyboard shortcuts instead of menu navigation is faster and more reliable for automation. This boundary
+    ensures consistent refresh behavior across different client versions.
+  evidence: easytrader/clienttrader.py:523(_switch_left_menus)
+  stage: ui_refresh
+- id: BD-041
+  type: B/BA
+  content: Market orders default to '对手方最优价格委托' (counterparty best price)
+  rationale: 对手方最优价格委托 is the standard market order type in Chinese markets, matching against the best
+    available counterparty price. This is the most common order type for immediate execution. The default
+    ensures market orders work without explicit type specification. The boundary prevents order type errors
+    when users don't specify order types.
+  evidence: easytrader/miniqmt/miniqmt_trader.py:576(market_trade)
+  stage: order_execution
+- id: BD-042
+  type: B
+  content: MiniQMT session ID uses random 6-digit integer (100000-999999)
+  rationale: Random session IDs prevent conflicts when multiple instances connect simultaneously. The
+    100000-999999 range provides 900,000 possible IDs, making collision unlikely. This boundary ensures
+    each connection has a unique identifier for tracking and authentication. Fixed IDs would cause conflicts;
+    non-random IDs could be predictable.
+  evidence: easytrader/miniqmt/miniqmt_trader.py:212(connect)
+  stage: authentication
+- id: BD-043
+  type: B/RC
+  content: Cancel entrust triggers pop dialog handling with 0.5s wait
+  rationale: Dialogs take time to appear after user actions. The 0.5-second wait allows the dialog to
+    render before checking its existence. This prevents false negatives where dialogs are missed due to
+    checking too soon. The boundary balances responsiveness against waiting time.
+  evidence: easytrader/clienttrader.py:362(is_exist_pop_dialog)
+  stage: ui_handling
+- id: BD-044
+  type: B/RC
+  content: Trade submit includes 0.2s sleep before clicking submit button
+  rationale: Form fields require time to update before submission. The 0.2-second delay ensures each input
+    fields (price, amount) are fully processed before the submit click. This prevents race conditions
+    where orders are submitted with incomplete data. The boundary ensures order data integrity before
+    execution.
+  evidence: easytrader/clienttrader.py:430(_submit_trade)
+  stage: trade_following
+- id: BD-045
+  type: B
+  content: Grid row click uses calculated Y coordinate with margins and row height
+  rationale: GUI automation must calculate exact screen coordinates to click specific rows. The formula
+    accounts for header height and multiplies row index by row height. This precision is necessary because
+    small coordinate errors click the wrong row. The boundary ensures correct row selection for each visible
+    rows in the grid.
+  evidence: easytrader/clienttrader.py:350(_click_grid_by_row)
+  stage: ui_navigation
+- id: BD-046
+  type: B
+  content: HTZQ and Universal brokers use different IPO field name ('可申购数量' vs '申购数量')
+  rationale: Different brokers label the IPO allocation field differently in their interfaces. The system
+    must use the broker-specific field name to read correct allocation data. This boundary enables the
+    auto-IPO feature to work across different broker systems without code changes.
+  evidence: easytrader/config/client.py:170(HTZQ)
+  stage: broker_config
+- id: BD-047
+  type: B
+  content: YH and HT clients use XLS export strategy instead of clipboard copy
+  rationale: Different broker clients have different grid implementations. YH and HT clients don't support
+    clipboard-based extraction reliably, requiring XLS export instead. This broker-specific strategy selection
+    ensures data extraction works across each supported clients. The boundary allows fallback to alternative
+    extraction methods.
+  evidence: easytrader/ht_clienttrader.py:11(grid_strategy)
+  stage: data_extraction
+  _evidence_issues:
+  - 'FN_NOT_FOUND: grid_strategy in easytrader/ht_clienttrader.py'
+- id: BD-048
+  type: B
+  content: Login retry limit is 10 attempts before raising NotLoginError
+  rationale: After 10 failed login attempts, continuing to retry indicates a configuration issue (wrong
+    credentials, server problem). The limit prevents infinite retry loops that waste resources. The boundary
+    ensures the system fails fast and clearly when login is not possible rather than hanging indefinitely.
+  evidence: easytrader/webtrader.py:62(autologin)
+  stage: authentication
+- id: BD-049
+  type: B
+  content: Response data type conversion uses regex pattern matching for field names
+  rationale: Broker APIs return data with inconsistent field naming (e.g., balance vsBALANCE vs Balance).
+    Regex patterns identify numeric fields that need type conversion. This allows handling of various
+    API response formats without individual field mappings. The boundary enables type-safe data handling
+    across different broker implementations.
+  evidence: easytrader/webtrader.py:222(format_response_data_type)
+  stage: data_parsing
+- id: BD-050
+  type: B
+  content: Trade worker uses queue-based single-threaded processing
+  rationale: Single-threaded queue processing ensures trades execute in strict FIFO order. This prevents
+    race conditions where concurrent processing could cause orders to execute out of sequence. The queue
+    provides backpressure and buffering. This boundary ensures trade order integrity and prevents duplicate
+    or missed executions.
+  evidence: easytrader/follower.py:31(__init__)
+  stage: order_execution
+- id: BD-051
+  type: B/BA
+  content: Default minimum stock trade unit is 100 shares (1 hand)
+  rationale: Chinese A-shares trade in 100-share lots (hand). round(initial_amount, -2) rounds to nearest
+    100, ensuring amounts are valid trading units. This prevents order rejections due to invalid quantities.
+    The boundary enforces exchange trading unit rules automatically.
+  evidence: easytrader/xq_follower.py:170(project_transactions)
+  stage: validation
+- id: BD-052
+  type: B
+  content: Captcha retry count limited to 5 attempts before canceling
+  rationale: Repeated captcha failures indicate recognition is not working for this captcha type. After
+    5 attempts, giving up prevents infinite loops. This boundary ensures the system fails gracefully and
+    can proceed without blocking indefinitely. The limit balances persistence against wasting time on
+    unwinnable captchas.
+  evidence: easytrader/grid_strategies.py:97(Copy._get_clipboard_data)
+  stage: authentication
+- id: BD-053
+  type: B/RC
+  content: Config file loading supports both parameter and file-based login
+  rationale: Users can provide credentials directly as parameters or load from configuration files. This
+    flexibility supports different security and automation preferences. File-based config keeps credentials
+    out of code; parameter-based config enables programmatic usage. The boundary provides both use cases
+    without compromising either.
+  evidence: easytrader/clienttrader.py:586(prepare)
+  stage: configuration
+- id: BD-054
+  type: B/BA
+  content: Entrust confirmation dialogs auto-confirm for specific messages
+  rationale: '''超出涨跌停'' (price limit exceeded) warnings are common and expected in automated trading.
+    Auto-confirming these prevents manual intervention for expected warnings. Other warnings still require
+    user attention. This boundary balances automation speed against safety for known warning types.'
+  evidence: easytrader/pop_dialog_handler.py:67(handle)
+  stage: ui_handling
+- id: BD-055
+  type: B/RC
+  content: XueQiu cookie-based authentication requires external cookie extraction
+  rationale: XueQiu uses browser-based authentication that cannot be automated directly. Users must extract
+    cookies from their browser and provide them to the system. This is a security measure by XueQiu. The
+    boundary acknowledges this external dependency and documents the required manual setup step.
+  evidence: easytrader/xq_follower.py:27(login)
+  stage: authentication
+- id: BD-056
+  type: B/BA
+  content: RemoteClient defaults to port 1430 for API communication
+  rationale: Port 1430 is the standard MiniQMT API port for XTP protocol communication. Defaulting to
+    this port simplifies connection setup for typical configurations. The boundary ensures connections
+    work out-of-the-box for standard setups while allowing custom port configuration.
+  evidence: easytrader/remoteclient.py:12(__init__)
+  stage: networking
+- id: BD-057
+  type: B/RC
+  content: SSL verification disabled for HTTPS requests
+  rationale: SSL verification may fail with self-signed certificates or corporate proxies. Disabling verification
+    allows connections to work in development/testing environments. This is a security trade-off for internal
+    tools. The boundary documents this known limitation.
+  evidence: easytrader/follower.py:35(__init__)
+  stage: networking
+- id: BD-058
+  type: B/BA
+  content: Date range for exchange bill queries defaults to last 30 days
+  rationale: 30 days is sufficient for typical transaction reconciliation while keeping data volume manageable.
+    Longer ranges increase API load and response times; shorter ranges might miss needed data. This boundary
+    balances data completeness against performance.
+  evidence: easytrader/utils/stock.py:28(get_30_date)
+  stage: account_query
+- id: BD-059
+  type: B/DK
+  content: Login window detection uses Edit1.wait('ready') polling loop
+  rationale: Edit1 is the username input field. Waiting for 'ready' state confirms the login window is
+    fully loaded before attempting input. Polling until ready handles variable window load times. This
+    boundary ensures reliable login automation across different system speeds.
+  evidence: easytrader/ht_clienttrader.py:17(login)
+  stage: ui_detection
+- id: BD-060
+  type: B/BA
+  content: Price rounding uses stock-specific decimal precision via easyutils
+  rationale: Different stocks have different price precisions (some use 2 decimals, others use 3). easyutils
+    provides stock-specific rounding rules. Exchange systems reject prices with incorrect precision. This
+    boundary ensures prices match the exchange's expected format for each security.
+  evidence: easytrader/clienttrader.py:449(_set_trade_params)
+  stage: price_calculation
+- id: BD-061
+  type: B/RC
+  content: Performance logging only enabled at DEBUG log level
+  rationale: Performance measurement adds overhead. Checking isEnabledFor(DEBUG) before capturing timestamps
+    avoids overhead in production. This boundary ensures performance tracking doesn't impact production
+    performance while being available in debug mode.
+  evidence: easytrader/utils/perf.py:18(perf_clock)
+  stage: logging
+- id: BD-062
+  type: B/BA
+  content: Trade entrust field name defaults to '合同编号' (contract number)
+  rationale: 合同编号 (contract number) is the standard field for identifying entrust orders in most Chinese
+    broker systems. This default works for most brokers without custom configuration. The boundary provides
+    sensible defaults while allowing broker-specific overrides.
+  evidence: easytrader/config/client.py:22(CommonConfig)
+  stage: broker_config
+- id: BD-063
+  type: B/DK
+  content: HTZQGZQ broker inherits from HT but removes stock market value from balance
+  rationale: HTZQ (Huarong Securities) excludes stock market value from available balance calculation.
+    This affects margin and buying power calculations. The inheritance pattern allows code reuse while
+    enabling broker-specific adjustments. The boundary ensures correct balance calculation for HTZQ's
+    specific requirements.
+  evidence: easytrader/config/client.py:173(HTZQ)
+  stage: broker_config
+- id: BD-064
+  type: B
+  content: Trade error extends IOError for exception chaining compatibility
+  rationale: Inheriting from IOError allows TradeError to be caught by IOError handlers, ensuring backward
+    compatibility. Exception chaining via 'from' preserves the original traceback. This boundary ensures
+    proper error handling across Python versions and existing code.
+  evidence: easytrader/exceptions.py:4(TradeError)
+  stage: error_handling
+- id: BD-065
+  type: B
+  content: Captcha image saved as JPEG with quality determined by broker
+  rationale: JPEG format provides good compression for captcha images, balancing file size against quality.
+    The quality parameter affects recognition accuracy vs storage size. This boundary allows broker-specific
+    optimization of the captcha image format.
+  evidence: easytrader/yh_clienttrader.py:103(capture_as_image)
+  stage: image_processing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: capture_as_image in easytrader/yh_clienttrader.py'
+- id: BD-066
+  type: B/BA
+  content: YH client expands captcha screenshot by 30% for 4-character codes
+  rationale: Captcha images may be clipped in default screenshots. Expanding by 30% ensures each 4 characters
+    are captured for recognition. This prevents incomplete captcha images that can't be solved. The boundary
+    ensures reliable captcha capture for YH client specifically.
+  evidence: easytrader/yh_clienttrader.py:91(_handle_verify_code)
+  stage: image_capture
+- id: BD-067
+  type: B/RC
+  content: Left menu navigation uses F5 key after item selection to refresh
+  rationale: After selecting a menu item, pressing F5 refreshes the content area to show the selected
+    module's data. This is required because the content doesn't automatically update on selection. The
+    boundary ensures correct navigation flow in the brokerage interface.
+  evidence: easytrader/clienttrader.py:523(_switch_left_menus)
+  stage: ui_navigation
+- id: BD-068
+  type: B
+  content: Cancel each entrusts clicks '全撤' button then checks for confirm dialog
+  rationale: '''全撤'' (cancel all) button initiates bulk cancellation. The system then checks for confirmation
+    dialogs which may require additional handling. This two-step process handles both the direct cancellation
+    and subsequent confirmation. The boundary ensures complete cancellation with proper confirmation handling.'
+  evidence: easytrader/clienttrader.py:183(cancel_all_entrusts)
+  stage: cancel_operation
+- id: BD-069
+  type: B/BA
+  content: Verify code recognition strips spaces and filters to alphanumeric only
+  rationale: Captcha characters should be alphanumeric. Stripping spaces and filtering removes noise characters
+    that OCR might misidentify. This ensures the recognized code matches the expected format. The boundary
+    prevents invalid captcha submissions due to extraneous characters.
+  evidence: easytrader/yh_clienttrader.py:107(return)
+  stage: input_processing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: return in easytrader/yh_clienttrader.py'
+- id: BD-070
+  type: B
+  content: JoinQuant strategy ID extracted from page HTML via regex
+  rationale: Strategy IDs are embedded in HTML as hidden form fields. Regex extraction allows getting
+    the ID without full HTML parsing. This enables programmatic strategy tracking. The boundary ensures
+    correct strategy identification from the web interface.
+  evidence: easytrader/joinquant_follower.py:93(extract_strategy_id)
+  stage: strategy_extraction
+- id: BD-071
+  type: B/DK
+  content: Thread-based strategy tracking with daemon threads for clean exit
+  rationale: Daemon threads terminate automatically when the main program exits. This prevents hanging
+    processes when the main thread completes. setDaemon(True) ensures clean shutdown. The boundary ensures
+    the follower doesn't block program exit.
+  evidence: easytrader/follower.py:133(start_trader_thread)
+  stage: concurrency
+- id: BD-072
+  type: B
+  content: Order of sell transactions calculated as weight difference vs previous holding
+  rationale: Weight difference (target minus previous) determines sell quantity. Positive difference means
+    increase (buy), negative means decrease (sell). The absolute value of negative differences is the
+    sell amount. This boundary ensures sells are correctly calculated from portfolio rebalancing decisions.
+  evidence: easytrader/xq_follower.py:172(project_transactions)
+  stage: position_calculation
+- id: BD-073
+  type: B
+  content: Popup dialog title detection uses partial string matching
+  rationale: Dialog titles may vary slightly across versions. Using 'in' (partial matching) instead of
+    exact equality handles these variations. The set of known dialog titles covers common cases. This
+    boundary ensures dialog handling works across different client versions.
+  evidence: easytrader/pop_dialog_handler.py:62(handle)
+  stage: ui_detection
+- id: BD-074
+  type: B/RC
+  content: XueQiu weight values rounded to 2 decimal places before submission
+  rationale: XueQiu API requires weights with at most 2 decimal places. Rounding ensures compliance with
+    API requirements. This prevents API rejections due to excessive precision. The boundary ensures weights
+    are within acceptable range.
+  evidence: easytrader/xqtrader.py:325(adjust_weight)
+  stage: trade_following
+- id: BD-075
+  type: B/RC
+  content: XueQiu pending entrust check uses 'pending' status string
+  rationale: XueQiu API uses 'pending' string to indicate unfilled orders that can be cancelled. This
+    exact string matching is required for correct status checking. The boundary ensures only cancellable
+    orders are identified for cancellation.
+  evidence: easytrader/xqtrader.py:283(cancel_entrust)
+  stage: status_check
+- id: BD-076
+  type: B
+  content: Balance retrieval supports frozen_cash field in MiniQMT but not in ClientTrader
+  rationale: MiniQMT provides frozen_cash field; ClientTrader does not expose this field. This asymmetry
+    means some balance calculations work differently per platform. The boundary documents this limitation
+    for correct usage.
+  evidence: easytrader/miniqmt/miniqmt_trader.py:255(balance)
+  stage: data_retrieval
+- id: BD-077
+  type: B
+  content: XueQiu entrust cancel calculates volume from weight difference times balance
+  rationale: Weight adjustment amount equals (target - current) weight percentage times total balance,
+    divided by 100 to get share count. This correctly translates portfolio weight changes into actual
+    trade volumes. The boundary ensures cancel amounts match intended portfolio rebalancing.
+  evidence: easytrader/xqtrader.py:283(cancel_entrust)
+  stage: cancel_calculation
+- id: BD-078
+  type: B
+  content: 'Broker-specific verify code APIs: YH uses Alibaba cloud, GF uses local Tesseract'
+  rationale: Different brokers have different captcha implementations requiring different recognition
+    services. YH captchas work with cloud OCR; GF captchas require local Tesseract. This broker-specific
+    routing ensures optimal recognition rates. The boundary ensures captcha solving works across different
+    broker systems.
+  evidence: easytrader/utils/captcha.py:45(detect_yh_client_result)
+  stage: remote_service
+- id: BD-079
+  type: B/RC
+  content: WebTrader heartbeat uses balance API call as keep-alive mechanism
+  rationale: Calling balance() keeps the session alive without additional API calls. This leverages an
+    existing required operation for session maintenance. The boundary avoids adding unnecessary API endpoints
+    for heartbeat while ensuring session stays active.
+  evidence: easytrader/webtrader.py:109(heartbeat)
+  stage: session_management
+- id: BD-080
+  type: B/DK
+  content: XLS grid export uses Ctrl+S followed by Alt+S to save, Alt+Y to overwrite
+  rationale: 'XLS export requires specific keyboard sequences: Ctrl+S opens save dialog, Alt+S confirms
+    save, Alt+Y overwrites existing file. This sequence works reliably across Windows dialog implementations.
+    The boundary ensures XLS extraction works without requiring COM automation.'
+  evidence: easytrader/grid_strategies.py:183(Xls.get)
+  stage: data_extraction
+- id: BD-081
+  type: B/DK
+  content: Linear slippage model adjusts buy price upward by slippage factor and sell price downward
+  rationale: 'Implements asymmetric slippage adjustment where buys are penalized upward and sells are
+    rewarded downward. This preserves model integrity by ensuring orders only execute at prices that maintain
+    theoretical edge. Boundary: Slippage factor is a fixed configurable parameter applied uniformly across
+    each order types.'
+  evidence: follower.py:122-126(_calculate_price_by_slippage)
+  stage: follower
+  alternative_considered: Symmetric slippage adjustment was considered but rejected because buy/sell price
+    dynamics differ in real markets
+  _evidence_issues:
+  - 'NOT_FOUND: follower.py'
+- id: BD-082
+  type: B/DK
+  content: Trade commands expire after a configurable TTL using datetime difference comparison
+  rationale: 'Prevents stale orders from executing at outdated prices, protecting against market timing
+    errors. TTL ensures market conditions referenced during order creation remain valid. Boundary: TTL
+    is user-configurable to accommodate different market volatilities and trading frequencies.'
+  evidence: follower.py:263-265(is_cmd_expired)
+  stage: follower
+  alternative_considered: Fixed expiration time was rejected in favor of configurable TTL for flexibility
+    across strategies
+  _evidence_issues:
+  - 'NOT_FOUND: follower.py'
+- id: BD-083
+  type: B/BA
+  content: Stock amount calculated as weight percentage of assets divided by price, rounded to nearest
+    100
+  rationale: 'Ensures position sizes align with target portfolio weights while complying with exchange
+    lot requirements. Rounding to 100 shares reduces residual cash drift and simplifies reconciliation.
+    Boundary: Rounding threshold is fixed at 100-share increments matching exchange trading conventions.'
+  evidence: xq_follower.py:176,186(project_transactions)
+  stage: xq_follower
+  alternative_considered: Precise fractional shares were rejected as Chinese A-shares markets require
+    integer lot trading
+  _evidence_issues:
+  - 'NOT_FOUND: xq_follower.py'
+- id: BD-084
+  type: B/BA
+  content: Sell amount adjusted to available holdings by floor division to 100-share lots
+  rationale: 'Prevents over-selling by constraining sell orders to actual available holdings, respecting
+    market microstructure constraints. Floor division ensures only complete lots are executed. Boundary:
+    Adjustment assumes holdings are already in lot increments; any remainder is excluded from sell order.'
+  evidence: xq_follower.py:219(_adjust_sell_amount)
+  stage: xq_follower
+  alternative_considered: Partial lot sales were rejected as most brokerages enforce round-lot requirements
+  _evidence_issues:
+  - 'NOT_FOUND: xq_follower.py'
+- id: BD-085
+  type: B/BA
+  content: Total assets computed as initial assets multiplied by portfolio net value
+  rationale: 'Derives current portfolio value from initial capital and accumulated performance, enabling
+    accurate position sizing and performance tracking. Net value multiplier captures each gains/losses.
+    Boundary: Calculation assumes net value is already denominated in consistent units with initial assets.'
+  evidence: xq_follower.py:126-127(calculate_assets)
+  stage: xq_follower
+  alternative_considered: Direct balance queries were rejected as they may not reflect pending unsettled
+    trades
+  _evidence_issues:
+  - 'NOT_FOUND: xq_follower.py'
+- id: BD-086
+  type: B/BA
+  content: Virtual portfolio value converted to real balance using fixed multiplier
+  rationale: 'Bridges simulated portfolio environment with real account balances, enabling paper trading
+    to map to actual capital constraints. Fixed multiplier ensures consistent scaling. Boundary: Multiplier
+    is a constant derived from initial funding ratio; changing it mid-session would create accounting
+    discontinuities.'
+  evidence: xqtrader.py:98(_virtual_to_balance)
+  stage: xqtrader
+  alternative_considered: Dynamic multipliers were rejected to maintain predictable mapping between virtual
+    and real values
+  _evidence_issues:
+  - 'NOT_FOUND: xqtrader.py'
+- id: BD-087
+  type: B/DK
+  content: Cash and market value derived from total asset balance and cash percentage
+  rationale: 'Provides accurate account composition breakdown for risk management and order sizing. Separating
+    cash from market value enables cash reserve calculations. Boundary: Cash percentage is maintained
+    separately; any inconsistency between percentage and absolute values indicates data corruption.'
+  evidence: xqtrader.py:157-158(get_balance)
+  stage: xqtrader
+  alternative_considered: Single total balance field was rejected as downstream logic requires explicit
+    cash/market split
+  _evidence_issues:
+  - 'NOT_FOUND: xqtrader.py'
+- id: BD-088
+  type: B
+  content: Position weight calculated as volume divided by total asset balance, rounded to 2 decimals
+  rationale: 'Quantifies portfolio allocation as percentage for rebalancing decisions and risk reporting.
+    Two-decimal rounding provides sufficient precision while limiting floating-point noise. Boundary:
+    Rounding occurs after each individual trade, potentially accumulating small discrepancies vs. true
+    weight.'
+  evidence: xqtrader.py:428-429(_trade)
+  stage: xqtrader
+  alternative_considered: Higher precision was rejected to reduce floating-point comparison instability
+  _evidence_issues:
+  - 'NOT_FOUND: xqtrader.py'
+- id: BD-089
+  type: B/BA
+  content: Cash position recalculated after trade as percentage of updated asset balance
+  rationale: 'Maintains accurate cash reserve tracking following every transaction, enabling subsequent
+    order validation and risk assessment. Post-trade recalculation ensures cash percentage reflects actual
+    portfolio state. Boundary: Calculation assumes immediate trade settlement; T+1 settlements may temporarily
+    cause reported vs. actual discrepancies.'
+  evidence: xqtrader.py:478-489(_trade)
+  stage: xqtrader
+  alternative_considered: Pre-trade only calculation was rejected as it would not capture realized P&L
+    until next session
+  _evidence_issues:
+  - 'NOT_FOUND: xqtrader.py'
+- id: BD-090
+  type: B/BA
+  content: Remaining weight calculated as 100 minus sum of each position weights
+  rationale: 'Derives unallocated portfolio weight for cash reserve or new position funding, enabling
+    complete portfolio representation. Complement calculation ensures weights always sum to 100%. Boundary:
+    Assumes input position weights are accurate; garbage-in produces garbage-out for remaining weight.'
+  evidence: easytrader/xqtrader.py:325(adjust_weight)
+  stage: xqtrader
+  alternative_considered: Independent cash tracking was rejected as complement calculation is more resistant
+    to synchronization issues
+- id: BD-091
+  type: B/BA
+  content: Image binarized using fixed threshold of 200 for captcha recognition
+  rationale: 'Converts grayscale captcha images to binary for simplified pattern matching, reducing computational
+    complexity. Fixed threshold provides deterministic behavior across captcha variations. Boundary: Threshold
+    200 assumes consistent captcha generation; changes in source system brightness would require threshold
+    adjustment.'
+  evidence: captcha.py:14(captcha_recognize)
+  stage: captcha
+  alternative_considered: Adaptive thresholding was rejected for simplicity and deterministic behavior
+  _evidence_issues:
+  - 'NOT_FOUND: captcha.py'
+- id: BD-092
+  type: B/BA
+  content: Captcha pixels below 100 brightness converted to white (256) for noise removal
+  rationale: 'Eliminates dark noise artifacts from captcha images by forcing low-brightness pixels to
+    maximum white, improving digit isolation. Threshold 100 distinguishes noise from actual captcha content.
+    Boundary: Pixels exactly at threshold are included in noise removal; this boundary is arbitrary but
+    empirically determined.'
+  evidence: captcha.py:82-83(detect_gf_result)
+  stage: captcha
+  alternative_considered: Edge-preserving filters were rejected as overkill for captcha noise patterns
+  _evidence_issues:
+  - 'NOT_FOUND: captcha.py'
+- id: BD-093
+  type: B/BA
+  content: Gray values in range 68-90 converted to black (0), others to white (256) for digit isolation
+  rationale: 'Isolates captcha digit regions by mapping expected digit gray range to black while background
+    becomes white, creating high-contrast digit extraction. Range 68-90 captures digit pixels while excluding
+    noise. Boundary: Range boundaries are empirically tuned; digits with unusual shading would be misclassified.'
+  evidence: captcha.py:85(detect_gf_result)
+  stage: captcha
+  alternative_considered: Histogram-based range detection was rejected due to processing overhead
+  _evidence_issues:
+  - 'NOT_FOUND: captcha.py'
+- id: BD-094
+  type: B/BA
+  content: Median filter applied twice to reduce noise in captcha image
+  rationale: 'Uses iterative median filtering to progressively reduce salt-and-pepper noise while preserving
+    edge sharpness better than mean filtering. Double application provides sufficient noise reduction
+    for clean digit extraction. Boundary: Two iterations are empirically sufficient; more passes would
+    degrade digit edges without proportional noise benefit.'
+  evidence: captcha.py:86-89(detect_gf_result)
+  stage: captcha
+  alternative_considered: Single-pass stronger filter was rejected as it would blur digit edges
+  _evidence_issues:
+  - 'NOT_FOUND: captcha.py'
+- id: BD-095
+  type: B/DK
+  content: Query date range calculated as today minus 30 days using timedelta
+  rationale: 'Provides consistent historical data window for backtesting and analysis by dynamically calculating
+    relative date ranges. 30-day lookback balances historical relevance with storage/processing constraints.
+    Boundary: 30 days is a fixed constant; different strategies may require different lookback periods.'
+  evidence: stock.py:36(get_30_date)
+  stage: stock
+  alternative_considered: Fixed calendar dates were rejected in favor of relative calculation to always
+    use recent data
+  _evidence_issues:
+  - 'NOT_FOUND: stock.py'
+- id: BD-096
+  type: B/BA
+  content: String numbers converted to numeric types using regex extraction and float conversion
+  rationale: 'Handles diverse numeric string formats from external sources by normalizing to float, enabling
+    consistent downstream numeric processing. Regex extraction strips non-numeric characters. Boundary:
+    Decimal separator assumption may vary by locale; current implementation assumes dot notation.'
+  evidence: misc.py:29-31(str2num)
+  stage: misc
+  alternative_considered: Locale-aware parsing was rejected for simplicity; commas as decimal separators
+    not supported
+  _evidence_issues:
+  - 'NOT_FOUND: misc.py'
+- id: BD-097
+  type: B/DK
+  content: Transactions ordered with sell orders inserted at front of list before buy orders
+  rationale: 'Prioritizes sell transactions to reduce market exposure faster than buy exposure accumulation,
+    a prudent risk management approach. Sell-first ordering also ensures sufficient cash availability
+    for subsequent buys. Boundary: Ordering is deterministic within each type; two sells at same price
+    have unspecified relative order.'
+  evidence: follower.py:400-408(order_transactions_sell_first)
+  stage: follower
+  alternative_considered: Randomized ordering was rejected to ensure deterministic, auditable execution
+    sequence
+  _evidence_issues:
+  - 'NOT_FOUND: follower.py'
+- id: BD-098
+  type: B/BA
+  content: Weight difference between target and current position used to calculate trade volume
+  rationale: 'Implements proportional rebalancing by sizing trades based on deviation from target allocation,
+    ensuring smooth transition toward ideal portfolio composition. Using difference rather than absolute
+    value enables direction-aware sizing. Boundary: Zero difference indicates no trade; small differences
+    below round-lot thresholds will be skipped.'
+  evidence: xqtrader.py:307-310(cancel_entrust)
+  stage: xqtrader
+  alternative_considered: Threshold-based triggers were considered but rejected to allow gradual continuous
+    rebalancing
+  _evidence_issues:
+  - 'NOT_FOUND: xqtrader.py'
+- id: BD-099
+  type: B/DK
+  content: Stock amount extracted from Chinese character string using regex pattern matching
+  rationale: 'Parses Chinese-language brokerage responses containing numeric quantities, enabling Chinese
+    market integration without manual parsing. Regex handles varied string formats from different brokers.
+    Boundary: Regex patterns must match specific broker output format; broker UI changes would break extraction.'
+  evidence: joinquant_follower.py:123-125(project_transactions)
+  stage: joinquant_follower
+  alternative_considered: OCR-based extraction was rejected as unnecessary given text-based broker responses
+  _evidence_issues:
+  - 'NOT_FOUND: joinquant_follower.py'
+- id: BD-100
+  type: B/BA
+  content: Transaction quantity converted to absolute integer value for standardized processing
+  rationale: 'Normalizes transaction quantities by removing sign information, enabling unified handling
+    of buys and sells based on separate direction indicators. Absolute value simplifies magnitude calculations.
+    Boundary: Direction must be tracked separately; losing direction would make transactions ambiguous.'
+  evidence: ricequant_follower.py:107(project_transactions)
+  stage: ricequant_follower
+  alternative_considered: Signed quantities were rejected as downstream code expects separate direction/quantity
+    handling
+  _evidence_issues:
+  - 'NOT_FOUND: ricequant_follower.py'
+- id: BD-101
+  type: B
+  content: Captcha recognition retried up to 5 times with 0.1s wait between attempts
+  rationale: 'Provides resilience against transient captcha recognition failures by implementing retry
+    logic with backoff, reducing false abandonment. 5 attempts balance success rate against latency cost.
+    Boundary: After 5 failures, captcha is abandoned and operation fails; no fallback to manual input.'
+  evidence: grid_strategies.py:103-136(_get_clipboard_data)
+  stage: grid_strategies
+  alternative_considered: Exponential backoff was rejected as captcha timing is relatively stable
+  _evidence_issues:
+  - 'NOT_FOUND: grid_strategies.py'
+- id: BD-102
+  type: B
+  content: Execution time measured using wall clock and CPU time difference
+  rationale: 'Captures both real-world latency and CPU consumption for performance profiling, enabling
+    distinction between I/O-bound and compute-bound operations. Dual measurement provides complete performance
+    picture. Boundary: Wall clock includes waiting time; CPU time excludes it; discrepancy indicates I/O
+    or sleep overhead.'
+  evidence: perf.py:31-38(perf_clock)
+  stage: perf
+  alternative_considered: Single measurement was rejected as insufficient to diagnose performance issues
+  _evidence_issues:
+  - 'NOT_FOUND: perf.py'
+- id: BD-103
+  type: B
+  content: Weight difference direction determines buy vs sell action via sign comparison
+  rationale: 'Determines trade direction based on whether position is underweight (buy) or overweight
+    (sell) relative to target, implementing mean-reversion logic. Sign comparison provides clean boolean
+    direction decision. Boundary: Zero difference produces no trade; near-zero differences may be noise
+    rather than true rebalancing signals.'
+  evidence: xq_follower.py:184(project_transactions)
+  stage: xq_follower
+  alternative_considered: Separate over/underweight thresholds were rejected in favor of single zero-threshold
+    for simplicity
+  _evidence_issues:
+  - 'NOT_FOUND: xq_follower.py'
+- id: BD-104
+  type: B/BA
+  content: Grid data parsed from tab-separated clipboard content using pandas read_csv
+  rationale: 'Enables spreadsheet-like data capture from clipboard for grid strategy configuration, leveraging
+    pandas robust CSV parsing. Tab delimiter matches spreadsheet copy-paste behavior. Boundary: Assumes
+    well-formed TSV input; malformed data will raise parsing exceptions rather than graceful degradation.'
+  evidence: grid_strategies.py:87-93(_format_grid_data)
+  stage: grid_strategies
+  alternative_considered: Manual string splitting was rejected as less robust than pandas for edge cases
+  _evidence_issues:
+  - 'NOT_FOUND: grid_strategies.py'
+- id: BD-105
+  type: RC
+  content: Every follower transactions MUST be ordered SELL before BUY to ensure cash availability
+  rationale: SELL before BUY ordering is mandatory because China A-shares market settles securities before
+    cash. Executing BUY first risks insufficient funds when SELL settlement is delayed, causing downstream
+    transaction failures. This is a hard settlement compliance rule with no business override flexibility.
+  evidence: easytrader/follower.py:400-408(order_transactions_sell_first)
+  stage: ordering_contract
+- id: BD-106
+  type: BA/RC
+  content: 'Grid Strategy Pattern: default=Copy, but YHClientTrader overrides to Xls for clipboard-disabled
+    clients'
+  rationale: Clipboard automation for grid data transfer fails in clipboard-disabled environments (headless
+    servers, restricted Windows policies). YHClientTrader overrides to XLS export as the only viable alternative
+    data transfer mechanism. This is a business architecture decision for automation reliability.
+  evidence: easytrader/clienttrader.py:65(grid_strategy), easytrader/yh_clienttrader.py:20(grid_strategy=Xls)
+  stage: pattern_choice
+  alternative_considered: Clipboard-only approach rejected because clipboard operations are unavailable
+    in certain Windows configurations
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: grid_strategy), easytrader/yh_clienttrader.py:20(grid_strategy=Xls in easytrader/clienttrader.py'
+- id: BD-107
+  type: BA/RC
+  content: 'Slippage asymmetry: buy price multiplied by (1+slippage), sell price by (1-slippage)'
+  rationale: Asymmetric slippage multipliers reflect real market conditions where buyers pay more (price
+    impact, spreads) while sellers receive less. The directional asymmetry is a business rule reflecting
+    market microstructure, not a bug. Configuration allows adjustment via slippage parameter.
+  evidence: easytrader/follower.py:115(_calculate_price_by_slippage)
+  stage: default_value
+  alternative_considered: Uniform (1+slippage) for both sides was rejected as it doesn't reflect actual
+    market asymmetry
+- id: BD-108
+  type: B/BA
+  content: send_interval=0 default delays sell-to-buy execution; delays must be configured for T+0 funds
+    safety
+  rationale: send_interval=0 creates minimal delay between sell and buy transactions. This default may
+    cause cash shortfalls in same-day trading scenarios where funds from sold positions are not immediately
+    available for buys. Users must explicitly increase this parameter for safe T+0 operations.
+  evidence: easytrader/follower.py:346,354-356(send_interval parameter)
+  stage: default_value
+  alternative_considered: Increasing default to 5 seconds was considered but rejected to avoid breaking
+    existing delayed-order workflows
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: send_interval parameter in easytrader/follower.py'
+- id: BD-109
+  type: B/DK
+  content: Stock shares must be multiple of 100 in China A-shares market (round down to nearest 100)
+  rationale: China A-shares market enforces round-lot trading where each share quantities must be multiples
+    of 100. The system rounds down to prevent over-ordering that would cause rejection. This is a hard
+    market rule with no business flexibility - the round-down behavior is the only correct implementation.
+  evidence: easytrader/xq_follower.py:186,219(transaction[amount] rounding, available//100*100)
+  stage: invariant
+  alternative_considered: Rounding up was rejected as it would over-order beyond available cash/position
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: transaction[amount] rounding, available//100*100 in easytrader/xq_follower.py'
+- id: BD-110
+  type: B/BA
+  content: CommonConfig.TITLE='网上股票交易系统5.0' but GFClientTrader overrides to '核新网上交易系统' for system compatibility
+  rationale: The default TITLE '网上股票交易系统5.0' does not match each trading system versions. GFClientTrader
+    requires override to '核新网上交易系统' for proper window detection and automation. This is a platform-specific
+    configuration override for automation reliability.
+  evidence: easytrader/config/client.py:24(TITLE), easytrader/config/client.py:150(TITLE=核新网上交易系统)
+  stage: default_value
+  alternative_considered: Client-side title detection was considered but rejected as less reliable than
+    explicit overrides
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: TITLE), easytrader/config/client.py:150(TITLE=核新网上交易系统 in easytrader/config/client.py'
+- id: BD-111
+  type: BA/RC
+  content: 'Refresh Strategy Pattern: default=Switch(F5), but configurable to Toolbar(click)'
+  rationale: Switch(F5) keyboard-based refresh works universally across each environments and is the safest
+    default. Toolbar(click) provides an alternative for environments where keyboard simulation is restricted.
+    This is a business architecture decision balancing reliability with flexibility.
+  evidence: easytrader/clienttrader.py:67(refresh_strategy=Switch()), easytrader/refresh_strategies.py:47-58(Toolbar.refresh)
+  stage: pattern_choice
+  alternative_considered: Toolbar-only approach was rejected in favor of keyboard-based default for maximum
+    compatibility
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: refresh_strategy=Switch()), easytrader/refresh_strategies.py:47-58(Toolbar.refresh
+    in easytrader/clienttrader.py'
+- id: BD-112
+  type: RC
+  content: Login must precede config loading in prepare() method flow
+  rationale: Login must execute before config loading because the authentication step establishes the
+    session state required by subsequent initialization steps. Specifically, _init_toolbar requires an
+    authenticated session context to properly initialize UI automation components. This is a hard ordering
+    dependency for correct authentication flow.
+  evidence: easytrader/clienttrader.py:586-616(prepare calls login, then _init_toolbar)
+  stage: ordering_contract
+  alternative_considered: Concurrent or reversed ordering was rejected as it would fail to establish required
+    session state
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: prepare calls login, then _init_toolbar in easytrader/clienttrader.py'
+- id: BD-113
+  type: DK/RC
+  content: WKClientTrader inherits from HTClientTrader (not BaseLoginClientTrader), inheriting Xls grid_strategy
+  rationale: WKClientTrader extends HTClientTrader rather than BaseLoginClientTrader, which causes it
+    to inherit the Xls grid_strategy from HTClientTrader. This inheritance path is a design decision with
+    regulatory implications for data handling. Understanding the hierarchy is essential for correct configuration.
+  evidence: easytrader/wk_clienttrader.py:7(module)
+  stage: inheritance
+  alternative_considered: Explicit configuration of grid_strategy was considered but inheritance provides
+    sensible defaults
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in easytrader/wk_clienttrader.py'
+- id: BD-114
+  type: B/BA
+  content: trade_cmd_expire_seconds=120 default; commands older than 2 minutes are discarded silently
+  rationale: Commands older than 120 seconds are discarded to prevent stale order execution when market
+    conditions have changed significantly. This 2-minute threshold balances command freshness against
+    network latency tolerance. Silent discarding is an operational behavior for clean failure handling.
+  evidence: easytrader/follower.py:94,264-276(expire check in _execute_trade_cmd)
+  stage: default_value
+  alternative_considered: Increasing default to 300 seconds was considered but rejected as too permissive
+    for volatile markets
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: expire check in _execute_trade_cmd in easytrader/follower.py'
+- id: BD-115
+  type: DK/RC
+  content: 'Stock code format varies by platform: XSHG/XSHE suffixes (JoinQuant) vs sh/sz prefixes (XueQiu)'
+  rationale: Stock code format inconsistency across platforms requires platform-specific parsing logic.
+    JoinQuant uses XSHG/XSHE suffixes while XueQiu uses sh/sz prefixes. Cross-platform strategies must
+    normalize codes to avoid order rejections. This is a known platform compatibility issue requiring
+    explicit format conversion.
+  evidence: easytrader/joinquant_follower.py:109-119(stock_shuffle_to_prefix)
+  stage: invariant
+  alternative_considered: Universal format was rejected due to platform-specific API requirements
+- id: BD-116
+  type: BA/RC
+  content: MiniqmtTrader uses callback pattern (XtQuantTraderCallback) for async order/trade events
+  rationale: MiniqmtTrader uses XtQuantTraderCallback for asynchronous order and trade event handling.
+    This callback pattern enables non-blocking event processing without polling. The architecture decision
+    balances responsiveness with resource efficiency for high-frequency trading scenarios.
+  evidence: easytrader/miniqmt/miniqmt_trader.py:119-196(DefaultXtQuantTraderCallback)
+  stage: pattern_choice
+  alternative_considered: Polling-based approach was rejected due to higher latency and resource consumption
+- id: BD-117
+  type: B/BA
+  content: WebTrader heartbeat defaults to query balance every 30 seconds for token validity
+  rationale: The 30-second heartbeat interval balances token validity verification frequency against API
+    rate limits. Missing heartbeats leads to session expiration and loss of trading capability. This is
+    a configuration default balancing responsiveness with API efficiency.
+  evidence: easytrader/webtrader.py:86-109(send_heartbeat, check_login)
+  stage: default_value
+  alternative_considered: 60-second heartbeat was considered but rejected as too slow for rapid trading;
+    disabled heartbeat was rejected due to session validity requirements
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: send_heartbeat, check_login in easytrader/webtrader.py'
+- id: BD-118
+  type: DK/RC
+  content: 'Broker-specific control IDs in config: YH has BALANCE_GRID_CONTROL_ID=1308, others lack it'
+  rationale: YH broker requires specific BALANCE_GRID_CONTROL_ID=1308 for grid-based balance queries that
+    other brokers do not need. This broker-specific control ID is essential for YHClientTrader balance
+    functionality. Missing this ID causes balance retrieval to fail on YH platform.
+  evidence: easytrader/config/client.py:87(BALANCE_GRID_CONTROL_ID), easytrader/yh_clienttrader.py:110-112(balance
+    uses grid)
+  stage: invariant
+  alternative_considered: Universal control ID was rejected as different brokers use incompatible UI frameworks
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: BALANCE_GRID_CONTROL_ID), easytrader/yh_clienttrader.py:110-112(balance uses
+    grid in easytrader/config/client.py'
+- id: BD-119
+  type: DK/RC
+  content: 'AUTO_IPO_NUMBER field differs: ''申购数量'' (default) vs ''可申购数量'' (HTZQ, UNIVERSAL)'
+  rationale: 'IPO quantity field name varies by broker: ''申购数量'' is the default but HTZQ and UNIVERSAL
+    require ''可申购数量''. Using the wrong field name causes IPO auto-fill to fail silently. This is a broker-specific
+    field mapping requirement for IPO automation.'
+  evidence: easytrader/config/client.py:81(AUTO_IPO_NUMBER)
+  stage: pattern_choice
+  alternative_considered: Universal field name mapping was rejected because different broker systems genuinely
+    use different identifiers
+  _evidence_issues:
+  - 'FN_NOT_FOUND: AUTO_IPO_NUMBER in easytrader/config/client.py'
+- id: BD-120
+  type: RC
+  content: send_interval must be configured for T+0 trading compliance; default 0 violates same-day fund
+    reuse rules
+  rationale: China A-shares market restricts T+0 same-day fund reuse without proper delays between sell
+    and buy transactions. send_interval=0 violates this regulatory requirement. Configured delays ensure
+    settlement completion before reusing funds. This is a hard compliance rule with no business override
+    flexibility.
+  evidence: easytrader/follower.py:346,354-356(send_interval parameter)
+  stage: default_value
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: send_interval parameter in easytrader/follower.py'
+- id: BD-121
+  type: RC
+  content: T+0 same-day fund reuse rule in China A-shares market requires transaction delays
+  rationale: T+0 same-day fund reuse in China A-shares is restricted by market regulations. Violations
+    result in rejected orders. The follower system must enforce proper delays between sell and buy transactions
+    to comply with settlement requirements. This is a hard market regulation with no business override
+    flexibility.
+  evidence: easytrader/follower.py:346,354-356(send_interval parameter)
+  stage: default_value
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: send_interval parameter in easytrader/follower.py'
+- id: BD-122
+  type: BA/RC
+  content: XLS grid strategy override required for YHClientTrader clipboard-disabled environments
+  rationale: YHClientTrader overrides grid_strategy to XLS because clipboard operations are disabled in
+    certain Windows configurations. The XLS export is the only viable alternative for transferring grid
+    data to the trading system. This platform-specific override ensures automation reliability in affected
+    environments.
+  evidence: easytrader/clienttrader.py:65(grid_strategy=Copy), easytrader/yh_clienttrader.py:20(grid_strategy=Xls)
+  stage: pattern_choice
+  alternative_considered: Clipboard-only default was rejected as clipboard operations are unavailable
+    in certain Windows configurations
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: grid_strategy=Copy), easytrader/yh_clienttrader.py:20(grid_strategy=Xls in easytrader/clienttrader.py'
+- id: BD-123
+  type: BA/RC
+  content: Switch(F5) refresh strategy is the universal default for maximum compatibility
+  rationale: Switch(F5) keyboard-based refresh is the default because it works universally across each
+    trading system environments. Toolbar(click) provides an alternative for restricted environments. This
+    architecture decision prioritizes reliability and maximum compatibility over specific implementation
+    approaches.
+  evidence: easytrader/clienttrader.py:67(refresh_strategy=Switch()), easytrader/refresh_strategies.py:47-58(Toolbar.refresh)
+  stage: pattern_choice
+  alternative_considered: Toolbar-only approach was rejected in favor of keyboard-based default for maximum
+    compatibility
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: refresh_strategy=Switch()), easytrader/refresh_strategies.py:47-58(Toolbar.refresh
+    in easytrader/clienttrader.py'
+- id: BD-124
+  type: RC
+  content: Login authentication must precede config-dependent initialization
+  rationale: Login must execute before configuration loading because authentication establishes session
+    state required by _init_toolbar and other config-dependent initialization. This ordering dependency
+    ensures authentication context is available for UI automation setup. Violating this order breaks the
+    authentication flow.
+  evidence: easytrader/clienttrader.py:586-616(prepare calls login, then _init_toolbar)
+  stage: ordering_contract
+  alternative_considered: Parallel or reversed ordering was rejected as it would fail to establish required
+    session state
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: prepare calls login, then _init_toolbar in easytrader/clienttrader.py'
+- id: BD-125
+  type: DK/RC
+  content: Stock code format normalization required across trading platforms
+  rationale: JoinQuant uses XSHG/XSHE suffixes while XueQiu uses sh/sz prefixes for stock codes. Platform-specific
+    code formats must be normalized for cross-platform strategy compatibility. Format mismatches cause
+    order rejections. This is a known platform compatibility constraint requiring explicit conversion
+    logic.
+  evidence: easytrader/joinquant_follower.py:109-119(stock_shuffle_to_prefix)
+  stage: invariant
+  alternative_considered: Universal format was rejected due to platform-specific API requirements
+- id: BD-126
+  type: RC
+  content: WebTrader session validity requires periodic heartbeat for token refresh
+  rationale: WebTrader sessions require periodic balance queries (heartbeat) to maintain token validity.
+    Without heartbeat, sessions expire and trading capability is lost. The 30-second interval balances
+    verification frequency against API rate limits. This is a platform session management requirement.
+  evidence: easytrader/webtrader.py:86-109(send_heartbeat, check_login)
+  stage: default_value
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: send_heartbeat, check_login in easytrader/webtrader.py'
+- id: BD-127
+  type: B/BA
+  content: 'INTERACTION: BD-107 (asymmetric slippage) × BD-114 (120s command expiration) → compounded
+    price risk for stale commands'
+  rationale: Commands older than 120 seconds execute with slippage applied to potentially stale prices.
+    Asymmetric slippage (buy higher, sell lower) amplifies losses when prices have moved significantly.
+    This creates a compounded risk where stale commands face both price drift AND conservative slippage
+    adjustments. The interaction is most dangerous in volatile markets where a 2-minute delay combined
+    with asymmetric slippage can cause systematic overpayment on buys or underreceipt on sells. Risk managers
+    shou
+  evidence: BD-107(easytrader/follower.py:122-125), BD-114(easytrader/follower.py:264)
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-128
+  type: BA/DK
+  content: 'INTERACTION: BD-108 (send_interval=0 default) × BD-120 (T+0 fund reuse restriction) → REJECTED:
+    silent compliance violation'
+  rationale: 'This is a CONTRADICTION: BD-108 defaults to send_interval=0 which violates the T+0 fund
+    reuse compliance requirement documented in BD-120/BD-121. When send_interval=0, sell and buy transactions
+    execute with minimal delay, potentially before sold securities settle. This violates China A-shares
+    market settlement rules. The contradiction creates silent compliance violations where orders may be
+    rejected or expose the account to regulatory risk. Users unaware of this conflict may trade legally.
+    BD-12'
+  evidence: BD-108(easytrader/follower.py:346), BD-120(easytrader/follower.py:346,354-356)
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-129
+  type: B/BA
+  content: 'INTERACTION: BD-017 (net_value × initial_assets) × BD-096 (float conversion) × BD-051 (round
+    to 100) → precision cascade in position sizing'
+  rationale: 'Three rounding steps cascade: (1) BD-017 calculates current_assets = net_value × initial_assets
+    using float, (2) BD-096 converts string numbers to float potentially losing precision, (3) BD-051
+    rounds to nearest 100 shares. Each step introduces small errors that compound. For example, a 1.5%
+    gain on 100,000 CNY with float precision issues could result in 1503.27 CNY instead of exact value,
+    causing position sizing to be off by one or more lots. High-frequency traders should be aware this
+    cascade '
+  evidence: BD-017(easytrader/xq_follower.py:127), BD-096(misc.py:29-31), BD-051(easytrader/xq_follower.py:186)
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-130
+  type: B
+  content: 'INTERACTION: BD-006 (broker-specific GRID_DTYPE) × BD-024 (clipboard grid extraction) → format
+    mismatch risk'
+  rationale: BD-006 defines broker-specific GRID_DTYPE mappings for correct CSV parsing, but BD-024 extracts
+    data via clipboard (Ctrl+A, Ctrl+C) before parsing. If broker UI updates change column formats, the
+    GRID_DTYPE mapping becomes stale and pandas parsing fails silently or raises exceptions. This hidden
+    dependency means broker UI updates can break grid data extraction without code changes to the trading
+    logic. Users should validate GRID_DTYPE mappings after broker software updates.
+  evidence: BD-006(easytrader/config/client.py:61), BD-024(easytrader/grid_strategies.py:78)
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-131
+  type: B
+  content: 'INTERACTION: BD-034 (XueQiu lowercase) × BD-125 (stock code format normalization) → RISK CASCADE:
+    platform code format conflicts'
+  rationale: 'RISK CASCADE: BD-034 converts stock codes to lowercase format (sz162411) for XueQiu API,
+    while BD-125 requires normalization to XSHG/XSHE suffixes for JoinQuant/RiceQuant. When strategies
+    span multiple platforms, code format conversions can conflict. A code normalized for one platform
+    may fail on another, causing order rejections. This cascade affects cross-platform strategy users
+    who must ensure code formats are correct for each target platform. The vulnerability exists in the
+    transformation lo'
+  evidence: BD-034(easytrader/xq_follower.py:182), BD-125(easytrader/joinquant_follower.py:109-119)
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-132
+  type: B
+  content: 'INTERACTION: BD-112 (login before config) × BD-079 (heartbeat uses session) × BD-002 (30s
+    heartbeat) → session state dependency chain'
+  rationale: 'HIDDEN DEPENDENCY: The heartbeat mechanism (BD-002/BD-079) silently depends on the login-before-config
+    ordering (BD-112). If login fails or is incomplete, heartbeat will attempt to maintain an invalid
+    session, wasting API calls and eventually failing. The dependency chain is: prepare() → login() →
+    _init_toolbar() → heartbeat() → balance_query(). Each step requires the previous step to complete
+    successfully, but error handling may not surface which step failed. Debugging session issues requires
+    t'
+  evidence: BD-112(easytrader/clienttrader.py:586-616), BD-079(easytrader/webtrader.py:109), BD-002(easytrader/webtrader.py:85)
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-133
+  type: B/DK
+  content: 'INTERACTION: BD-107 (slippage) × TRD-2 (commission not modeled) → systematic cost underestimation'
+  rationale: 'AMPLIFICATION: Slippage (BD-107) adjusts buy prices upward and sell prices downward as a
+    cost buffer, but BD-107 does not account for transaction fees, exchange fees, or stamp duties. When
+    slippage is used for position sizing decisions, the calculated position sizes are based on incomplete
+    cost models. The net execution cost = slippage + commission + fees. Underestimating costs leads to
+    positions that appear profitable but actually lose money after each costs. This amplification affects
+    high-freq'
+  evidence: BD-107(easytrader/follower.py:122-125), TRD-2 audit finding
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-134
+  type: B
+  content: 'INTERACTION: BD-047 (XLS export for YH) × BD-080 (Ctrl+S/Alt+S keyboard sequence) → restricted
+    environment failures'
+  rationale: 'HIDDEN DEPENDENCY: BD-047 switches to XLS export for YH brokers, but BD-080 requires Ctrl+S
+    → Alt+S → Alt+Y keyboard sequences for XLS file saving. In environments where keyboard simulation
+    is restricted (virtual desktops, remote sessions, accessibility software conflicts), these keyboard
+    shortcuts fail silently or cause incorrect dialog actions. Users in restricted environments experience
+    automation failures without understanding why XLS export was chosen. The fallback path is unclear
+    when keyb'
+  evidence: BD-047(easytrader/ht_clienttrader.py:11), BD-080(easytrader/grid_strategies.py:183)
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-135
+  type: BA
+  content: 'INTERACTION: BD-105 (sell-first ordering) × BD-016 (send_interval configurable) × BD-120 (T+0
+    compliance) → RISK CASCADE: capital sequencing violation'
+  rationale: 'RISK CASCADE: BD-105 enforces sell-first ordering to release capital for buys, but BD-016''s
+    send_interval must be configured to allow sell settlement before buy execution. If send_interval=0
+    (BD-108 default), buys execute before sells settle, violating T+0 fund reuse rules (BD-120/BD-121).
+    This cascade: (1) user initiates sell-then-buy strategy, (2) sell-first ordering processes sells,
+    (3) send_interval=0 allows immediate buys, (4) buys fail due to unsettled funds, (5) both transactions
+    stuck in'
+  evidence: BD-105(easytrader/follower.py:400-408), BD-016(easytrader/follower.py:345), BD-120(easytrader/follower.py:346)
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-136
+  type: B/BA
+  content: 'INTERACTION: BD-032 (trade_cmd datetime) × TRD-1 (signal-execution timing gap) → stale command
+    detection unreliability'
+  rationale: 'HIDDEN DEPENDENCY: Commands store trade_cmd[''datetime''] from signal source API, but expiration
+    checks use datetime.datetime.now() at execution time. If signal source time differs from local system
+    time (different timezones, clock drift, API latency), the 120-second expiration threshold becomes
+    unreliable. Commands that are actually fresh may appear stale, and commands that are truly stale may
+    appear valid. This timing mismatch is especially problematic for users with distributed systems where
+    di'
+  evidence: BD-032(easytrader/follower.py:263), TRD-1 audit finding
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-137
+  type: B/DK
+  content: 'INTERACTION: BD-013 (pickle command cache) × BD-031 (pickle for idempotent replay) × BD-014
+    (120s expiration) → cache inconsistency during expiration'
+  rationale: 'HIDDEN DEPENDENCY: Commands cached in pickle (BD-013/BD-031) persist across restarts, but
+    expiration (BD-014/BD-032) is checked after deserialization. If a command is cached just before expiration,
+    the restart time is not counted in the 120-second window. A command that would have expired during
+    operation survives restart due to pickle persistence, leading to stale command execution after restart.
+    This creates a subtle inconsistency where restart timing affects command validity independent of ma'
+  evidence: BD-013(easytrader/follower.py:128), BD-031(easytrader/follower.py:26), BD-014(easytrader/follower.py:250)
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-138
+  type: BA/DK
+  content: 'INTERACTION: BD-076 (MiniQMT has frozen_cash) × BD-063 (HTZQ excludes market value) × BD-087
+    (cash/market split) → inconsistent balance semantics'
+  rationale: 'CONTRADICTION: BD-076 indicates MiniQMT exposes frozen_cash field that ClientTrader does
+    not, while BD-063 shows HTZQ excludes market value from balance. BD-087 derives cash position as percentage
+    of total balance. These decisions create inconsistent balance semantics across platforms. Users switching
+    between brokers may make incorrect capital availability assumptions. The cash/market split calculation
+    (BD-087) may not correctly handle frozen funds on platforms that expose them. Cross-broker str'
+  evidence: BD-076(easytrader/miniqmt/miniqmt_trader.py:275), BD-063(easytrader/config/client.py:173),
+    BD-087(xqtrader.py:157-158)
+  stage: global
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-GAP-001
+  type: DK
+  content: 'Missing: as-of vs processing time'
+  rationale: 'Audit finding: missing: as-of vs processing time. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: authentication
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-002
+  type: DK
+  content: 'Missing: Point-in-Time data availability'
+  rationale: 'Audit finding: missing: point-in-time data availability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: authentication
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-003
+  type: DK
+  content: 'Missing: Random seed full coverage'
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: authentication
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-004
+  type: RC
+  content: 'Missing: Settlement and delivery time'
+  rationale: 'Audit finding: missing: settlement and delivery time. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: authentication
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-005
+  type: B
+  content: 'Missing: Funding/Carry Modeling'
+  rationale: 'Audit finding: missing: funding/carry modeling. TRD-6 | Backtest Overfitting Protection
+    | N/A | No backtesting framework; live trading only. This gap affects production reliability and should
+    be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: authentication
+  status: missing
+  known_gap: true
+  severity: high
+  impact: TRD-6 | Backtest Overfitting Protection | N/A | No backtesting framework; live trading only
+- id: BD-GAP-006
+  type: B
+  content: 'Missing: Time Series Index Sort Guarantee'
+  rationale: 'Audit finding: missing: time series index sort guarantee. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: authentication
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-007
+  content: 'Missing: as-of vs processing time'
+  type: DK
+  rationale: 'Audit finding: missing: as-of vs processing time. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: authentication
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-008
+  content: 'Missing: Random seed full coverage'
+  type: DK
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: authentication
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: Broker API Server for Trading Operations
+  source: easytrader/server.py
+  type: live_trading
+  business_problem: Provides HTTP REST API endpoints for broker authentication and retrieving account
+    balance information programmatically, enabling integration with external trading systems.
+  intent_keywords:
+  - server
+  - api
+  - http
+  - flask
+  - broker login
+  - balance endpoint
+  stage: data_collection
+  negative_keywords:
+  - strategy
+  - screening
+  - factor
+  - backtest
+  - machine learning
+  - data pipeline
+  disambiguation: Are you looking to build an HTTP API server for broker operations, or are you developing
+    a quantitative trading strategy?
+  data_domain: trading_data
+- id: UC-102
+  name: XueQiu Trader Account Preparation Validation Test
+  source: tests/test_xqtrader.py
+  type: builtin_factor
+  business_problem: Unit test that validates XueQiuTrader correctly handles account preparation with required
+    parameters (cookies) and properly stores portfolio configuration.
+  intent_keywords:
+  - xueqiu
+  - trader
+  - account preparation
+  - cookies
+  - portfolio code
+  stage: data_collection
+  negative_keywords:
+  - strategy
+  - backtest
+  - screening
+  - factor computation
+  - live trading
+  disambiguation: Are you looking for the XueQiuTrader implementation code or its unit test specifications?
+  data_domain: trading_data
+- id: UC-103
+  name: YunHui Client Trader Integration Tests
+  source: tests/test_easytrader.py
+  type: builtin_factor
+  business_problem: Integration tests for YunHui (yh_client) broker trading operations including balance
+    queries, today's trades/entrusts, and entrust cancellation functionality.
+  intent_keywords:
+  - yh_client
+  - balance
+  - entrust
+  - trades
+  - cancel
+  - integration test
+  stage: data_collection
+  negative_keywords:
+  - strategy
+  - screening
+  - factor computation
+  - backtest
+  disambiguation: Are you looking for the yh_client trader implementation or test cases for broker operations?
+  data_domain: trading_data
+- id: UC-104
+  name: XueQiu Portfolio Follower Sell Adjustment Tests
+  source: tests/test_xq_follower.py
+  type: builtin_factor
+  business_problem: Unit tests for XueQiuFollower that verify transaction projection and sell amount adjustment
+    logic for portfolio mirroring operations.
+  intent_keywords:
+  - xueqiu
+  - follower
+  - transaction
+  - sell adjustment
+  - portfolio weight
+  stage: data_collection
+  negative_keywords:
+  - strategy backtest
+  - screening
+  - factor computation
+  - market data
+  disambiguation: Are you looking for XueQiuFollower implementation tests or the XueQiuTrader core implementation?
+  data_domain: trading_data
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 79
+  evidence_invalid: 47
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.626984126984127
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 0
+    warn: 11
+    fail: 5
+  subdomain_totals:
+    pass: 1
+    warn: 8
+    fail: 3
+  coverage: 28/28 (100%)
+  pass_rate: 1/28 (3%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: data_source
+  description: 'Choose based on: 1) Whether real trading is needed, 2) Broker support, 3) OS platform,
+    4) Technical expertise'
+  used_in_stages: []
+  options:
+  - name: XueQiu Web Trader
+    traits:
+    - cookie_auth
+    - portfolio_management
+    - no_broker_required
+    fit_for:
+    - Users without broker accounts who want to track virtual portfolios
+    not_fit_for:
+    - Real-money trading, users who need live broker execution
+  - name: MiniQMT Direct Trading
+    traits:
+    - direct_broker_api
+    - real_money
+    - low_latency
+    - requires_broker
+    fit_for:
+    - Users with MiniQMT-supported brokers who need real trading
+    not_fit_for:
+    - Non-MiniQMT brokers, simulated trading only
+  - name: Broker GUI Automation
+    traits:
+    - gui_simulation
+    - real_money
+    - windows_only
+    - broker_specific
+    fit_for:
+    - Users with specific supported brokers who want real trading
+    not_fit_for:
+    - Linux/Mac users, unsupported brokers, headless servers
+  - name: Remote Client Server
+    traits:
+    - remote_control
+    - api_access
+    - requires_server_running
+    fit_for:
+    - Deploying trading bot on Windows server with remote access
+    not_fit_for:
+    - Direct local access, embedded scenarios
+  default: XueQiu Web Trader
+  _source: worker_resource
+- id: slot-002
+  name: simulated_trading_platform
+  description: Choose based on which platform hosts your simulated trading strategies
+  used_in_stages: []
+  options:
+  - name: JoinQuant Follower
+    traits:
+    - simulated_trading
+    - web_api
+    - free_account
+    fit_for:
+    - JoinQuant users who want to mirror strategies to real broker
+    not_fit_for:
+    - Non-JoinQuant users, users wanting direct API trading
+  - name: RiceQuant Follower
+    traits:
+    - simulated_trading
+    - web_api
+    - requires_rqopen
+    fit_for:
+    - RiceQuant users who want to mirror strategies to real broker
+    not_fit_for:
+    - Non-RiceQuant users, users wanting direct API trading
+  - name: XueQiu Follower
+    traits:
+    - simulated_trading
+    - cookie_auth
+    - portfolio_weight_based
+    fit_for:
+    - XueQiu users who want to mirror portfolio weights to real broker
+    not_fit_for:
+    - Non-XueQiu users, time-based strategy users
+  default: JoinQuant Follower
+  _source: worker_resource
+- id: slot-003
+  name: captcha_recognition
+  description: Choose based on automation requirements, network availability, and accuracy needs
+  used_in_stages: []
+  options:
+  - name: External API Service
+    traits:
+    - cloud_based
+    - api_required
+    - network_dependency
+    fit_for:
+    - Quick setup, development environments
+    not_fit_for:
+    - Production with reliability requirements, air-gapped environments
+  - name: Tesseract OCR Local
+    traits:
+    - local_processing
+    - no_network
+    - accuracy_issues
+    fit_for:
+    - Offline environments, users who want full control
+    not_fit_for:
+    - Users needing high accuracy, non-English captchas
+  - name: Manual Input
+    traits:
+    - human_input
+    - high_accuracy
+    - not_automatable
+    fit_for:
+    - Any environment, highest reliability
+    not_fit_for:
+    - Fully automated trading systems
+  default: External API Service
+  _source: worker_resource
+- id: slot-004
+  name: broker_client
+  description: Choose based on your actual broker. Check if your broker offers MiniQMT for API access,
+    otherwise use GUI automation.
+  used_in_stages: []
+  options:
+  - name: YinHe (银河证券)
+    traits:
+    - windows_gui
+    - binarystar
+    - xls_grid
+    fit_for:
+    - China Galaxy Securities customers
+    not_fit_for:
+    - Other brokers, non-Windows platforms
+  - name: HuaTai (华泰证券)
+    traits:
+    - windows_gui
+    - xiadan
+    - xls_grid
+    - comm_password_required
+    fit_for:
+    - HuaTai Securities customers
+    not_fit_for:
+    - Other brokers, non-Windows platforms
+  - name: GuangFa (广发证券)
+    traits:
+    - windows_gui
+    - xiadan
+    - captcha_required
+    fit_for:
+    - GuangFa Securities customers
+    not_fit_for:
+    - Other brokers, non-Windows platforms
+  - name: GuoJin (国金证券)
+    traits:
+    - windows_gui
+    - xiadan
+    - captcha_required
+    fit_for:
+    - GuoJin Securities customers
+    not_fit_for:
+    - Other brokers, non-Windows platforms
+  - name: HaiTong (海通证券)
+    traits:
+    - windows_gui
+    - xiadan
+    - modified_field_names
+    fit_for:
+    - HaiTong Securities customers
+    not_fit_for:
+    - Other brokers, non-Windows platforms
+  - name: WuKuang (五矿证券)
+    traits:
+    - windows_gui
+    - xiadan
+    - inherits_hutai
+    fit_for:
+    - WuKuang Securities customers
+    not_fit_for:
+    - Other brokers, non-Windows platforms
+  - name: Universal THS (通用同花顺)
+    traits:
+    - windows_gui
+    - xiadan
+    - universal_config
+    fit_for:
+    - Any broker using TongHuaShun trading software
+    not_fit_for:
+    - Brokers not using THS, non-Windows platforms
+  - name: MiniQMT
+    traits:
+    - direct_api
+    - no_gui
+    - cross_compatible
+    fit_for:
+    - Users whose broker supports MiniQMT/XTPython
+    not_fit_for:
+    - Brokers without MiniQMT support
+  default: None (user must select based on their broker)
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: XueQiu (雪球)
+  description: 'portfolio_data, stock_search, rebalancing_trades, nav_history, ipo_data. Coverage: N/A.
+    Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: JoinQuant (聚宽)
+  description: 'transaction_history, strategy_info. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: RiceQuant (米筐)
+  description: 'positions, day_trades. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: XTPython/QMT MiniQMT (迅投QMT极简版)
+  description: 'account_info, positions, orders, trades. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: Verify Code Recognition Service (银河验证码)
+  description: 'captcha_recognition. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: XueQiu (雪球) Trading Platform
+  description: Stock portfolio management and simulated trading
+  used_in_stages: []
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: JoinQuant (聚宽) Trading Platform
+  description: Simulated trading strategy tracking
+  used_in_stages: []
+  _source: worker_resource
+- id: res-008
+  type: external_service
+  name: RiceQuant (米筐) Trading Platform
+  description: Simulated trading strategy tracking
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: external_service
+  name: MiniQMT/XTPython Trading Client
+  description: Direct broker trading via QMT terminal
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: external_service
+  name: Broker Desktop Clients (Windows)
+  description: Simulate manual trading through broker GUI
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: external_service
+  name: Remote Trading Server
+  description: Remote broker client control
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: external_service
+  name: Captcha Recognition Service
+  description: Verify code recognition for broker login
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: python_package
+  name: requests
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-014
+  type: python_package
+  name: pandas
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-015
+  type: python_package
+  name: pywinauto
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: python_package
+  name: flask
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-017
+  type: python_package
+  name: easyutils
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-018
+  type: python_package
+  name: six
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-019
+  type: python_package
+  name: pillow
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-020
+  type: python_package
+  name: xtquant
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-021
+  type: python_package
+  name: pytesseract
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-022
+  type: python_package
+  name: rqopen_client
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-023
+  type: code_example
+  name: Broker API Server for Trading Operations
+  path: easytrader/server.py
+  description: Provides HTTP REST API endpoints for broker authentication and retrieving account balance
+    information programmatically, enabling integration with external trading systems.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-024
+  type: code_example
+  name: XueQiu Trader Account Preparation Validation Test
+  path: tests/test_xqtrader.py
+  description: Unit test that validates XueQiuTrader correctly handles account preparation with required
+    parameters (cookies) and properly stores portfolio configuration.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-025
+  type: code_example
+  name: YunHui Client Trader Integration Tests
+  path: tests/test_easytrader.py
+  description: Integration tests for YunHui (yh_client) broker trading operations including balance queries,
+    today's trades/entrusts, and entrust cancellation functionality.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-026
+  type: code_example
+  name: XueQiu Portfolio Follower Sell Adjustment Tests
+  path: tests/test_xq_follower.py
+  description: Unit tests for XueQiuFollower that verify transaction projection and sell amount adjustment
+    logic for portfolio mirroring operations.
+  used_in_stages:
+  - data_collection
+  _source: uc_list

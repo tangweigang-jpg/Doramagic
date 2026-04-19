@@ -1,0 +1,2225 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-073
+name: Formance Ledger
+sop_version: '3.6'
+source:
+  projects:
+  - ledger
+  commit_hash: 96c923fe70c82017cec57cd0f4eb9093cdc1bde8
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Programmable financial core ledger with atomic multi-postings transactions, account-based
+    modeling, and Numscript DSL execution
+  description: A programmable financial ledger that provides foundation for money-moving applications
+    with atomic multi-postings transactions, double-entry bookkeeping, immutable audit trails, and continuous
+    replication to external systems.
+  prerequisites: Understanding of double-entry bookkeeping, PostgreSQL for transactional storage, and
+    Numscript DSL for scripting financial transactions
+  not_suitable_for: Simple key-value storage, non-financial data tracking, applications without need for
+    audit trails, or use cases where PostgreSQL dependency is not acceptable
+  activation:
+    triggers:
+    - When creating a new git branch in this repository
+    - When reviewing branch names for consistency
+    emphasis:
+    - Use ESPECIALLY when naming release and hotfix branches that require version coordination
+    anti_skip:
+    - Don't skip branch naming conventions because they seem trivial — inconsistent naming breaks automation
+      and release workflows
+stages:
+- id: numscript_execution
+  name: Numscript Script Execution
+  order: 1
+  responsibility: Compiles and executes Numscript DSL programs to generate double-entry postings with
+    balance tracking. This stage is the entry point for financial logic, converting human-readable scripts
+    into executable postings that move funds between accounts.
+  interface:
+    inputs:
+    - Numscript script containing variables, resources, operations, and financial expressions
+    outputs:
+    - '[]Posting with Source/Destination/Amount/Asset, metadata for tx and accounts'
+  required_methods:
+  - name: Machine.Run
+    description: Executes Numscript programs, manages balances during execution, and generates postings.
+      Handles VM initialization, script compilation to bytecode, and runtime execution.
+    evidence: internal/machine/vm/machine.go:27(Machine)
+  - name: Machine.Execute
+    description: 'Strict ordering: SetVarsFromJSON → ResolveResources → ResolveBalances → Execute. Returns
+      ErrResourcesNotInitialized or ErrBalancesNotInitialized if called out of order.'
+    evidence: internal/machine/vm/machine.go:471-479(Execute)
+  key_behaviors:
+  - behavior: Bytecode VM with opcode-based instruction set
+    description: VM compiles Numscript DSL to bytecode instructions for fast execution. Opcodes handle
+      fund allocation, account operations, and posting generation.
+    evidence: internal/machine/vm/machine.go:197(opcodes)
+  - behavior: Store interface abstracts balance queries
+    description: VM queries balances through Store interface, decoupling execution from storage. Enables
+      StaticStore for testing and vmStoreAdapter for production.
+    evidence: internal/machine/vm/store.go:18(Store)
+  - behavior: Funding model tracks source parts for partial credit/debit
+    description: Funding tracks multiple sources for allocation. Fundings.Take() processes parts in FIFO
+      order with remainder going to later parts. Concatenation merges adjacent parts with same account.
+    evidence: internal/machine/vm/machine.go:127(Funding)
+  - behavior: Postings accumulate during execution, not on-demand
+    description: Single-pass execution collects each postings before returning. Prevents double-spending
+      by ensuring each allocations complete atomically.
+    evidence: internal/machine/vm/machine.go:37(Postings)
+  - behavior: WORLD account as special sink/source
+    description: Credits to world are no-ops with no balance tracking. Used as destination never stores
+      value; used as source requires ALL semantics to consume each available funds.
+    evidence: internal/machine/vm/machine.go:156-158(credit)
+  - behavior: 'Dual runtimes: Machine vs Interpreter'
+    description: Transactions can select either bytecode Machine or direct Interpreter at execution time.
+      Different runtimes may produce different results for same script.
+    evidence: internal/controller/ledger/controller.go:94-96
+  replaceable_points:
+  - name: Store implementation
+    description: Balance query backend used during VM execution
+    options:
+    - name: vmStoreAdapter
+      traits:
+      - production-ready
+      - database-backed
+      - transactional
+      fit_for:
+      - production deployments with real-time balance queries
+      not_fit_for:
+      - testing, CI/CD environments requiring fast execution
+    - name: StaticStore
+      traits:
+      - in-memory
+      - no database
+      - deterministic
+      fit_for:
+      - unit testing, fast test execution, no test containers needed
+      not_fit_for:
+      - production, multi-user scenarios, real-time balances
+    default: vmStoreAdapter
+  design_decisions:
+  - VM uses opcode-based instruction set for efficiency (internal/machine/vm/machine.go:197) - Bytecode
+    VM enables fast execution and compilation from DSL
+  - Store interface abstracts balance queries (internal/machine/vm/store.go:18) - Decouples VM from storage
+    implementation, enables testing with StaticStore
+  - Funding model tracks source parts for partial credit/debit (internal/machine/vm/machine.go:127) -
+    Enables complex multi-source allocations common in financial systems
+  - Postings accumulate during execution, not on-demand (internal/machine/vm/machine.go:37) - Single-pass
+    execution prevents double-spending
+  - WORLD account is special sink/source for external flows (internal/machine/vm/machine.go:156) - Completes
+    double-entry for external asset flows
+  acceptance_hints:
+  - Numscript scripts execute and produce balanced postings (Input = Output per transaction)
+  - StaticStore tests pass without database dependency
+  - Execute returns appropriate errors when called before resource/balance resolution
+  - Funding.Take() processes parts in consistent FIFO order
+- id: transaction_processing
+  name: Transaction Processing
+  order: 2
+  responsibility: Validates, persists, and tracks transactions with idempotency and schema enforcement.
+    This stage ensures each financial operations are recorded atomically with full audit support.
+  interface:
+    inputs:
+    - TransactionData containing postings, metadata, timestamp, reference, idempotency key
+    outputs:
+    - Ledger Log with immutable audit trail, CreatedTransaction payload with computed volumes
+  required_methods:
+  - name: logProcessor.runTx
+    description: 'Main transaction processing: BeginTX → runLog → validateSchema → InsertLog → Commit.
+      Handles rollback on dry-run and retry on deadlock.'
+    evidence: internal/controller/ledger/log_process.go:34-65
+  - name: logProcessor.fetchLogWithIK
+    description: Idempotency validation using key+hash. Prevents duplicate transactions while allowing
+      safe retries.
+    evidence: internal/controller/ledger/log_process.go:148(fetchLogWithIK)
+  key_behaviors:
+  - behavior: Log-first architecture with immutable logs
+    description: Every changes produce immutable logs. Logs are the source of truth; transactions derived
+      by replaying logs. Event sourcing enables complete audit trail and replication.
+    evidence: internal/log.go:88(Log)
+  - behavior: Idempotency via key+hash validation
+    description: IdempotencyKey + IdempotencyHash uniquely identifies requests. Hash mismatch returns
+      ErrInvalidIdempotencyInputs. Key reuse with same inputs returns cached result.
+    evidence: internal/controller/ledger/log_process.go:148
+  - behavior: Deadlock retry with exponential backoff
+    description: logProcessor retries on ErrDeadlockDetected. Retry changes transaction order under contention;
+      idempotency hash prevents duplicates.
+    evidence: internal/controller/ledger/log_process.go:194(deadlock)
+  - behavior: Schema validation with enforcement modes
+    description: 'SchemaEnforcementMode controls strictness: strict fails on violation, warn logs warning,
+      audit mode allows anything with warnings. Allows gradual schema adoption.'
+    evidence: internal/controller/ledger/log_process.go:97(SchemaEnforcementMode)
+  - behavior: PostCommitEffectiveVolumes by timestamp ordering
+    description: Volumes computed by timestamp, not insertion order. Inserting past-dated transactions
+      recalculates effective volumes retroactively.
+    evidence: internal/transaction.go:51(PostCommitEffectiveVolumes)
+  replaceable_points:
+  - name: Schema enforcement mode
+    description: How strictly to enforce posting schema against chart of accounts
+    options:
+    - name: strict
+      traits:
+      - enforces each rules
+      - rejects invalid data
+      fit_for:
+      - production with established schema, compliance requirements
+      not_fit_for:
+      - development, schema migration periods
+    - name: warn
+      traits:
+      - validates but allows
+      - logs warnings
+      fit_for:
+      - gradual schema adoption, transitioning ledgers
+      not_fit_for:
+      - strict compliance, audit-only scenarios
+    - name: audit
+      traits:
+      - optional validation
+      - warnings only
+      fit_for:
+      - audit mode, historical data import, testing
+      not_fit_for:
+      - production with schema requirements
+    default: warn
+  design_decisions:
+  - 'Log-first architecture: each changes produce immutable logs (internal/log.go:88) - Enables complete
+    audit trail and event sourcing for replication'
+  - Idempotency via key+hash validation (internal/controller/ledger/log_process.go:148) - Prevents duplicate
+    transactions while allowing safe retries
+  - Deadlock retry with exponential backoff (internal/controller/ledger/log_process.go:194) - Handles
+    PostgreSQL deadlocks without failing requests
+  - Schema validation optional with enforcement modes (internal/controller/ledger/log_process.go:97) -
+    Allows gradual schema adoption across ledgers
+  - IdempotencyKey + IdempotencyHash; hash mismatch prevents duplicate execution (internal/log.go:233-234)
+    - Ensures request inputs haven't changed on retry
+  acceptance_hints:
+  - Duplicate transaction submissions with same idempotency key return identical response
+  - Failed transactions don't leave partial state (atomic commit/rollback)
+  - Schema violations logged in warn/audit mode but don't block in those modes
+  - Deadlock errors cause automatic retry without client-visible failure
+- id: volume_accounting
+  name: Volume Accounting
+  order: 3
+  responsibility: Tracks Input/Output volumes per account/asset for balance calculation. Provides the
+    foundation for each balance queries and ensures financial integrity through double-entry bookkeeping.
+  interface:
+    inputs:
+    - Postings with source, destination, amount, asset and existing volumes
+    outputs:
+    - Volumes struct with Input, Output, computed Balance per account/asset
+  required_methods:
+  - name: N/A
+    description: No user-facing methods identified by assembly
+    evidence: N/A
+  key_behaviors:
+  - behavior: Balance = Input - Output (computed, not stored)
+    description: Balance is always computed as Input minus Output. If Output exceeds Input, balance is
+      negative (overdraft). Single source of truth prevents sync issues between stored fields.
+    evidence: internal/volumes.go:86(Balance)
+  - behavior: PostCommitVolumes computed in-flight, never stored
+    description: Aggregate volumes are computed when needed, not pre-calculated and stored. Eliminates
+      stale data; always accurate at query time.
+    evidence: internal/transaction.go:48(PostCommitVolumes)
+  - behavior: WORLD account absorbs external transactions
+    description: The special WORLD account completes double-entry bookkeeping for external asset flows.
+      Credits to WORLD are no-ops; debits from WORLD require explicit ALL semantics.
+    evidence: internal/account.go:13(WORLD)
+  - behavior: Effective volumes account for timestamp ordering
+    description: Volumes are filtered by timestamp for effective-at queries. Past-dated transactions affect
+      current balances differently than future-dated ones.
+    evidence: internal/transaction.go:51(PostCommitEffectiveVolumes)
+  replaceable_points: []
+  design_decisions:
+  - Balance = Input - Output (not separate field) (internal/volumes.go:86) - Single source of truth prevents
+    sync issues between fields
+  - PostCommitVolumes computed in-flight, never stored (internal/transaction.go:48) - Eliminates stale
+    data; always accurate at query time
+  - WORLD account absorbs external transactions (internal/account.go:13) - Completes double-entry for
+    external asset flows
+  - DefaultFeatures merged via SetDefaults(); feature flags control schema/hashing behavior (internal/ledger.go:102-115)
+    - Ledger-specific configuration
+  acceptance_hints:
+  - Balance equals Input minus Output for each accounts
+  - Negative balances possible (overdraft) when Output exceeds Input
+  - Volume calculations remain consistent across concurrent transactions
+  - WORLD account does not track its own balance
+- id: log_creation
+  name: Log Chain Creation
+  order: 4
+  responsibility: Creates immutable, cryptographically chained logs for audit trail. Ensures tamper-evidence
+    through hash chaining where each log includes the previous log's hash.
+  interface:
+    inputs:
+    - LogPayload containing CreatedTransaction, SavedMetadata, account updates
+    outputs:
+    - Log with ID, hash chained to previous log, type, timestamp
+  required_methods:
+  - name: N/A
+    description: No user-facing methods identified by assembly
+    evidence: N/A
+  key_behaviors:
+  - behavior: SHA256 hash includes previous log hash (chain)
+    description: Each log's hash includes the previous log's hash, creating an immutable chain. Any log
+      modification breaks each subsequent hashes, making tampering evident.
+    evidence: internal/log.go:146(ComputeHash)
+  - behavior: Memento pattern excludes non-decision fields from hash
+    description: GetMemento excludes computed fields like postCommitVolumes from hash computation. Changing
+      Volume computation doesn't invalidate log history.
+    evidence: internal/log.go:238(GetMemento)
+  - behavior: Log types are numbered constants, not strings
+    description: Type safety prevents typos in log type handling. Constants define the full log type system.
+    evidence: internal/log.go:21(LogType)
+  - behavior: Strict ID ordering with hash chaining
+    description: Every logs must be in strict ID order, chained by hash. ChainLog validates ordering before
+      creating new log.
+    evidence: internal/log.go:115(ChainLog)
+  replaceable_points: []
+  design_decisions:
+  - SHA256 hash includes previous log hash (chain) (internal/log.go:146) - Tamper-evident chain; any log
+    modification breaks subsequent hashes
+  - Memento pattern excludes non-decision fields from hash (internal/log.go:238) - postCommitVolumes excluded
+    from hash as they're computed, not causal
+  - Log types are numbered constants, not strings (internal/log.go:21) - Type safety; prevents typos in
+    log type handling
+  - 'Event sourcing: logs are immutable, transactions derived from logs (internal/log.go:88) - Replaying
+    logs rebuilds state; changing log types requires migration'
+  acceptance_hints:
+  - Log chain maintains integrity with each hash including previous hash
+  - Modifying any log breaks each subsequent hashes (tamper-evident)
+  - Computed volumes don't affect log hashes (Memento pattern)
+  - Log IDs are strictly increasing with no gaps
+- id: schema_enforcement
+  name: Chart/Schema Enforcement
+  order: 5
+  responsibility: Validates account addresses and postings against hierarchical chart of accounts. Enables
+    controlled account structure with parameterized patterns and default metadata inheritance.
+  interface:
+    inputs:
+    - ChartOfAccounts JSON with hierarchical account patterns, Posting or account address to validate
+    outputs:
+    - Validated posting or ChartAccount with default metadata
+  required_methods:
+  - name: ChartOfAccounts.ValidatePosting
+    description: Validates posting addresses against chart patterns, applies default metadata for new
+      accounts, enforces type constraints.
+    evidence: internal/chart.go:306(ValidatePosting)
+  - name: ChartOfAccounts.FindAccountSchema
+    description: 'Hierarchical matching using : separator (e.g., bank:checking:alice). Searches from most
+      specific to least specific.'
+    evidence: internal/chart.go:298(FindAccountSchema)
+  key_behaviors:
+  - behavior: 'Hierarchical addresses with : separator'
+    description: 'Natural organization structure representation. Example: bank:checking:alice. Pattern
+      matching finds most specific applicable schema.'
+    evidence: internal/chart.go:298(FindAccountSchema)
+  - behavior: Variable segments with regex patterns
+    description: Parameterized account patterns like $userId enable dynamic account creation with validation.
+      Patterns constrain valid values for each segment.
+    evidence: internal/chart.go:109(Pattern)
+  - behavior: Schema versioning for controlled evolution
+    description: Multiple schema versions can coexist during migration. FindLatestSchemaVersion returns
+      current version for new ledgers.
+    evidence: internal/controller/ledger/store.go:52(FindLatestSchemaVersion)
+  - behavior: Default metadata flows to accounts on first transaction
+    description: Chart schema default metadata flows to accounts on first transaction. If schema validation
+      is disabled (audit mode), accounts don't get default metadata.
+    evidence: internal/chart.go:318-326(DefaultMetadata)
+  replaceable_points:
+  - name: Chart pattern engine
+    description: Account validation logic backend
+    options:
+    - name: builtin_regex
+      traits:
+      - built-in
+      - fast
+      - limited expressiveness
+      fit_for:
+      - standard account patterns, high-performance requirements
+      not_fit_for:
+      - complex validation rules, external system integration
+    - name: external_validator
+      traits:
+      - extensible
+      - integration-ready
+      - slower
+      fit_for:
+      - complex validation, external system checks, custom business rules
+      not_fit_for:
+      - simple patterns, performance-critical paths
+    default: builtin_regex
+  design_decisions:
+  - 'Hierarchical addresses with : separator (internal/chart.go:298) - Natural org structure representation
+    (e.g., bank:checking:alice)'
+  - Variable segments with regex patterns (internal/chart.go:109) - Enables dynamic account creation with
+    validation
+  - Schema versioning allows controlled evolution (internal/controller/ledger/store.go:52) - Multiple
+    schema versions can coexist during migration
+  acceptance_hints:
+  - Valid account addresses matching chart patterns are accepted
+  - Invalid addresses are rejected with appropriate errors
+  - New accounts created via posting get default metadata from chart
+  - Schema versioning allows coexistence of multiple versions
+- id: controller_store
+  name: Controller Store
+  order: 6
+  responsibility: DB-backed store implementing Controller interface with transactions and locking. Provides
+    data access layer with PostgreSQL transactions, advisory locks, and pagination.
+  interface:
+    inputs:
+    - SQL context with bun ORM, transaction options
+    outputs:
+    - Accounts, Transactions, Logs with pagination, locked balances
+  required_methods:
+  - name: Store.GetBalances
+    description: Returns locked balances for transaction duration. Prevents double-spend during transaction
+      validation by holding advisory lock on balances.
+    evidence: internal/controller/ledger/store.go:35(GetBalances)
+  - name: Store.LockLedger
+    description: Advisory lock on ledger ID using hashtext. Must unlock before closing connection. Serializes
+      writes to prevent race conditions.
+    evidence: internal/storage/ledger/store.go:158(LockLedger)
+  key_behaviors:
+  - behavior: Store interface adapts to multiple consumers
+    description: vmStoreAdapter and numscriptRewriteAdapter adapt Store to different interfaces. Same
+      store serves VM, Numscript, and API with appropriate views.
+    evidence: internal/controller/ledger/store.go:69(vmStoreAdapter)
+  - behavior: Advisory lock on ledger ID
+    description: Lock held until explicit unlock or connection close. Prevents concurrent modifications
+      across transactions.
+    evidence: internal/storage/ledger/store.go:158-194(LockLedger)
+  - behavior: GetBalances returns locked balances for TX duration
+    description: Prevents double-spend during transaction validation by holding lock on queried balances.
+    evidence: internal/controller/ledger/store.go:35(GetBalances)
+  replaceable_points: []
+  design_decisions:
+  - Store interface adapts to multiple consumers (internal/controller/ledger/store.go:69) - Same store
+    serves VM, Numscript, and API with different interfaces
+  - LockLedger prevents concurrent modifications (internal/controller/ledger/store.go:55) - Serializes
+    writes to prevent race conditions in balance updates
+  - GetBalances returns locked balances for TX duration (internal/controller/ledger/store.go:35) - Prevents
+    double-spend during transaction validation
+  - aloneInBucket flag shared across each stores in bucket for query optimization (internal/storage/ledger/store.go:31-35)
+    - When second ledger added to bucket, each stores must update flag
+  acceptance_hints:
+  - Concurrent write transactions are serialized via locks
+  - Balance queries during transaction hold appropriate locks
+  - Store adapters correctly translate between different interface expectations
+  - Pagination works correctly for large result sets
+- id: async_block_hashing
+  name: Async Block Hashing
+  order: 7
+  responsibility: Periodic background job that groups logs into blocks and computes cumulative hashes.
+    Provides batched block creation for efficient querying and additional integrity verification.
+  interface:
+    inputs:
+    - Logs from ledger store (poll-based)
+    outputs:
+    - Stored blocks in ledger schema via create_blocks PostgreSQL procedure
+  required_methods:
+  - name: AsyncBlockRunner.Run
+    description: Cron-scheduled block hasher runner. Manages polling interval, block creation, and graceful
+      shutdown via lifecycle hooks.
+    evidence: internal/storage/worker_async_block.go:30(AsyncBlockRunner)
+  key_behaviors:
+  - behavior: Async via PostgreSQL procedure (create_blocks)
+    description: Bulk block creation via SQL procedure is faster than individual inserts. Reduces database
+      round-trips by batching log-to-block assignments.
+    evidence: internal/storage/worker_async_block.go:111(create_blocks)
+  - behavior: CRON-based scheduling with configurable interval
+    description: Schedule controls block frequency vs compute cost. Next() calculates next run time from
+      CRON expression.
+    evidence: internal/storage/worker_async_block.go:45(Schedule.Next)
+  - behavior: Selective execution via feature flag
+    description: Ledgers can opt-in/opt-out of block hashing via FeatureHashLogs. New ledgers can enable;
+      existing ledgers unaffected.
+    evidence: internal/storage/worker_async_block.go:85(features.FeatureHashLogs)
+  - behavior: Graceful shutdown via lifecycle hooks
+    description: Lifecycle hooks manage start/stop order. Proper sequencing prevents requests during cleanup.
+    evidence: internal/storage/worker_async_block.go:151(lc.Append)
+  replaceable_points:
+  - name: Block size
+    description: Maximum number of logs to include per block
+    options:
+    - name: '1000'
+      traits:
+      - high throughput
+      - larger blocks
+      - less granular
+      fit_for:
+      - high-volume ledgers, efficient querying
+      not_fit_for:
+      - low-volume ledgers needing granular verification
+    - name: '500'
+      traits:
+      - balanced
+      - moderate throughput
+      fit_for:
+      - general purpose workloads
+      not_fit_for:
+      - extreme high/low volume scenarios
+    - name: '100'
+      traits:
+      - fine-grained
+      - more blocks
+      - higher overhead
+      fit_for:
+      - low-volume ledgers, frequent verification
+      not_fit_for:
+      - high-volume ledgers with compute constraints
+    default: '1000'
+  - name: Schedule
+    description: CRON expression controlling block creation frequency
+    options:
+    - name: 0 * * * * *
+      traits:
+      - hourly
+      - 60 blocks/day
+      fit_for:
+      - high-frequency processing, real-time integrity needs
+      not_fit_for:
+      - low-frequency requirements, compute cost sensitivity
+    - name: 0 */5 * * * *
+      traits:
+      - every 5 minutes
+      - 288 blocks/day
+      fit_for:
+      - very high frequency, near-real-time verification
+      not_fit_for:
+      - cost-sensitive deployments
+    default: 0 * * * * *
+  design_decisions:
+  - Async via PostgreSQL procedure (create_blocks) (internal/storage/worker_async_block.go:111) - Bulk
+    block creation is faster than individual inserts; reduces DB round-trips
+  - CRON-based scheduling with configurable interval (internal/storage/worker_async_block.go:45) - Allows
+    tuning block frequency vs compute cost
+  - Selective execution via feature flag (internal/storage/worker_async_block.go:85) - Ledgers can opt-in/out
+    of block hashing feature
+  - Feature flags gate optional functionality per ledger (internal/storage/worker_async_block.go:85) -
+    New ledgers can opt into features; existing ledgers unaffected
+  acceptance_hints:
+  - Blocks created according to schedule with correct CRON timing
+  - Block hashes correctly chain (each includes previous block hash)
+  - Feature flag controls enable/disable without errors
+  - Graceful shutdown completes current block before stopping
+- id: pipeline_replication
+  name: Pipeline Replication
+  order: 8
+  responsibility: Continuous log streaming to external systems (Kafka, HTTP, OTLP) via driver plugins.
+    Enables horizontal scaling by allowing replicas to consume logs at their own pace.
+  interface:
+    inputs:
+    - Logs from ledger store (poll-based with pagination)
+    outputs:
+    - Events pushed to configured exporters with retry logic
+  required_methods:
+  - name: Manager.Run
+    description: Manages lifecycle of each pipelines. Initializes exporters, starts polling loops, handles
+      graceful shutdown.
+    evidence: internal/replication/manager.go:21(Manager)
+  - name: PipelineHandler.Run
+    description: Handles polling and pushing logs for one pipeline. Maintains cursor, applies backoff
+      on failures.
+    evidence: internal/replication/pipeline.go:57(PipelineHandler)
+  key_behaviors:
+  - behavior: Pull-based polling with configurable page size
+    description: Ledger doesn't need to track consumers; scales horizontally. Each replica polls independently
+      at its own pace.
+    evidence: internal/replication/pipeline.go:86(ListLogs)
+  - behavior: Cursor stored as lastLogID for resumable replication
+    description: Crash recovery without data loss or duplication. Pipeline resumes from last successfully
+      pushed log.
+    evidence: internal/replication/pipeline.go:148(LastLogID)
+  - behavior: Push retry with backoff prevents thundering herd
+    description: Downstream failures don't cascade to ledger. Exponential backoff prevents overwhelming
+      failing systems.
+    evidence: internal/replication/pipeline.go:128(PushRetryPeriod)
+  - behavior: Driver factory enables plugin architecture
+    description: New exporters (S3, Webhook, etc.) can be added without core changes. Factory pattern
+      creates appropriate driver instances.
+    evidence: internal/replication/manager.go:58(driverFactory.Create)
+  - behavior: Exporter must be initialized before pipeline starts
+    description: Starting pipeline with uninitialized exporter fails. Exporter lifecycle tied to pipeline;
+      both start/stop together.
+    evidence: internal/replication/manager.go:114-117(startPipeline)
+  replaceable_points:
+  - name: Driver type
+    description: Export destination and protocol
+    options:
+    - name: kafka
+      traits:
+      - message queue
+      - high throughput
+      - async
+      fit_for:
+      - event streaming, microservices, real-time analytics
+      not_fit_for:
+      - simple webhooks, low-complexity deployments
+    - name: http
+      traits:
+      - webhook
+      - simple
+      - synchronous
+      fit_for:
+      - simple integrations, serverless, HTTP-based systems
+      not_fit_for:
+      - high-throughput requirements, message queuing needs
+    - name: otlp
+      traits:
+      - observability
+      - traces/metrics
+      - standardized
+      fit_for:
+      - APM integration, distributed tracing, monitoring
+      not_fit_for:
+      - non-observability use cases, simple storage
+    default: kafka
+  - name: Pull interval
+    description: Time between log polls from ledger
+    options:
+    - name: 5s
+      traits:
+      - near real-time
+      - higher load
+      fit_for:
+      - real-time replication requirements
+      not_fit_for:
+      - cost-sensitive deployments, infrequent updates
+    - name: 10s
+      traits:
+      - balanced
+      - moderate load
+      fit_for:
+      - general purpose replication
+      not_fit_for:
+      - very high/low frequency requirements
+    - name: 1m
+      traits:
+      - batch-oriented
+      - lowest load
+      fit_for:
+      - cost-sensitive deployments, periodic sync
+      not_fit_for:
+      - real-time requirements
+    default: 5s
+  design_decisions:
+  - Pull-based polling with configurable page size (internal/replication/pipeline.go:86) - Ledger doesn't
+    need to track consumers; scales horizontally
+  - Cursor stored as lastLogID for resumable replication (internal/replication/pipeline.go:148) - Crash
+    recovery without data loss or duplication
+  - Push retry with backoff prevents thundering herd (internal/replication/pipeline.go:128) - Downstream
+    failures don't cascade to ledger
+  - Driver factory enables plugin architecture (internal/replication/manager.go:58) - New exporters (S3,
+    Webhook, etc.) can be added without core changes
+  - Pagination cursor prevents unbounded queries (internal/replication/pipeline.go:86) - Large ledgers
+    don't cause OOM; streaming replication scales
+  acceptance_hints:
+  - Logs delivered to external systems in order
+  - Failed pushes retried with exponential backoff
+  - Pipeline resumes from lastLogID after crash/restart
+  - No duplicate log delivery on normal operation
+- id: bucket_cleanup
+  name: Bucket Cleanup
+  order: 9
+  responsibility: Periodic cleanup of soft-deleted buckets after retention period expires. Provides recovery
+    window for accidentally deleted ledgers while ensuring eventual cleanup.
+  interface:
+    inputs:
+    - Deleted buckets from system store with deletion timestamps
+    outputs:
+    - Hard-deleted bucket schemas and data from PostgreSQL
+  required_methods:
+  - name: BucketCleanupRunner.Run
+    description: Cron-scheduled cleanup runner. Queries soft-deleted buckets past retention period, hard-deletes
+      them one by one with continue-on-failure behavior.
+    evidence: internal/storage/worker_bucket_cleanup.go:25(BucketCleanupRunner)
+  key_behaviors:
+  - behavior: Soft delete + delayed hard delete pattern
+    description: Recovery window prevents accidental data loss. Configurable retention period (default
+      30 days) allows time to recover accidentally deleted ledgers.
+    evidence: internal/storage/worker_bucket_cleanup.go:77(cutoffTime)
+  - behavior: Continues on individual bucket failure
+    description: One bad bucket doesn't block cleanup of others. Failed buckets logged and skipped, cleanup
+      continues with remaining buckets.
+    evidence: internal/storage/worker_bucket_cleanup.go:95(continue)
+  replaceable_points:
+  - name: Retention period
+    description: Time between soft delete and hard delete
+    options:
+    - name: 30d
+      traits:
+      - standard
+      - balanced recovery window
+      fit_for:
+      - production use, most recovery scenarios
+      not_fit_for:
+      - rapid cleanup requirements, storage-constrained environments
+    - name: 7d
+      traits:
+      - short
+      - faster cleanup
+      fit_for:
+      - testing, development, storage-constrained environments
+      not_fit_for:
+      - production with compliance requirements
+    - name: 90d
+      traits:
+      - extended
+      - maximum recovery window
+      fit_for:
+      - compliance-heavy environments, audit requirements
+      not_fit_for:
+      - storage-constrained environments, rapid cleanup needs
+    default: 30d
+  design_decisions:
+  - Soft delete + delayed hard delete pattern (internal/storage/worker_bucket_cleanup.go:77) - Recovery
+    window prevents accidental data loss; configurable 30-day default
+  - Continues on individual bucket failure (internal/storage/worker_bucket_cleanup.go:95) - One bad bucket
+    doesn't block cleanup of others
+  - Retention period prevents accidental bucket deletion (internal/storage/worker_bucket_cleanup.go:77)
+    - 30-day window allows recovery of accidentally deleted ledgers
+  acceptance_hints:
+  - Soft-deleted buckets persist for full retention period
+  - Buckets are hard-deleted after retention period expires
+  - Failed bucket cleanup doesn't affect other buckets
+  - Cleanup runs according to configured schedule
+- id: worker_fx_module
+  name: Worker FX Module
+  order: 10
+  responsibility: Wires together each worker components via Uber FX dependency injection. Provides cohesive
+    worker binary combining async block hashing, replication, and cleanup workers.
+  interface:
+    inputs:
+    - WorkerConfiguration from CLI flags, feature toggles
+    outputs:
+    - Running workers for async block hashing, replication pipelines, bucket cleanup
+  required_methods:
+  - name: NewFXModule
+    description: Creates worker module combining storage, replication, and cleanup workers. Provides dependency
+      injection wiring via Uber FX.
+    evidence: internal/worker/module.go:24(ModuleConfig)
+  key_behaviors:
+  - behavior: FX modules compose into single app
+    description: Modular DI enables testing and selective feature enablement. Each sub-module (storage,
+      replication, cleanup) can be tested in isolation.
+    evidence: cmd/worker.go:113(storage.NewFXModule)
+  - behavior: Lifecycle hooks manage start/stop order
+    description: Proper shutdown sequencing prevents requests during cleanup. Workers start after DB ready;
+      stop before connections close.
+    evidence: internal/storage/worker_async_block.go:151(lc.Append)
+  - behavior: Graceful shutdown via channels
+    description: Clean goroutine termination without force-kill. Stop channels signal each workers to
+      finish current work before exiting.
+    evidence: internal/storage/worker_async_block.go:56(stopChannel)
+  replaceable_points:
+  - name: Feature toggles
+    description: Which workers to enable in the worker binary
+    options:
+    - name: all
+      traits:
+      - full functionality
+      - each workers running
+      fit_for:
+      - production deployments requiring each background jobs
+      not_fit_for:
+      - minimal deployments, resource-constrained environments
+    - name: replication_only
+      traits:
+      - streaming only
+      - reduced resource usage
+      fit_for:
+      - dedicated replication workers, horizontal scaling
+      not_fit_for:
+      - environments needing block hashing or cleanup
+    - name: async_only
+      traits:
+      - block hashing only
+      - minimal external dependencies
+      fit_for:
+      - environments without replication targets, testing
+      not_fit_for:
+      - production with replication requirements
+    default: all
+  design_decisions:
+  - FX modules compose into single app (cmd/worker.go:113) - Modular DI enables testing and selective
+    feature enablement
+  - Lifecycle hooks manage start/stop order (internal/storage/worker_async_block.go:151) - Proper shutdown
+    sequencing prevents requests during cleanup
+  - Graceful shutdown via channels (internal/storage/worker_async_block.go:56) - Clean goroutine termination
+    without force-kill
+  - FX lifecycle ensures clean startup/shutdown order (internal/worker/module.go:34) - Workers start after
+    DB ready; stop before connections close
+  acceptance_hints:
+  - Every configured workers start successfully after database connection
+  - Workers shut down gracefully when receiving stop signal
+  - No goroutine leaks after worker shutdown
+  - Feature flags correctly enable/disable workers
+data_flow:
+- from_stage: numscript_execution
+  to_stage: transaction_processing
+  data: '[]Posting with Source/Destination/Amount/Asset, transaction and account metadata'
+- from_stage: transaction_processing
+  to_stage: volume_accounting
+  data: Postings trigger volume updates (Input/Output per account/asset)
+- from_stage: transaction_processing
+  to_stage: log_creation
+  data: CreatedTransaction payload containing postings and computed volumes
+- from_stage: log_creation
+  to_stage: controller_store
+  data: Immutable Log with ID, hash chained to previous log, type, timestamp
+- from_stage: schema_enforcement
+  to_stage: transaction_processing
+  data: Validated postings with confirmed account addresses, default metadata for new accounts
+- from_stage: controller_store
+  to_stage: numscript_execution
+  data: Balances via vmStoreAdapter for fund allocation during script execution
+- from_stage: async_block_hashing
+  to_stage: controller_store
+  data: Polls logs by cursor, creates blocks via create_blocks PostgreSQL procedure
+- from_stage: pipeline_replication
+  to_stage: controller_store
+  data: Polls logs by LastLogID cursor with configurable page size
+- from_stage: worker_fx_module
+  to_stage: async_block_hashing
+  data: Config (MaxBlockSize, Schedule) and lifecycle management hooks
+- from_stage: worker_fx_module
+  to_stage: pipeline_replication
+  data: Manager with configured drivers, pull intervals, feature toggles
+- from_stage: worker_fx_module
+  to_stage: bucket_cleanup
+  data: Retention period configuration and lifecycle management
+global_contracts:
+- contract: Every logs must be in strict ID order (chained by hash)
+  evidence: internal/log.go:115(ChainLog)
+- contract: Postings must balance (Input = Output per transaction)
+  evidence: internal/machine/vm/machine.go:412(SEND)
+- contract: Amounts must be non-negative big integers
+  evidence: internal/posting.go:57(Validate)
+- contract: Account addresses match chart patterns defined in schema
+  evidence: internal/chart.go:306(ValidatePosting)
+- contract: WORLD account is special sink/source for external flows (credits are no-ops, no balance tracking)
+  evidence: internal/machine/vm/machine.go:156(credit)
+- contract: Effective volumes account for timestamp ordering, not insertion order
+  evidence: internal/transaction.go:51(PostCommitEffectiveVolumes)
+- contract: Idempotency key + hash uniquely identifies requests (hash mismatch returns ErrInvalidIdempotencyInputs)
+  evidence: internal/controller/ledger/log_process.go:232(ComputeIdempotencyHash)
+- contract: 'VM execution requires strict ordering: SetVarsFromJSON → ResolveResources → ResolveBalances
+    → Execute'
+  evidence: internal/machine/vm/machine.go:471-479(Execute)
+- contract: Balance = Input - Output (computed, not stored; overdrafts produce negative balance)
+  evidence: internal/volumes.go:86-88(Balance)
+- contract: 'Log processing order: BeginTX → runLog → validateSchema → InsertLog → Commit'
+  evidence: internal/controller/ledger/log_process.go:34-65
+- contract: Pipeline replication cursors stored as lastLogID for resumable recovery
+  evidence: internal/replication/pipeline.go:148(LastLogID)
+- contract: Funding.Take() processes parts in FIFO order, remainder goes to later parts
+  evidence: internal/machine/funding.go:52-103(Take)
+- contract: Memento excludes computed fields (postCommitVolumes) from log hash computation
+  evidence: internal/log.go:238(GetMemento)
+business_decisions:
+- id: BD-001
+  type: T
+  content: VM uses opcode-based instruction set (bytecode) instead of direct AST interpretation
+  rationale: Bytecode compilation enables faster repeated execution of the same script and provides a
+    stable IR for potential optimizations. Switching to AST interpretation would change performance characteristics
+    but not financial results.
+  evidence: internal/machine/vm/machine.go:197(opcodes)
+  stage: numscript_execution
+  alternative_considered: AST-based interpreter (slower, simpler debugging)
+  _evidence_issues:
+  - 'SYMBOL_NOT_IN_WINDOW: opcodes near internal/machine/vm/machine.go:197'
+- id: BD-002
+  type: BA
+  content: Store interface abstracts balance queries, allowing multiple implementations
+  rationale: Interface decouples VM from storage, enabling StaticStore for testing without DB dependency.
+    The assumption is that store behavior is deterministic and read-only during execution.
+  evidence: internal/machine/vm/store.go:18(Store)
+  stage: numscript_execution
+  alternative_considered: Direct DB coupling (faster but harder to test)
+- id: BD-003
+  type: B/BA
+  content: Funding model tracks source parts with FIFO allocation for partial credit/debit
+  rationale: Financial systems often need multi-source allocations where funds are consumed in order.
+    The assumption is that FIFO ordering matches business intent for fund consumption.
+  evidence: internal/machine/vm/machine.go:127(Funding)
+  stage: numscript_execution
+  alternative_considered: Random allocation, priority-based allocation
+- id: BD-004
+  type: M
+  content: Postings accumulate during execution in single pass, preventing double-spending
+  rationale: 'Single-pass execution with accumulation ensures balance invariant is maintained throughout.
+    Mathematical invariant: sum of each postings in a transaction equals zero.'
+  evidence: internal/machine/vm/machine.go:37(Postings)
+  stage: numscript_execution
+  alternative_considered: Multi-pass with balance checkpoints
+- id: BD-005
+  type: B
+  content: 'Log-first architecture: each state changes produce immutable logs as source of truth'
+  rationale: Event sourcing pattern enables complete audit trail and temporal queries. Every business
+    state change is recorded; derived state (balances, volumes) is recomputed from logs.
+  evidence: internal/log.go:88(Log)
+  stage: transaction_processing
+  alternative_considered: State-first with append-only journal (less complete audit)
+- id: BD-006
+  type: B/BA
+  content: Idempotency enforced via IdempotencyKey + IdempotencyHash validation
+  rationale: 'Prevents duplicate transactions from network retries while allowing clients to safely retry
+    failed requests. Assumption: hash of inputs uniquely identifies transaction intent.'
+  evidence: internal/controller/ledger/log_process.go:148(fetchLogWithIK)
+  stage: transaction_processing
+  alternative_considered: Pure key-based idempotency (collision risk higher)
+- id: BD-007
+  type: DK
+  content: Deadlock retry with exponential backoff handles PostgreSQL deadlock errors
+  rationale: PostgreSQL's lock-based concurrency can cause deadlocks under contention. Backoff prevents
+    thundering herd. This is database-specific behavior, not universal.
+  evidence: internal/controller/ledger/log_process.go:166-168(deadlock)
+  stage: transaction_processing
+  alternative_considered: Immediate retry, serialized execution
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'SYMBOL_NOT_IN_WINDOW: deadlock near internal/controller/ledger/log_process.go:166'
+- id: BD-008
+  type: B/BA
+  content: 'Schema validation has three enforcement modes: strict, warn, and audit'
+  rationale: Allows gradual schema adoption across ledgers. Warn mode validates but doesn't fail; audit
+    mode logs warnings without blocking.
+  evidence: internal/controller/ledger/log_process.go:97(SchemaEnforcementMode)
+  stage: transaction_processing
+  alternative_considered: Binary on/off only (less flexible)
+  _evidence_issues:
+  - 'SYMBOL_NOT_IN_WINDOW: SchemaEnforcementMode near internal/controller/ledger/log_process.go:97'
+- id: BD-009
+  type: B
+  content: Balance = Input - Output computed field, never stored separately
+  rationale: Single source of truth prevents sync issues between balance and volume fields. Overdraft
+    is allowed (negative balance) by this formula.
+  evidence: internal/volumes.go:86(Balance)
+  stage: volume_accounting
+  alternative_considered: Separate balance field (sync risk)
+- id: BD-010
+  type: BA
+  content: PostCommitVolumes computed in-flight from logs, never persisted
+  rationale: 'Eliminates stale data risk; volumes always accurate at query time. Assumption: query-time
+    computation is acceptable performance tradeoff.'
+  evidence: internal/transaction.go:48(PostCommitVolumes)
+  stage: volume_accounting
+  alternative_considered: Cached volumes (stale data risk)
+- id: BD-011
+  type: B
+  content: WORLD account is special sink/source for external asset flows
+  rationale: Completes double-entry bookkeeping for external transactions. WORLD never stores received
+    value; as source, requires ALL funds available.
+  evidence: internal/machine/vm/machine.go:156(credit)
+  stage: volume_accounting
+  alternative_considered: Multiple external accounts (complexity)
+- id: BD-012
+  type: B/RC
+  content: SHA256 hash chain includes previous log hash for tamper-evident log chain
+  rationale: 'Tamper-evident: any modification to historical log breaks each subsequent hashes. Critical
+    for audit compliance and detection of unauthorized changes.'
+  evidence: internal/log.go:146(ComputeHash)
+  stage: log_creation
+  alternative_considered: Separate Merkle tree (more complex verification)
+- id: BD-013
+  type: BA
+  content: Memento pattern excludes computed postCommitVolumes from hash computation
+  rationale: postCommitVolumes are derived, not causal to the transaction. Excluding them from hash allows
+    volume computation changes without invalidating history.
+  evidence: internal/log.go:238(GetMemento)
+  stage: log_creation
+  alternative_considered: Include each fields (changing volume formula breaks history)
+- id: BD-014
+  type: T
+  content: Log types are Go integer constants, not strings, for type safety
+  rationale: Integer constants prevent typos and enable exhaustive switch matching at compile time. Changing
+    to strings would require runtime validation.
+  evidence: internal/log.go:21(LogType)
+  stage: log_creation
+  alternative_considered: String-based log types (more human-readable logs)
+- id: BD-015
+  type: B
+  content: Account addresses use hierarchical colon-separated format (e.g., bank:checking:alice)
+  rationale: Natural representation of organizational structures. Hierarchical matching enables wildcard
+    queries (bank:* returns each bank accounts).
+  evidence: internal/chart.go:298(FindAccountSchema)
+  stage: schema_enforcement
+  alternative_considered: Flat addresses (loses organizational semantics)
+- id: BD-016
+  type: BA
+  content: Variable account segments use regex patterns for dynamic validation
+  rationale: 'Enables parameterized accounts (e.g., $userId) with schema-level validation. Assumption:
+    regex patterns correctly encode business rules.'
+  evidence: internal/chart.go:109(Pattern)
+  stage: schema_enforcement
+  alternative_considered: External validator service (more complex)
+  _evidence_issues:
+  - 'SYMBOL_NOT_IN_WINDOW: Pattern near internal/chart.go:109'
+- id: BD-017
+  type: BA
+  content: Schema versioning allows multiple schema versions to coexist during migration
+  rationale: 'Ledgers can migrate schemas without downtime. Assumption: version conflict resolution is
+    deterministic.'
+  evidence: internal/controller/ledger/store.go:52(FindLatestSchemaVersion)
+  stage: schema_enforcement
+  alternative_considered: Exclusive migration lock (blocks concurrent writes)
+- id: BD-018
+  type: B
+  content: Advisory lock on ledger ID using hashtext prevents concurrent modifications
+  rationale: Serializes writes to prevent race conditions in balance updates. Lock held until explicit
+    unlock or connection close.
+  evidence: internal/storage/ledger/store.go:158(LockLedger)
+  stage: controller_store
+  alternative_considered: Optimistic locking with version vectors (higher retry rate)
+- id: BD-019
+  type: B
+  content: GetBalances returns locked balances for transaction duration to prevent double-spend
+  rationale: Within a transaction, balance queries see consistent state. Critical for validating sufficient
+    funds before commit.
+  evidence: internal/controller/ledger/store.go:35(GetBalances)
+  stage: controller_store
+  alternative_considered: Check-and-reserve pattern (more complex)
+- id: BD-020
+  type: BA
+  content: Block hashing runs asynchronously via PostgreSQL stored procedure in CRON-scheduled worker
+  rationale: Bulk block creation in SQL is faster than app-level iteration; reduces round-trips. CRON
+    scheduling allows tuning block frequency vs compute cost.
+  evidence: internal/storage/worker_async_block.go:111(create_blocks)
+  stage: async_block_hashing
+  alternative_considered: Synchronous block creation (blocks log ingestion)
+- id: BD-021
+  type: M
+  content: CRON-based scheduling with configurable interval controls block creation frequency
+  rationale: Periodic scheduling follows standard cron semantics. Interval choice balances latency of
+    block availability against compute overhead.
+  evidence: internal/storage/worker_async_block.go:45(Schedule.Next)
+  stage: async_block_hashing
+  alternative_considered: Event-driven on log insert (higher overhead)
+- id: BD-022
+  type: BA
+  content: Feature flag controls per-ledger opt-in for block hashing feature
+  rationale: 'Ledgers can opt-in/out of block hashing. Assumption: feature flag checks are consistently
+    evaluated.'
+  evidence: internal/storage/worker_async_block.go:85(features.FeatureHashLogs)
+  stage: async_block_hashing
+  alternative_considered: Mandatory hashing (breaking change for existing ledgers)
+- id: BD-023
+  type: B
+  content: Pipeline replication uses pull-based polling with cursor stored as lastLogID
+  rationale: Ledger doesn't need to track consumers; each exporter tracks its own cursor. Crash recovery
+    guaranteed without data loss or duplication.
+  evidence: internal/replication/pipeline.go:148(LastLogID)
+  stage: pipeline_replication
+  alternative_considered: Push-based with acknowledgment (ledger must track consumers)
+- id: BD-024
+  type: M
+  content: Push retry with exponential backoff prevents thundering herd on downstream failures
+  rationale: Exponential backoff is standard retry algorithm theory. Downstream failures don't cascade
+    to overwhelm the ledger.
+  evidence: internal/replication/pipeline.go:128(PushRetryPeriod)
+  stage: pipeline_replication
+  alternative_considered: Fixed retry interval (can cause resonance)
+- id: BD-025
+  type: T
+  content: Driver factory pattern enables plugin architecture for new exporter types
+  rationale: Factory pattern allows adding new exporters (S3, Webhook, etc.) without modifying core replication
+    logic.
+  evidence: internal/replication/manager.go:58(driverFactory.Create)
+  stage: pipeline_replication
+  alternative_considered: Hardcoded exporters (compile-time selection)
+- id: BD-026
+  type: B/BA
+  content: Soft delete + 30-day delayed hard delete pattern for bucket cleanup
+  rationale: '30-day recovery window prevents permanent data loss from accidental deletions. Assumption:
+    most deletions are accidental.'
+  evidence: internal/storage/worker_bucket_cleanup.go:77(cutoffTime)
+  stage: bucket_cleanup
+  alternative_considered: Immediate hard delete (irreversible)
+- id: BD-027
+  type: T
+  content: Bucket cleanup continues on individual failure to avoid blocking other cleanups
+  rationale: 'Fault isolation: one corrupted bucket doesn''t prevent cleanup of others. Failed cleanups
+    logged for manual intervention.'
+  evidence: internal/storage/worker_bucket_cleanup.go:95(continue)
+  stage: bucket_cleanup
+  alternative_considered: Fail-fast (cleaner but riskier)
+- id: BD-028
+  type: T
+  content: FX dependency injection modules compose each worker components
+  rationale: Modular DI enables testing with injected mocks and selective feature enablement without code
+    changes.
+  evidence: cmd/worker.go:113(storage.NewFXModule)
+  stage: worker_fx_module
+  alternative_considered: Manual wire-up (more error-prone)
+- id: BD-029
+  type: T
+  content: FX lifecycle hooks ensure proper startup/shutdown ordering for each workers
+  rationale: Workers start after DB is ready; stop before connections close. Prevents requests during
+    cleanup phases.
+  evidence: internal/storage/worker_async_block.go:151(lc.Append)
+  stage: worker_fx_module
+  alternative_considered: Implicit ordering (less explicit control)
+- id: BD-030
+  type: T
+  content: Graceful shutdown via stop channels for clean goroutine termination
+  rationale: Stop signal via channel allows goroutines to finish current work before exiting. Force-kill
+    could leave work incomplete.
+  evidence: internal/storage/worker_async_block.go:56(stopChannel)
+  stage: worker_fx_module
+  alternative_considered: Context cancellation only (less control)
+- id: BD-031
+  type: B/BA
+  content: 'VM execution requires strict phase ordering: SetVarsFromJSON → ResolveResources → ResolveBalances
+    → Execute'
+  rationale: Each phase prepares state for the next. Skipping phases returns initialization errors. Ordering
+    is contract for correct execution.
+  evidence: internal/machine/vm/machine.go:471-479(Execute)
+  stage: numscript_execution
+  alternative_considered: Lazy initialization (slower)
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-032
+  type: B
+  content: Postings.Reverse() swaps source/destination AND reverses array order for transaction reversal
+  rationale: Simple swap would not correctly reverse a transaction with multiple postings. Array order
+    matters for matching source-destination pairs.
+  evidence: internal/posting.go:37-50(Reverse)
+  stage: transaction_processing
+  alternative_considered: Simple swap only (insufficient for multi-posting reversal)
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-033
+  type: B/RC
+  content: PostCommitEffectiveVolumes computed by transaction timestamp, not insertion order
+  rationale: Timestamp-based ordering respects business time. Backdated transactions retroactively affect
+    effective volumes.
+  evidence: internal/transaction.go:49-51(PostCommitEffectiveVolumes)
+  stage: volume_accounting
+  alternative_considered: Insertion order (simpler but ignores business time)
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-034
+  type: B
+  content: Funding concatenation merges adjacent funding parts with same account into single part
+  rationale: Multiple sends to same account in same script become one funding part for efficiency. Changes
+    allocation semantics.
+  evidence: internal/machine/funding.go:150-156(Concat)
+  stage: numscript_execution
+  alternative_considered: Keep separate parts (more verbose)
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'SYMBOL_NOT_IN_WINDOW: Concat near internal/machine/funding.go:150'
+- id: BD-035
+  type: B/RC
+  content: Controller upserts accounts after log is created; log exists but accounts may be missing on
+    failure
+  rationale: Log creation is critical path; account upsert is secondary. If upsert fails, data is inconsistent
+    but recoverable.
+  evidence: internal/controller/ledger/controller_default.go:420-460
+  stage: controller_store
+  alternative_considered: Account upsert in same transaction (slower log creation)
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-036
+  type: B
+  content: TAKE opcode rejects mismatched assets but not negative amounts; TAKE_MAX rejects both
+  rationale: TAKE_ALWAYS allows negative amounts (no validation error); TAKE only rejects asset mismatches.
+    Inconsistent validation between similar opcodes.
+  evidence: internal/machine/vm/machine.go:324-330
+  stage: numscript_execution
+  alternative_considered: Consistent validation in both (potential breaking change)
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-037
+  type: T
+  content: StaticStore enables in-memory VM testing without database dependency
+  rationale: Test execution is fast and deterministic without test containers. Enables unit testing of
+    VM logic in isolation.
+  evidence: internal/machine/vm/store.go:45(StaticStore)
+  stage: numscript_execution
+  alternative_considered: DB-backed test stores (slower, requires containers)
+- id: BD-038
+  type: M
+  content: Pagination with configurable page size prevents unbounded queries in replication
+  rationale: Bounded fetching prevents OOM on large ledgers. Streaming replication scales regardless of
+    ledger size.
+  evidence: internal/replication/pipeline.go:86(PageSize)
+  stage: pipeline_replication
+  alternative_considered: Cursor-based streaming (more complex)
+- id: BD-039
+  type: T
+  content: Ledger names must match pattern '^[0-9a-zA-Z_-]{1,63}$' - alphanumeric with hyphens/underscores,
+    max 63 characters
+  rationale: URL-safe names are required for REST API routing and path parameter handling. Swapping to
+    dots or unicode would break URL parsing without changing any financial computation results.
+  evidence: internal/ledger.go:85(ledgerNameFormat)
+  stage: configuration
+  alternative_considered: allow dots, allow unicode, longer names
+- id: BD-040
+  type: B/DK
+  content: 'Reserved ledger names: ''_'', ''_info'', ''_healthcheck'' cannot be created by users'
+  rationale: Prevents users from accidentally shadowing system endpoints. Changing this would cause routing
+    conflicts and break health checks for affected ledgers.
+  evidence: internal/ledger.go:88-93(reservedLedgerName)
+  stage: configuration
+  alternative_considered: no reserved names, different reserved set
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-041
+  type: B/BA
+  content: Default bucket name is '_default' when not explicitly specified
+  rationale: Single-tenant deployments benefit from automatic bucket assignment without explicit configuration.
+    Changing to ledger name as bucket would break existing single-tenant workflows.
+  evidence: internal/ledger.go:81(DefaultBucket)
+  stage: configuration
+  alternative_considered: no default, use ledger name as bucket
+- id: BD-042
+  type: B
+  content: 'Transactions have dual volume tracking: PostCommitVolumes (immutable) and PostCommitEffectiveVolumes
+    (updated on past-dated inserts)'
+  rationale: Backdated transactions require effective volume recalculation while preserving commit history.
+    Removing dual tracking would corrupt historical balance views when inserting past-dated transactions.
+  evidence: internal/transaction.go:48-51(PostCommitVolumes fields)
+  stage: data_model
+  alternative_considered: single volume tracking, eventual consistency model
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-043
+  type: M
+  content: Balance is calculated as Input minus Output (not cumulative sum)
+  rationale: Integer subtraction (big.Int.Sub) provides exact balance without cumulative sum errors. Changing
+    to Output - Input would negate each balance results, breaking every account query.
+  evidence: internal/volumes.go:86-88(Balance method)
+  stage: data_model
+  alternative_considered: store computed balance, use credit/debit convention
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-044
+  type: T
+  content: Account addresses use ':' separator for chart segment hierarchy
+  rationale: Colon separator provides clear visual hierarchy without affecting financial calculations.
+    Swapping to dot or underscore would only change parsing patterns, not computation results.
+  evidence: internal/chart.go:299(strings.Split(account, ":"))
+  stage: data_model
+  alternative_considered: dot separator, underscore separator, flat namespace
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-045
+  type: B
+  content: Posting amounts must be non-negative (zero allowed)
+  rationale: Double-entry bookkeeping uses source/destination accounts to determine fund flow direction.
+    Allowing negative amounts would introduce ambiguity and violate double-entry invariants.
+  evidence: internal/posting.go:57-58(amount.Cmp(Zero)<0)
+  stage: validation
+  alternative_considered: allow negative amounts, separate debit/credit fields
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-046
+  type: B/BA
+  content: MOVES_HISTORY feature defaults to ON - funds movements are tracked per account/asset
+  rationale: Audit trail is enabled by default assuming most deployments value compliance over storage
+    cost. The business assumption is that storage is cheaper than audit gaps. Turning OFF would save storage
+    but lose historical movement data.
+  evidence: pkg/features/features.go:30(DefaultFeatures)
+  stage: configuration
+  alternative_considered: OFF by default for performance, per-ledger config
+- id: BD-047
+  type: B/BA
+  content: HASH_LOGS feature defaults to SYNC - logs are hashed synchronously on write
+  rationale: SYNC default prioritizes data integrity assuming most use cases cannot tolerate import with
+    invalid hashes. The business assumption is that throughput cost is acceptable for integrity guarantees.
+  evidence: pkg/features/features.go:32(DefaultFeatures)
+  stage: configuration
+  alternative_considered: ASYNC for performance, DISABLED for simplicity
+- id: BD-048
+  type: B
+  content: Transaction references must be unique per ledger
+  rationale: Unique references per ledger enable safe retry logic for transaction submission. Relaxing
+    uniqueness would break idempotency guarantees and cause duplicate transactions.
+  evidence: internal/transaction.go:24(Reference unique constraint)
+  stage: validation
+  alternative_considered: no references, globally unique references
+- id: BD-049
+  type: B
+  content: Idempotency keys include hash of input to detect conflicting parameters
+  rationale: Hash-based conflict detection prevents duplicate submissions with modified parameters. Removing
+    hash comparison would allow silent parameter changes on retry.
+  evidence: internal/controller/ledger/log_process.go:233(ComputeIdempotencyHash)
+  stage: validation
+  alternative_considered: ignore input diff, reject on any IK reuse
+- id: BD-050
+  type: B
+  content: Transactions support DryRun mode - execute without committing
+  rationale: DryRun enables pre-flight validation for clients before committing. Removing this would force
+    trial submissions or require separate preview endpoints.
+  evidence: internal/controller/ledger/log_process.go:53-58(DryRun)
+  stage: numscript_execution
+  alternative_considered: no dry-run, separate preview endpoint
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-051
+  type: B/RC
+  content: 'Schema enforcement has two modes: Strict (fail) and Audit (warn)'
+  rationale: Two-mode enforcement enables migration from permissive to strict without breaking existing
+    data. Single mode would force immediate compliance or permanent permissiveness.
+  evidence: internal/controller/ledger/controller_default.go:155(schemaEnforcementMode)
+  stage: configuration
+  alternative_considered: single mode, three-tier enforcement
+- id: BD-052
+  type: B
+  content: RevertTransaction supports Force flag - allow negative balances after revert
+  rationale: Force flag allows correcting historical errors where balances were calculated incorrectly.
+    Always checking balances would prevent legitimate corrections.
+  evidence: internal/controller/ledger/controller_default.go:548(Force check)
+  stage: numscript_execution
+  alternative_considered: no force option, always check balances
+- id: BD-053
+  type: B/RC
+  content: RevertTransaction supports AtEffectiveDate flag - use original timestamp
+  rationale: AtEffectiveDate preserves temporal audit trail integrity during corrections. Always using
+    current time would corrupt historical timing records.
+  evidence: internal/controller/ledger/controller_default.go:540-544(AtEffectiveDate)
+  stage: numscript_execution
+  alternative_considered: always use current time, separate parameter
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-054
+  type: B/BA
+  content: Bulk operations default to atomic mode - each succeed or each fail
+  rationale: Atomic default prioritizes data integrity over convenience. Users must explicitly choose
+    parallel mode indicating they understand consistency tradeoffs.
+  evidence: internal/api/bulking/bulker.go:108(Atomic default)
+  stage: numscript_execution
+  alternative_considered: non-atomic default, separate atomic flag
+- id: BD-055
+  type: T
+  content: Bulk parallel execution capped at 10 workers
+  rationale: Hard cap prevents runaway resource consumption from large bulk requests. This is an infrastructure
+    protection that does not affect financial computation correctness.
+  evidence: internal/api/bulking/bulker.go:293(WithParallelism(10))
+  stage: configuration
+  alternative_considered: no cap, configurable per request
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-056
+  type: B
+  content: Atomic and Parallel bulk options are mutually exclusive
+  rationale: ACID atomicity requires sequential processing; parallel execution cannot guarantee all-or-nothing
+    behavior. Allowing both would break consistency guarantees.
+  evidence: internal/api/bulking/bulker.go:22(ErrAtomicParallelConflict)
+  stage: validation
+  alternative_considered: allow both, implement distributed transactions
+- id: BD-057
+  type: T
+  content: Async block hasher runs on cron schedule with configurable MaxBlockSize
+  rationale: Cron-based batch hashing amortizes CPU overhead across transactions. This is an implementation
+    optimization that does not change hash outputs or ledger correctness.
+  evidence: internal/storage/worker_async_block.go:25-28(AsyncBlockRunnerConfig)
+  stage: configuration
+  alternative_considered: continuous hashing, event-driven hashing
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-058
+  type: B/BA
+  content: Bucket cleanup uses retention period - hard delete after cutoff time
+  rationale: Retention period assumes data may need recovery within a time window. The business assumption
+    is that storage cost for retention period is acceptable for recovery capability. Zero retention would
+    eliminate recovery window.
+  evidence: internal/storage/worker_bucket_cleanup.go:77(cutoffTime)
+  stage: data_retention
+  alternative_considered: immediate hard delete, no cleanup
+- id: BD-059
+  type: T
+  content: Parallel bucket migrations default to 10 workers with 5-second retry
+  rationale: Migration parallelism and retry timing are infrastructure optimizations for upgrade speed.
+    These do not affect final data state or computation correctness.
+  evidence: internal/storage/driver/driver.go:343-346(defaultOptions)
+  stage: configuration
+  alternative_considered: sequential migrations, exponential backoff
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-060
+  type: B
+  content: Importer rejects logs if ledger is not empty or logs are out of order
+  rationale: Append-only semantics ensure import does not corrupt existing data. Allowing non-empty imports
+    or reordering would break audit trail integrity.
+  evidence: internal/controller/ledger/controller_default.go:243-250(import validation)
+  stage: validation
+  alternative_considered: allow non-empty import, auto-reorder logs
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-061
+  type: B/BA
+  content: World account is the system root - not subject to insufficient funds check
+  rationale: World account represents external monetary system where funds originate/terminate. The business
+    assumption is that world cannot have insufficient funds because it represents each external money.
+    Checking world would incorrectly reject valid transactions.
+  evidence: internal/controller/ledger/controller_default.go:565(account != "world")
+  stage: validation
+  alternative_considered: check each accounts, no special account
+- id: BD-062
+  type: T
+  content: Reversion metadata uses 'com.formance.spec/state/reverts' key
+  rationale: Namespaced key convention prevents collisions with user-defined metadata. Swapping to a different
+    namespace only changes key names, not computational behavior.
+  evidence: internal/metadata.go:10-11(formanceNamespace, revertKey)
+  stage: data_model
+  alternative_considered: plain key, different namespace
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-063
+  type: B
+  content: Reverted transactions cannot be reverted again (ErrAlreadyReverted)
+  rationale: Double-revert prevention maintains clear audit trail and prevents infinite revert chains.
+    Allowing double-revert would create ambiguous transaction history.
+  evidence: internal/controller/ledger/errors.go:89-108(ErrAlreadyReverted)
+  stage: validation
+  alternative_considered: allow double revert, error on second revert
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-064
+  type: B/RC
+  content: Chart segment validation regex allows '$' prefix for variable segments
+  rationale: Dollar prefix marks variable segments for parameterized matching. Changing the prefix would
+    break existing chart definitions that use the current syntax.
+  evidence: internal/chart.go:44(ChartSegmentRegexp)
+  stage: data_model
+  alternative_considered: different variable marker, no variable segments
+- id: BD-065
+  type: T
+  content: Variable placeholders use '${variable}' syntax in filter templates
+  rationale: Mustache-style delimiters prevent ambiguity with other syntax. Swapping to $variable or @variable
+    only changes parsing patterns, not query results.
+  evidence: internal/queries/filter_template.go:256(varRegex)
+  stage: query
+  alternative_considered: $variable syntax, @variable syntax
+- id: BD-066
+  type: B/BA
+  content: 'Default query pagination: sort desc by ID, max page size enforced'
+  rationale: Desc default is a business preference for recent-first viewing. Max page size is a technical
+    guard against memory exhaustion that also limits result set size.
+  evidence: internal/controller/ledger/controller_default.go:763(PageSize cap)
+  stage: query
+  alternative_considered: asc by default, no max page size
+- id: BD-067
+  type: B/RC
+  content: Funding.Take processes parts in order and merges consecutive same-account parts
+  rationale: Deterministic ordering ensures same inputs always produce same fund allocation results. Random
+    ordering would cause non-deterministic behavior making audits impossible.
+  evidence: internal/machine/funding.go:150-156(Concat same account)
+  stage: numscript_execution
+  alternative_considered: random order, no merging
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-068
+  type: T
+  content: Replication pipeline pulls logs every 10s with 100 log page size
+  rationale: Poll interval and page size are performance tuning parameters. These affect replication latency
+    and resource usage but not the correctness of replicated data.
+  evidence: internal/replication/pipeline.go:19-20(DefaultPullInterval, LogsPageSize)
+  stage: pipeline_replication
+  alternative_considered: push model, configurable per pipeline
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-069
+  type: T
+  content: Exporters are lazily stopped when no pipelines use them
+  rationale: Lazy stop is a connection pooling optimization. This reduces overhead from frequent connect/disconnect
+    cycles without affecting data correctness.
+  evidence: internal/replication/manager.go:193-204(stopExporterIfNeeded)
+  stage: pipeline_replication
+  alternative_considered: eager stop, reference counting explicit
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-070
+  type: B
+  content: Pipeline reset re-enables pipeline with lastLogID set to nil
+  rationale: Reset to nil enables replay from start for catchup scenarios. Keeping lastLogID would prevent
+    catching up after consumer falls behind.
+  evidence: internal/replication/manager.go:460-463(ResetPipeline)
+  stage: pipeline_replication
+  alternative_considered: keep position, full resync option
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'SYMBOL_NOT_IN_WINDOW: ResetPipeline near internal/replication/manager.go:460'
+- id: BD-071
+  type: M/BA
+  content: Monetary amounts use big.Int for arbitrary precision
+  rationale: Arbitrary precision integer arithmetic guarantees no rounding errors in financial calculations.
+    Changing to float64 would introduce precision loss; changing precision would alter calculation accuracy.
+  evidence: internal/volumes.go:14(Amount *big.Int)
+  stage: data_model
+  alternative_considered: float64, fixed-point decimal
+- id: BD-072
+  type: B
+  content: Transaction reversal creates new transaction with swapped source/destination and negated amounts
+  rationale: Full reversal preserves double-entry invariant (debits = credits) and maintains audit trail.
+    Alternative approaches would break accounting balance or create inconsistent records.
+  evidence: internal/transaction.go:64-67(Reverse method)
+  stage: numscript_execution
+  alternative_considered: mark original as reversed, create offset entry only
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-073
+  type: M
+  content: Balance calculation uses Input - Output formula via big.Int subtraction
+  rationale: Integer subtraction (big.Int.Sub) is the named mathematical operation. Changing to Output
+    - Input would negate each balances; changing to absolute value would lose direction information.
+  evidence: internal/volumes.go:86-88
+  stage: data_model
+  alternative_considered: Output - Input, absolute value
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-074
+  type: M
+  content: SQL SUM aggregation for volume totals across accounts/assets
+  rationale: SQL sum aggregate is a named mathematical operation. Changing to application-level aggregation
+    would alter consistency guarantees and possibly precision.
+  evidence: internal/storage/ledger/resource_aggregated_balances.go:148
+  stage: query
+  alternative_considered: Application-level aggregation, MAP REDUCE
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-075
+  type: M
+  content: SHA256 hashing for log chain integrity and idempotency signatures
+  rationale: SHA-256 is a named cryptographic hash function. Changing to SHA-512, BLAKE3, or Merkle trees
+    would change hash outputs and break compatibility with existing chains.
+  evidence: internal/log.go:147, sha256.New()
+  stage: data_model
+  alternative_considered: SHA-512, BLAKE3, Merkle tree
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-076
+  type: M/BA
+  content: Arbitrary precision integers (big.Int) for each financial amounts
+  rationale: Arbitrary precision integer arithmetic is a named mathematical theory. Changing to fixed-point
+    or float64 would introduce precision loss affecting financial accuracy.
+  evidence: N/A:0(see_rationale)
+  stage: data_model
+  alternative_considered: Fixed-point decimal, float64
+- id: BD-077
+  type: B/BA
+  content: Numeric variables must be integers only - no decimal values allowed
+  rationale: Integer-only assumption is a domain knowledge decision. The business assumption is that each
+    monetary values represent whole units. Allowing decimals would require decimal precision handling
+    throughout.
+  evidence: internal/queries/variables.go:75-77, IsInt() check
+  stage: validation
+  alternative_considered: Allow decimals, use string-encoded decimals
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-078
+  type: M
+  content: PostCommitVolumes tracks cumulative account/asset volumes after transaction
+  rationale: Cumulative sum with incremental updates is a named mathematical pattern. Changing to point-in-time
+    snapshots or event sourcing would alter how volumes are tracked and queried.
+  evidence: internal/volumes.go:134-143, AddInput/AddOutput
+  stage: data_model
+  alternative_considered: Point-in-time snapshots, event sourcing
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-079
+  type: M
+  content: ComputePostCommitEffectiveVolumes finds most recent move per account/asset
+  rationale: Reverse iteration with deduplication is a named algorithm pattern. Changing to SQL window
+    functions or pre-computed indexes would alter effective volume calculation timing.
+  evidence: internal/moves.go:29-61, slices.Reverse(m)
+  stage: data_model
+  alternative_considered: SQL window function, pre-computed index
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-080
+  type: M
+  content: JSON encoder feeds canonical data to hash function for reproducible signatures
+  rationale: Canonical JSON serialization is a named technique for deterministic hashing. Changing to
+    Protocol Buffers or msgpack would break signature reproducibility.
+  evidence: internal/log.go:148-182, enc.Encode()
+  stage: data_model
+  alternative_considered: Protocol buffers, msgpack, custom binary
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-081
+  type: T
+  content: Template variable extraction uses regex pattern ^${([a-z_]+)}$
+  rationale: Regex pattern matching is a technical implementation choice. Swapping to different template
+    engines would only change parsing syntax.
+  evidence: internal/queries/filter_template.go:256
+  stage: query
+  alternative_considered: Templating engines, code generation
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-082
+  type: M
+  content: SQL first_value window function for point-in-time volume queries
+  rationale: SQL first_value window function is a named mathematical operation. Changing to self-join
+    or recursive CTE would alter query performance and possibly results.
+  evidence: internal/storage/ledger/resource_aggregated_balances.go:38
+  stage: query
+  alternative_considered: Self-join with max, recursive CTE
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-083
+  type: B/M
+  content: Transaction reversal swaps source/destination and negates via reverse postings
+  rationale: Bilateral swap with negation is a named mathematical operation for reversal. Changing to
+    separate reversal type or compensation log would alter reversal semantics.
+  evidence: internal/posting.go:37-50
+  stage: numscript_execution
+  alternative_considered: Separate reversal transaction type, compensation log
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-084
+  type: B
+  content: Posting amounts must be non-negative (>= 0)
+  rationale: Non-negative validation is a comparison operation. Allowing negative amounts or separate
+    sign field would change posting semantics.
+  evidence: internal/posting.go:57, Amount.Cmp(Zero) < 0
+  stage: validation
+  alternative_considered: Allow negative (debits), separate sign field
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-085
+  type: M
+  content: SQL ON CONFLICT upsert for volume accumulation on duplicate accounts
+  rationale: Database upsert with additive resolution is a named operation. Changing to application-level
+    merge would alter conflict handling semantics.
+  evidence: internal/storage/ledger/volumes.go:36-38
+  stage: numscript_execution
+  alternative_considered: Application-level merge, separate insert/update
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-086
+  type: T
+  content: 'Decimal validation: math.Floor(v) == v for float64 variable values'
+  rationale: Floor equality is a technical validation approach. Using big.Int parsing directly or decimal
+    library would be alternative implementations with same semantic result.
+  evidence: internal/queries/substitution.go:54
+  stage: validation
+  alternative_considered: Parse to big.Int directly, use decimal library
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-087
+  type: M
+  content: SQL DISTINCT ON for deduplicating account/asset volume queries
+  rationale: SQL DISTINCT ON is a named operation. Changing to GROUP BY or application deduplication would
+    alter query semantics and performance.
+  evidence: internal/storage/ledger/resource_aggregated_balances.go:30
+  stage: query
+  alternative_considered: GROUP BY, application deduplication
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-088
+  type: T
+  content: Variable substitution falls back from json.Number to float64 then big.Float to big.Int
+  rationale: Parsing cascade is a technical implementation for format flexibility. Single format requirement
+    would simplify but reduce compatibility.
+  evidence: internal/queries/filter_template.go:231-250
+  stage: query
+  alternative_considered: Single format requirement, string-encoded integers
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-089
+  type: M/BA
+  content: 'Log ID chaining: next ID = previous.ID + 1'
+  rationale: Sequential integer increment is a named ID generation method. Changing to UUID or distributed
+    ID would break ID ordering assumptions throughout the system.
+  evidence: internal/log.go:119
+  stage: data_model
+  alternative_considered: UUID, distributed ID generation
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-090
+  type: M
+  content: Volume updates per posting add amounts using big.Int.Add()
+  rationale: Integer addition is a named mathematical operation. Subtracting negative or CAS operations
+    would alter volume update semantics.
+  evidence: internal/transaction.go:153-156
+  stage: numscript_execution
+  alternative_considered: Subtract negative, CAS operations
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-091
+  type: M
+  content: SubtractPostings negates posting amounts for pre-commit volume calculation
+  rationale: Integer negation is a named mathematical operation. Separate debit/credit tracking would
+    change how inverse operations are computed.
+  evidence: internal/volumes.go:127-128
+  stage: numscript_execution
+  alternative_considered: Separate debit/credit tracking, reversal flag
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-092
+  type: T
+  content: 'Variable name parsing: lowercase letter start, alphanum or underscore tail'
+  rationale: Character classification is a technical parsing approach. Using regex or scanning libraries
+    would only change implementation.
+  evidence: internal/queries/substitution.go:141-148
+  stage: query
+  alternative_considered: Regex pattern, identifier scanning
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+- id: BD-93
+  type: B/B
+  content: 'INTERACTION: [BD-047] × [BD-020] → SYNC hashing default contradicts async block hasher worker
+    - SYNC means immediate hashing but async CRON worker performs batch hashing separately'
+  rationale: BD-047 (HASH_LOGS defaults to SYNC) claims logs are hashed synchronously on write, but BD-020
+    describes async block hashing via CRON. This is a contradiction because SYNC implies immediate blocking
+    hash computation, yet the block hasher runs as a separate background worker on a schedule. In SYNC
+    mode, individual logs should be hashed immediately, but the CRON-based worker batch-hashes blocks.
+    These are different hashing operations at different stages with conflicting timing assumptions.
+  evidence: 'BD-047: pkg/features/features.go:32(DefaultFeatures HASH_LOGS=SYNC); BD-020: internal/storage/worker_async_block.go:111(create_blocks
+    CRON-scheduled)'
+  stage: global
+  alternative_considered: 'Clarify distinction: SYNC applies to log hashing, ASYNC applies to block hashing;
+    or merge into single unified hashing mode'
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-047: pkg/features/features.go'
+- id: BD-94
+  type: B/B
+  content: 'INTERACTION: [BD-036] × [BD-045] → TAKE opcode allows negative amounts silently but posting
+    validation rejects them, creating inconsistent enforcement boundaries'
+  rationale: BD-036 states TAKE opcode does NOT validate negative amounts, while BD-045 mandates each
+    posting amounts must be non-negative. This creates a validation gap where a NumScript with negative
+    TAKE amounts will execute in the VM (possibly accumulating balances incorrectly) but fail at posting
+    persistence. The enforcement is split between execution and validation layers, causing silent failures
+    and potentially corrupted intermediate VM state.
+  evidence: 'BD-036: internal/machine/vm/machine.go:324-330(negative amounts not rejected in OP_TAKE);
+    BD-045: internal/posting.go:57(amount.Cmp(Zero)<0)'
+  stage: numscript_execution
+  alternative_considered: Validate negative amounts in TAKE opcode like TAKE_MAX does; enforce validation
+    at single layer
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-036: internal/machine/vm/machine.go'
+- id: BD-95
+  type: B/BA
+  content: 'INTERACTION: [BD-035] × [BD-005] → Account upsert after log creation can leave orphaned logs
+    with missing account metadata in log-first architecture'
+  rationale: BD-035 (controller upserts accounts after log created) interacts with BD-005 (log-first architecture
+    as source of truth) to create a systemic risk. Log-first architecture means the log IS the authoritative
+    record, but if account upsert fails post-log-commit, the ledger contains logs for accounts that don't
+    have metadata. While the financial data is safe (logs are immutable), account-specific metadata (schemas,
+    metadata, created_at timestamps) becomes orphaned. This violates the principle that each state changes
+    should be traceable to logs.
+  evidence: 'BD-035: internal/controller/ledger/controller_default.go:420-460(account upsert after log);
+    BD-005: internal/log.go:88(Log as source of truth)'
+  stage: controller_store
+  alternative_considered: Transactionally upsert accounts in same DB transaction as log creation; implement
+    outbox pattern for eventual consistency
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-035: internal/controller/ledger/controller_default.go'
+- id: BD-96
+  type: B/BA
+  content: 'INTERACTION: [BD-042] × [BD-033] × [BD-010] → Dual volume tracking with timestamp-based ordering
+    causes effective volumes to retroactively change on backdated inserts, cascading to each historical
+    balance queries'
+  rationale: 'Three decisions interact to create a systemic risk cascade: (1) BD-042 introduces dual volume
+    tracking (PostCommitVolumes + PostCommitEffectiveVolumes), (2) BD-033 computes effective volumes by
+    timestamp not insertion order, (3) BD-010 computes PostCommitVolumes in-flight never persisted. When
+    a backdated transaction is inserted, BD-033 recalculates effective volumes retroactively, which cascades
+    to each queries that use effective volumes. Since BD-010 never persists these values, every balance
+    query must recompute, and changing historical effective volumes means historical balance views become
+    unstable over time.'
+  evidence: 'BD-042: internal/transaction.go:48-51(PostCommitVolumes fields); BD-033: internal/machine/funding.go:150-156(timestamp
+    ordering); BD-010: internal/transaction.go:48(PostCommitVolumes in-flight)'
+  stage: volume_accounting
+  alternative_considered: Immutable effective volumes with forward-only updates; materialized effective
+    volumes with versioning
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-042: internal/transaction.go'
+- id: BD-97
+  type: B/BA
+  content: 'INTERACTION: [BD-003] × [BD-067] → Funding FIFO ordering assumption breaks when concat merges
+    same-account parts, potentially corrupting fund allocation semantics'
+  rationale: BD-003 establishes FIFO allocation for partial credit/debit, assuming sources are consumed
+    in order. BD-067 adds processing that merges consecutive same-account parts via Concat(). When parts
+    from different sources arrive interleaved, the Concat operation may merge segments that were not originally
+    adjacent, obscuring the intended FIFO ordering for specific accounts. This creates hidden semantic
+    changes where fund allocation no longer follows the documented FIFO rule for complex multi-source
+    scenarios.
+  evidence: 'BD-003: internal/machine/vm/machine.go:127(Funding FIFO allocation); BD-067: internal/machine/funding.go:150-156(Concat
+    same account)'
+  stage: numscript_execution
+  alternative_considered: Preserve original ordering independent of concatenation; mark merged parts with
+    original indices
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-003: internal/machine/vm/machine.go'
+- id: BD-98
+  type: B/B
+  content: 'INTERACTION: [BD-006] × [BD-049] → Idempotency hash depends on idempotency key''s uniqueness
+    guarantee, creating circular dependency where hash collision detection requires hash to already exist'
+  rationale: 'BD-006 enforces idempotency via IdempotencyKey + IdempotencyHash validation. BD-049 adds
+    input hash to idempotency key. This creates a hidden dependency: if two different inputs produce the
+    same hash (collision), one transaction will be rejected as a duplicate of the other, even though they
+    have different parameters. The hash-based conflict detection provides security but relies on cryptographic
+    hash properties (pre-image resistance) that aren''t explicitly guaranteed by the implementation.'
+  evidence: 'BD-006: internal/controller/ledger/log_process.go:148(fetchLogWithIK); BD-049: internal/controller/ledger/log_process.go:233(ComputeIdempotencyHash)'
+  stage: transaction_processing
+  alternative_considered: Include input hash in log ID computation instead of idempotency key; use separate
+    conflict detection mechanism
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-006: internal/controller/ledger/log_process.go'
+- id: BD-99
+  type: B/BA
+  content: 'INTERACTION: [BD-018] × [BD-019] × [BD-007] → Advisory lock serialization combined with deadlock
+    retry creates performance bottleneck under contention; high contention amplifies retry delays exponentially'
+  rationale: 'Three decisions interact to create performance amplification: (1) BD-018 advisory lock on
+    ledger ID serializes each writes, (2) BD-019 GetBalances returns locked balances preventing double-spend,
+    (3) BD-007 deadlock retry uses exponential backoff. Under high contention, these decisions compound:
+    the advisory lock creates queuing, deadlock errors trigger BD-007 retries with exponentially increasing
+    delays, and each retry competes for the same lock. A small increase in contention can cause disproportionate
+    increases in wait times, potentially timing out clients.'
+  evidence: 'BD-018: internal/storage/ledger/store.go:158(LockLedger advisory lock); BD-019: internal/controller/ledger/store.go:35(GetBalances
+    locked); BD-007: internal/controller/ledger/log_process.go:166-168(deadlock retry)'
+  stage: controller_store
+  alternative_considered: Optimistic locking with version vectors to reduce lock contention; separate
+    deadlock handling from general retry logic
+  _evidence_issues:
+  - 'BACKFILLED_FROM_MD: recovered from step2c_business_decisions.md'
+  - 'NOT_FOUND: BD-018: internal/storage/ledger/store.go'
+known_use_cases: []
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 79
+  evidence_invalid: 13
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.8586956521739131
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 8
+    warn: 6
+    fail: 0
+  subdomain_totals:
+    pass: 4
+    warn: 4
+    fail: 0
+  coverage: 22/22 (100%)
+  pass_rate: 12/22 (54%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: primary_storage
+  description: Use default PostgreSQL for development/self-hosting; use RDS for production on AWS
+  used_in_stages: []
+  options:
+  - name: PostgreSQL
+    traits:
+    - ACID
+    - relational
+    - transactional
+    - mature
+    fit_for:
+    - General-purpose ledger storage with strong consistency requirements
+    not_fit_for:
+    - Massive analytical queries; consider ClickHouse exporter instead
+  - name: AWS RDS PostgreSQL
+    traits:
+    - ACID
+    - managed
+    - HA-ready
+    - IAM auth
+    fit_for:
+    - Production on AWS with managed database, IAM authentication
+    not_fit_for:
+    - Multi-cloud or on-prem deployments
+  default: PostgreSQL
+  _source: worker_resource
+- id: slot-002
+  name: exporter_destination
+  description: Use ClickHouse for analytics, Elasticsearch for search, HTTP for integrations, stdout for
+    debugging
+  used_in_stages: []
+  options:
+  - name: ClickHouse
+    traits:
+    - OLAP
+    - columnar
+    - high-throughput
+    - schema-on-write
+    fit_for:
+    - Analytical workloads, aggregations, time-series analysis of transactions
+    not_fit_for:
+    - Real-time point lookups; transactional workloads
+  - name: Elasticsearch
+    traits:
+    - full-text-search
+    - document-store
+    - REST API
+    fit_for:
+    - Search-heavy use cases, log analysis, flexible querying
+    not_fit_for:
+    - Complex aggregations on financial data; use ClickHouse instead
+  - name: HTTP Webhook
+    traits:
+    - simple
+    - push-based
+    - integration-friendly
+    fit_for:
+    - Integrating with external systems, custom ETL pipelines
+    not_fit_for:
+    - High-volume production analytics (no batching)
+  - name: stdout
+    traits:
+    - debugging
+    - log-file based
+    fit_for:
+    - Development, debugging, container log aggregation
+    not_fit_for:
+    - Production analytics or persistence
+  - name: noop
+    traits:
+    - disabled
+    - no-op
+    fit_for:
+    - Disabling exports entirely for testing or minimal deployments
+    not_fit_for:
+    - Any production use requiring data export
+  default: noop (exports disabled by default unless EXPERIMENTAL_EXPORTERS=true)
+  _source: worker_resource
+- id: slot-003
+  name: event_bus
+  description: Use NATS for standard deployments; add Kafka for enterprise durability/replay requirements
+  used_in_stages: []
+  options:
+  - name: NATS
+    traits:
+    - pub/sub
+    - streaming
+    - low-latency
+    - at-least-once
+    fit_for:
+    - Microservices communication, event-driven architectures
+    not_fit_for:
+    - Durable message storage beyond retention window
+  - name: Kafka (via Watermill)
+    traits:
+    - durable
+    - high-throughput
+    - exactly-once
+    - replay
+    fit_for:
+    - Enterprise event streaming, audit trails, replay capability
+    not_fit_for:
+    - Simple pub/sub; lower throughput than Kafka needed
+  default: NATS (configured via github.com/formancehq/go-libs/v4)
+  _source: worker_resource
+- id: slot-004
+  name: observability_backend
+  description: Use defaults for development; configure OTLP endpoint for production cloud backends
+  used_in_stages: []
+  options:
+  - name: OTLP (OpenTelemetry Protocol)
+    traits:
+    - vendor-neutral
+    - metrics + traces
+    - standardized
+    fit_for:
+    - Any production environment; integrates with most backends
+    not_fit_for:
+    - Environments without OTEL collector
+  - name: Prometheus + Jaeger
+    traits:
+    - metrics
+    - traces
+    - open-source
+    fit_for:
+    - Development, self-hosted observability stack
+    not_fit_for:
+    - Managed/cloud-native observability
+  default: OTLP with Prometheus/Jaeger via docker-compose
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: PostgreSQL
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: OpenTelemetry Collector
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: Prometheus
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: Jaeger
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: NATS
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: ClickHouse (optional exporter)
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: Elasticsearch (optional exporter)
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-008
+  type: python_package
+  name: github.com/jackc/pgx/v5
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: python_package
+  name: github.com/uptrace/bun
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: python_package
+  name: github.com/formancehq/go-libs/v4
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: python_package
+  name: github.com/nats-io/nats.go
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: python_package
+  name: github.com/formancehq/numscript
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: python_package
+  name: go.opentelemetry.io/otel
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-014
+  type: python_package
+  name: github.com/ThreeDotsLabs/watermill
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-015
+  type: python_package
+  name: github.com/ClickHouse/clickhouse-go/v2
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: python_package
+  name: github.com/olivere/elastic/v7
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-017
+  type: python_package
+  name: github.com/spf13/viper
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
