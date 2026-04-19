@@ -1,0 +1,3253 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-090
+name: QUANTAXIS
+sop_version: '3.6'
+source:
+  projects:
+  - QUANTAXIS
+  commit_hash: a69e978a2e38d045a64c380cc3b5c9fa08fa4903
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Quantitative trading framework with multi-market support (stocks, futures, crypto, options)
+  description: A comprehensive quantitative financial analysis framework with Python 3.9+ support and
+    Rust core integration for 100x performance acceleration, supporting event-driven strategy execution
+    for backtesting and live trading across multiple asset classes.
+  prerequisites: Python 3.9-3.12, pandas 2.0+, MongoDB, basic understanding of financial markets and trading
+    concepts, familiarity with OHLCV data structures
+  not_suitable_for: Sub-millisecond latency HFT trading, users without programming experience seeking
+    pre-built trading signals, single-asset-only workflows that don't need multi-market support
+stages:
+- id: data_collection
+  name: Data Collection & Storage
+  order: 1
+  responsibility: Fetch market data from external sources (TDX, Tushare, exchanges) and persist to MongoDB/ClickHouse.
+    Supports stocks, futures, crypto, options with parallel download. This stage exists because market
+    data must be acquired from multiple providers before any analysis can occur.
+  interface:
+    inputs:
+    - Security codes
+    - Date ranges
+    - Data source engine (tdx/tushare)
+    outputs:
+    - QA_DataStruct_* objects stored in MongoDB collections
+  required_methods:
+  - name: QA_SU_save_stock_day.save
+    description: Main entry point for saving daily stock data to MongoDB collections with QA_DataStruct
+      format
+    evidence: QUANTAXIS/QASU/main.py:215(QA_SU_save_stock_day)
+  - name: QA_Tdx_Executor.execute
+    description: Concurrent TDX API executor using threading for parallel market data downloads
+    evidence: QUANTAXIS/QAFetch/QATdx_adv.py:36(QA_Tdx_Executor)
+  - name: QA_Fetcher.fetch
+    description: Unified data fetch facade supporting multiple data sources with consistent API
+    evidence: QUANTAXIS/QAFetch/Fetcher.py:61(QA_Fetcher)
+  - name: Parallelism.run
+    description: Base parallelism abstraction for parallel download operations
+    evidence: QUANTAXIS/QAUtil/Parallelism.py:56(Parallelism)
+  key_behaviors:
+  - behavior: Multi-engine fetch abstraction
+    description: Provides consistent API across different data sources (tdx, tushare, huobi, binance,
+      bitmex) with automatic fallback when primary source fails
+    evidence: QUANTAXIS/QAFetch/Fetcher.py:75(QA_quotation)
+  - behavior: ProcessPoolExecutor parallelization
+    description: Stock downloads use parallel execution via ProcessPoolExecutor for 10x speedup on I/O-bound
+      operations
+    evidence: QUANTAXIS/QASU/save_tdx_parallelism.py:43(__saving_work)
+  - behavior: Dual storage strategy
+    description: MongoDB stores operational data with schema-on-read flexibility; ClickHouse stores append-only
+      factor data with ReplacingMergeTree dedup
+    evidence: QUANTAXIS/QAFactor/feature.py:14(CREATE TABLE)
+  replaceable_points:
+  - name: fetch_engine
+    description: Data source engine for market data acquisition
+    options:
+    - name: tdx
+      traits:
+      - Chinese market focus
+      - Real-time support
+      - Proprietary protocol
+      fit_for:
+      - A-shares day/minute data
+      - Chinese futures
+      - Quick setup for CN markets
+      not_fit_for:
+      - International markets
+      - Free data access
+    - name: tushare
+      traits:
+      - Comprehensive CN data
+      - Financial data included
+      - REST API
+      fit_for:
+      - Financial statement data
+      - Extended CN market coverage
+      not_fit_for:
+      - Real-time trading
+      - High-frequency requests
+    - name: huobi
+      traits:
+      - Crypto-native
+      - WebSocket support
+      - 24/7 markets
+      fit_for:
+      - Cryptocurrency trading
+      - DeFi analysis
+      not_fit_for:
+      - Traditional securities
+      - Chinese regulatory compliance
+    - name: binance
+      traits:
+      - Global crypto exchange
+      - High frequency
+      - Futures included
+      fit_for:
+      - Crypto algorithmic trading
+      - Binance futures strategies
+      not_fit_for:
+      - Stock/futures markets
+      - China A-shares
+    - name: bitmex
+      traits:
+      - Perpetual contracts
+      - Leverage tokens
+      - Derivatives focus
+      fit_for:
+      - Crypto derivatives backtesting
+      - Bitcoin perpetual strategies
+      not_fit_for:
+      - Spot trading
+      - Traditional asset classes
+    default: tdx
+  - name: storage_backend
+    description: Primary database for market data persistence
+    options:
+    - name: mongodb
+      traits:
+      - Schema-on-read
+      - JSON documents
+      - Flexible queries
+      fit_for:
+      - Schema-changing data
+      - Operational data
+      - Rapid prototyping
+      not_fit_for:
+      - Analytics-heavy workloads
+      - Time-series aggregation
+    - name: clickhouse
+      traits:
+      - Column-oriented
+      - High write throughput
+      - ReplacingMergeTree
+      fit_for:
+      - Factor storage
+      - Time-series analytics
+      - Large dataset queries
+      not_fit_for:
+      - Single-document flexibility
+      - Real-time updates
+    default: mongodb
+  design_decisions:
+  - MongoDB as primary storage for flexibility and JSON-like documents (QUANTAXIS/QASU/main.py:1) — QUANTAXIS
+    predates ClickHouse adoption; MongoDB's schema-on-read handles schema changes in Chinese market data
+  - ClickHouse for factor storage with ReplacingMergeTree (QUANTAXIS/QAFactor/feature.py:14) — Factor
+    data is append-only time-series; ReplacingMergeTree dedupes updates efficiently
+  - Multi-engine fetch abstraction (tdx/tushare/huobi) (QUANTAXIS/QAFetch/Fetcher.py:75) — Different sources
+    have different coverage/costs; engine abstraction allows fallback
+  - Parallel download via ProcessPoolExecutor (QUANTAXIS/QASU/save_tdx_parallelism.py:43) — Stock downloads
+    are I/O bound; parallelization cuts download time 10x
+  acceptance_hints:
+  - Successfully downloads and stores at least 1000 bars of stock day data
+  - Parallel download completes within 10% of sequential time for 100 securities
+  - Data persists across MongoDB restarts with correct QA_DataStruct format
+  - Fallback to secondary engine succeeds when primary fails
+- id: data_processing
+  name: Data Processing & Resampling
+  order: 2
+  responsibility: Transform raw OHLCV data through resampling (1min→5min→day), forward/backward adjustment
+    (fq), market cap calculation, and tick-to-bar aggregation. This stage exists to normalize and prepare
+    market data for consistent analysis.
+  interface:
+    inputs:
+    - Raw OHLCV DataFrames
+    - Target frequency
+    - Adjustment type (qfq/hfq/bfq)
+    outputs:
+    - Resampled QA_DataStruct_* with MultiIndex (datetime, code)
+  required_methods:
+  - name: _quotation_base.resample
+    description: Abstract base method for resampling OHLCV data to different frequencies
+    evidence: QUANTAXIS/QAData/base_datastruct.py:50(_quotation_base)
+  - name: QA_DataStruct_Stock_day.adjust
+    description: Apply forward/backward price adjustment to stock daily data
+    evidence: QUANTAXIS/QAData/QADataStruct.py:114(QA_DataStruct_Stock_day)
+  - name: QA_DataStruct_Stock_min.resample
+    description: Resample minute-level data to higher frequencies with proper OHLCV aggregation
+    evidence: QUANTAXIS/QAData/QADataStruct.py:299(QA_DataStruct_Stock_min)
+  - name: QA_data_min_resample.resample
+    description: Core OHLCV resampling logic supporting multiple aggregation functions
+    evidence: QUANTAXIS/QAData/data_resample.py:50(QA_data_min_resample)
+  - name: QA_data_stock_to_fq.calculate
+    description: Compute forward adjustment factors for stock price normalization
+    evidence: QUANTAXIS/QAData/data_fq.py:20(QA_data_stock_to_fq)
+  key_behaviors:
+  - behavior: MultiIndex (datetime, code) as canonical identifier
+    description: Every DataStruct objects use MultiIndex as primary key enabling efficient multi-security
+      queries and pandas groupby semantics
+    evidence: QUANTAXIS/QAData/base_datastruct.py:82(drop_duplicates.sort_index)
+  - behavior: DataFrame.drop_duplicates() on initialization
+    description: Prevents duplicate bars from causing incorrect indicator calculations by deduplicating
+      on DataStruct creation
+    evidence: QUANTAXIS/QAData/base_datastruct.py:82
+  - behavior: Forward adjustment (qfq) as default if_fq='bfq'
+    description: Backward adjustment preserves original price levels; qfq preferred by most Chinese quant
+      practitioners for backtesting
+    evidence: QUANTAXIS/QAData/base_datastruct.py:92(self.if_fq=if_fq)
+  replaceable_points:
+  - name: fq_method
+    description: Stock price adjustment method for handling splits and dividends
+    options:
+    - name: qfq
+      traits:
+      - Forward adjustment
+      - Current perspective
+      - Analyst preference
+      fit_for:
+      - Factor research
+      - Performance attribution
+      - Cross-security comparison
+      not_fit_for:
+      - Historical P&L
+      - Execution simulation
+      - Original price analysis
+    - name: hfq
+      traits:
+      - Historical perspective
+      - Split-adjusted
+      fit_for:
+      - Historical returns
+      - Technical analysis
+      - Pattern recognition
+      not_fit_for:
+      - Current price comparison
+      - Factor construction
+    - name: bfq
+      traits:
+      - No adjustment
+      - Original prices
+      - No splits/dividends applied
+      fit_for:
+      - Live trading simulation
+      - Original market conditions
+      - Execution backtesting
+      not_fit_for:
+      - Long-term factor analysis
+      - Cross-period comparison
+    - name: none
+      traits:
+      - Raw data passthrough
+      - No transformation
+      fit_for:
+      - Raw data preservation
+      - Debugging
+      - External validation
+      not_fit_for:
+      - Factor backtesting
+      - Performance analysis
+    default: bfq
+  - name: resample_agg
+    description: OHLCV aggregation function for resampling
+    options:
+    - name: last
+      traits:
+      - Close price preservation
+      - Simple aggregation
+      fit_for:
+      - Simple bar aggregation
+      - Volume summing
+      - Standard resampling
+      not_fit_for:
+      - Open/high/low analysis
+      - OHLC-specific strategies
+    - name: ohlc
+      traits:
+      - Full OHLC preservation
+      - Complete bar information
+      fit_for:
+      - Candlestick patterns
+      - Intraday analysis
+      - Technical indicators
+      not_fit_for:
+      - Simple aggregation
+      - Memory-constrained environments
+    - name: first
+      traits:
+      - Open price preservation
+      - Gap analysis
+      fit_for:
+      - Gap analysis
+      - Jump detection
+      - Specific open strategies
+      not_fit_for:
+      - Standard resampling
+      - Most indicator calculations
+    default: last
+  design_decisions:
+  - MultiIndex (datetime, code) as canonical data identifier (QUANTAXIS/QAData/base_datastruct.py:82)
+    — Enables efficient multi-security queries and aligns with pandas groupby semantics
+  - Forward adjustment (qfq) as default if_fq='bfq' (QUANTAXIS/QAData/base_datastruct.py:92) — Backward
+    adjustment preserves original price levels; qfq preferred by most Chinese quant practitioners
+  - DataFrame.drop_duplicates() on init (QUANTAXIS/QAData/base_datastruct.py:82) — Prevents duplicate
+    bars from causing incorrect indicator calculations
+  - Resample methods on DataStruct instead of raw DataFrame (QUANTAXIS/QAData/QADataStruct.py:435) — Keeps
+    resample context-aware (preserves dtype, fq settings)
+  acceptance_hints:
+  - Resampled 1min data to 5min produces correct OHLCV aggregation
+  - MultiIndex (datetime, code) queryable by either dimension independently
+  - Forward adjustment produces consistent factor values across different date ranges
+  - drop_duplicates removes exactly 0 rows when input has no duplicates
+- id: factor_computation
+  name: Factor Computation & Analysis
+  order: 3
+  responsibility: Compute alpha factors (MA, MACD, custom), store in ClickHouse, analyze IC/IR, and generate
+    forward returns for backtesting. This stage exists to transform raw price data into predictive signals.
+  interface:
+    inputs:
+    - Stock day/min DataFrames
+    - Factor parameters
+    outputs:
+    - Factor values in ClickHouse
+    - IC/IR analysis reports
+  required_methods:
+  - name: QASingleFactor_DailyBase.calc
+    description: Compute factor values and return DataFrame with date/code/factor columns for batch ClickHouse
+      insertion
+    evidence: QUANTAXIS/QAFactor/feature.py:104(calc)
+  - name: QASingleFactor_DailyBase.register
+    description: Register factor metadata enabling discovery and versioning across the factor library
+    evidence: QUANTAXIS/QAFactor/feature.py:62(register)
+  - name: QAFeatureAnalysis.analyze
+    description: Analyze factor IC (Information Coefficient) and IR (Information Ratio) with neutralization
+    evidence: QUANTAXIS/QAFactor/featureAnalysis.py:29(QAFeatureAnalysis)
+  - name: QAFeatureBacktest.generate_signals
+    description: Generate trading signals based on factor values for backtesting
+    evidence: QUANTAXIS/QAFactor/featurebacktest.py:10(QAFeatureBacktest)
+  - name: QA_indicator_MA.calculate
+    description: Moving average indicator computation supporting multiple window sizes
+    evidence: QUANTAXIS/QAIndicator/indicators.py:30(QA_indicator_MA)
+  key_behaviors:
+  - behavior: ClickHouse ReplacingMergeTree for factor storage
+    description: Deduplication on merge handles factor recalculation; high write throughput for daily
+      updates with efficient querying
+    evidence: QUANTAXIS/QAFactor/feature.py:14(CREATE TABLE)
+  - behavior: Factor calc() returns standard schema DataFrame
+    description: Standard schema (date, code, factor columns) enables batch processing and easy ClickHouse
+      insertion
+    evidence: QUANTAXIS/QAFactor/feature.py:104(calc)
+  - behavior: Factor base class with register/insert lifecycle
+    description: Metadata tracking enables factor discovery, versioning, and portfolio-level factor management
+    evidence: QUANTAXIS/QAFactor/feature.py:62(register)
+  replaceable_points:
+  - name: factor_type
+    description: Factor computation class for different alpha strategies
+    options:
+    - name: MA10
+      traits:
+      - Simple moving average
+      - Trend-following
+      - Low complexity
+      fit_for:
+      - Momentum strategies
+      - Trend confirmation
+      - Baseline comparison
+      not_fit_for:
+      - Mean reversion
+      - High-frequency signals
+      - Multi-factor models
+    - name: EMA
+      traits:
+      - Exponential weighting
+      - Responsive
+      - Noise filtering
+      fit_for:
+      - Short-term signals
+      - Adaptive strategies
+      - Recent data emphasis
+      not_fit_for:
+      - Long-term trends
+      - Slow-moving markets
+    - name: custom
+      traits:
+      - User-defined logic
+      - Flexible computation
+      - Full control
+      fit_for:
+      - Novel alpha research
+      - Complex factors
+      - Proprietary signals
+      not_fit_for:
+      - Standard benchmarks
+      - Quick prototyping
+    default: MA10
+  - name: storage
+    description: Factor storage backend for persistence and retrieval
+    options:
+    - name: clickhouse
+      traits:
+      - High throughput
+      - Time-series optimized
+      - ReplacingMergeTree
+      fit_for:
+      - Production factors
+      - Large universes
+      - Analytical queries
+      not_fit_for:
+      - Small datasets
+      - Frequent updates
+      - Schema flexibility
+    - name: mongodb
+      traits:
+      - Flexible schema
+      - Document storage
+      - JSON-native
+      fit_for:
+      - Factor prototyping
+      - Flexible factor formats
+      - Quick iterations
+      not_fit_for:
+      - Large-scale production
+      - Analytical workloads
+    default: clickhouse
+  design_decisions:
+  - ClickHouse ReplacingMergeTree for factor storage (QUANTAXIS/QAFactor/feature.py:14) — Deduplication
+    on merge handles factor recalculation; high write throughput for daily updates
+  - Factor calc() returns DataFrame with date/code/factor columns (QUANTAXIS/QAFactor/feature.py:104)
+    — Standard schema enables batch processing and easy ClickHouse insertion
+  - Factor base class with register/insert lifecycle (QUANTAXIS/QAFactor/feature.py:62) — Metadata tracking
+    enables factor discovery and versioning
+  acceptance_hints:
+  - Factor values successfully insert into ClickHouse without duplicate keys after merge
+  - IC analysis returns correlation coefficient between factor and forward returns
+  - Custom factor inheriting from base class registers and can be queried
+  - Factor computation completes for 3000+ securities within 60 seconds
+- id: strategy_execution
+  name: Strategy Execution Engine
+  order: 4
+  responsibility: Run trading strategies on historical data (backtest) or live streams. Handle bar/tick
+    callbacks, position tracking, and order generation. This stage is the core of the system that transforms
+    signals into executable orders.
+  interface:
+    inputs:
+    - Historical DataFrames or live tick/bar streams
+    outputs:
+    - Orders
+    - Trade fills
+    - Position updates
+  required_methods:
+  - name: QAStrategyCtaBase.on_bar
+    description: Event callback for processing bar data and generating trading signals
+    evidence: QUANTAXIS/QAStrategy/qactabase.py:27(QAStrategyCtaBase)
+  - name: QAStrategyStockBase.send_order
+    description: Send order with T+1 handling and stock-specific semantics
+    evidence: QUANTAXIS/QAStrategy/qamultibase.py:25(QAStrategyStockBase)
+  - name: QARSStrategy.run
+    description: Rust-powered strategy execution for QARS backtester with 10-20x speedup
+    evidence: QUANTAXIS/QARSBridge/qars_backtest.py:108(QARSStrategy)
+  - name: QARSBacktest.execute
+    description: High-performance Rust backtest runner for large dataset strategies
+    evidence: QUANTAXIS/QARSBridge/qars_backtest.py:18(QARSBacktest)
+  - name: QA_Engine.run
+    description: Multi-kernel thread engine for parallel strategy job execution
+    evidence: QUANTAXIS/QAEngine/QAThreadEngine.py:131(QA_Engine)
+  key_behaviors:
+  - behavior: Separate CTA base vs Stock base for market-specific rules
+    description: Stock T+1 trading requires different position tracking than futures; separation avoids
+      logic branching and market-specific conditionals
+    evidence: QUANTAXIS/QAStrategy/qamultibase.py:25(QAStrategyStockBase)
+  - behavior: Rust QARS engine for 10-20x backtest speedup
+    description: Python backtests on large datasets are too slow; Rust provides near-C performance with
+      full Python API compatibility
+    evidence: QUANTAXIS/QARSBridge/qars_backtest.py:18(__init__)
+  - behavior: Market type auto-detection from code regex
+    description: Futures codes contain letters (e.g., rb2005); stocks are pure digits — no explicit parameter
+      needed
+    evidence: QUANTAXIS/QAStrategy/qactabase.py:85(re.search)
+  - behavior: LIMIT order fills at CURRENT bar prices
+    description: Backtest execution model fills orders at current bar; NEXT_OPEN recommended for realism
+    evidence: QUANTAXIS/QAUtil/QAParameter.py:114-122(ORDER_MODEL)
+  replaceable_points:
+  - name: strategy_base
+    description: Strategy base class defining execution paradigm
+    options:
+    - name: QAStrategyCtaBase
+      traits:
+      - CTA-style
+      - Futures-oriented
+      - Single标的
+      fit_for:
+      - Trend-following
+      - Futures trading
+      - Single-asset strategies
+      not_fit_for:
+      - Multi-asset portfolios
+      - Stock T+1 trading
+      - Mean reversion
+    - name: QAStrategyStockBase
+      traits:
+      - Stock-oriented
+      - T+1 support
+      - Multi-asset
+      fit_for:
+      - Stock portfolios
+      - Long-only strategies
+      - Chinese A-shares
+      not_fit_for:
+      - Futures trading
+      - Same-day trading
+      - Short selling
+    - name: QARSStrategy
+      traits:
+      - Rust-powered
+      - High-performance
+      - Batch processing
+      fit_for:
+      - Large backtests
+      - Production strategies
+      - Performance-critical
+      not_fit_for:
+      - Live trading
+      - Strategy prototyping
+      - Debug scenarios
+    default: QAStrategyCtaBase
+  - name: execution_mode
+    description: Strategy execution mode for backtest vs live trading
+    options:
+    - name: backtest
+      traits:
+      - Historical data
+      - Batch processing
+      - No latency
+      fit_for:
+      - Strategy validation
+      - Performance measurement
+      - Parameter optimization
+      not_fit_for:
+      - Live trading
+      - Real-time signals
+    - name: sim
+      traits:
+      - Simulation mode
+      - Paper trading
+      - Live data
+      fit_for:
+      - Strategy testing
+      - Signal validation
+      - Live prototyping
+      not_fit_for:
+      - Production trading
+      - High-frequency
+    - name: py
+      traits:
+      - Python-native
+      - Event-driven
+      - Standard execution
+      fit_for:
+      - Standard strategies
+      - Learning purposes
+      - Custom logic
+      not_fit_for:
+      - High-performance
+      - Large-scale backtests
+    default: py
+  - name: data_feed
+    description: Data subscription model for live strategy updates
+    options:
+    - name: eventmq
+      traits:
+      - Message queue
+      - Decoupled
+      - Multi-subscriber
+      fit_for:
+      - Production systems
+      - Multi-strategy
+      - Distributed architectures
+      not_fit_for:
+      - Single strategy
+      - Low latency requirements
+    - name: direct
+      traits:
+      - Direct connection
+      - Low overhead
+      - Synchronous
+      fit_for:
+      - Simple strategies
+      - Low-latency
+      - Single strategy
+      not_fit_for:
+      - Multi-strategy
+      - Distributed deployments
+    default: eventmq
+  design_decisions:
+  - Separate CTA base vs Stock base for market-specific rules (QUANTAXIS/QAStrategy/qamultibase.py:25)
+    — Stock T+1 trading requires different position tracking than futures; separation avoids logic branching
+  - Rust QARS engine for 10-20x backtest speedup (QUANTAXIS/QARSBridge/qars_backtest.py:18) — Python backtests
+    on large datasets are too slow; Rust provides near-C performance
+  - init_cash=1000000 as default (QUANTAXIS/QAStrategy/qactabase.py:29) — 1M CNY is a common initial capital
+    for retail-sized backtests
+  - market_type auto-detection from code regex (QUANTAXIS/QAStrategy/qactabase.py:85) — Futures codes
+    contain letters (e.g., rb2005); stocks are pure digits — no explicit parameter needed
+  acceptance_hints:
+  - Strategy executes on 1 year of daily data without memory errors
+  - Rust backtest completes 10x faster than Python equivalent with identical results
+  - Market type auto-detection correctly classifies stocks vs futures from code strings
+  - 'T+1 trading restriction enforced: same-day sells rejected for stocks'
+- id: order_management
+  name: Order Management & Execution
+  order: 5
+  responsibility: Create, track, and settle orders. Support limit/market orders, order queuing, partial
+    fills, cancellation, and commission calculation. This stage exists to manage the complete order lifecycle
+    from creation to settlement.
+  interface:
+    inputs:
+    - Order requests (price, volume, direction, offset)
+    outputs:
+    - Order status updates
+    - Trade confirmations
+    - Commission fees
+  required_methods:
+  - name: QA_Order.create
+    description: Create single order representation with lifecycle state machine
+    evidence: QUANTAXIS/QAMarket/QAOrder.py:68(QA_Order)
+  - name: QA_OrderQueue.settle
+    description: Daily order book management with settlement processing
+    evidence: QUANTAXIS/QAMarket/QAOrder.py:694(QA_OrderQueue)
+  - name: QA_Position.update
+    description: Position tracking for long/short, today/his, and frozen margins
+    evidence: QUANTAXIS/QAMarket/QAPosition.py:17(QA_Position)
+  - name: QIFI_Account.sync
+    description: Account with dynamic equity and multi-position support, compatible with DIFF protocol
+    evidence: QUANTAXIS/QIFI/QifiAccount.py:35(QIFI_Account)
+  - name: MARKET_PRESET.get_commission
+    description: Market-specific commission/margin/tick tables lookup
+    evidence: QUANTAXIS/QAMarket/market_preset.py:6(MARKET_PRESET)
+  key_behaviors:
+  - behavior: ORDER_DIRECTION encodes both action and market semantics
+    description: BUY/SELL for stocks, BUY_OPEN/SELL_CLOSE for futures — single enum covers both without
+      branching
+    evidence: QUANTAXIS/QAUtil/QAParameter.py:44(ORDER_DIRECTION)
+  - behavior: Order status state machine with 9 distinct states
+    description: 'Explicit state machine prevents invalid transitions: NEW→QUEUED→SUCCESS_ALL/SUCCESS_PART/CANCEL_ALL→SETTLED'
+    evidence: QUANTAXIS/QAUtil/QAParameter.py:124(ORDER_STATUS)
+  - behavior: T+1 stock settlement with close_available tracking
+    description: Chinese stocks cannot be sold same day; frozen volumes enforce trading restrictions
+    evidence: QUANTAXIS/QAMarket/QAPosition.py:821(close_available)
+  - behavior: SELL orders processed before BUY during settlement
+    description: Critical ordering contract ensures cash preservation — buy orders may execute with insufficient
+      funds if sell orders processed after
+    evidence: QUANTAXIS/QIFI/QifiAccount.py:455-466(settle)
+  replaceable_points:
+  - name: order_model
+    description: Order execution model determining fill price
+    options:
+    - name: LIMIT
+      traits:
+      - Price-specified
+      - Fill guarantee uncertain
+      - Common
+      fit_for:
+      - Standard backtesting
+      - Execution simulation
+      - Controlled entry/exit
+      not_fit_for:
+      - Urgent execution
+      - Market orders
+    - name: MARKET
+      traits:
+      - Immediate fill
+      - Price uncertainty
+      - Slippage
+      fit_for:
+      - Urgent execution
+      - Liquidity simulation
+      - HFT strategies
+      not_fit_for:
+      - Precise backtesting
+      - Cost-sensitive strategies
+    - name: CLOSE
+      traits:
+      - Close bar execution
+      - End-of-day
+      fit_for:
+      - Daily rebalancing
+      - End-of-day strategies
+      not_fit_for:
+      - Intraday execution
+      - Timely entry
+    - name: NEXT_OPEN
+      traits:
+      - Next bar open
+      - Realistic simulation
+      fit_for:
+      - Realistic backtesting
+      - Execution modeling
+      not_fit_for:
+      - Same-bar execution
+      - Intraday precision
+    default: LIMIT
+  - name: commission_calc
+    description: Commission calculation method for transaction costs
+    options:
+    - name: standard
+      traits:
+      - Market preset-based
+      - Stock/future differentiated
+      fit_for:
+      - Production trading
+      - Regulatory compliance
+      - Chinese markets
+      not_fit_for:
+      - Custom fee structures
+      - Discount brokers
+    - name: custom
+      traits:
+      - User-defined rates
+      - Flexible formulas
+      fit_for:
+      - Discount brokers
+      - Proprietary fee structures
+      not_fit_for:
+      - Standard compliance
+      - Regulatory reporting
+    default: standard
+  design_decisions:
+  - ORDER_DIRECTION encodes both action and market semantics (QUANTAXIS/QAUtil/QAParameter.py:44) — BUY/SELL
+    for stocks, BUY_OPEN/SELL_CLOSE for futures — single enum covers both without branching
+  - Order status machine with state transitions 100→300→200/400→500 (QUANTAXIS/QAUtil/QAParameter.py:124)
+    — Explicit state machine prevents invalid transitions (e.g., cancel before queued)
+  - Commission computed in QA_Order.calc_commission (QUANTAXIS/QAMarket/QAOrder.py:304) — Order knows
+    its market_type; delegates to MARKET_PRESET for correct formula
+  - 'T+1 stock settlement: close_available tracks locked shares (QUANTAXIS/QAMarket/QAPosition.py:821)
+    — Chinese stocks cannot be sold same day; frozen volumes enforce this'
+  - Float profit computed on every price tick (QUANTAXIS/QAMarket/QAPosition.py:287) — Mark-to-market
+    requires real-time P&L; called from on_price_change callback
+  acceptance_hints:
+  - Order lifecycle transitions correctly through each states without invalid jumps
+  - T+1 restriction prevents same-day sell of purchased stock
+  - Commission calculated matches MARKET_PRESET rates for stocks (0.025%) and futures
+  - SELL before BUY settlement order preserves cash availability
+- id: messaging_infrastructure
+  name: Real-time Messaging Infrastructure
+  order: 6
+  responsibility: Event-driven pub/sub for live strategy updates. Transport layer for distributing market
+    data and trade signals. This stage enables real-time communication between components.
+  interface:
+    inputs:
+    - Market data events
+    - Order/trade events
+    outputs:
+    - Subscribed market data
+    - Trade confirmations
+  required_methods:
+  - name: base_ps.connect
+    description: RabbitMQ connection management with graceful close using context manager protocol
+    evidence: QUANTAXIS/QAPubSub/base.py:14(base_ps)
+  - name: publisher_routing.publish
+    description: Routing-key based message producer for order/event distribution
+    evidence: QUANTAXIS/QAPubSub/producer.py:30(publisher_routing)
+  - name: subscriber.subscribe
+    description: Message consumer with callback registration for event processing
+    evidence: QUANTAXIS/QAPubSub/consumer.py:30(subscriber)
+  - name: QA_AsyncScheduler.schedule
+    description: Async task scheduler for managing scheduled strategy events
+    evidence: QUANTAXIS/QAEngine/QAAsyncSchedule.py:20(QA_AsyncScheduler)
+  - name: QA_Thread.execute
+    description: Thread-based task executor for parallel strategy operations
+    evidence: QUANTAXIS/QAEngine/QAThreadEngine.py:36(QA_Thread)
+  key_behaviors:
+  - behavior: RabbitMQ as message broker for live data distribution
+    description: Decouples data producers from consumers; enables multi-subscriber strategies with reliable
+      message delivery
+    evidence: QUANTAXIS/QAPubSub/base.py:3(pika)
+  - behavior: Context manager for RabbitMQ connections
+    description: v2.1.0 improvement ensures channel→connection close order prevents resource leaks
+    evidence: QUANTAXIS/QAPubSub/base.py:83(__exit__)
+  - behavior: Routing key exchange for order routing
+    description: strategy_id as routing key allows per-strategy order filtering and multi-strategy support
+    evidence: QUANTAXIS/QAPubSub/producer.py:30(publisher_routing)
+  replaceable_points:
+  - name: broker
+    description: Message broker for pub/sub communication
+    options:
+    - name: rabbitmq
+      traits:
+      - AMQP protocol
+      - Reliable delivery
+      - Routing keys
+      fit_for:
+      - Production systems
+      - Multi-subscriber
+      - Reliable messaging
+      not_fit_for:
+      - Ultra-low latency
+      - Simple deployments
+    - name: redis
+      traits:
+      - In-memory
+      - Pub/Sub native
+      - Low latency
+      fit_for:
+      - Low-latency requirements
+      - Simple pub/sub
+      - Caching integration
+      not_fit_for:
+      - Reliable messaging
+      - Multi-subscriber
+      - Message persistence
+    default: rabbitmq
+  - name: exchange_type
+    description: RabbitMQ exchange type for message routing
+    options:
+    - name: fanout
+      traits:
+      - Broadcast to all
+      - No routing key
+      fit_for:
+      - Market data distribution
+      - All-strategy notifications
+      not_fit_for:
+      - Selective routing
+      - Multi-strategy filtering
+    - name: direct
+      traits:
+      - Exact match routing
+      - Single consumer
+      fit_for:
+      - Specific strategy routing
+      - Order management
+      not_fit_for:
+      - Broadcast scenarios
+      - Multi-subscriber
+    - name: topic
+      traits:
+      - Pattern matching
+      - Flexible routing
+      fit_for:
+      - Complex routing
+      - Multi-strategy with filters
+      not_fit_for:
+      - Simple scenarios
+      - Performance-critical
+    default: fanout
+  design_decisions:
+  - RabbitMQ as message broker for live data distribution (QUANTAXIS/QAPubSub/base.py:3) — Decouples data
+    producers from consumers; enables multi-subscriber strategies
+  - 'Context manager (__enter__/__exit__) for RabbitMQ connections (QUANTAXIS/QAPubSub/base.py:83) — v2.1.0
+    improvement: ensures channel→connection close order prevents resource leaks'
+  - Routing key exchange for order routing (QUANTAXIS/QAPubSub/producer.py:30) — strategy_id as routing
+    key allows per-strategy order filtering
+  acceptance_hints:
+  - Publisher successfully delivers messages to subscriber within 100ms
+  - Context manager properly closes channel before connection
+  - Routing key filtering correctly routes messages to subscribed strategies
+  - Multiple subscribers receive same market data without data loss
+- id: data_bridging
+  name: Cross-Language Data Bridge
+  order: 7
+  responsibility: Zero-copy data exchange between Python and Rust/C++. Enables Arrow/Pandas/Polars interop
+    and shared memory for high-throughput data transfer. This stage enables Rust acceleration without
+    sacrificing Python ecosystem compatibility.
+  interface:
+    inputs:
+    - Pandas DataFrames or Polars DataFrames
+    outputs:
+    - Converted Arrow/Polars/Pandas with shared memory support
+  required_methods:
+  - name: SharedMemoryWriter.write
+    description: Shared memory writer for IPC with zero-copy data transfer
+    evidence: QUANTAXIS/QADataBridge/shared_memory.py:25(SharedMemoryWriter)
+  - name: SharedMemoryReader.read
+    description: Shared memory reader for efficient cross-process data retrieval
+    evidence: QUANTAXIS/QADataBridge/shared_memory.py:60(SharedMemoryReader)
+  - name: convert_pandas_to_polars.convert
+    description: Zero-copy pandas→polars conversion using Arrow IPC for efficient data transfer
+    evidence: QUANTAXIS/QADataBridge/__init__.py:100(convert_pandas_to_polars)
+  key_behaviors:
+  - behavior: Optional qadataswap import with graceful fallback
+    description: Rust library may not be installed; Python fallback ensures core functionality works without
+      Rust dependency
+    evidence: QUANTAXIS/QADataBridge/__init__.py:42(try:import qadataswap)
+  - behavior: Arrow as zero-copy interchange format
+    description: Arrow IPC shares memory directly between processes; avoids serialization overhead and
+      provides 7x speedup
+    evidence: QUANTAXIS/QADataBridge/__init__.py:46(has_arrow_support)
+  replaceable_points:
+  - name: data_format
+    description: Data interchange format for cross-language communication
+    options:
+    - name: pandas
+      traits:
+      - Python-native
+      - Ecosystem integration
+      - Familiar API
+      fit_for:
+      - Python-only workflows
+      - Standard analysis
+      - Visualization
+      not_fit_for:
+      - Rust interop
+      - High performance
+      - Large datasets
+    - name: polars
+      traits:
+      - Rust-native
+      - Fast
+      - Memory-efficient
+      fit_for:
+      - High-performance analysis
+      - Rust integration
+      - Large datasets
+      not_fit_for:
+      - Python ecosystem
+      - Simple scripts
+    - name: arrow
+      traits:
+      - Zero-copy
+      - Columnar
+      - Cross-language
+      fit_for:
+      - Rust/Python interop
+      - IPC
+      - High throughput
+      not_fit_for:
+      - Single-language workflows
+      - Simple operations
+    - name: auto
+      traits:
+      - Runtime detection
+      - Optimal selection
+      - Graceful fallback
+      fit_for:
+      - Production systems
+      - Compatibility
+      - Optimal performance
+      not_fit_for:
+      - Predictable performance
+      - Controlled environments
+    default: auto
+  design_decisions:
+  - Optional qadataswap import with graceful fallback (QUANTAXIS/QADataBridge/__init__.py:42) — Rust library
+    may not be installed; Python fallback ensures core functionality works
+  - Arrow as zero-copy interchange format (QUANTAXIS/QADataBridge/__init__.py:46) — Arrow IPC shares memory
+    directly between processes; avoids serialization overhead
+  acceptance_hints:
+  - Pandas to Polars conversion completes with identical data values
+  - Shared memory transfer preserves data without serialization errors
+  - Graceful fallback to Python implementation when Rust unavailable
+  - 1000x1000 DataFrame conversion completes within 500ms
+data_flow:
+- from_stage: data_collection
+  to_stage: data_processing
+  data: Raw OHLCV DataFrames from MongoDB collections for processing and normalization
+- from_stage: data_processing
+  to_stage: factor_computation
+  data: Resampled DataFrames with MultiIndex (datetime, code) for factor calculation
+- from_stage: data_processing
+  to_stage: strategy_execution
+  data: Historical bars as DataFrames or live ticks via PubSub for strategy signals
+- from_stage: factor_computation
+  to_stage: strategy_execution
+  data: Factor values from ClickHouse for signal generation and portfolio construction
+- from_stage: strategy_execution
+  to_stage: order_management
+  data: Order requests containing price, volume, direction, and offset specifications
+- from_stage: order_management
+  to_stage: strategy_execution
+  data: Trade fills, position updates, and account equity for strategy state management
+- from_stage: messaging_infrastructure
+  to_stage: strategy_execution
+  data: Live bar/tick events via RabbitMQ for real-time strategy execution
+- from_stage: data_bridging
+  to_stage: strategy_execution
+  data: Arrow-format market data from Rust backtester for high-performance strategy runs
+global_contracts:
+- contract: Every DataStruct objects use MultiIndex (datetime, code) as primary key
+  evidence: QUANTAXIS/QAData/base_datastruct.py:82(self.data=DataFrame.drop_duplicates().sort_index())
+- contract: 'Order direction semantics: BUY=1, SELL=-1 for stocks; BUY_OPEN=2, SELL_CLOSE=-3 for futures'
+  evidence: QUANTAXIS/QAUtil/QAParameter.py:44(ORDER_DIRECTION)
+- contract: 'Order lifecycle state machine: NEW→QUEUED→SUCCESS_ALL/SUCCESS_PART/CANCEL_ALL→SETTLED'
+  evidence: QUANTAXIS/QAUtil/QAParameter.py:124(ORDER_STATUS)
+- contract: 'Market types encoded as integers: STOCK=0, FUTURE=2, CRYPTO=5'
+  evidence: QUANTAXIS/QAUtil/QAParameter.py:219(MARKET_TYPE)
+- contract: 'Frequency strings: ''1min'', ''5min'', ''15min'', ''day'', ''week'' for bar aggregation'
+  evidence: QUANTAXIS/QAUtil/QAParameter.py:350(FREQUENCE)
+- contract: Every PubSub connections use RabbitMQ with context manager protocol ensuring channel→connection
+    close order
+  evidence: QUANTAXIS/QAPubSub/base.py:83(__exit__)
+- contract: 'Factor storage schema: date, code, factor Float32 in ClickHouse ReplacingMergeTree with deduplication
+    on merge'
+  evidence: QUANTAXIS/QAFactor/feature.py:52(CREATE TABLE)
+- contract: Strategy init_cash defaults to 1000000 (1M CNY) for retail-sized backtests
+  evidence: QUANTAXIS/QAStrategy/qactabase.py:29(init_cash=1000000)
+- contract: Default fq method is 'bfq' (不复权) affecting each price calculations system-wide
+  evidence: QUANTAXIS/QAData/base_datastruct.py:92(self.if_fq=if_fq)
+- contract: SELL orders MUST be processed before BUY orders during settlement to preserve cash
+  evidence: QUANTAXIS/QIFI/QifiAccount.py:455-466(settle)
+- contract: FIFO position matching rule hardcoded in QA_Position for cost basis and profit calculations
+  evidence: QUANTAXIS/QAMarket/QAPosition.py:143(rule='FIFO')
+- contract: QIFI protocol bridges Python Account objects with external systems for DIFF-compatible integration
+  evidence: QUANTAXIS/QIFI/QifiAccount.py:54(source_id)
+business_decisions:
+- id: BD-001
+  type: B/DK
+  content: MongoDB as primary storage for flexibility and JSON-like documents
+  rationale: MongoDB was chosen over relational alternatives because QUANTAXIS predates ClickHouse adoption;
+    its schema-on-read capability handles schema evolution gracefully as Chinese market data structures
+    change over time without requiring costly migrations.
+  evidence: QUANTAXIS/QASU/main.py:1(DATABASE)
+  stage: data_collection
+  alternative_considered: PostgreSQL with JSONB columns was considered but would require upfront schema
+    design
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DATABASE in QUANTAXIS/QASU/main.py'
+- id: BD-002
+  type: B
+  content: ClickHouse ReplacingMergeTree engine for factor storage with deduplication on merge
+  rationale: Factor data is append-only time-series where recalculations overwrite prior values; ReplacingMergeTree
+    engine automatically deduplicates records with identical primary keys during background merges, eliminating
+    the need for explicit DELETE operations and supporting high-throughput daily batch updates.
+  evidence: QUANTAXIS/QAFactor/feature.py:14(CREATE TABLE)
+  stage: data_collection
+  alternative_considered: Standard MergeTree would require scheduled DELETE queries before re-insertion
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: CREATE TABLE in QUANTAXIS/QAFactor/feature.py'
+- id: BD-003
+  type: BA/DK
+  content: Multi-engine fetch abstraction (tdx/tushare/huobi) for data source fallback
+  rationale: Different data sources provide varying coverage across Chinese markets with different latency,
+    cost, and availability profiles; engine abstraction allows transparent fallback when primary source
+    fails or lacks coverage for specific instruments, ensuring continuous data supply.
+  evidence: QUANTAXIS/QAFetch/Fetcher.py:316(QA_quotation)
+  stage: data_collection
+  alternative_considered: Hard-coded single source would cause gaps when source is unavailable
+- id: BD-004
+  type: M/DK
+  content: Parallel download via ProcessPoolExecutor for I/O-bound stock downloads
+  rationale: Stock market data downloads are primarily I/O-bound with network latency dominating execution
+    time; using ProcessPoolExecutor enables concurrent downloads across multiple processes, achieving
+    approximately 10x speedup compared to sequential fetching for large universe backfills.
+  evidence: QUANTAXIS/QASU/save_tdx_parallelism.py:506(__saving_work)
+  stage: data_collection
+  alternative_considered: Sequential downloads; threading limited by GIL for CPU-bound tasks
+- id: BD-005
+  type: B/RC
+  content: MultiIndex (datetime, code) as canonical data identifier for efficient multi-security queries
+  rationale: Financial time-series data naturally requires dual indexing by timestamp and security code;
+    MultiIndex enables efficient filtering by either dimension and aligns with pandas groupby semantics
+    for cross-sectional analysis while maintaining proper temporal ordering within each security.
+  evidence: QUANTAXIS/QAData/base_datastruct.py:50(_quotation_base)
+  stage: data_processing
+  alternative_considered: Single-level index would require separate data structures per security
+- id: BD-006
+  type: B/BA
+  content: Forward adjustment (qfq) as default price adjustment when if_fq='bfq'
+  rationale: Backward adjustment preserves original price levels which is important for historical accuracy,
+    but forward adjustment (qfq) is the industry standard preferred by most Chinese quantitative practitioners
+    as it normalizes each historical prices to current levels for easier ratio calculations and strategy
+    development.
+  evidence: QUANTAXIS/QAData/base_datastruct.py:92(self.if_fq=if_fq)
+  stage: data_processing
+  alternative_considered: No adjustment (none) would require manual handling in every strategy
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: self.if_fq=if_fq in QUANTAXIS/QAData/base_datastruct.py'
+- id: BD-007
+  type: M/BA
+  content: DataFrame.drop_duplicates() on DataStruct initialization to prevent duplicate bars
+  rationale: Duplicate bars in financial time-series data can cause incorrect indicator calculations such
+    as double-counting volume or generating false technical patterns; calling drop_duplicates during initialization
+    ensures data integrity from the point of entry and prevents propagation of corrupted state to indicators.
+  evidence: QUANTAXIS/QAData/base_datastruct.py:62(__init__)
+  stage: data_processing
+  alternative_considered: Lazy deduplication would allow corrupted state to persist longer in pipeline
+- id: BD-008
+  type: BA/DK
+  content: Resample methods on DataStruct class rather than raw DataFrame for context awareness
+  rationale: Resampling on raw DataFrame loses domain-specific metadata such as adjustment flags and dtype
+    information; implementing resample as a DataStruct method preserves fq (forward adjustment) settings
+    and ensures consistent output type, maintaining data lineage and preventing subtle bugs from dtype
+    coercion.
+  evidence: QUANTAXIS/QAData/QADataStruct.py:1717(resample)
+  stage: data_processing
+  alternative_considered: Standalone resample functions would require passing metadata separately
+- id: BD-009
+  type: BA
+  content: Factor calc() method returns DataFrame with standardized date/code/factor columns
+  rationale: Standardized output schema (date, code, factor columns) enables uniform batch processing
+    pipelines and simplifies ClickHouse insertion by matching table schema; this contract ensures any
+    factor implementation is compatible with the storage and analysis downstream without per-factor adapter
+    code.
+  evidence: QUANTAXIS/QAFactor/feature.py:104(calc)
+  stage: factor_computation
+  alternative_considered: Custom return types per factor would require factor-specific handling downstream
+- id: BD-010
+  type: BA
+  content: Factor base class with register/insert lifecycle for metadata tracking and versioning
+  rationale: Factor discovery and reproducibility require tracking which factors exist and their computation
+    parameters; the register method maintains a registry enabling lazy loading of factors while the insert
+    lifecycle handles persistence, supporting factor lineage tracking and audit trails for compliance.
+  evidence: QUANTAXIS/QAFactor/feature.py:62(register)
+  stage: factor_computation
+  alternative_considered: Manual factor registration would rely on developer discipline rather than enforced
+    protocol
+- id: BD-011
+  type: B/DK
+  content: Separate CTA strategy base vs Stock strategy base for market-specific trading rules
+  rationale: Stock T+1 trading requires position tracking that locks shares until next trading day while
+    futures allow same-day position reversal; separating base classes avoids conditional branching for
+    incompatible rules and prevents bugs where stock position logic incorrectly applies to futures or
+    vice versa.
+  evidence: QUANTAXIS/QAStrategy/qamultibase.py:25(QAStrategyStockBase)
+  stage: strategy_execution
+  alternative_considered: Unified base with market_type flags would create complex if-else chains
+- id: BD-012
+  type: BA
+  content: Rust QARS engine for 10-20x backtest speedup via cross-language bridge
+  rationale: Python backtests on large historical datasets with millions of ticks are prohibitively slow
+    for iterative strategy development; the Rust QARS engine provides near-C performance for simulation
+    while Python handles strategy logic, achieving 10-20x speedup that makes overnight backtests complete
+    in minutes.
+  evidence: QUANTAXIS/QARSBridge/qars_backtest.py:135(__init__)
+  stage: strategy_execution
+  alternative_considered: Pure Python backtest would require sampling large datasets, reducing accuracy
+- id: BD-013
+  type: B/BA
+  content: init_cash=1000000 CNY as default initial capital for retail-sized backtests
+  rationale: One million CNY represents a common initial capital level for individual retail quant traders
+    in China; using this as default provides realistic slippage and commission estimates for the primary
+    target user segment without requiring explicit configuration for standard use cases.
+  evidence: QUANTAXIS/QAStrategy/qactabase.py:29(init_cash=1000000)
+  stage: strategy_execution
+  alternative_considered: Smaller defaults would understate real-world slippage for larger accounts
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: init_cash=1000000 in QUANTAXIS/QAStrategy/qactabase.py'
+- id: BD-014
+  type: B/DK
+  content: market_type auto-detection from security code regex patterns
+  rationale: Futures contract codes contain alphanumeric characters (e.g., rb2005 for rebar) while stock
+    codes are purely numeric (e.g., 600000); automatic detection via regex eliminates the need for users
+    to explicitly specify market type and prevents errors from mismatched market configuration.
+  evidence: QUANTAXIS/QAStrategy/qactabase.py:85(re.search)
+  stage: strategy_execution
+  alternative_considered: Manual market_type parameter would require user knowledge and be error-prone
+  _evidence_issues:
+  - 'FN_NOT_FOUND: re.search in QUANTAXIS/QAStrategy/qactabase.py'
+- id: BD-015
+  type: B/BA
+  content: ORDER_DIRECTION enum encodes both action and market semantics for unified order handling
+  rationale: Stock trading uses BUY/SELL semantics while futures require BUY_OPEN/SELL_CLOSE distinction;
+    a single enum with market-aware values eliminates branching logic and ensures order routing correctly
+    interprets intent without requiring separate order types for each market.
+  evidence: QUANTAXIS/QAUtil/QAParameter.py:31(ORDER_DIRECTION)
+  stage: order_management
+  alternative_considered: Separate order types per market would double the enum size and routing complexity
+- id: BD-016
+  type: B
+  content: 'Order status state machine with explicit transitions: 100→300→200/400→500'
+  rationale: Order lifecycle involves queued (100), submitted (300), filled (200), partially-filled (400),
+    and rejected/cancelled (500) states; explicit state machine prevents invalid transitions such as cancelling
+    an order before it enters the queue or filling an already-cancelled order, ensuring data consistency.
+  evidence: QUANTAXIS/QAUtil/QAParameter.py:124(ORDER_STATUS)
+  stage: order_management
+  alternative_considered: Free-form status updates could allow impossible state combinations
+- id: BD-017
+  type: B/DK
+  content: Commission computed within QA_Order.calc_commission using market_type delegation
+  rationale: Different markets have different commission structures (stocks vs futures vs options); computing
+    commission inside the Order object delegates to MARKET_PRESET for the correct formula based on market_type,
+    ensuring accurate cost calculation without coupling order creation to market-specific calculator objects.
+  evidence: QUANTAXIS/QAMarket/QAOrder.py:304(calc_commission)
+  stage: order_management
+  alternative_considered: External commission calculators would require passing market context separately
+- id: BD-018
+  type: B/DK
+  content: 'T+1 stock settlement: close_available tracks locked shares preventing same-day selling'
+  rationale: Chinese stock market regulations prohibit selling shares acquired on the same trading day;
+    close_available subtracts frozen volumes from total holdings to enforce this restriction, preventing
+    orders that would violate settlement rules and protecting against regulatory penalties.
+  evidence: QUANTAXIS/QAMarket/QAPosition.py:821(close_available)
+  stage: order_management
+  alternative_considered: Ignoring T+1 would cause rejected orders and potential compliance violations
+- id: BD-019
+  type: M/DK
+  content: Float profit computed on every price tick via on_price_change callback
+  rationale: Mark-to-market accounting requires real-time P&L valuation; computing float_profit on each
+    price update enables live position tracking with current unrealized gains/losses, supporting real-time
+    dashboard displays and risk monitoring without requiring explicit valuation calls.
+  evidence: QUANTAXIS/QAMarket/QAPosition.py:287(float_profit_long)
+  stage: order_management
+  alternative_considered: Batch valuation would introduce lag in P&L reporting
+- id: BD-020
+  type: B/DK
+  content: RabbitMQ as message broker for decoupled live data distribution
+  rationale: Decoupling data producers from consumers via message broker enables multiple strategy instances
+    to subscribe to live market data without direct connection management; RabbitMQ's pub/sub model supports
+    multi-subscriber patterns where different strategies receive identical data simultaneously.
+  evidence: QUANTAXIS/QAPubSub/base.py:3(pika)
+  stage: messaging_infrastructure
+  alternative_considered: Direct socket connections would require managing per-instance connections
+  _evidence_issues:
+  - 'FN_NOT_FOUND: pika in QUANTAXIS/QAPubSub/base.py'
+- id: BD-021
+  type: M
+  content: Context manager (__enter__/__exit__) for RabbitMQ connections ensuring proper cleanup
+  rationale: RabbitMQ connection leaks cause resource exhaustion and broker connection errors; context
+    manager ensures channel closes before connection closes in reverse order of opening, preventing resource
+    leaks that accumulated in v2.1.0 and earlier versions.
+  evidence: QUANTAXIS/QAPubSub/base.py:83(__exit__)
+  stage: messaging_infrastructure
+  alternative_considered: Manual close calls would require developer discipline to always execute cleanup
+- id: BD-022
+  type: BA
+  content: Routing key exchange pattern for per-strategy order filtering
+  rationale: Using strategy_id as the RabbitMQ routing key enables per-strategy message filtering at the
+    broker level; exchanges route orders to appropriate strategy queues without requiring in-process filtering,
+    supporting multi-strategy deployments where different instances process different subsets of orders.
+  evidence: QUANTAXIS/QAPubSub/producer.py:64(publisher_routing)
+  stage: messaging_infrastructure
+  alternative_considered: Fan-out exchange would duplicate each orders to each consumers
+  vague_rationale: true
+- id: BD-023
+  type: BA
+  content: Optional qadataswap import with graceful fallback to pure Python implementation
+  rationale: The optional Rust library qadataswap may not be installed in each environments; try/except
+    import pattern ensures core functionality works without the optional acceleration while falling back
+    to Python implementation, enabling deployment in environments where Rust toolchain is unavailable.
+  evidence: QUANTAXIS/QADataBridge/__init__.py:65(has_dataswap_support)
+  stage: global
+  alternative_considered: Hard dependency would prevent installation in environments without Rust
+- id: BD-024
+  type: B
+  content: Arrow IPC as zero-copy interchange format between Python and Rust processes
+  rationale: Arrow IPC enables direct memory sharing between processes without serialization/deserialization
+    overhead; avoiding pickle or JSON encoding for large DataFrames significantly reduces cross-process
+    communication latency and CPU usage during high-frequency data transfers between Python strategy logic
+    and Rust backtest engine.
+  evidence: QUANTAXIS/QADataBridge/__init__.py:46(has_arrow_support)
+  stage: global
+  alternative_considered: Pickle serialization would add 10-100ms overhead per large DataFrame transfer
+  _evidence_issues:
+  - 'FN_NOT_FOUND: has_arrow_support in QUANTAXIS/QADataBridge/__init__.py'
+- id: BD-025
+  type: B
+  content: Butterworth filter order = 3, cutoff = 0.05
+  rationale: 'Butterworth filter parameters: order 3 for rolloff, cutoff 0.05 (5% of Nyquist). The boundary
+    is higher order = sharper cutoff but more oscillation; lower cutoff = more smoothing but lag. Affects
+    signal denoising quality.'
+  evidence: QUANTAXIS/QAAnalysis/QAAnalysis_signal.py:120(module)
+  stage: data_processing
+  alternative_considered: 2nd order was too gradual; 5th order had excessive ringing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in QUANTAXIS/QAAnalysis/QAAnalysis_signal.py'
+- id: BD-026
+  type: B/DK
+  content: Exponential Moving Average (EMA) smoothing parameter
+  rationale: EMA smoothing parameter controls price sensitivity balance. Lower values react faster to
+    price changes but increase noise; higher values smooth volatility but lag market turns. This boundary
+    determines trade signal responsiveness vs. false signal frequency.
+  evidence: QUANTAXIS/QAIndicator/base.py:40-41(EMA)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: Simple Moving Average (less responsive), Weighted MA (more complex rebalancing)
+- id: BD-027
+  type: B/DK
+  content: MACD indicator standard parameters (12,26,9)
+  rationale: MACD parameters define fast/slow EMA periods and signal line smoothing. The 12/26/9 standard
+    reflects historical market cycles. Changing these shifts the boundary between trend detection sensitivity
+    and signal noise, directly impacting crossover timing.
+  evidence: QUANTAXIS/QAIndicator/indicators.py:92-102(QA_indicator_MACD)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: Alternative period combinations (8,17,9) for shorter cycles, (19,39,9) for longer
+    horizons
+- id: BD-028
+  type: B/BA
+  content: William's SMA iterative formula
+  rationale: Simple Moving Average calculation method determines baseline trend direction. The iterative
+    implementation boundary balances computational efficiency against cumulative floating-point error
+    over extended periods.
+  evidence: QUANTAXIS/QAIndicator/base.py:50-74(SMA)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: Cumulative sum method (slower for sliding windows), numpy-based vectorization
+- id: BD-029
+  type: B
+  content: Bollinger Bands standard parameters (20-period, 2 standard deviations)
+  rationale: Bollinger Bands period and deviation multiplier set volatility-adjusted support/resistance
+    boundaries. Period affects lag vs. responsiveness; deviation multiplier determines channel width capturing
+    statistical price distribution (95% for 2σ).
+  evidence: QUANTAXIS/QAIndicator/indicators.py:467-475(QA_indicator_BOLL)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: 1.5σ for tighter bands (more signals), 3σ for wider bands (fewer false breakouts)
+- id: BD-030
+  type: B/BA
+  content: RSI overbought/oversold thresholds (70/30)
+  rationale: RSI thresholds define extreme momentum boundaries triggering reversal signals. Standard 70/30
+    splits assumes symmetric distribution; aggressive traders use 80/20 while conservative use 60/40.
+    This boundary directly controls mean-reversion signal frequency.
+  evidence: QUANTAXIS/QAIndicator/indicators.py:292-301(QA_indicator_RSI)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: Dynamic thresholds based on historical percentile, 80/20 for high-volatility
+    assets
+- id: BD-031
+  type: B/RC
+  content: KDJ stochastic oscillator parameters (9,3,3)
+  rationale: KDJ parameters control %K smoothing (RSV period), %D secondary smoothing, and J-line amplification.
+    The 9,3,3 standard balances noise filtering with responsiveness; J-line multiplier affects boundary
+    crossing sensitivity.
+  evidence: QUANTAXIS/QAIndicator/indicators.py:213-223(QA_indicator_KDJ)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: Longer periods (14,3,3) for reduced sensitivity, shorter (5,2,2) for faster
+    signals
+- id: BD-032
+  type: B/BA
+  content: CCI commodity channel index period (typical 20)
+  rationale: CCI period determines typical price averaging window against mean. Shorter periods increase
+    sensitivity to cyclical turns; longer periods smooth but delay signals. This boundary aligns with
+    estimated commodity cycle lengths.
+  evidence: QUANTAXIS/QAIndicator/indicators.py:247-260(QA_indicator_CCI)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: 14-period (faster), 20-period (standard), 50-period (smoother for long-term)
+- id: BD-033
+  type: B/BA
+  content: DMI directional movement trend parameters (ADX smoothing period)
+  rationale: DMI/ADX parameters control trend strength measurement. ADX smoothing period (typically 14)
+    filters directional movement noise. Threshold boundaries (±25) determine trend vs. range-bound market
+    classification for strategy routing.
+  evidence: QUANTAXIS/QAIndicator/indicators.py:105-128(QA_indicator_DMI)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: ADX 7 for faster trend detection, ADX 21 for stronger trend confirmation
+- id: BD-034
+  type: B/DK
+  content: ATR SuperTrend stop-loss factor multiplier
+  rationale: SuperTrend stop-loss factor determines ATR multiplier for dynamic trailing stops. Higher
+    multipliers widen stops (reduce premature exits) but increase drawdown; lower multipliers tighten
+    protection but cause more stop-outs. Critical risk management boundary.
+  evidence: QUANTAXIS/QAIndicator/talib_numpy.py:292-342(ATR_SuperTrend_cross)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: Factor 2.0 (aggressive), Factor 3.0 (conservative for volatile assets)
+- id: BD-035
+  type: B
+  content: Hull Moving Average adaptive smoothing
+  rationale: HMA smoothing period determines adaptive responsiveness using weighted moving averages. Balances
+    low-lag trend indication against noise reduction. Period selection defines boundary between trend
+    clarity and signal stability.
+  evidence: QUANTAXIS/QAIndicator/talib_numpy.py:181-190(TA_HMA)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: Period 9 for intraday, Period 21 for swing trading, Period 50 for positional
+- id: BD-036
+  type: B/BA
+  content: Butterworth lowpass filter for peak detection
+  rationale: Butterworth filter cutoff frequency determines noise vs. signal separation boundary. Higher
+    cutoff preserves more price variation (more peaks detected); lower cutoff smooths aggressively (fewer
+    but stronger peaks). Critical for pattern recognition accuracy.
+  evidence: QUANTAXIS/QAAnalysis/QAAnalysis_signal.py:89(find_peak_vextors)
+  stage: QUANTAXIS.QAAnalysis
+  alternative_considered: Chebyshev filter (sharper cutoff but ripple), Kalman filter (adaptive)
+- id: BD-037
+  type: B/BA
+  content: ADX trend strength threshold boundary (25)
+  rationale: ADX threshold determines trend vs. range market classification. Values below 25 indicate
+    weak/no trend favoring mean-reversion; above 25 confirms trending conditions for trend-following.
+    This boundary enables regime-based strategy switching.
+  evidence: QUANTAXIS/QAIndicator/talib_numpy.py:193-243(ADX_MA)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: Threshold 20 (more trend signals), Threshold 30 (stronger trend confirmation
+    only)
+- id: BD-038
+  type: B
+  content: Hurst exponent R/S analysis bin count
+  rationale: R/S analysis bin count determines statistical power vs. estimation variance tradeoff. More
+    bins increase sample size but reduce observations per bin; fewer bins improve bin statistics but reduce
+    power. Critical for long-term memory/mean-reversion classification.
+  evidence: QUANTAXIS/QAIndicator/hurst.py:75-146(calculateHurst)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: Fixed bin count (simpler), logarithmically spaced bins (better for scale invariance)
+- id: BD-039
+  type: B
+  content: Factor IC correlation ranking method
+  rationale: IC calculation method (Pearson vs Spearman) determines factor return correlation measurement.
+    Pearson captures linear relationships; Spearman captures monotonic/rank-based relationships robust
+    to outliers. Selection affects factor quality assessment accuracy.
+  evidence: QUANTAXIS/QAFactor/featureAnalysis.py:92(factor_and_forward_returns)
+  stage: QUANTAXIS.QAFactor
+  alternative_considered: Mutual information for non-linear dependencies, Kendall tau for robustness
+- id: BD-040
+  type: B
+  content: Information Coefficient stability ratio (IC/IC_std)
+  rationale: IR ratio divides mean IC by standard deviation, measuring factor stability over time. Higher
+    IR indicates consistent predictive power; IR<0.5 suggests unreliable factors. This boundary determines
+    factor retention vs. replacement decisions.
+  evidence: QUANTAXIS/QAFactor/featureAnalysis.py:29(QAFeatureAnalysis)
+  stage: QUANTAXIS.QAFactor
+  alternative_considered: Rolling IR for dynamic tracking, t-statistic based threshold
+- id: BD-041
+  type: B
+  content: Factor quantile binning for returns (number of portfolios)
+  rationale: Quantile bin count determines granularity of factor return distribution analysis. More bins
+    reveal finer return spread but reduce statistical power per bin; fewer bins improve power but lose
+    resolution. Affects long-short portfolio construction quality.
+  evidence: QUANTAXIS/QAFactor/featureAnalysis.py:92(factor_and_forward_returns)
+  stage: QUANTAXIS.QAFactor
+  alternative_considered: 5 quintiles (standard), 10 deciles (finer), equal-weight vs. value-weight
+- id: BD-042
+  type: B
+  content: Winsorization outlier clipping bounds (percentile)
+  rationale: Winsorization bounds truncate extreme factor values to reduce tail risk from data errors.
+    1%/99% clips extreme 1% of observations; tighter bounds (5%/95%) provide stronger outlier protection.
+    Affects factor robustness vs. information loss tradeoff.
+  evidence: QUANTAXIS/QAFactor/featureAnalysis.py:185-192(winsorize)
+  stage: QUANTAXIS.QAFactor
+  alternative_considered: Standard deviation clipping (3σ), IQR-based clipping, adaptive winsorization
+- id: BD-043
+  type: B/DK
+  content: Weighted Least Squares factor neutralization
+  rationale: WLS neutralization weights control exposure removal to market/sector factors. Inverse-variance
+    weighting downweights noisy observations. Affects residual factor return purity vs. estimation stability.
+  evidence: QUANTAXIS/QAFactor/featureAnalysis.py:194-200(neut)
+  stage: QUANTAXIS.QAFactor
+  alternative_considered: OLS neutralization (simpler), double-blind neutralization (remove style factors
+    too)
+- id: BD-044
+  type: B
+  content: Forward return calculation shift offset
+  rationale: Forward return shift offset determines look-ahead avoidance and return horizon. 1-day forward
+    measures short-term alpha; 5-day measures weekly momentum. Must exceed transaction lag to prevent
+    lookahead bias while capturing actionable signal.
+  evidence: QUANTAXIS/QAFactor/featureAnalysis.py:65-73(make_ret)
+  stage: QUANTAXIS.QAFactor
+  alternative_considered: Multiple horizon returns (1,5,20 days) for multi-factor models, risk-adjusted
+    returns
+- id: BD-045
+  type: B/BA
+  content: Time series momentum risk-free rate adjustment
+  rationale: Risk-free rate adjustment annualizes excess returns for risk-adjusted momentum calculation.
+    Selection affects momentum ranking and strategy Sharpe ratio. China market typically uses SHIBOR or
+    1-year deposit rate as benchmark.
+  evidence: QUANTAXIS/QAAnalysis/QAAnalysis_signal.py:57-62(time_series_momemtum)
+  stage: QUANTAXIS.QAAnalysis
+  alternative_considered: Zero rate (simpler), LIBOR/SHIBOR spot rate, bond yield curve
+- id: BD-046
+  type: B/BA
+  content: Peak detection threshold normalization method
+  rationale: Peak threshold normalization determines local extremum detection sensitivity. Relative threshold
+    catches smaller peaks; absolute threshold requires larger price moves. This boundary affects pattern
+    recognition granularity.
+  evidence: QUANTAXIS/QAAnalysis/QAAnalysis_signal.py:83-84,143-144(find_peak_vextors_eagerly,find_peak_vextors)
+  stage: QUANTAXIS.QAAnalysis
+  alternative_considered: Percentage of recent high/low, standard deviation bands, percentile-based
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: find_peak_vextors_eagerly,find_peak_vextors in QUANTAXIS/QAAnalysis/QAAnalysis_signal.py'
+- id: BD-047
+  type: B/BA
+  content: Cross signal cumulative integral with reset
+  rationale: Timeline integral reset conditions determine accumulated signal boundary. Reset on opposite
+    signal vs. threshold-based reset affects momentum confirmation vs. early reversal detection. Critical
+    for timing precision.
+  evidence: QUANTAXIS/QAAnalysis/QAAnalysis_signal.py:180-204(Timeline_Integral)
+  stage: QUANTAXIS.QAAnalysis
+  alternative_considered: Time-based reset (daily/weekly), threshold-based decay reset
+- id: BD-048
+  type: B
+  content: Longest increasing subsequence binary search parameters
+  rationale: LIS algorithm parameters determine subsequence detection for price pattern matching. Patience
+    sorting boundary affects computational efficiency vs. pattern sensitivity. Used for identifying sustained
+    trend sequences.
+  evidence: QUANTAXIS/QAAnalysis/QAAnalysis_signal.py:262-311(LIS)
+  stage: QUANTAXIS.QAAnalysis
+  alternative_considered: Full dynamic programming (O(n²) but exact), sliding window LIS
+- id: BD-049
+  type: B/BA
+  content: Stock commission minimum fee floor (CNY)
+  rationale: Commission minimum floor sets absolute cost floor per trade. Below this threshold, fixed
+    costs dominate returns for small orders. This boundary determines minimum viable position size for
+    profitability and affects order routing decisions.
+  evidence: QUANTAXIS/QAMarket/QAOrder.py:304-325(calc_commission)
+  stage: QUANTAXIS.QAMarket
+  alternative_considered: Market-specific floors (Shanghai vs. Shenzhen), tiered minimums by volume
+- id: BD-050
+  type: B/BA
+  content: Annualized Sharpe ratio 365-day year convention
+  rationale: Sharpe ratio annualization uses 365 trading days for Chinese A-shares (250 actual trading
+    days). This boundary affects risk-adjusted performance comparison across different return horizons
+    and trading frequencies.
+  evidence: QUANTAXIS/QIFI/QifiManager.py:196(get_sharpe)
+  stage: QUANTAXIS.QIFI
+  alternative_considered: 252 days (US markets), actual trading days calibration, risk-free rate interpolation
+- id: BD-051
+  type: B/BA
+  content: Average True Range volatility period (14-day default)
+  rationale: ATR period determines volatility measurement window. 14-day standard aligns with half trading
+    month; shorter periods capture faster volatility spikes while longer periods smooth but lag. Affects
+    position sizing and stop-loss calibration.
+  evidence: QUANTAXIS/QAIndicator/talib_indicators.py:78-80(ATR)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: 7-day (short-term volatility), 20-day (monthly), 50-day (quarterly)
+- id: BD-052
+  type: B/BA
+  content: ADX average directional movement period (14-day default)
+  rationale: ADX period determines trend strength measurement averaging window. 14-day standard balances
+    responsiveness with stability. This boundary affects trend-following signal generation timing and
+    market regime classification.
+  evidence: QUANTAXIS/QAIndicator/talib_indicators.py:47-49(ADX)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: 7-day (faster signals), 21-day (smoother, fewer whipsaws)
+- id: BD-053
+  type: B/DK
+  content: AROON oscillator lookback period
+  rationale: Aroon period determines time since last high/low within lookback window. Shorter periods
+    detect faster trend changes; longer periods confirm sustained trends. This boundary affects trend
+    reversal timing sensitivity.
+  evidence: QUANTAXIS/QAIndicator/talib_indicators.py:57-71(AROON)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: 14-day (standard), 25-day (intermediate), 50-day (long-term)
+- id: BD-054
+  type: B/DK
+  content: KAMA adaptive moving average period
+  rationale: KAMA period controls efficiency ratio smoothing window. Adaptive behavior reduces whipsaws
+    in volatile markets while maintaining responsiveness in trends. This boundary balances noise reduction
+    vs. signal lag tradeoff.
+  evidence: QUANTAXIS/QAIndicator/talib_series.py:95-97(KAMA)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: Fixed period vs. variable efficiency ratio scaling
+- id: BD-055
+  type: B/DK
+  content: Chande Momentum Oscillator period
+  rationale: CMO period determines raw momentum calculation window. Unlike RSI, CMO uses sum of up/down
+    changes without smoothing. Shorter periods increase sensitivity; longer periods reduce noise. Affects
+    momentum reversal signal timing.
+  evidence: QUANTAXIS/QAIndicator/talib_series.py:34-36(CMO)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: 9-day (short-term), 20-day (swing), 50-day (positional)
+- id: BD-056
+  type: B/DK
+  content: Bollinger Bands period (20) and standard deviations (2)
+  rationale: BBANDS parameters define moving average window and envelope width. 20-period/2σ standard
+    captures ~95% price distribution assuming normal returns. This boundary determines breakout sensitivity
+    vs. noise filtering.
+  evidence: QUANTAXIS/QAIndicator/talib_series.py:39-42(BBANDS)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: 15-period/1.5σ (tighter), 25-period/2.5σ (wider bands)
+- id: BD-057
+  type: B
+  content: DEMA double exponential moving average period
+  rationale: DEMA reduces EMA lag by applying double exponential smoothing. Period selection affects noise
+    reduction vs. responsiveness balance. DEMA reacts faster than equivalent SMA/EMA, affecting early
+    trend signal generation.
+  evidence: QUANTAXIS/QAIndicator/talib_series.py:55-57(DEMA)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: TEMA triple EMA (even less lag), DEMA with adaptive period
+- id: BD-058
+  type: B/DK
+  content: Stochastic RSI momentum parameters (fastK, fastD, RSI period)
+  rationale: Stochastic RSI applies stochastic oscillator to RSI values, creating a second-order indicator.
+    Parameters control RSI calculation window and stochastic smoothing. This boundary affects momentum
+    confirmation sensitivity.
+  evidence: QUANTAXIS/QAIndicator/talib_series.py:178-181(STOCHRSI)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: Different RSI period scaling, slow stochastic variant for fewer signals
+- id: BD-059
+  type: B
+  content: AD oscillator fast/slow periods for accumulation/distribution
+  rationale: ADOSC parameters control fast/slow accumulation/distribution moving average convergence.
+    Fast/slow period ratio determines momentum confirmation speed. This boundary affects volume-price
+    divergence signal timing.
+  evidence: QUANTAXIS/QAIndicator/talib_indicators.py:41-44(ADOSC)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: Different fast/slow ratio (2/5 vs. 3/10), volume-weighted variation
+- id: BD-060
+  type: B/DK
+  content: Standard deviation rolling window period
+  rationale: Rolling standard deviation window determines volatility measurement horizon. Shorter windows
+    capture recent volatility spikes; longer windows smooth but delay response. Critical for volatility
+    targeting and risk management.
+  evidence: QUANTAXIS/QAIndicator/talib_series.py:174-175(STDDEV)
+  stage: QUANTAXIS.QAIndicator
+  alternative_considered: Exponentially weighted volatility (EWMA), GARCH-based implied volatility
+- id: BD-061
+  type: B/RC
+  content: SELL orders MUST be processed before BUY orders during settlement
+  rationale: 'Ensures fund settlement priority where sell proceeds are available before buy obligations.
+    Critical for maintaining account solvency during concurrent order processing. Boundary: Every settlement
+    operations in QIFI module must respect this ordering invariant.'
+  evidence: QIFI/QifiAccount.py:455(settle)
+  stage: ordering_contract
+  alternative_considered: Parallel processing was rejected due to settlement finality requirements
+  _evidence_issues:
+  - 'NOT_FOUND: QIFI/QifiAccount.py'
+- id: BD-062
+  type: B/BA
+  content: Default if_fq='bfq' (不复权) affects each price calculations system-wide
+  rationale: 'Maintains backward compatibility with historical Chinese stock market data conventions.
+    Using non-adjusted prices ensures consistency with legacy analysis. Boundary: Any price-dependent
+    calculation inherits this default; changing to ''qfq'' would retroactively alter each historical P&L
+    calculations.'
+  evidence: QAData/base_datastruct.py:66(_quotation_base.__init__)
+  stage: default_value
+  alternative_considered: Forward-adjusted (qfq) was considered but rejected for backward compatibility
+  _evidence_issues:
+  - 'NOT_FOUND: QAData/base_datastruct.py'
+- id: BD-063
+  type: B/BA
+  content: Default commission_coeff=0.00025 (万2.5) hardcoded in QA_Order
+  rationale: 'Implements standard Chinese broker commission rate of 万2.5 (0.025%). Boundary: Hardcoded
+    at order creation; actual rates vary by broker and must be overridden in production. Default serves
+    backtesting with typical retail rates.'
+  evidence: QAMarket/QAOrder.py:96(__init__)
+  stage: default_value
+  alternative_considered: Zero default was rejected to avoid unrealistic backtesting results
+  _evidence_issues:
+  - 'NOT_FOUND: QAMarket/QAOrder.py'
+- id: BD-064
+  type: B/BA
+  content: Default tax_coeff=0.001 (千1) hardcoded in QA_Order for stamp duty
+  rationale: 'Implements Chinese government-mandated stock stamp duty of 千1 (0.1%) charged on SELL transactions
+    only. Regulatory requirement enforced at order level. Boundary: Applied automatically to sell orders;
+    buy orders are exempt by law.'
+  evidence: QAMarket/QAOrder.py:97(__init__)
+  stage: default_value
+  alternative_considered: No alternative; stamp duty is legally mandated by Chinese tax authority
+  _evidence_issues:
+  - 'NOT_FOUND: QAMarket/QAOrder.py'
+- id: BD-065
+  type: B/BA
+  content: QIFI account-level commission fee rate set to 0.0015 (万15)
+  rationale: 'Account-level commission rate for QIFI simulation; represents institutional-grade rate of
+    0.15%. Boundary: Overrides order-level defaults when account-level calculation is enabled; used for
+    account equity tracking.'
+  evidence: QIFI/QifiAccount.py:70(__init__)
+  stage: default_value
+  alternative_considered: Order-level commission (0.00025) is fallback when account rate not configured
+  _evidence_issues:
+  - 'NOT_FOUND: QIFI/QifiAccount.py'
+- id: BD-066
+  type: BA
+  content: QIFI account architecture implements account-level commission calculation mechanism
+  rationale: 'Architectural decision to calculate commissions at account level rather than per-order.
+    Enables unified fee tracking and multi-strategy fee aggregation. Boundary: Requires consistent rate
+    application across each orders in account.'
+  evidence: QIFI/QifiAccount.py:70(__init__)
+  stage: default_value
+  alternative_considered: Per-order commission was rejected for consistency; per-transaction was rejected
+    for complexity
+  _evidence_issues:
+  - 'NOT_FOUND: QIFI/QifiAccount.py'
+- id: BD-067
+  type: M/BA
+  content: LRU cache on each price properties creates memory/performance tradeoff
+  rationale: 'Performance optimization using LRU cache to avoid repeated DataFrame computations on OHLCV
+    data. Boundary: Cache size unbounded (default infinite LRU); memory grows with data access patterns.
+    Must monitor for memory leaks in long-running processes.'
+  evidence: QAData/base_datastruct.py:277-311(open/high/low/close/volume@property@lru_cache)
+  stage: pattern_choice
+  alternative_considered: Manual cache invalidation was rejected for complexity; no-cache was rejected
+    for performance
+  _evidence_issues:
+  - 'NOT_FOUND: QAData/base_datastruct.py'
+- id: BD-068
+  type: DK
+  content: 'Market type auto-detection by code pattern: letter=future, digit=stock'
+  rationale: 'Domain knowledge encoding: Chinese stock codes are numeric (6-digit) while futures codes
+    contain letters. Automatic detection simplifies market identification. Boundary: Only valid for Chinese
+    A-share and futures markets; international markets may have different conventions.'
+  evidence: QAStrategy/qactabase.py:85-89(__init__)
+  stage: invariant
+  alternative_considered: Explicit market parameter was rejected for convenience; external mapping table
+    was rejected for maintenance burden
+  _evidence_issues:
+  - 'NOT_FOUND: QAStrategy/qactabase.py'
+- id: BD-069
+  type: B/DK
+  content: QAStrategyStockBase auto-converts SELL_CLOSE->SELL for stock market
+  rationale: 'Stock markets lack concept of position close vs open; SELL closes existing position while
+    SELL_CLOSE implies futures-style closing. Auto-conversion ensures compatibility. Boundary: Only applies
+    to stock market context; futures retain SELL_CLOSE semantics.'
+  evidence: QAStrategy/qamultibase.py:183-186(send_order)
+  stage: inheritance
+  alternative_considered: Rejecting SELL_CLOSE for stocks was rejected for strategy portability
+  _evidence_issues:
+  - 'NOT_FOUND: QAStrategy/qamultibase.py'
+- id: BD-070
+  type: B/DK
+  content: FIFO position matching rule hardcoded in QA_Position
+  rationale: 'First-In-First-Out matching determines cost basis when partially closing positions. Chinese
+    markets legally require FIFO for stock position matching. Boundary: Every position close operations
+    use FIFO; cannot mix with specific-lot or LIFO matching.'
+  evidence: QAMarket/QAPosition.py:143(rule='FIFO')
+  stage: pattern_choice
+  alternative_considered: LIFO was rejected (not legally compliant); specific-lot was rejected for complexity
+  _evidence_issues:
+  - 'NOT_FOUND: QAMarket/QAPosition.py'
+- id: BD-071
+  type: M/DK
+  content: _num_cached=120 bars default market data cache in strategy
+  rationale: 'Default cache window of 120 bars balances memory usage against historical data access needs.
+    Boundary: Affects lookback window for indicators; strategies requiring longer history must override
+    explicitly.'
+  evidence: QAStrategy/qactabase.py:94(__init__)
+  stage: default_value
+  alternative_considered: Smaller cache (60 bars) was rejected for insufficient lookback; larger (300)
+    was rejected for memory
+  _evidence_issues:
+  - 'NOT_FOUND: QAStrategy/qactabase.py'
+- id: BD-072
+  type: B
+  content: Order status state machine with 9 distinct states in QA_Order
+  rationale: 'Nine-state lifecycle (new/submitted/accepted/partially-filled/filled/canceled/rejected/pending-cancel/expired)
+    tracks complete order journey. Boundary: Every order state transitions must follow defined state machine;
+    invalid transitions are rejected.'
+  evidence: QAUtil/QAParameter.py:124-157(ORDER_STATUS)
+  stage: pattern_choice
+  alternative_considered: Simplified 5-state model was rejected for insufficient granularity; 12-state
+    was rejected for complexity
+  _evidence_issues:
+  - 'NOT_FOUND: QAUtil/QAParameter.py'
+- id: BD-073
+  type: B/BA
+  content: LIMIT order fills at CURRENT bar prices, not NEXT bar
+  rationale: 'Bar-based backtesting: LIMIT orders check against current bar''s high/low for fill eligibility.
+    Boundary: Assumes order submitted at bar open; next-bar execution would require async order model.
+    Affects fill rate and slippage estimation.'
+  evidence: QAUtil/QAParameter.py:114-122(ORDER_MODEL)
+  stage: ordering_contract
+  alternative_considered: Next-bar execution was rejected for backtesting efficiency; tick-based was rejected
+    for complexity
+  _evidence_issues:
+  - 'NOT_FOUND: QAUtil/QAParameter.py'
+- id: BD-074
+  type: BA/DK
+  content: MARKET_PRESET table hardcodes each futures contract parameters
+  rationale: 'Centralized configuration for futures contract specifications (tick size, contract multiplier,
+    commission rates, trading hours). Boundary: Adding new contracts requires code update; no dynamic
+    loading from exchange feeds.'
+  evidence: QAMarket/market_preset.py:22-500(module)
+  stage: subdirectory
+  alternative_considered: Database-backed config was rejected for deployment complexity; external JSON
+    was rejected for consistency
+  _evidence_issues:
+  - 'NOT_FOUND: QAMarket/market_preset.py'
+- id: BD-075
+  type: B/BA
+  content: 'Stock transactions buyorsell: 0=buy 1=sell 2=none convention'
+  rationale: 'Integer encoding for transaction direction: 0=buy, 1=sell, 2=none/unknown. Standard convention
+    across each data structures. Boundary: Every transaction data must use this encoding; external data
+    requires conversion.'
+  evidence: QAData/QADataStruct.py:807-816(buyorsell)
+  stage: ordering_contract
+  alternative_considered: String encoding ('buy'/'sell') was rejected for memory efficiency
+  _evidence_issues:
+  - 'NOT_FOUND: QAData/QADataStruct.py'
+- id: BD-076
+  type: M
+  content: Limit price calculation adds 0.0002 magic number for rounding
+  rationale: 'Magic constant 0.0002 added to prevent boundary edge cases in price limit calculations.
+    Likely handles floating-point precision. Boundary: Affects high/low limit computation; modifying would
+    change limit prices.'
+  evidence: QAData/QADataStruct.py:220,229(high_limit/low_limit)
+  stage: default_value
+  alternative_considered: Decimal arithmetic was rejected for performance; pure rounding was rejected
+    for precision
+  _evidence_issues:
+  - 'NOT_FOUND: QAData/QADataStruct.py'
+- id: BD-077
+  type: M
+  content: Factor analysis shift(-day-1) for forward returns vs shift(-day)
+  rationale: 'Forward return calculation uses shift(-day-1) to align returns with signal date (day t return
+    starts from t+1). Boundary: Must align with factor computation date; misalignment causes look-ahead
+    bias in factor analysis.'
+  evidence: QAFactor/featureAnalysis.py:71,76(make_ret)
+  stage: pattern_choice
+  alternative_considered: shift(-day) was rejected (includes signal day return causing look-ahead); shift(-day+1)
+    was rejected (excludes one day)
+  _evidence_issues:
+  - 'NOT_FOUND: QAFactor/featureAnalysis.py'
+- id: BD-078
+  type: BA/DK
+  content: Database table mapping by (MARKET_TYPE, FREQUENCE) tuple in QAParameter
+  rationale: 'Data storage architecture uses composite key (market, frequency) to determine target database
+    table. Enables separation of stock/futures and 1min/5min/daily data. Boundary: Adding new markets
+    or frequencies requires table mapping update.'
+  evidence: QAUtil/QAParameter.py:448-480(DATABASE_TABLE)
+  stage: default_value
+  alternative_considered: Single table with type column was rejected for query performance; hierarchical
+    DB names was rejected for complexity
+  _evidence_issues:
+  - 'NOT_FOUND: QAUtil/QAParameter.py'
+- id: BD-079
+  type: M
+  content: Rust/QARS wrapper pattern for 100x performance acceleration
+  rationale: 'Performance-critical calculations (risk, margin, P&L) delegated to Rust backend via Python
+    wrapper. Boundary: Fallback to Python if Rust unavailable; introduces binary dependency.'
+  evidence: QARSBridge/qars_account.py:1-20(module docstring)
+  stage: pattern_choice
+  alternative_considered: Pure Python was rejected for performance; Cython was rejected for compilation
+    complexity
+  _evidence_issues:
+  - 'NOT_FOUND: QARSBridge/qars_account.py'
+- id: BD-080
+  type: B/BA
+  content: init_cash default 1,000,000 in strategy initialization
+  rationale: 'Default initial capital of 1,000,000 CNY provides reasonable backtesting baseline. Boundary:
+    Strategies can override; must match account balance for live trading consistency.'
+  evidence: QAStrategy/qactabase.py:29(__init__ init_cash=1000000)
+  stage: ordering_contract
+  alternative_considered: Zero default was rejected (requires explicit config); infinite default was rejected
+    for risk
+  _evidence_issues:
+  - 'NOT_FOUND: QAStrategy/qactabase.py'
+- id: BD-081
+  type: B/DK
+  content: Database session model selection based on time-of-day for trading day
+  rationale: 'Trading day determination uses time-of-day logic to select appropriate database session/model.
+    Boundary: Affects which historical data is loaded; incorrect session causes data inconsistency during
+    market transitions.'
+  evidence: QIFI/QifiAccount.py:179-185(reload)
+  stage: invariant
+  alternative_considered: Static trading day parameter was rejected for automation; external calendar
+    service was rejected for reliability
+  _evidence_issues:
+  - 'NOT_FOUND: QIFI/QifiAccount.py'
+  vague_rationale: true
+- id: BD-082
+  type: B/BA
+  content: 'INTERACTION: BD-062 (Default if_fq=''bfq'') × BD-006 (qfq industry standard) → Contradictory
+    price adjustment defaults causing factor calculation ambiguity'
+  rationale: BD-062 hardcodes 'bfq' (不复权/unadjusted) as default parameter, but BD-006 rationale claims
+    qfq is the industry standard. This contradiction means price-based calculations (indicators, factors)
+    may use inconsistent price series across modules, leading to subtle P&L discrepancies when strategies
+    compare backtest results against live execution.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Unified price adjustment flag enforced system-wide with explicit migration path
+- id: BD-083
+  type: B
+  content: 'INTERACTION: BD-044 (Forward return shift offset) × BD-077 (factor shift -day-1) → Hidden
+    look-ahead bias amplification with Arrow IPC caching'
+  rationale: Factor analysis uses shift(-day-1) for forward returns while Arrow IPC transfers data between
+    Python and Rust without preserving temporal metadata. The LRU cache (BD-067) amplifies this by serving
+    stale factor data across multiple backtest iterations, causing look-ahead bias to compound rather
+    than reset between experiments.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Cache invalidation on parameter change, explicit timestamp watermarks on IPC
+    transfers
+- id: BD-084
+  type: BA/DK
+  content: 'INTERACTION: BD-018 (T+1 settlement) × BD-061 (SELL before BUY) × BD-069 (SELL_CLOSE→SELL
+    auto-convert) → Risk cascade: position liquidation ordering creates regulatory violation under mixed
+    market positions'
+  rationale: When a portfolio holds both stocks (subject to T+1) and futures, BD-061 mandates SELL processing
+    first. For stocks, BD-069 auto-converts SELL_CLOSE to SELL, but BD-018 prevents selling shares acquired
+    same day via close_available check. If futures liquidation requires cross-margining and stock positions
+    were recently acquired, the SELL-first rule can trigger T+1 violations or forced position retention
+    beyond intended liquidation horizon.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: 'Market-aware settlement ordering: futures first when cross-margining exists,
+    stock T+1 respected independently'
+- id: BD-085
+  type: B/BA
+  content: 'INTERACTION: BD-050 (365-day Sharpe convention) × BD-067 (unbounded LRU cache) → Risk cascade:
+    annualized performance metrics cached without day-count awareness causing systematic mis-ranking'
+  rationale: Sharpe ratio uses 365-day annualization assuming uniform trading days, but Chinese A-shares
+    have ~250 actual trading days. The unbounded LRU cache means Sharpe calculations for different strategies
+    may serve stale results where one strategy's metrics reflect 365-day convention while another's reflect
+    actual data span, leading to incorrect strategy ranking and capital allocation decisions.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Cache keys including day-count convention and actual trading days; rolling Sharpe
+    recalculation on cache miss
+- id: BD-086
+  type: B/BA
+  content: 'INTERACTION: BD-076 (0.0002 magic number rounding) × BD-073 (current bar fill prices) → Amplification:
+    systematic price distortion compounds through stop-loss and position calculations'
+  rationale: The 0.0002 magic constant adjusts limit prices for floating-point boundaries, but when combined
+    with current-bar fill assumptions, this distortion affects both entry/exit prices and the stop-loss
+    distances computed from them. ATR-based stops (BD-034) compound the error as the distorted base price
+    propagates through volatility calculations, causing systematic over/under-stopping.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Decimal-based price calculations with explicit tick rounding instead of magic
+    constants
+- id: BD-087
+  type: BA/DK
+  content: 'INTERACTION: BD-014 (regex market detection) × BD-069 (SELL_CLOSE auto-convert) → Hidden dependency:
+    multi-market strategies silently depend on market type detection accuracy for order routing'
+  rationale: Order routing for multi-market strategies depends on BD-014 correctly identifying market
+    type from code patterns, then BD-069 applying correct order semantics. If a code contains mixed alphanumeric
+    patterns or follows non-standard conventions, the regex detection fails silently, causing BD-069 to
+    apply wrong conversion rules. Futures orders may be incorrectly converted to stock-style SELL, or
+    vice versa, routing to wrong market.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Explicit market_type parameter required; code-based detection as secondary validation
+    only
+- id: BD-088
+  type: B/RC
+  content: 'INTERACTION: BD-061 (SELL before BUY settlement) × BD-070 (FIFO matching) × BD-049 (commission
+    minimum floor) → Risk cascade: settlement ordering with FIFO creates position underestimation for
+    minimum-commission trades'
+  rationale: When reducing positions across multiple lots, SELL-first settlement (BD-061) with FIFO matching
+    (BD-070) means the oldest (potentially highest-cost) lots are sold first. For small position reductions
+    where proceeds fall below commission minimum floor (BD-049), net proceeds become negative, but FIFO
+    continues matching subsequent lots before BUY orders settle, causing apparent position over-reduction
+    in account view.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Commission minimum applied after net position change; batch settlement for small
+    lots
+- id: BD-089
+  type: B/BA
+  content: 'INTERACTION: BD-037 (ADX threshold 25) × BD-034 (SuperTrend multiplier) × BD-060 (rolling
+    volatility window) → Amplification: regime transition timing compounds volatility mis-estimation during
+    trend reversals'
+  rationale: ADX crossing 25 triggers regime switch from mean-reversion to trend-following, typically
+    increasing position sizes. However, the SuperTrend multiplier and rolling volatility window were calibrated
+    for different market regimes. During regime transitions, volatility spikes while ADX hasn't fully
+    confirmed, causing positions sized for trending markets to receive stops calibrated to range-bound
+    assumptions, leading to premature stop-outs on false breakouts.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Adaptive SuperTrend multiplier based on ADX gradient; position size reduction
+    during ADX transition zone
+- id: BD-GAP-001
+  type: T
+  content: Threading with Queue chosen over asyncio for task execution in QA_Thread, enabling producer-consumer
+    pattern with thread-safe blocking operations
+  rationale: Threading was selected to support blocking task execution with queue operations (put/get)
+    and pause/resume controls that integrate naturally with Python threading primitives; breaks under
+    CPU-bound workloads where GIL contention degrades throughput
+  evidence: QUANTAXIS/QAEngine/QAThreadEngine.py:142(__init__)
+  stage: architecture
+  alternative_considered: asyncio with async queues was considered but rejected for simpler blocking API
+- id: BD-GAP-002
+  type: BA/M
+  content: Kernel pool architecture uses dictionary mapping names to QA_Thread instances, allowing named
+    kernel registration and isolated task queues per kernel
+  rationale: Named kernel pool enables work distribution across multiple threads with explicit registration/stop/start
+    controls; breaks when kernel name collisions occur or when each kernels are blocked waiting on full
+    queues
+  evidence: QUANTAXIS/QAEngine/QAThreadEngine.py:164(register_kernel)
+  stage: architecture
+  alternative_considered: Thread pool executor pattern was not used; each kernel maintains independent
+    queue
+- id: BD-GAP-003
+  type: B
+  content: SQLite database chosen for job cache persistence with separate tables for job metadata and
+    run history, enabling crash recovery and state reconstruction
+  rationale: SQLite provides embedded, zero-config persistence ideal for single-node scheduler state;
+    breaks under distributed deployment where multiple processes need concurrent cache access
+  evidence: QUANTAXIS/QASetting/cache.py:68(_create)
+  stage: data_bridging
+  alternative_considered: Redis or MongoDB were not used despite being available in the ecosystem
+- id: BD-GAP-004
+  type: B/DK
+  content: 'Scheduler enforces hard limits: max 100 concurrent jobs (limit=100), max 10000 pending jobs
+    (pending_limit=10000), and 0.1s close timeout'
+  rationale: Fixed limits protect system resources from runaway job spawning; breaks when job volume exceeds
+    10000 pending or when graceful shutdown needs longer than 0.1s
+  evidence: QUANTAXIS/QAEngine/QAAsyncSchedule.py:135(create_QAAsyncScheduler)
+  stage: configuration
+  alternative_considered: Dynamic limits or queue-based backpressure were not implemented
+- id: BD-GAP-005
+  type: B/BA
+  content: Web server binds to 0.0.0.0:8010 by default, enabling external access from any network interface
+  rationale: 0.0.0.0 binding allows connections from each interfaces for distributed deployment; breaks
+    in security-sensitive environments requiring localhost-only access
+  evidence: QUANTAXIS/QAWebServer/server.py:95(start_server)
+  stage: deployment
+  alternative_considered: localhost binding was not the default for easier remote access
+- id: BD-GAP-006
+  type: BA/DK
+  content: QA_Worker uses abstract base pattern requiring subclasses to implement run(event) method, enforced
+    by documentation for extensible event handlers
+  rationale: Abstract worker pattern enables plugin architecture where QA_Broker, QA_Account, QA_OrderHandler
+    extend QA_Worker with domain-specific logic; breaks when subclasses don't properly implement run()
+    causing silent failures
+  evidence: QUANTAXIS/QAEngine/QAEvent.py:46(run)
+  stage: architecture
+  alternative_considered: Explicit interface protocol or abstract base class was not used
+- id: BD-GAP-007
+  type: B/DK
+  content: Market data model supports only stock/future/index markets with 1min/1day frequencies, hardcoding
+    supported asset classes
+  rationale: Fixed market taxonomy matches common Chinese financial instruments; breaks when adding options,
+    bonds, or crypto markets that require different data schemas
+  evidence: config/data_init.py:26(__init__)
+  stage: business
+  alternative_considered: Dynamic market registry was not implemented
+- id: BD-GAP-008
+  type: B/BA
+  content: execute() function uses optional shell parameter defaulting to None, choosing shell=False for
+    security when command is a string
+  rationale: Defaulting to shell=False prevents shell injection attacks; breaks when legitimate shell
+    features (pipes, globbing) are needed in commands
+  evidence: QUANTAXIS/QASetting/executor.py:33(execute)
+  stage: security
+  alternative_considered: Shell=True as default was rejected for security; parameterized command builder
+    was not provided
+- id: BD-GAP-009
+  type: T
+  content: QA_AsyncTask implements explicit lifecycle with wait(timeout) and close(timeout) methods rather
+    than relying on asyncio.Task automatic cleanup
+  rationale: Explicit lifecycle control enables graceful shutdown with configurable timeouts; breaks when
+    coroutines never complete and timeout enforcement becomes too aggressive
+  evidence: QUANTAXIS/QAEngine/QAAsyncTask.py:52(wait)
+  stage: architecture
+  alternative_considered: asyncio.wait() with shield was considered but custom implementation chosen for
+    explicit control
+- id: BD-GAP-010
+  type: B/BA
+  content: Daemon thread mode available in QA_Thread constructor (daemon=False by default), controlling
+    whether thread blocks program exit
+  rationale: Non-daemon threads by default ensure tasks complete before exit; breaks when long-running
+    tasks prevent graceful shutdown
+  evidence: QUANTAXIS/QAEngine/QAThreadEngine.py:142(__init__)
+  stage: configuration
+  alternative_considered: Automatic daemon conversion for background tasks was not implemented
+- id: BD-GAP-011
+  type: T
+  content: Tornado framework chosen for web server with WebSocket support, enabling bidirectional communication
+    for real-time updates
+  rationale: Tornado provides built-in WebSocketHandler for real-time command execution feedback; breaks
+    when high-throughput REST-only endpoints would benefit from lighter framework
+  evidence: QUANTAXIS/QAWebServer/basehandles.py:93(QAWebSocketHandler)
+  stage: architecture
+  alternative_considered: Flask or FastAPI were not chosen despite simpler REST APIs
+- id: BD-GAP-012
+  type: BA
+  content: Custom CJsonEncoder extends json.JSONEncoder to handle non-serializable objects during web
+    response serialization
+  rationale: Custom encoder handles domain objects that standard JSON cannot serialize; breaks when new
+    object types are added without extending the encoder
+  evidence: QUANTAXIS/QAWebServer/util.py:42(default)
+  stage: integration
+  alternative_considered: Pydantic or dataclass JSON serialization was not used
+- id: BD-GAP-013
+  type: RC
+  content: 'Missing: float vs Decimal for currency'
+  rationale: 'Audit finding: missing: float vs decimal for currency. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: factor_computation
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-014
+  type: M
+  content: 'Missing: Convergence criteria explicit declaration'
+  rationale: 'Audit finding: missing: convergence criteria explicit declaration. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: factor_computation
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-015
+  type: B
+  content: 'Missing: PnL conservation (realized + unrealized = total)'
+  rationale: 'Audit finding: missing: pnl conservation (realized + unrealized = total). Identified by
+    audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-016
+  type: DK
+  content: 'Missing: Random seed full coverage'
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: factor_computation
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-017
+  type: B
+  content: 'Missing: 资金成本建模（Carry/Funding）'
+  rationale: 'Audit finding: missing: 资金成本建模（carry/funding）. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-018
+  type: B
+  content: 'Missing: 回测过拟合防护'
+  rationale: 'Audit finding: missing: 回测过拟合防护. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-019
+  type: B
+  content: 'Missing: 再平衡触发机制'
+  rationale: 'Audit finding: missing: 再平衡触发机制. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-020
+  type: B
+  content: 'Missing: 波动率模型族与分布选择'
+  rationale: 'Audit finding: missing: 波动率模型族与分布选择. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-021
+  type: B
+  content: 'Missing: GHG 排放范围边界（Scope 1/2/3）'
+  rationale: 'Audit finding: missing: ghg 排放范围边界（scope 1/2/3）. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-022
+  type: B
+  content: 'Missing: PCAF 数据质量评分'
+  rationale: 'Audit finding: missing: pcaf 数据质量评分. CMP Coverage: 0/6 pass, 1/6 partial, 5/6 fail. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: 'CMP Coverage: 0/6 pass, 1/6 partial, 5/6 fail'
+- id: BD-GAP-023
+  type: B
+  content: 'Missing: RL 奖励函数交易成本建模'
+  rationale: 'Audit finding: missing: rl 奖励函数交易成本建模. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-024
+  type: B
+  content: 'Missing: Pipeline fit/transform 隔离'
+  rationale: 'Audit finding: missing: pipeline fit/transform 隔离. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-025
+  type: B
+  content: 'Missing: 多智能体决策共识与风险否决权'
+  rationale: 'Audit finding: missing: 多智能体决策共识与风险否决权. AIL Coverage: 0/6 pass, 3/6 partial, 3/6 fail. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: 'AIL Coverage: 0/6 pass, 3/6 partial, 3/6 fail'
+- id: BD-GAP-026
+  content: 'Missing: Matrix ill-conditioning and stability'
+  type: M
+  rationale: 'Audit finding: missing: matrix ill-conditioning and stability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: factor_computation
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-027
+  content: 'Missing: PnL conservation (realized + unrealized = total)'
+  type: B
+  rationale: 'Audit finding: missing: pnl conservation (realized + unrealized = total). Identified by
+    audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-028
+  content: 'Missing: 回测过拟合防护'
+  type: B
+  rationale: 'Audit finding: missing: 回测过拟合防护. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-029
+  content: 'Missing: 协方差矩阵 PSD 修复策略'
+  type: M
+  rationale: 'Audit finding: missing: 协方差矩阵 psd 修复策略. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: factor_computation
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-030
+  content: 'Missing: 协方差估计量选择与收缩'
+  type: B
+  rationale: 'Audit finding: missing: 协方差估计量选择与收缩. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-031
+  content: 'Missing: VaR/CVaR 置信水平与窗口'
+  type: B
+  rationale: 'Audit finding: missing: var/cvar 置信水平与窗口. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-032
+  content: 'Missing: 波动率模型族与分布选择'
+  type: B
+  rationale: 'Audit finding: missing: 波动率模型族与分布选择. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-033
+  content: 'Missing: RL 奖励函数交易成本建模'
+  type: B
+  rationale: 'Audit finding: missing: rl 奖励函数交易成本建模. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-034
+  content: 'Missing: Pipeline fit/transform 隔离'
+  type: B
+  rationale: 'Audit finding: missing: pipeline fit/transform 隔离. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-035
+  content: 'Missing: 多智能体决策共识与风险否决权'
+  type: B
+  rationale: 'Audit finding: missing: 多智能体决策共识与风险否决权. AIL Coverage: 0/6 pass, 3/6 partial, 3/6 fail. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: 'AIL Coverage: 0/6 pass, 3/6 partial, 3/6 fail'
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: Moving Average Factor Computation
+  source: examples/factoranalysis.py
+  type: builtin_factor
+  business_problem: Computes and stores a 5-day moving average (MA5) factor for daily stock data, enabling
+    technical indicator analysis across multiple stocks using ClickHouse database storage.
+  intent_keywords:
+  - factor
+  - moving average
+  - MA5
+  - technical indicator
+  - daily factor
+  stage: factor_computation
+  negative_keywords:
+  - backtest
+  - trading
+  - screening
+  - machine learning
+  - order
+  disambiguation: Are you looking to create a new technical factor/indicator for analysis, or do you want
+    to analyze existing factors using tear sheets?
+  data_domain: market_data
+- id: UC-102
+  name: Factor Tear Sheet Analysis
+  source: examples/featureanalysis.ipynb
+  type: research_analysis
+  business_problem: Retrieves pre-computed MA5 factor data from ClickHouse and generates comprehensive
+    tear sheets for factor performance analysis and visualization in research environments.
+  intent_keywords:
+  - tear sheet
+  - factor analysis
+  - visualization
+  - research
+  - performance analysis
+  stage: factor_computation
+  negative_keywords:
+  - backtest trading
+  - live trading
+  - data conversion
+  - scheduling
+  - factor creation
+  disambiguation: Do you need to analyze existing factors with tear sheets, or are you trying to create
+    a new factor?
+  data_domain: market_data
+- id: UC-103
+  name: Zero-Copy Data Bridge Conversion
+  source: examples/qadatabridge_example.py
+  type: data_pipeline
+  business_problem: Demonstrates efficient zero-copy conversion between Pandas and Polars dataframes,
+    and shared memory-based cross-process data transmission for high-performance data pipelines.
+  intent_keywords:
+  - pandas
+  - polars
+  - conversion
+  - shared memory
+  - zero copy
+  stage: data_collection
+  negative_keywords:
+  - backtest
+  - factor
+  - account management
+  - scheduling
+  - order execution
+  disambiguation: Do you need to convert data between Pandas/Polars formats, or are you looking for trading/factor
+    computation functionality?
+  data_domain: mixed
+- id: UC-104
+  name: QARS2 Rust Backend Bridge
+  source: examples/qarsbridge_example.py
+  type: live_trading
+  business_problem: Provides a bridge interface to QARS2 Rust-powered backend components for high-performance
+    account management, trading operations, and backtesting with 100x account and 10x backtest speed improvements.
+  intent_keywords:
+  - QARS
+  - Rust backend
+  - account
+  - backtest engine
+  - trading operations
+  stage: data_collection
+  negative_keywords:
+  - data conversion
+  - factor creation
+  - scheduling
+  - resource management
+  - tear sheet
+  disambiguation: Are you looking for high-performance trading/backtesting capabilities with Rust backend,
+    or do you need data pipeline/analysis features?
+  data_domain: trading_data
+- id: UC-105
+  name: QIFI Account Backtest Simulation
+  source: examples/qifiaccountexample.py
+  type: trading_strategy
+  business_problem: Simulates trading account operations including order placement, trade execution, and
+    daily settlement for backtesting trading strategies with persistent account state management.
+  intent_keywords:
+  - backtest
+  - QIFI account
+  - send order
+  - make deal
+  - settle
+  stage: data_collection
+  negative_keywords:
+  - live trading
+  - factor analysis
+  - data conversion
+  - scheduling
+  - resource management
+  disambiguation: Are you running historical backtest simulations or executing live trades with real orders?
+  data_domain: trading_data
+- id: UC-106
+  name: Multi-Database Resource Manager
+  source: examples/resource_manager_example.py
+  type: data_pipeline
+  business_problem: Provides unified context manager-based resource management for MongoDB, RabbitMQ,
+    ClickHouse, and Redis connections with automatic connection handling and exception safety.
+  intent_keywords:
+  - resource manager
+  - MongoDB
+  - ClickHouse
+  - Redis
+  - database connection
+  stage: data_collection
+  negative_keywords:
+  - backtest
+  - factor
+  - trading
+  - tear sheet
+  - scheduling
+  disambiguation: Do you need to manage database connections and resources, or are you looking for trading/factor
+    analysis features?
+  data_domain: mixed
+- id: UC-107
+  name: Web Server Task Scheduler
+  source: examples/scheduleserver.py
+  type: monitoring
+  business_problem: Implements a web-based task scheduler allowing users to add, query, and manage periodic
+    or cron-based jobs through HTTP endpoints for automated trading task execution.
+  intent_keywords:
+  - scheduler
+  - web server
+  - periodic task
+  - cron job
+  - automated
+  stage: data_collection
+  negative_keywords:
+  - backtest
+  - factor
+  - data conversion
+  - account management
+  - tear sheet
+  disambiguation: Are you setting up scheduled automated tasks/jobs, or do you need trading/factor computation
+    functionality?
+  data_domain: mixed
+- id: UC-108
+  name: ClickHouse QIFI Data Reader
+  source: examples/test_ckread_qifi.py
+  type: data_pipeline
+  business_problem: Provides direct SQL query access to QIFI trading data stored in ClickHouse, enabling
+    retrieval of account information, orders, trades, and positions for analysis.
+  intent_keywords:
+  - ClickHouse
+  - QIFI
+  - SQL query
+  - orders
+  - trades
+  - positions
+  stage: data_collection
+  negative_keywords:
+  - backtest
+  - factor
+  - data conversion
+  - scheduling
+  - resource manager
+  disambiguation: Do you need to query historical trading data from the database, or are you looking for
+    trading execution/factor analysis features?
+  data_domain: trading_data
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 63
+  evidence_invalid: 30
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.6774193548387096
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 2
+    warn: 7
+    fail: 11
+  subdomain_totals:
+    pass: 6
+    warn: 19
+    fail: 19
+  coverage: 64/64 (100%)
+  pass_rate: 8/64 (12%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: primary_database
+  description: MongoDB for flexibility and async support; ClickHouse for analytical performance
+  used_in_stages: []
+  options:
+  - name: MongoDB (default)
+    traits:
+    - document_store
+    - time_series_friendly
+    - schema_flexible
+    - async_support
+    fit_for:
+    - General purpose storage, flexible schema, time-series data
+    not_fit_for:
+    - Complex analytical queries, very high write throughput
+  - name: ClickHouse
+    traits:
+    - columnar_store
+    - analytical_queries
+    - high_compression
+    - vectorized_execution
+    fit_for:
+    - Fast analytical queries, large-scale data analysis, reporting
+    not_fit_for:
+    - Real-time writes, complex transactions, flexible schema needs
+  - name: PostgreSQL
+    traits:
+    - relational
+    - ACID_compliant
+    - mature_ecosystem
+    - JSON_support
+    fit_for:
+    - Structured data with relationships, strict consistency requirements
+    not_fit_for:
+    - High-volume time-series without TimescaleDB extension
+  default: MongoDB
+  _source: worker_resource
+- id: slot-002
+  name: message_queue
+  description: RabbitMQ for reliability and management features; Redis for speed
+  used_in_stages: []
+  options:
+  - name: RabbitMQ (default)
+    traits:
+    - AMQP
+    - reliable_delivery
+    - management_ui
+    - federation_support
+    fit_for:
+    - Task queues, pub/sub patterns, reliable message delivery
+    not_fit_for:
+    - Ultra-high throughput (>100k msg/s), streaming
+  - name: Redis Streams
+    traits:
+    - in_memory
+    - low_latency
+    - pub_sub_compatible
+    - consumer_groups
+    fit_for:
+    - Low-latency requirements, caching with persistence, simple queues
+    not_fit_for:
+    - Complex routing, enterprise features, durable storage
+  - name: Apache Kafka
+    traits:
+    - distributed_log
+    - high_throughput
+    - durable
+    - replay_capability
+    fit_for:
+    - Event streaming, real-time pipelines, high-volume data ingestion
+    not_fit_for:
+    - Simple request-response, low-latency requirements
+  default: RabbitMQ
+  _source: worker_resource
+- id: slot-003
+  name: chinese_stock_data_source
+  description: PyTDX for real-time and comprehensive data; Tushare for fundamentals; BaoStock for free
+    historical
+  used_in_stages: []
+  options:
+  - name: PyTDX (default)
+    traits:
+    - real_time
+    - free
+    - broad_coverage
+    - Windows_compatible
+    fit_for:
+    - Real-time quotes, minute data, historical data, multiple markets
+    not_fit_for:
+    - Linux-only production servers (connection stability), premium fundamentals
+  - name: Tushare Pro
+    traits:
+    - comprehensive
+    - fundamentals
+    - macro_data
+    - cloud_accessible
+    fit_for:
+    - Fundamental data, financial reports, macro indicators, cloud deployments
+    not_fit_for:
+    - Real-time trading (latency), free tier limitations
+  - name: BaoStock
+    traits:
+    - free
+    - simple_api
+    - no_token_needed
+    fit_for:
+    - Free historical data, simple backtesting, quick prototyping
+    not_fit_for:
+    - Real-time data, minute-level data, comprehensive coverage
+  - name: JoinQuant
+    traits:
+    - minute_data
+    - fundamental_data
+    - factor_data
+    fit_for:
+    - Minute-level historical data, factor data, research
+    not_fit_for:
+    - Real-time trading, free users
+  - name: Gengmei (GM)
+    traits:
+    - minute_data
+    - real_time
+    - factor_data
+    fit_for:
+    - Minute-level data, real-time data, factor research
+    not_fit_for:
+    - Free access, simple setup
+  default: PyTDX
+  _source: worker_resource
+- id: slot-004
+  name: cryptocurrency_data_source
+  description: Binance for liquidity and availability; Huobi for CN accessibility; CCXT for multi-exchange
+  used_in_stages: []
+  options:
+  - name: Binance
+    traits:
+    - high_liquidity
+    - broad_coverage
+    - real_time
+    - free_public
+    fit_for:
+    - Major crypto pairs, real-time data, historical data
+    not_fit_for:
+    - Privacy (requires VPN in China), niche coins
+  - name: Huobi
+    traits:
+    - CN_friendly
+    - broad_coverage
+    - real_time
+    fit_for:
+    - Users in China, good Huobi liquidity
+    not_fit_for:
+    - International users
+  - name: OKEx
+    traits:
+    - derivatives
+    - broad_coverage
+    - real_time
+    fit_for:
+    - Derivatives data, comprehensive coverage
+    not_fit_for:
+    - Simple spot trading data only
+  - name: CCXT
+    traits:
+    - unified_api
+    - multi_exchange
+    - standardized_format
+    fit_for:
+    - Multi-exchange strategies, unified interface
+    not_fit_for:
+    - Simple single-exchange needs (overhead)
+  default: Binance
+  _source: worker_resource
+- id: slot-005
+  name: cache_layer
+  description: Redis for comprehensive features and performance
+  used_in_stages: []
+  options:
+  - name: Redis (default)
+    traits:
+    - in_memory
+    - data_structures
+    - persistence
+    - pub_sub
+    fit_for:
+    - Caching, session management, pub/sub, complex data structures
+    not_fit_for:
+    - Disk-heavy workloads, simple key-value only
+  - name: Memcached
+    traits:
+    - simple
+    - memory_only
+    - distributed
+    fit_for:
+    - Simple caching, high-throughput simple key-value
+    not_fit_for:
+    - Complex data, persistence needs, pub/sub
+  - name: MongoDB (in-memory)
+    traits:
+    - schema_flexible
+    - already_deployed
+    - simple_setup
+    fit_for:
+    - Teams already using MongoDB, flexible cache needs
+    not_fit_for:
+    - Performance-critical caching
+  default: Redis
+  _source: worker_resource
+- id: slot-006
+  name: dataframe_engine
+  description: Pandas for flexibility; Polars for speed on large datasets
+  used_in_stages: []
+  options:
+  - name: Pandas (default)
+    traits:
+    - mature
+    - wide_support
+    - familiar_api
+    - flexible
+    fit_for:
+    - General use, flexibility, ecosystem compatibility
+    not_fit_for:
+    - Large datasets (>10M rows), performance-critical code
+  - name: Polars
+    traits:
+    - fast
+    - lazy_evaluation
+    - multi_threading
+    - memory_efficient
+    fit_for:
+    - Large datasets, performance-critical analysis, parallel processing
+    not_fit_for:
+    - Small datasets, complex index operations
+  - name: PySpark
+    traits:
+    - distributed
+    - big_data
+    - ML_integration
+    fit_for:
+    - Enterprise-scale data processing, distributed computing
+    not_fit_for:
+    - Single-machine use, simple operations
+  default: Pandas
+  _source: worker_resource
+- id: slot-007
+  name: visualization_backend
+  description: Matplotlib for static; PyECharts for Chinese web dashboards
+  used_in_stages: []
+  options:
+  - name: Matplotlib + Seaborn (default)
+    traits:
+    - static_charts
+    - publication_quality
+    - wide_support
+    fit_for:
+    - Static reports, academic use, fine-grained control
+    not_fit_for:
+    - Interactive dashboards, web integration
+  - name: PyECharts
+    traits:
+    - interactive
+    - web_ready
+    - rich_charts
+    fit_for:
+    - Web dashboards, interactive reports, Chinese-friendly
+    not_fit_for:
+    - Static reports, print publications
+  - name: Plotly
+    traits:
+    - interactive
+    - web_ready
+    - scientific
+    fit_for:
+    - Scientific visualization, interactive dashboards
+    not_fit_for:
+    - Simple static charts
+  - name: Bokeh
+    traits:
+    - interactive
+    - streaming
+    - web_ready
+    fit_for:
+    - Real-time streaming data, interactive web apps
+    not_fit_for:
+    - Static reports
+  default: Matplotlib + Seaborn
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: RainX/pytdx
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: Tushare
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: BaoStock
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: Binance Exchange
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: Huobi Global
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: OKX Exchange
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: Bitfinex Exchange
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-008
+  type: external_service
+  name: BitMEX Exchange
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-009
+  type: external_service
+  name: EastMoney Securities
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-010
+  type: external_service
+  name: Hexun Financial
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-011
+  type: external_service
+  name: 10jqka (同花顺)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-012
+  type: external_service
+  name: TDX
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-013
+  type: external_service
+  name: JoinQuant
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-014
+  type: external_service
+  name: Gengmei Quant
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-015
+  type: external_service
+  name: ShinnyTech (shinnytech)
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-016
+  type: external_service
+  name: Shanghai/SZ Stock Exchange
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-017
+  type: external_service
+  name: QUANTAXIS Web
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-018
+  type: external_service
+  name: MongoDB
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-019
+  type: external_service
+  name: ClickHouse
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-020
+  type: external_service
+  name: RabbitMQ
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-021
+  type: external_service
+  name: Redis
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-022
+  type: external_service
+  name: QA Web Server
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-023
+  type: external_service
+  name: QIFI Server
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-024
+  type: external_service
+  name: Jupyter Notebook
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-025
+  type: external_service
+  name: QIFI Protocol Clients
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-026
+  type: python_package
+  name: pymongo
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-027
+  type: python_package
+  name: motor
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-028
+  type: python_package
+  name: clickhouse-driver
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-029
+  type: python_package
+  name: redis
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-030
+  type: python_package
+  name: pandas
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-031
+  type: python_package
+  name: numpy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-032
+  type: python_package
+  name: pyarrow
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-033
+  type: python_package
+  name: requests
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-034
+  type: python_package
+  name: tornado
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-035
+  type: python_package
+  name: pika
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-036
+  type: code_example
+  name: Moving Average Factor Computation
+  path: examples/factoranalysis.py
+  description: Computes and stores a 5-day moving average (MA5) factor for daily stock data, enabling
+    technical indicator analysis across multiple stocks using ClickHouse database storage.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list
+- id: res-037
+  type: code_example
+  name: Factor Tear Sheet Analysis
+  path: examples/featureanalysis.ipynb
+  description: Retrieves pre-computed MA5 factor data from ClickHouse and generates comprehensive tear
+    sheets for factor performance analysis and visualization in research environments.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list
+- id: res-038
+  type: code_example
+  name: Zero-Copy Data Bridge Conversion
+  path: examples/qadatabridge_example.py
+  description: Demonstrates efficient zero-copy conversion between Pandas and Polars dataframes, and shared
+    memory-based cross-process data transmission for high-performance data pipelines.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-039
+  type: code_example
+  name: QARS2 Rust Backend Bridge
+  path: examples/qarsbridge_example.py
+  description: Provides a bridge interface to QARS2 Rust-powered backend components for high-performance
+    account management, trading operations, and backtesting with 100x account and 10x backtest speed improvements.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-040
+  type: code_example
+  name: QIFI Account Backtest Simulation
+  path: examples/qifiaccountexample.py
+  description: Simulates trading account operations including order placement, trade execution, and daily
+    settlement for backtesting trading strategies with persistent account state management.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-041
+  type: code_example
+  name: Multi-Database Resource Manager
+  path: examples/resource_manager_example.py
+  description: Provides unified context manager-based resource management for MongoDB, RabbitMQ, ClickHouse,
+    and Redis connections with automatic connection handling and exception safety.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-042
+  type: code_example
+  name: Web Server Task Scheduler
+  path: examples/scheduleserver.py
+  description: Implements a web-based task scheduler allowing users to add, query, and manage periodic
+    or cron-based jobs through HTTP endpoints for automated trading task execution.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-043
+  type: code_example
+  name: ClickHouse QIFI Data Reader
+  path: examples/test_ckread_qifi.py
+  description: Provides direct SQL query access to QIFI trading data stored in ClickHouse, enabling retrieval
+    of account information, orders, trades, and positions for analysis.
+  used_in_stages:
+  - data_collection
+  _source: uc_list

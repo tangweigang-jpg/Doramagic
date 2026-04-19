@@ -1,0 +1,2844 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-020
+name: GS Quant
+sop_version: '3.6'
+source:
+  projects:
+  - gs-quant
+  commit_hash: f1f7d6238f03c8e1d9ad722fba4ed022f2539c89
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Quantitative trading strategies and risk management
+  description: Python toolkit by Goldman Sachs for building quantitative trading strategies, derivative
+    structuring, trading, risk management, and statistical data analytics. Provides instrument modeling,
+    pricing, risk analysis, backtesting, and portfolio performance analytics.
+  prerequisites: Python 3.9+, Goldman Sachs Marquee API access (client id and secret available to institutional
+    clients)
+  not_suitable_for: Non-financial analytics, users without Marquee API credentials, real-time trading
+    execution systems, retail investor use cases
+  activation:
+    triggers:
+    - Starting any gs_quant workflow that requires pricing or data
+    - Building any analysis involving GS analytics API
+    - Running backtests against historical market data
+    - Fetching market data from Marquee datasets
+    emphasis:
+    - Use gs_quant when building trade analytics workflows that require GS pricing
+    - Use gs_quant backtesting when simulating trading strategies against historical data
+    - Use Dataset for any market data access from Marquee catalog
+    anti_skip:
+    - Don't skip session creation — each API calls require authentication
+    - Don't skip premium=0 for FX options — DollarPrice will always be ~0 without it
+    - Don't skip naming instruments — names appear in trade ledger for debugging
+stages:
+- id: data_ingestion
+  name: Data Ingestion Layer
+  order: 1
+  responsibility: Retrieves market data from Marquee/Goldman Sachs APIs. Provides time-series, coordinate-based,
+    and batch data retrieval with caching and async support. This layer exists because quantitative analysis
+    requires reliable, performant access to market data with proper handling of data quality issues.
+  interface:
+    inputs:
+    - Dataset ID
+    - Date ranges
+    - Field specifications
+    - Asset identifiers
+    outputs:
+    - pandas DataFrame
+    - MarketDataResponseFrame
+    - Async futures
+  required_methods:
+  - name: Dataset.get_data
+    description: Primary data retrieval API for fetching market data by coordinates and date ranges
+    evidence: gs_quant/data/dataset.py:51(Dataset)
+  - name: Dataset.get_data_series
+    description: Retrieves time series data for single coordinate with flexible date ranges
+    evidence: gs_quant/data/dataset.py:51(Dataset)
+  - name: GsDataApi.query
+    description: Core query execution with caching support and coordinate handling
+    evidence: gs_quant/api/gs/data.py:193(GsDataApi)
+  - name: MarqueeDataIngestionLibrary.create_dataset
+    description: Creates Snowflake datasets and uploads user data for custom data integration
+    evidence: gs_quant/data/dataset.py:694(MarqueeDataIngestionLibrary)
+  key_behaviors:
+  - behavior: Thread-local cache isolation
+    description: API request caching uses thread-local storage to prevent cache pollution across concurrent
+      threads in async code
+    evidence: gs_quant/api/gs/data.py:202(set_api_request_cache)
+  - behavior: Coordinate-based data retrieval
+    description: MarketDataResponseFrame extends pandas DataFrame with market data coordinate awareness
+      for financial data semantics
+    evidence: gs_quant/api/gs/data.py:1508(MarketDataResponseFrame)
+  - behavior: Missing data handling strategies
+    description: DataSource implementations handle gaps in time series via configurable MissingDataStrategy
+      enum
+    evidence: gs_quant/backtests/data_sources.py:40(DataSource)
+  replaceable_points:
+  - name: DataProvider
+    description: Vendor data source implementation for Dataset class
+    options:
+    - name: GsDataApi
+      traits:
+      - Official Goldman Sachs API
+      - Full market data coverage
+      - Authentication required
+      fit_for:
+      - Production Marquee integration
+      - Complete market data needs
+      not_fit_for:
+      - Offline development
+      - Mock testing without API access
+    - name: Custom DataApi
+      traits:
+      - User-defined implementation
+      - Requires DataApi interface
+      fit_for:
+      - Testing with mock data
+      - Alternative data sources
+      not_fit_for:
+      - Production without Marquee
+    default: GsDataApi
+  - name: MissingDataStrategy
+    description: How the backtest engine handles gaps in time series data
+    options:
+    - name: FAIL
+      traits:
+      - Strict validation
+      - Stops on missing data
+      fit_for:
+      - Production with clean data
+      - Data quality verification
+      not_fit_for:
+      - Real-world data with gaps
+      - Historical data with holidays
+    - name: SKIP
+      traits:
+      - Default behavior
+      - Skips missing dates
+      fit_for:
+      - Standard backtesting
+      - Discontinuous data
+      not_fit_for:
+      - Continuous calculations requiring each dates
+    - name: FORWARD_FILL
+      traits:
+      - Last known value propagation
+      - Smooths discontinuities
+      fit_for:
+      - Holiday handling
+      - Low-frequency data
+      not_fit_for:
+      - High-frequency data
+      - Gap-sensitive strategies
+    - name: ZERO_FILL
+      traits:
+      - Treats missing as zero
+      - Conservative approach
+      fit_for:
+      - Volume data
+      - Clear indication of no activity
+      not_fit_for:
+      - Price data
+      - Any calculation requiring continuity
+    default: SKIP
+  design_decisions:
+  - 'Thread-local context for GsDataApi caching (evidence: gs_quant/api/gs/data.py:202(set_api_request_cache))
+    — Enables per-thread cache isolation while maintaining shared API - avoids cache pollution in async
+    code'
+  - 'MarketDataResponseFrame extends pd.DataFrame (evidence: gs_quant/api/gs/data.py:1508(MarketDataResponseFrame))
+    — Leverages pandas ecosystem while adding market data semantics - familiar API for users'
+  - 'Dataset uses provider pattern for vendor abstraction (evidence: gs_quant/data/dataset.py:98(__init__))
+    — Allows swapping data providers without changing consuming code - enables testing with mock providers'
+  acceptance_hints:
+  - Data retrieval completes without network errors for valid queries
+  - Thread-local caching reduces repeated API calls for identical requests
+  - Invalid dataset IDs raise descriptive DatasetNotFoundError
+  - Date range queries return correctly bounded results
+- id: instrument_modeling
+  name: Instrument Modeling
+  order: 2
+  responsibility: Represents financial instruments (swaps, options, equities) with resolution, pricing,
+    and risk calculation capabilities. This layer exists to provide a unified abstraction for diverse
+    financial products that can be priced and risk-analyzed consistently.
+  interface:
+    inputs:
+    - Instrument parameters (tenor, strike, notional)
+    - Market data for resolution
+    outputs:
+    - Resolved instrument values
+    - Risk measures (delta, gamma, PV)
+    - Dollar prices
+  required_methods:
+  - name: Priceable.resolve
+    description: Resolves instrument against market data, optionally in-place to populate pricing parameters
+    evidence: gs_quant/base.py:430(Priceable)
+  - name: Priceable.calc
+    description: Calculates risk measures for the instrument, returning Future in async context for non-blocking
+      execution
+    evidence: gs_quant/base.py:497(calc)
+  - name: Portfolio.price
+    description: Prices each instruments in the portfolio with aggregation support
+    evidence: gs_quant/markets/portfolio.py:46(Portfolio)
+  - name: Grid.parameterize
+    description: Creates parameterized grid of similar instruments for scenario analysis
+    evidence: gs_quant/markets/portfolio.py:626(Grid)
+  key_behaviors:
+  - behavior: In-place resolution default
+    description: Priceable.resolve() has in_place=True by default, allowing mutation of existing instrument
+      for efficiency
+    evidence: gs_quant/base.py:431(resolve)
+  - behavior: Recursive portfolio nesting
+    description: Portfolios support nested structures enabling hierarchical aggregation for fund-of-funds
+      use cases
+    evidence: gs_quant/markets/portfolio.py:205(portfolios)
+  - behavior: Async risk calculations
+    description: calc() returns Future in async context for non-blocking risk calculations with multiple
+      instruments
+    evidence: gs_quant/base.py:497(calc)
+  replaceable_points:
+  - name: Instrument resolution
+    description: How instruments obtain market data required for pricing
+    options:
+    - name: Marquee API
+      traits:
+      - Remote pricing
+      - Full market data
+      - API dependency
+      fit_for:
+      - Production pricing
+      - Real-time market data
+      not_fit_for:
+      - Offline use
+      - Air-gapped environments
+    - name: Local pricing model
+      traits:
+      - Offline capable
+      - Model-defined pricing
+      - Custom calibration
+      fit_for:
+      - Testing
+      - Closed system environments
+      not_fit_for:
+      - Real-time pricing
+      - Complex derivatives
+    default: Marquee API
+  design_decisions:
+  - 'Priceable.resolve() has in_place default True (evidence: gs_quant/base.py:431(resolve)) — Allows
+    mutation of existing instrument - more efficient for single-use, but risks unintended side effects'
+  - 'Portfolio supports recursive nesting (evidence: gs_quant/markets/portfolio.py:205(portfolios)) —
+    Enables hierarchical portfolio structures - fund of funds use cases'
+  - 'calc() returns Future in async context (evidence: gs_quant/base.py:497(calc)) — Non-blocking risk
+    calculations - critical for performance with multiple instruments'
+  acceptance_hints:
+  - Instruments resolve to populated values when market data is available
+  - Portfolio pricing aggregates individual instrument values correctly
+  - Unit quantity instruments have default quantity of 1
+  - Nested portfolios aggregate through hierarchy correctly
+- id: pricing_context
+  name: Pricing Context Management
+  order: 3
+  responsibility: Thread-local and async-aware context for market data and pricing parameters. Enables
+    nested contexts with shadowing for scenario analysis. This layer exists to provide thread-safe, composable
+    pricing environments that can be entered and exited safely.
+  interface:
+    inputs:
+    - Market data coordinates
+    - Pricing date
+    - Currency/currency pair
+    outputs:
+    - Context-scoped market values
+    - Historical/predicted values
+  required_methods:
+  - name: PricingContext.__enter__
+    description: Enters pricing context, establishing market and date parameters for subsequent operations
+    evidence: gs_quant/markets/__init__.py(PricingContext)
+  - name: PricingContext.__exit__
+    description: Exits pricing context, restoring previous context state
+    evidence: gs_quant/markets/__init__.py(PricingContext)
+  - name: ContextBase.push
+    description: Pushes new context on stack with optional parameter shadowing
+    evidence: gs_quant/context_base.py:96(push)
+  - name: ContextBaseWithDefault.default_value
+    description: Auto-instantiates default context when accessed without explicit instance
+    evidence: gs_quant/context_base.py:173(default_value)
+  key_behaviors:
+  - behavior: Thread-local storage isolation
+    description: Context uses thread_local storage ensuring thread-safety without global locks - each
+      thread has independent context path
+    evidence: gs_quant/context_base.py:21(thread_local)
+  - behavior: Nested context push/pop
+    description: Contexts support nested push/pop allowing shadowing of parameters in nested scopes for
+      scenario analysis within backtests
+    evidence: gs_quant/context_base.py:96(push)
+  - behavior: Singleton default creation
+    description: ContextBaseWithDefault creates singleton default instance for convenient usage reducing
+      boilerplate in simple cases
+    evidence: gs_quant/context_base.py:173(default_value)
+  - behavior: Nullcontext fallback for older Python
+    description: Backward compatibility fallback using Nullcontext for Python <3.7 without contextlib
+      dependency
+    evidence: gs_quant/context_base.py:182(nullcontext)
+  replaceable_points:
+  - name: Context default behavior
+    description: How the system handles access when context is uninitialized
+    options:
+    - name: Raise exception
+      traits:
+      - Strict mode
+      - Explicit initialization required
+      fit_for:
+      - Production code
+      - Ensuring proper setup
+      not_fit_for:
+      - Quick scripts
+      - Interactive exploration
+    - name: Create default
+      traits:
+      - Convenient mode
+      - Auto-initialization
+      fit_for:
+      - Testing
+      - Exploratory analysis
+      not_fit_for:
+      - Production requiring explicit configuration
+    - name: Use global
+      traits:
+      - Global state
+      - Shared context
+      fit_for:
+      - Simple scripts
+      - Single-user environments
+      not_fit_for:
+      - Multi-threaded applications
+      - Complex scenarios
+    default: Raise exception (MqUninitialisedError)
+  design_decisions:
+  - 'Context uses thread_local storage (evidence: gs_quant/context_base.py:21(thread_local)) — Thread-safety
+    without global locks - each thread has independent context path'
+  - 'Contexts support nested push/pop (evidence: gs_quant/context_base.py:96(push)) — Allows shadowing
+    parameters in nested scopes - enables scenario analysis within backtests'
+  - 'ContextBaseWithDefault creates singleton (evidence: gs_quant/context_base.py:173(default_value))
+    — Convenient default - reduces boilerplate for simple use cases'
+  - 'Nullcontext fallback for Python <3.7 (evidence: gs_quant/context_base.py:182(nullcontext)) — Backward
+    compatibility - supports older Python versions without contextlib'
+  acceptance_hints:
+  - PricingContext must be entered before instrument resolution and pricing
+  - Nested contexts correctly shadow outer context parameters
+  - Thread-local storage prevents context leakage between threads
+  - Accessing default context without initialization raises MqUninitialisedError
+- id: risk_analysis
+  name: Risk Analysis & Measures
+  order: 4
+  responsibility: Calculates risk measures (greeks, VaR, scenario P&L) for instruments and portfolios
+    with result aggregation. This layer exists to provide standardized, comparable risk quantification
+    across each instrument types with full audit trails.
+  interface:
+    inputs:
+    - Instruments/portfolios
+    - Risk measures (IRDelta, PnlExplain, etc.)
+    outputs:
+    - FloatWithInfo/ScalarWithInfo
+    - DataFrameWithInfo
+    - SeriesWithInfo
+  required_methods:
+  - name: RiskMeasure.calculate
+    description: Computes the risk measure for given target instruments or portfolios
+    evidence: gs_quant/target/measures.py:0(RiskMeasure)
+  - name: FloatWithInfo.value
+    description: Accesses risk result value with units and error tracking
+    evidence: gs_quant/risk/core.py:189(FloatWithInfo)
+  - name: DataFrameWithInfo.filter
+    description: Filters bucketed risk results by coordinate with location validation
+    evidence: gs_quant/risk/core.py:382(DataFrameWithInfo)
+  - name: aggregate_risk
+    description: Aggregates heterogeneous risk results across instruments with mixed result types
+    evidence: gs_quant/risk/core.py:516(aggregate_risk)
+  key_behaviors:
+  - behavior: Risk result metadata via RiskKey
+    description: ResultInfo contains RiskKey for full audit trail of what generated each result - critical
+      for regulatory compliance
+    evidence: gs_quant/risk/core.py:37(ResultInfo)
+  - behavior: Pandas-compatible result types
+    description: Risk results extend pandas types (ScalarWithInfo, DataFrameWithInfo, SeriesWithInfo)
+      enabling dataframe operations on risk results
+    evidence: gs_quant/risk/core.py:155(ScalarWithInfo)
+  - behavior: Heterogeneous aggregation support
+    description: aggregate_risk handles mixed scalar/series results - instruments may return different
+      result types that must be combined
+    evidence: gs_quant/risk/core.py:516(aggregate_risk)
+  replaceable_points:
+  - name: Risk measure
+    description: What risk quantity to compute for instruments
+    options:
+    - name: IRDelta
+      traits:
+      - Interest rate sensitivity
+      - Per curve tenor bucket
+      fit_for:
+      - Rates products
+      - Fixed income portfolios
+      not_fit_for:
+      - Equity-only portfolios
+      - Currency trades
+    - name: EqDelta
+      traits:
+      - Equity sensitivity
+      - Per-underlying
+      fit_for:
+      - Equity portfolios
+      - Single-stock exposure
+      not_fit_for:
+      - Rates portfolios
+      - Pure derivatives books
+    - name: Gamma
+      traits:
+      - Second-order sensitivity
+      - Volatility exposure
+      fit_for:
+      - Option-heavy portfolios
+      - Volatility trading
+      not_fit_for:
+      - Linear instruments
+      - Forward positions
+    - name: PnlExplain
+      traits:
+      - P&L attribution
+      - Factor decomposition
+      fit_for:
+      - Performance attribution
+      - Risk decomposition
+      not_fit_for:
+      - Forward projections
+      - Scenario analysis
+    - name: VaR
+      traits:
+      - Value at Risk
+      - Confidence intervals
+      fit_for:
+      - Risk limits
+      - Regulatory reporting
+      not_fit_for:
+      - Tail risk analysis
+      - Expected shortfall
+    default: Instrument-specific default
+  design_decisions:
+  - 'Risk results extend pandas types with RiskKey (evidence: gs_quant/risk/core.py:155(ScalarWithInfo))
+    — Combines rich metadata with pandas API - enables dataframe operations on risk results'
+  - 'ResultInfo contains RiskKey for provenance (evidence: gs_quant/risk/core.py:37(ResultInfo)) — Full
+    audit trail of what generated the result - critical for regulatory compliance'
+  - 'aggregate_risk supports heterogeneous types (evidence: gs_quant/risk/core.py:516(aggregate_risk))
+    — Handles mixed scalar/series results - instruments may return different result types'
+  acceptance_hints:
+  - Risk results carry RiskKey through each computations for audit trail
+  - Every DataFrames with risk data use RiskKey for provenance tracking
+  - Composing results from different market locations raises ValueError
+  - Risk aggregation preserves result types correctly
+- id: backtesting
+  name: Backtesting Engine
+  order: 5
+  responsibility: Historical simulation of trading strategies with triggers, actions, transaction costs,
+    and risk hedging. Supports systematic and predefined asset strategies. This layer exists to enable
+    quantitative strategy validation against historical data with realistic cost modeling and risk management.
+  interface:
+    inputs:
+    - Strategy with triggers/actions
+    - Date range
+    - Initial capital
+    outputs:
+    - BackTest results
+    - Trade ledger
+    - Risk summaries
+    - P&L explain
+  required_methods:
+  - name: Strategy.run
+    description: Executes the backtest with defined strategy, triggers, and actions over specified date
+      range
+    evidence: gs_quant/backtests/strategy.py:39(Strategy)
+  - name: GenericEngine.run_backtest
+    description: Main backtest engine execution for priced instruments with risk-based actions
+    evidence: gs_quant/backtests/generic_engine.py:89(GenericEngine)
+  - name: PredefinedAssetEngine.run
+    description: Engine execution for order-based strategies with fill simulation
+    evidence: gs_quant/backtests/predefined_asset_engine.py:103(PredefinedAssetEngine)
+  - name: BackTest.get_results
+    description: Retrieves accumulated backtest results including trades, P&L, and risk summaries
+    evidence: gs_quant/backtests/backtest_objects.py:85(BackTest)
+  key_behaviors:
+  - behavior: ActionHandler factory pattern
+    description: Maps Action types to implementations via factory - new engines add handlers without modifying
+      existing code following open/closed principle
+    evidence: gs_quant/backtests/action_handler.py:46(ActionHandlerBaseFactory)
+  - behavior: Mutable state accumulation
+    description: BackTest is mutable state container that accumulates results across dates enabling incremental
+      result inspection during backtest
+    evidence: gs_quant/backtests/backtest_objects.py:85(__post_init__)
+  - behavior: Deferred risk calculations
+    description: calc_calls attribute enables deferring risk calculations that may need future context
+      - trade exits may require future pricing date
+    evidence: gs_quant/backtests/backtest_objects.py:179(calc_calls)
+  - behavior: Calculation type ordering
+    description: 'CalcType enum enforces execution order: simple then semi_path_dependent then path_dependent
+      - path-dependent actions need prior risk results'
+    evidence: gs_quant/backtests/backtest_utils.py:32-35(CalcType)
+  replaceable_points:
+  - name: TransactionCostModel
+    description: How trading costs are calculated for each trade execution
+    options:
+    - name: ConstantTransactionModel
+      traits:
+      - Fixed cost per trade
+      - Simple modeling
+      fit_for:
+      - Basic backtesting
+      - Benchmark comparisons
+      not_fit_for:
+      - Market-impact sensitive strategies
+      - Large trade sizing
+    - name: ScaledTransactionModel
+      traits:
+      - Size-proportional costs
+      - Market impact modeling
+      fit_for:
+      - Institutional strategies
+      - Large position changes
+      not_fit_for:
+      - Small retail-like trades
+      - Fixed-cost environments
+    - name: AggregateTransactionModel
+      traits:
+      - Multi-component costs
+      - Combined fee structures
+      fit_for:
+      - Complex fee structures
+      - Multi-asset strategies
+      not_fit_for:
+      - Simple flat-fee brokers
+    default: ConstantTransactionModel
+  - name: CashAccrualModel
+    description: How cash accrues during backtest holding periods
+    options:
+    - name: ConstantCashAccrualModel
+      traits:
+      - Fixed accrual rate
+      - Simple coupon modeling
+      fit_for:
+      - Fixed income basics
+      - Bond-like instruments
+      not_fit_for:
+      - Floating rate products
+      - Variable coupons
+    - name: DataCashAccrualModel
+      traits:
+      - Data-driven accrual
+      - External rate source
+      fit_for:
+      - OIS-linked products
+      - LIBOR transitions
+      not_fit_for:
+      - Fixed-coupon instruments
+    - name: OisFixingCashAccrualModel
+      traits:
+      - OIS-based accrual
+      - Risk-free rate linkage
+      fit_for:
+      - Swap valuation
+      - Overnight-indexed products
+      not_fit_for:
+      - Equity positions
+      - Non-rate products
+    default: ConstantCashAccrualModel
+  - name: BacktestEngine
+    description: Engine implementation for strategy execution
+    options:
+    - name: GenericEngine
+      traits:
+      - Full feature set
+      - Risk-based triggers
+      - Every instrument types
+      fit_for:
+      - Derivatives strategies
+      - Risk-managed approaches
+      not_fit_for:
+      - Simple order-based strategies
+      - Equity-only trading
+    - name: PredefinedAssetEngine
+      traits:
+      - Order-based execution
+      - Fill simulation
+      fit_for:
+      - Asset allocation
+      - Predefined trading rules
+      not_fit_for:
+      - Derivatives pricing
+      - Complex risk triggers
+    - name: EquityVolEngine
+      traits:
+      - Volatility-specific
+      - Equity vol strategies
+      fit_for:
+      - Volatility arbitrage
+      - Options-based equity strategies
+      not_fit_for:
+      - Rates products
+      - Multi-asset portfolios
+    default: GenericEngine
+  design_decisions:
+  - 'ActionHandler factory pattern for engine extensibility (evidence: gs_quant/backtests/action_handler.py:46(ActionHandlerBaseFactory))
+    — Maps Action types to implementations - new engines add handlers without modifying existing code'
+  - 'BackTest is mutable state container (evidence: gs_quant/backtests/backtest_objects.py:85(__post_init__))
+    — Accumulates results across dates - enables incremental result inspection during backtest'
+  - 'TransactionCostEntry is stateful wrapper (evidence: gs_quant/backtests/backtest_objects.py:586(TransactionCostEntry))
+    — Links costs to CashPayments with scaling - supports hedged strategies with dynamic scaling'
+  - 'BackTest.calc_calls for deferred risk calculations (evidence: gs_quant/backtests/backtest_objects.py:179(calc_calls))
+    — Trade exits may need future risk calc - deferring allows proper pricing context'
+  - 'RiskTriggerRequirements references backtest for state access (evidence: gs_quant/backtests/triggers.py:191(has_triggered))
+    — Strategy risk triggers need backtest state - tight coupling enables complex exit logic'
+  - 'default_transaction_cost returns zero cost by default (evidence: gs_quant/backtests/actions.py:50-51(default_transaction_cost))
+    — Transaction costs silently ignored unless explicitly set - backtest profitability may be overstated'
+  acceptance_hints:
+  - BackTest requires GenericEngine or engine subclass for execution
+  - Exit costs default to entry costs if not explicitly overridden
+  - Partial hedges require explicit risk_percentage setting (default 100%)
+  - AggregateTriggerRequirements takes max of child calc types - path_dependent dominates
+- id: analytics_processing
+  name: Analytics Processing
+  order: 6
+  responsibility: Applies analytical processors (volatility, correlation, returns) to market data with
+    dependency resolution and async execution. This layer exists to provide composable, reusable analytical
+    computations with automatic parallelization and shared sub-expression optimization.
+  interface:
+    inputs:
+    - Data coordinates/entities
+    - Processor parameters (windows, returns type)
+    outputs:
+    - ProcessorResult with computed values
+    - Plot expressions
+  required_methods:
+  - name: BaseProcessor.process
+    description: Computes the analytical function with automatic dependency graph ordering
+    evidence: gs_quant/analytics/core/processor.py:83(BaseProcessor)
+  - name: BaseProcessor.update
+    description: Updates processor results using ProcessPoolExecutor for CPU-bound calculations
+    evidence: gs_quant/analytics/core/processor.py:147(update)
+  - name: DataGrid.poll
+    description: Polls for live data updates without recreating grid - suitable for dashboards
+    evidence: gs_quant/analytics/datagrid/datagrid.py:236(poll)
+  - name: VolatilityProcessor.compute
+    description: Computes rolling volatility with configurable window and returns type
+    evidence: gs_quant/analytics/processors/econometrics_processors.py:42(VolatilityProcessor)
+  key_behaviors:
+  - behavior: Dependency graph topological ordering
+    description: Processors build dependency graph before execution enabling topological ordering - shared
+      sub-expressions computed once minimizing API calls
+    evidence: gs_quant/analytics/core/processor.py:204(build_graph)
+  - behavior: Parallel execution via ProcessPoolExecutor
+    description: Update method uses ProcessPoolExecutor for CPU-bound calculations offloaded from main
+      thread improving performance for large grids
+    evidence: gs_quant/analytics/core/processor.py:147(update)
+  - behavior: Recursive parent traversal calculation
+    description: calculate() propagates up processor tree through parent references - chain breaks if
+      parent reference is wrong resulting in incomplete grid calculations
+    evidence: gs_quant/analytics/core/processor.py:256-286(calculate)
+  - behavior: Date range masking
+    description: Processor applies user-specified date filters to results ensuring consistency with query
+      parameters
+    evidence: gs_quant/analytics/core/processor.py:110(__handle_date_range)
+  replaceable_points:
+  - name: Processor type
+    description: Analytical function to apply to market data
+    options:
+    - name: VolatilityProcessor
+      traits:
+      - Rolling window vol
+      - Configurable returns
+      fit_for:
+      - Risk estimation
+      - Volatility trading
+      not_fit_for:
+      - Trend analysis
+      - Mean-reversion strategies
+    - name: SharpeRatioProcessor
+      traits:
+      - Risk-adjusted returns
+      - Rolling calculation
+      fit_for:
+      - Performance measurement
+      - Strategy selection
+      not_fit_for:
+      - Single-asset analysis
+      - Absolute return measurement
+    - name: CorrelationProcessor
+      traits:
+      - Pairwise correlation
+      - Rolling window
+      fit_for:
+      - Diversification analysis
+      - Pair trading
+      not_fit_for:
+      - Single-asset portfolios
+      - Causal relationships
+    - name: ReturnsProcessor
+      traits:
+      - Return series computation
+      - Multiple types
+      fit_for:
+      - P&L calculation
+      - Performance attribution
+      not_fit_for:
+      - Risk measurement
+      - Cross-sectional analysis
+    - name: BetaProcessor
+      traits:
+      - Market sensitivity
+      - Rolling regression
+      fit_for:
+      - CAPM analysis
+      - Factor exposure
+      not_fit_for:
+      - Market-neutral strategies
+      - Multi-factor models
+    default: Processor-specific
+  - name: Returns type
+    description: Method for computing returns from price series
+    options:
+    - name: LOGARITHMIC
+      traits:
+      - Log returns
+      - Additive over time
+      - Normally distributed
+      fit_for:
+      - Statistical analysis
+      - Multi-period returns
+      not_fit_for:
+      - Simple percentage comparison
+      - Short-term intraday
+    - name: SIMPLE
+      traits:
+      - Simple returns
+      - Multiplicative
+      - Portfolio math
+      fit_for:
+      - Portfolio returns
+      - Dividend adjustment
+      not_fit_for:
+      - Long-horizon statistical analysis
+    default: SIMPLE
+  design_decisions:
+  - 'Processors build dependency graph before execution (evidence: gs_quant/analytics/core/processor.py:204(build_graph))
+    — Topological ordering minimizes API calls - shared sub-expressions computed once'
+  - 'Process uses ProcessPoolExecutor for parallelism (evidence: gs_quant/analytics/core/processor.py:147(update))
+    — CPU-bound calculations offloaded - improves performance for large grids'
+  - 'DataGrid supports polling for live data (evidence: gs_quant/analytics/datagrid/datagrid.py:236(poll))
+    — Real-time data refresh without recreation - suitable for dashboards'
+  - 'Processor handles date range masking (evidence: gs_quant/analytics/core/processor.py:110(__handle_date_range))
+    — Applies user-specified date filters to results - ensures consistency with query parameters'
+  acceptance_hints:
+  - Dependency graph correctly orders processor calculations
+  - Shared sub-expressions computed once in graph execution
+  - Date range filters applied consistently across processors
+  - Live polling updates data without full grid recreation
+- id: timeseries_analysis
+  name: Time Series Analysis
+  order: 7
+  responsibility: 'Statistical and econometric analysis of financial time series: returns, volatility,
+    correlation, regression models. This layer exists to provide specialized time series operations optimized
+    for financial data with proper handling of datetime indices and financial calculations.'
+  interface:
+    inputs:
+    - Price series (pandas Series)
+    - Windows, periods, parameters
+    outputs:
+    - Computed series
+    - Model objects (SIRModel, LinearRegression)
+  required_methods:
+  - name: ExtendedSeries.returns
+    description: Computes returns from price series with configurable return type and annualization
+    evidence: gs_quant/timeseries/measures.py:89(ExtendedSeries)
+  - name: LinearRegression.fit
+    description: Fits OLS regression model to time series data with coefficient and prediction methods
+    evidence: gs_quant/timeseries/statistics.py:1083(LinearRegression)
+  - name: RollingLinearRegression.rolling_fit
+    description: Rolling window OLS regression for time-varying relationships
+    evidence: gs_quant/timeseries/statistics.py:1173(RollingLinearRegression)
+  - name: vol_swap_volatility
+    description: Computes vol swap volatility with separate annualization for pricing applications
+    evidence: gs_quant/timeseries/econometrics.py:693(vol_swap_volatility)
+  key_behaviors:
+  - behavior: ExtendedSeries pandas extension
+    description: ExtendedSeries extends pd.Series providing drop-in pandas replacement with additional
+      market data semantics for familiar API
+    evidence: gs_quant/timeseries/measures.py:89(ExtendedSeries)
+  - behavior: Window type for flexible lookback
+    description: Statistics functions support Window type encapsulating period and point type providing
+      cleaner API than separate parameters
+    evidence: gs_quant/timeseries/statistics.py:87(min_)
+  - behavior: Separate vol swap annualization
+    description: vol_swap_volatility uses different scaling than standard vol - explicit parameter avoids
+      confusion between pricing and statistical volatility
+    evidence: gs_quant/timeseries/econometrics.py:693(vol_swap_volatility)
+  - behavior: Datetime index normalization
+    description: ExtendedSeries maintains datetime index for time series operations ensuring proper alignment
+      and operations
+    evidence: gs_quant/timeseries/measures.py:78(_normalize_dtidx)
+  replaceable_points:
+  - name: Returns type
+    description: Return calculation method for price series
+    options:
+    - name: LOGARITHMIC
+      traits:
+      - Log returns
+      - Time-additive
+      - Asymptotically normal
+      fit_for:
+      - Statistical modeling
+      - Multi-period aggregation
+      not_fit_for:
+      - Portfolio returns
+      - Dividend handling
+    - name: SIMPLE
+      traits:
+      - Simple returns
+      - Portfolio-accurate
+      - Multiplicative
+      fit_for:
+      - Portfolio P&L
+      - Performance measurement
+      not_fit_for:
+      - Long-horizon statistics
+    default: SIMPLE
+  - name: Mean type
+    description: Mean calculation method for statistics
+    options:
+    - name: ARITHMETIC
+      traits:
+      - Simple average
+      - Standard calculation
+      fit_for:
+      - General statistics
+      - Cross-sectional means
+      not_fit_for:
+      - Returns averaging
+      - Growth rates
+    - name: GEOMETRIC
+      traits:
+      - Geometric mean
+      - CAGR appropriate
+      fit_for:
+      - Returns averaging
+      - Compound growth
+      not_fit_for:
+      - General statistics
+      - Non-positive values
+    default: ARITHMETIC
+  design_decisions:
+  - 'ExtendedSeries extends pd.Series (evidence: gs_quant/timeseries/measures.py:89(ExtendedSeries)) —
+    Drop-in pandas replacement - users get familiar API with additional semantics'
+  - 'Statistics functions support Window type for flexible lookback (evidence: gs_quant/timeseries/statistics.py:87(min_))
+    — Window encapsulates period and point type - cleaner API than separate parameters'
+  - 'vol_swap_volatility uses separate annualization (evidence: gs_quant/timeseries/econometrics.py:693(vol_swap_volatility))
+    — Vol swap pricing requires different scaling than standard vol - explicit parameter avoids confusion'
+  acceptance_hints:
+  - ExtendedSeries maintains datetime index for each operations
+  - Statistics functions correctly apply Window parameters
+  - Returns calculations produce expected values for known test cases
+  - Regression models converge for valid input data
+- id: risk_models
+  name: Risk Model Management
+  order: 8
+  responsibility: Manages Marquee risk models (factor, macro, thematic) with data retrieval and upload
+    capabilities. This layer exists to provide access to sophisticated risk factor models that decompose
+    portfolio risk into explainable components.
+  interface:
+    inputs:
+    - Risk model ID
+    - Date ranges
+    - Asset identifiers
+    outputs:
+    - Factor exposures
+    - Specific risk
+    - Covariance matrices
+    - Factor returns
+  required_methods:
+  - name: RiskModel.get_data
+    description: Retrieves risk model data for specified assets and date range
+    evidence: gs_quant/models/risk_model.py:91(RiskModel)
+  - name: FactorRiskModel.get_asset_factor_attribution
+    description: Gets factor attribution for individual assets within the risk model
+    evidence: gs_quant/models/risk_model.py:1365(FactorRiskModel)
+  - name: MacroRiskModel.get_fair_value_gap
+    description: Computes macro fair value gap for thematic analysis
+    evidence: gs_quant/models/risk_model.py:2791(MacroRiskModel)
+  - name: ThematicRiskModel.get_exposure
+    description: Gets thematic basket exposure for thematic risk analysis
+    evidence: gs_quant/models/risk_model.py:3175(ThematicRiskModel)
+  - name: FactorRiskModel.upload_partial_data
+    description: Enables incremental data uploads for daily publication - prevents data loss on upload
+      failure
+    evidence: gs_quant/models/risk_model.py:1278(upload_partial_data)
+  key_behaviors:
+  - behavior: Immutable value objects
+    description: Risk model classes are immutable value objects enabling safe caching and reuse across
+      calculations preventing accidental modification of model parameters
+    evidence: gs_quant/models/risk_model.py:126(__init__)
+  - behavior: Partial data uploads
+    description: upload_partial_data supports daily data publication - partial uploads prevent data loss
+      on upload failure
+    evidence: gs_quant/models/risk_model.py:1278(upload_partial_data)
+  - behavior: Combined measure retrieval
+    description: FactorRiskModel.get_data combines multiple measures in single request minimizing API
+      calls for better performance
+    evidence: gs_quant/models/risk_model.py:1196(get_data)
+  replaceable_points:
+  - name: Return format
+    description: Output format for risk model data retrieval
+    options:
+    - name: DATA_FRAME
+      traits:
+      - Pandas DataFrame
+      - Column-based access
+      - Series operations
+      fit_for:
+      - Analysis workflows
+      - Visualization
+      not_fit_for:
+      - Memory-constrained environments
+      - Streaming use cases
+    - name: dict
+      traits:
+      - Native Python dict
+      - Key-value access
+      - JSON serialization
+      fit_for:
+      - API integration
+      - Lightweight results
+      not_fit_for:
+      - Tabular analysis
+      - Bulk operations
+    default: DATA_FRAME
+  design_decisions:
+  - 'Risk model classes are immutable value objects (evidence: gs_quant/models/risk_model.py:126(__init__))
+    — Caching and reuse across calculations - prevents accidental modification of model parameters'
+  - 'upload_partial_data for incremental updates (evidence: gs_quant/models/risk_model.py:1278(upload_partial_data))
+    — Daily data publication - partial uploads prevent data loss on upload failure'
+  - 'FactorRiskModel.get_data combines measures (evidence: gs_quant/models/risk_model.py:1196(get_data))
+    — Minimizes API calls - single request for multiple measures is faster'
+  acceptance_hints:
+  - Risk model instances can be safely cached and shared
+  - Partial data uploads succeed without losing existing data
+  - Factor exposures sum to total risk for correctly attributed portfolios
+  - Model data retrieval completes within expected time bounds
+- id: reporting
+  name: Reporting & Performance Analytics
+  order: 9
+  responsibility: 'Retrieves and analyzes portfolio performance data: P&L, attribution, factor risk, thematic
+    exposure. This layer exists to provide standardized reporting formats for portfolio analytics with
+    both raw data access and formatted views.'
+  interface:
+    inputs:
+    - Portfolio/report ID
+    - Date ranges
+    - Report type
+    outputs:
+    - Performance metrics DataFrames
+    - Factor risk tables
+    - Attribution breakdowns
+  required_methods:
+  - name: Report.run
+    description: Initiates report execution with scheduling and status tracking returning async ReportJobFuture
+    evidence: gs_quant/markets/report.py:197(Report)
+  - name: PerformanceReport.get_results
+    description: Retrieves historical P&L, exposure, and turnover analysis results
+    evidence: gs_quant/markets/report.py:419(PerformanceReport)
+  - name: FactorRiskReport.get_results
+    description: Gets raw factor risk attribution data separate from UI-formatted view
+    evidence: gs_quant/markets/report.py:1068(get_results)
+  - name: FactorRiskReport.get_view
+    description: Gets Marquee UI-formatted factor risk view with different layout than raw results
+    evidence: gs_quant/markets/report.py:1068(get_results)
+  - name: PortfolioManager.get_aum
+    description: Retrieves assets under management with source tracking
+    evidence: gs_quant/markets/portfolio_manager.py:82(PortfolioManager)
+  - name: PerformanceReport.get_brinson_attribution
+    description: Computes Brinson attribution with configurable aggregation types (arithmetic vs geometric)
+    evidence: gs_quant/markets/report.py:895(get_brinson_attribution)
+  key_behaviors:
+  - behavior: Async status monitoring
+    description: ReportJobFuture enables non-blocking report execution - clients poll or wait for completion
+      without blocking
+    evidence: gs_quant/markets/report.py:118(ReportJobFuture)
+  - behavior: Separate view and results
+    description: FactorRiskReport has distinct get_results (raw data) and get_view (UI format) methods
+      serving different use cases
+    evidence: gs_quant/markets/report.py:1068(get_results)
+  - behavior: Brinson aggregation types
+    description: Attribution supports arithmetic vs geometric aggregation reflecting different client
+      preferences for performance attribution
+    evidence: gs_quant/markets/report.py:895(get_brinson_attribution)
+  replaceable_points:
+  - name: Report type
+    description: Type of analysis report to generate
+    options:
+    - name: PerformanceReport
+      traits:
+      - P&L analysis
+      - Exposure tracking
+      - Turnover metrics
+      fit_for:
+      - Performance measurement
+      - Attribution analysis
+      not_fit_for:
+      - Factor risk
+      - Thematic analysis
+    - name: FactorRiskReport
+      traits:
+      - Factor attribution
+      - Risk decomposition
+      fit_for:
+      - Risk analysis
+      - Factor exposure
+      not_fit_for:
+      - Performance attribution
+      - Simple P&L
+    - name: ThematicReport
+      traits:
+      - Thematic exposure
+      - Basket analysis
+      fit_for:
+      - Thematic investing
+      - ESG analysis
+      not_fit_for:
+      - Traditional risk factors
+      - Performance attribution
+    default: PerformanceReport
+  - name: Return format
+    description: Output format for report data
+    options:
+    - name: DATA_FRAME
+      traits:
+      - Pandas DataFrame
+      - Tabular analysis
+      fit_for:
+      - Analysis workflows
+      - Visualization
+      not_fit_for:
+      - API serialization
+      - Memory constraints
+    - name: dict
+      traits:
+      - Native Python dict
+      - API-friendly
+      fit_for:
+      - API integration
+      - Serialization
+      not_fit_for:
+      - Tabular analysis
+    default: DATA_FRAME
+  design_decisions:
+  - 'ReportJobFuture for async status monitoring (evidence: gs_quant/markets/report.py:118(ReportJobFuture))
+    — Non-blocking report execution - clients poll or wait for completion'
+  - 'FactorRiskReport has separate get_results/get_view (evidence: gs_quant/markets/report.py:1068(get_results))
+    — View is Marquee UI format, results is raw data - different use cases need different formats'
+  - 'Brinson attribution with aggregation types (evidence: gs_quant/markets/report.py:895(get_brinson_attribution))
+    — Arithmetic vs geometric aggregation - different client preferences for attribution'
+  acceptance_hints:
+  - Report execution completes with status tracking via ReportJobFuture
+  - Raw results and UI views contain equivalent data in different formats
+  - Attribution breakdowns sum to total P&L for validation
+  - Brinson aggregation produces consistent results across aggregation types
+- id: entity_management
+  name: Entity Management
+  order: 10
+  responsibility: Manages first-class entities (assets, countries, KPIs) with data coordinates and entitlements.
+    This layer exists to provide unified access to financial entities with proper typing, validation,
+    and coordinate resolution across the platform.
+  interface:
+    inputs:
+    - Entity ID and type
+    - Measure/dimension specifications
+    outputs:
+    - Entity objects
+    - Data coordinates
+    - Entitlements
+  required_methods:
+  - name: Entity.get
+    description: Factory method retrieving entity by ID with automatic type resolution - single entry
+      point for each entity types
+    evidence: gs_quant/entities/entity.py:139(get)
+  - name: PositionedEntity.get_latest_position_set
+    description: Gets latest position data with position type (CLOSE vs OPEN) for different analysis contexts
+    evidence: gs_quant/entities/entity.py:371(get_latest_position_set)
+  - name: Country.get_region_mapping
+    description: Retrieves region mappings for geographic analysis and grouping
+    evidence: gs_quant/entities/entity.py:214(Country)
+  - name: Entity.get_entitlements
+    description: Gets access entitlements for entity-level permission management
+    evidence: gs_quant/entities/entity.py:110(Entity)
+  key_behaviors:
+  - behavior: Factory pattern for type resolution
+    description: Entity.get uses factory pattern for automatic type resolution reducing client code complexity
+      with single entry point
+    evidence: gs_quant/entities/entity.py:139(get)
+  - behavior: Position type awareness
+    description: PositionedEntity distinguishes CLOSE vs OPEN position types for end-of-day vs intraday
+      positioning analysis
+    evidence: gs_quant/entities/entity.py:371(get_latest_position_set)
+  - behavior: Entity ID validation
+    description: Entity IDs are validated against EntityType enum ensuring type consistency and preventing
+      invalid lookups
+    evidence: gs_quant/entities/entity.py:73(EntityType)
+  replaceable_points:
+  - name: Entity identifier type
+    description: Identifier format for entity lookup
+    options:
+    - name: MQID
+      traits:
+      - Marquee internal ID
+      - Platform-native
+      - Full coverage
+      fit_for:
+      - Internal workflows
+      - Marquee integration
+      not_fit_for:
+      - External data mapping
+      - Third-party systems
+    - name: BBID
+      traits:
+      - Bloomberg identifier
+      - Industry standard
+      fit_for:
+      - Third-party integration
+      - Market data vendors
+      not_fit_for:
+      - Internal Marquee entities
+      - Non-Bloomberg assets
+    - name: GSID
+      traits:
+      - Goldman Sachs internal ID
+      - Proprietary mapping
+      fit_for:
+      - Internal systems
+      - GS-specific data
+      not_fit_for:
+      - External compatibility
+    - name: CUSIP
+      traits:
+      - Committee on Uniform Securities Identification Procedures
+      - US-centric
+      fit_for:
+      - US securities
+      - Regulatory reporting
+      not_fit_for:
+      - International securities
+      - Derivatives
+    - name: ISIN
+      traits:
+      - International Securities Identification Number
+      - Global standard
+      fit_for:
+      - International securities
+      - Cross-border analysis
+      not_fit_for:
+      - US-centric workflows
+    default: MQID
+  design_decisions:
+  - 'Entity.get uses factory pattern for type resolution (evidence: gs_quant/entities/entity.py:139(get))
+    — Single entry point for each entity types - reduces client code complexity'
+  - 'PositionedEntity has position type (CLOSE vs OPEN) (evidence: gs_quant/entities/entity.py:371(get_latest_position_set))
+    — Different position types for different analyses - end of day vs intraday positioning'
+  acceptance_hints:
+  - Entity IDs are validated against EntityType enum on creation
+  - Factory method correctly resolves entity type from ID
+  - Position sets correctly distinguish CLOSE vs OPEN positions
+  - Entitlements are enforced for entity access operations
+data_flow:
+- from_stage: data_ingestion
+  to_stage: instrument_modeling
+  data: Market data coordinates and time series for instrument resolution
+- from_stage: instrument_modeling
+  to_stage: pricing_context
+  data: Instrument references that resolve against context market data
+- from_stage: pricing_context
+  to_stage: risk_analysis
+  data: Market values and scenario parameters for risk calculations
+- from_stage: risk_analysis
+  to_stage: backtesting
+  data: Risk measures for trigger evaluation and P&L explain
+- from_stage: data_ingestion
+  to_stage: analytics_processing
+  data: Raw market data for processor queries and analytical computations
+- from_stage: analytics_processing
+  to_stage: reporting
+  data: Computed analytics including volatility and correlation for dashboards
+- from_stage: risk_models
+  to_stage: risk_analysis
+  data: Factor exposures and covariance matrices for risk attribution
+- from_stage: entity_management
+  to_stage: data_ingestion
+  data: Entity IDs and data coordinates for market data queries
+- from_stage: entity_management
+  to_stage: reporting
+  data: Portfolio and entity references for report generation
+global_contracts:
+- contract: Every DataFrames with risk data use RiskKey for provenance tracking
+  evidence: gs_quant/risk/core.py:37(ResultInfo.risk_key)
+- contract: PricingContext must be entered for instrument resolution and pricing
+  evidence: gs_quant/markets/__init__.py(PricingContext)
+- contract: BackTest requires GenericEngine or engine subclass for execution
+  evidence: gs_quant/backtests/generic_engine.py:89(GenericEngine)
+- contract: ExtendedSeries maintains datetime index for time series operations
+  evidence: gs_quant/timeseries/measures.py:78(_normalize_dtidx)
+- contract: Entity IDs are validated against EntityType enum
+  evidence: gs_quant/entities/entity.py:73(EntityType)
+- contract: RiskMeasure subclasses must implement pricing_context() for context binding
+  evidence: gs_quant/base.py:41(pricing_context)
+business_decisions:
+- id: BD-001
+  type: B/BA
+  content: DimensionsOverride converts enum keys to string values
+  rationale: DimensionsOverride automatically converts enum-typed dimension keys to their string representations
+    during initialization. This conversion boundary ensures consistent serialization and comparison while
+    allowing enum-typed internal representation for type safety.
+  evidence: gs_quant/analytics/datagrid/data_row.py:171(__init__)
+  stage: data_ingestion
+- id: BD-002
+  type: B/BA
+  content: Annualized rolling volatility uses simple std with ddof=1 and 252-day annualization
+  rationale: The choice of ddof=1 (Bessel correction) provides unbiased sample variance estimator which
+    is standard in financial applications for consistency with statistical theory. The 252-day annualization
+    factor assumes 252 trading days per year, standard for US equity markets. Alternative ddof=0 would
+    produce biased population variance estimates.
+  evidence: gs_quant/timeseries/statistics.py:95(annualization_factor_252)
+  stage: gs_quant.timeseries.statistics
+  alternative_considered: Using 250 or 365 days as annualization factor depending on market convention;
+    ddof=0 for population variance
+  _evidence_issues:
+  - 'FN_NOT_FOUND: annualization_factor_252 in gs_quant/timeseries/statistics.py'
+- id: BD-003
+  type: B/BA
+  content: Exponential moving average uses span=14 default (beta=0.94, alpha=0.06), no adjustment
+  rationale: Span=14 is the industry standard for short-term momentum indicators in equities, providing
+    responsiveness while filtering noise. The no-adjustment flag prevents biased estimation at series
+    boundaries. Changing span fundamentally alters the smoothing-speed versus lag tradeoff.
+  evidence: gs_quant/timeseries/statistics.py:120-122(default_span_14)
+  stage: gs_quant.timeseries.statistics
+  alternative_considered: Span=20 or 26 as alternative standard values; adjust=True for boundary handling
+  _evidence_issues:
+  - 'FN_NOT_FOUND: default_span_14 in gs_quant/timeseries/statistics.py'
+- id: BD-004
+  type: B/BA
+  content: Exponentially weighted std uses beta=0.75 (alpha=0.25), with debiasing factor
+  rationale: Beta=0.75 gives alpha=0.25 weighting more recent observations significantly more than older
+    ones, suitable for volatile financial series. The debiasing factor corrects for the initial window
+    bias in exponential weighting. This balances responsiveness to recent regime changes with statistical
+    stability.
+  evidence: gs_quant/timeseries/statistics.py:584-625(exponential_std)
+  stage: gs_quant.timeseries.statistics
+  alternative_considered: Beta=0.94 matching EMA span=14; beta=0.90 for longer memory
+- id: BD-005
+  type: B/BA
+  content: Rolling z-scores computed with sample std (ddof=1) over rolling window
+  rationale: Using sample standard deviation with ddof=1 ensures unbiased estimation of population volatility
+    when computing z-scores. The rolling window approach allows for time-varying standardization. This
+    choice affects outlier detection thresholds and signal generation.
+  evidence: gs_quant/timeseries/statistics.py:734(zscores)
+  stage: gs_quant.timeseries.statistics
+  alternative_considered: Population std (ddof=0) for larger samples; median absolute deviation for robust
+    z-scores
+- id: BD-006
+  type: B/DK
+  content: Rolling variance uses Bessel correction (ddof=1) for unbiased sample variance
+  rationale: Bessel correction provides unbiased variance estimation in rolling windows where the true
+    population mean is unknown. This is essential for statistical inference on rolling variance. Using
+    population variance would systematically underestimate uncertainty.
+  evidence: gs_quant/timeseries/statistics.py:55(rolling_std)
+  stage: gs_quant.timeseries.statistics
+  alternative_considered: MLE variance (ddof=0) for very large windows; Welford's algorithm for numerical
+    stability
+- id: BD-007
+  type: B/DK
+  content: Rolling covariance uses Bessel correction (ddof=1) for unbiased sample covariance
+  rationale: Unbiased covariance estimation with ddof=1 is required when the true means are estimated
+    from data, which is standard practice for rolling windows. This ensures proper correlation estimates
+    and portfolio optimization inputs.
+  evidence: gs_quant/timeseries/statistics.py:695-723(rolling_cov)
+  stage: gs_quant.timeseries.statistics
+  alternative_considered: Shrinkage estimators for ill-conditioned covariance matrices in high dimensions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: rolling_cov in gs_quant/timeseries/statistics.py'
+- id: BD-008
+  type: B/BA
+  content: Winsorization caps values at ±2.5 sigma from sample mean
+  rationale: The 2.5-sigma threshold captures approximately 99% of normally distributed data while limiting
+    the influence of extreme outliers. This is more aggressive than 3-sigma rules but less than 2-sigma,
+    balancing robustness with information retention. Symmetric capping avoids directional bias.
+  evidence: gs_quant/timeseries/statistics.py:794-851(winsorize)
+  stage: gs_quant.timeseries.statistics
+  alternative_considered: 3-sigma for conservative outlier handling; adaptive threshold based on kurtosis;
+    asymmetric winsorization
+- id: BD-009
+  type: B/BA
+  content: Rolling percentile rank uses 'mean' interpolation between tied values
+  rationale: Mean interpolation for ties provides smooth percentile estimates avoiding discrete jumps
+    when multiple values share the same rank. This is consistent with scipy's default behavior and produces
+    more stable time series of percentile ranks compared to 'min' or 'max' interpolation.
+  evidence: gs_quant/timeseries/statistics.py:1036(percentile)
+  stage: gs_quant.timeseries.statistics
+  alternative_considered: Min/max interpolation for conservative/aggressive ranking; no interpolation
+    for exact percentile matching
+- id: BD-010
+  type: B
+  content: OLS linear regression via statsmodels OLS with optional intercept, filters NaN/inf
+  rationale: Using statsmodels OLS provides full statistical inference (t-stats, R-squared) beyond simple
+    least squares. Optional intercept allows forced-through-origin models. NaN/inf filtering prevents
+    contamination of regression estimates by missing or invalid data points.
+  evidence: gs_quant/timeseries/statistics.py:1083-1121(ols_regression)
+  stage: gs_quant.timeseries.statistics
+  alternative_considered: Numpy lstsq for speed; sklearn LinearRegression for different regularization
+    options; weighted least squares for heteroskedasticity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ols_regression in gs_quant/timeseries/statistics.py'
+- id: BD-011
+  type: B/DK
+  content: Rolling OLS via statsmodels RollingOLS with fixed window, optional intercept
+  rationale: Fixed-window RollingOLS enables time-varying coefficient estimation capturing regime changes
+    in relationships. Statsmodels implementation provides consistent methodology with static OLS. Optional
+    intercept allows behavioral constraints on factor exposures.
+  evidence: gs_quant/timeseries/statistics.py:1173-1256(RollingOLS)
+  stage: gs_quant.timeseries.statistics
+  alternative_considered: Expanding window for full-sample history; Kalman filter for time-varying coefficients;
+    recursive least squares
+  _evidence_issues:
+  - 'FN_NOT_FOUND: RollingOLS in gs_quant/timeseries/statistics.py'
+- id: BD-012
+  type: B/DK
+  content: Rolling product computes product of (1+r) values over window for cumulative return
+  rationale: Computing (1+r) product over returns correctly compounds returns accounting for geometric
+    growth, unlike simple averaging which ignores compounding. Using nanprod handles missing values appropriately.
+    This is the standard approach for computing cumulative returns from periodic returns.
+  evidence: gs_quant/timeseries/statistics.py:492(product)
+  stage: gs_quant.timeseries.statistics
+  alternative_considered: Log returns with exp(sum(log(1+r))) for numerical stability; arithmetic sum
+    for simple aggregation
+  vague_rationale: true
+- id: BD-013
+  type: B
+  content: Autocorrelation uses unbiased Var(X) estimator (ddof=1) per Bartlett's formula
+  rationale: Bartlett's formula for autocorrelation confidence intervals requires unbiased variance estimation
+    with ddof=1. This ensures proper statistical inference about serial dependence. The unbiased estimator
+    is essential for significance testing of autocorrelation in financial time series.
+  evidence: gs_quant/timeseries/statistics.py:55(rolling_std)
+  stage: gs_quant.timeseries.statistics
+  alternative_considered: Spectral methods for long-memory processes; Ljung-Box test for joint significance
+- id: BD-014
+  type: B
+  content: SIR compartmental model uses Levenberg-Marquardt (leastsq) via lmfit.minimize for fitting
+  rationale: Levenberg-Marquardt is optimal for nonlinear least squares fitting with good convergence
+    properties. lmfit provides robust parameter bounds and uncertainty estimation. This method balances
+    Gauss-Newton and gradient descent approaches, handling ill-conditioned Jacobians well.
+  evidence: gs_quant/models/epidemiology.py:29(compartmentalModel)
+  stage: gs_quant.models.epidemiology
+  alternative_considered: Differential evolution for global optimization; MCMC for full posterior estimation;
+    Nelder-Mead simplex
+  _evidence_issues:
+  - 'FN_NOT_FOUND: compartmentalModel in gs_quant/models/epidemiology.py'
+- id: BD-015
+  type: B
+  content: SEIR adds exposed compartment with sigma transition rate, same LM fitting
+  rationale: SEIR extends SIR with an exposed/latent period capturing incubation delay, more realistic
+    for diseases like COVID-19. Sigma parameter controls transition rate from exposed to infectious. Using
+    same LM fitting maintains consistency with SIR implementation while accommodating additional compartment.
+  evidence: gs_quant/models/epidemiology.py:124(seir)
+  stage: gs_quant.models.epidemiology
+  alternative_considered: SEIRS with immunity waning; SEIR with time-varying parameters; agent-based models
+    for heterogeneity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: seir in gs_quant/models/epidemiology.py'
+- id: BD-016
+  type: B
+  content: SEAIRD adds age stratification (K groups), quarantine (T), mortality (M) compartments
+  rationale: Age stratification captures differential susceptibility and mortality across age groups,
+    critical for policy analysis. Quarantine compartment models intervention effectiveness. Mortality
+    compartment allows infection fatality rate estimation. K groups provide granularity for heterogeneous
+    populations.
+  evidence: gs_quant/models/epidemiology.py:250-538(SEAIRD_derivatives)
+  stage: gs_quant.models.epidemiology
+  alternative_considered: Continuous age distribution; regional stratification; multi-layer networks for
+    contact patterns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: SEAIRD_derivatives in gs_quant/models/epidemiology.py'
+- id: BD-017
+  type: B
+  content: ODE integration uses scipy.integrate.odeint (LSODA algorithm) for model solving
+  rationale: LSODA algorithm automatically switches between stiff and non-stiff methods, handling the
+    transition that occurs in epidemiological models. odeint provides good balance of speed and accuracy
+    for compartment models. This is the industry standard for epidemiological ODE solving.
+  evidence: gs_quant/models/epidemiology.py:585(odeint_LSODA)
+  stage: gs_quant.models.epidemiology
+  alternative_considered: solve_ivp with RK45 for adaptive step sizing;jitcode for speed;PyTorch for GPU
+    acceleration
+  _evidence_issues:
+  - 'FN_NOT_FOUND: odeint_LSODA in gs_quant/models/epidemiology.py'
+- id: BD-018
+  type: B
+  content: Residual = solution - data (L2 norm minimized), with optional fit_period tail truncation
+  rationale: L2 norm minimization (ordinary least squares) is standard for epidemic curve fitting, treating
+    each residuals equally. Tail truncation allows excluding unreliable future data points which is important
+    early in outbreaks. This approach balances fitting to observed data while acknowledging data quality
+    issues.
+  evidence: gs_quant/models/epidemiology.py:589(residual)
+  stage: gs_quant.models.epidemiology
+  alternative_considered: Weighted least squares for heteroskedastic data; LAD for robust fitting;Poisson
+    likelihood for count data
+- id: BD-019
+  type: B/BA
+  content: Seasonal decomposition via statsmodels seasonal_decompose, additive or multiplicative
+  rationale: statsmodels seasonal_decompose implements classical decomposition with moving average smoothing.
+    Additive decomposition assumes constant seasonal amplitude; multiplicative assumes seasonal effect
+    proportional to trend level. This choice affects detrending methodology and seasonal pattern extraction.
+  evidence: gs_quant/timeseries/technicals.py:480(seasonal_decompose)
+  stage: gs_quant.timeseries.technicals
+  alternative_considered: STL decomposition for robustness; X-13ARIMA-SEATS for official statistics; Hodrick-Prescott
+    filter for business cycle
+  _evidence_issues:
+  - 'FN_NOT_FOUND: seasonal_decompose in gs_quant/timeseries/technicals.py'
+- id: BD-020
+  type: B
+  content: Seasonally adjusted = trend + resid (additive) or trend * resid (multiplicative)
+  rationale: Additive adjustment adds seasonal and irregular components to trend, appropriate for series
+    with stable seasonal amplitude. Multiplicative adjustment multiplies components, appropriate when
+    seasonal variation grows with trend level. This fundamental choice affects economic data interpretation
+    and inflation-adjusted metrics.
+  evidence: gs_quant/timeseries/technicals.py:485(seasonally_adjusted)
+  stage: gs_quant.timeseries.technicals
+  alternative_considered: Log-additive decomposition; seasonal differencing instead of decomposition;Reg-ARIMA
+    for model-based adjustment
+  vague_rationale: true
+- id: BD-021
+  type: B/BA
+  content: Bollinger Bands at ±2 standard deviations from 20-period SMA
+  rationale: ±2 standard deviations captures approximately 95% of normally distributed price action, creating
+    natural support/resistance boundaries. 20-period SMA balances responsiveness with smoothing. These
+    parameters define Bollinger Bands behavior for mean-reversion signals and volatility breakout detection.
+  evidence: gs_quant/timeseries/technicals.py:94(bollinger_bands)
+  stage: gs_quant.timeseries.technicals
+  alternative_considered: ±1.5 sigma for tighter bands; 30-period for longer-term; exponential moving
+    average instead of SMA
+- id: BD-022
+  type: B
+  content: Exponential volatility = annualized exp-weighted std of log returns
+  rationale: Exponentially weighted volatility emphasizes recent price action while maintaining annualization
+    for comparison. Log returns ensure multiplicative returns compounding correctly. This approach captures
+    time-varying volatility clustering better than equal-weighted estimates.
+  evidence: gs_quant/timeseries/technicals.py:343(exponential_volatility)
+  stage: gs_quant.timeseries.technicals
+  alternative_considered: GARCH models for formal volatility modeling; simple std for stability; Parkinson/Garman-Klass
+    for range-based estimates
+- id: BD-023
+  type: B/BA
+  content: 'Frequency-to-period mapping converts index freq to number of points: daily=365, business=5,
+    weekly=52, monthly=12'
+  rationale: The mapping determines annualization factors for each risk and performance metrics. Calendar
+    daily (365) vs business daily (5) choice affects Sharpe ratio and volatility scaling. Weekly=52 and
+    monthly=12 approximate actual calendar divisions for consistent annualization.
+  evidence: gs_quant/timeseries/technicals.py:409(_freq_to_period)
+  stage: gs_quant.timeseries.technicals
+  alternative_considered: Trading days=252 for equities; exact calendar days; flexible user-specified
+    factors
+- id: BD-024
+  type: B
+  content: EMA Crossover uses difference of two EMAs, no explicit signal line
+  rationale: The EMA difference directly generates crossover signals without separate smoothing, providing
+    faster response to momentum shifts. Some systems apply additional smoothing (MACD-style), but direct
+    difference maintains signal purity. This defines the core crossover signal generation behavior.
+  evidence: gs_quant/timeseries/econometrics.py:180-185(ema_crossover)
+  stage: gs_quant.timeseries.econometrics
+  alternative_considered: Signal line smoothing (9-period EMA of difference); histogram visualization;
+    percentage versus absolute difference
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ema_crossover in gs_quant/timeseries/econometrics.py'
+- id: BD-025
+  type: B
+  content: AR model via OLS on lagged values using numpy lstsq
+  rationale: OLS estimation of autoregressive models is efficient and provides optimal linear prediction
+    under homoskedasticity. Using lstsq avoids explicit matrix inversion which can be numerically unstable
+    for high lag orders. This is the standard approach for AR model estimation.
+  evidence: gs_quant/timeseries/econometrics.py:240-250(ar_model_lstsq)
+  stage: gs_quant.timeseries.econometrics
+  alternative_considered: Yule-Walker for AR-specific estimation; Burg algorithm for AR spectral estimation;
+    MLE for full distribution
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ar_model_lstsq in gs_quant/timeseries/econometrics.py'
+- id: BD-026
+  type: B
+  content: Augmented Dickey-Fuller test for stationarity with AIC-based lag selection
+  rationale: ADF test is the standard unit root test for financial time series stationarity. AIC-based
+    lag selection balances model fit against over-fitting, automating lag determination. Stationarity
+    testing is fundamental for return predictability and mean-reversion strategies.
+  evidence: gs_quant/timeseries/econometrics.py:400(adf_autolag_AIC)
+  stage: gs_quant.timeseries.econometrics
+  alternative_considered: Phillips-Perron for nonparametric adjustment; KPSS for trend stationarity; AIC
+    versus BIC lag selection
+  _evidence_issues:
+  - 'FN_NOT_FOUND: adf_autolag_AIC in gs_quant/timeseries/econometrics.py'
+- id: BD-027
+  type: B
+  content: Engle-Granger two-step cointegration test using OLS residuals
+  rationale: Engle-Granger is the standard linear cointegration test in finance. Two-step procedure estimates
+    long-run relationship then tests residual stationarity. Including constant (trend='c') captures nonzero
+    equilibrium. Cointegration testing is essential for pairs trading and spread analysis.
+  evidence: gs_quant/timeseries/econometrics.py:520(coint_engle_granger)
+  stage: gs_quant.timeseries.econometrics
+  alternative_considered: Johansen test for multiple cointegrating relationships; Phillips-Ouliaris for
+    robustness; DOLS for dynamic regression
+  _evidence_issues:
+  - 'FN_NOT_FOUND: coint_engle_granger in gs_quant/timeseries/econometrics.py'
+- id: BD-028
+  type: B/BA
+  content: Variance targeting estimator scales realized var by window mean, annualizes
+  rationale: Variance targeting improves GARCH estimation by conditioning on the unconditional variance
+    proxy. Scaling realized variance by the ratio of unconditional to realized variance targets stabilizes
+    estimation. Annualization allows comparison across frequencies.
+  evidence: gs_quant/timeseries/econometrics.py:60(SharpeAssets)
+  stage: gs_quant.timeseries.econometrics
+  alternative_considered: EWMA with fixed decay; QMLE for direct estimation; robust variance estimation
+    for jumps
+- id: BD-029
+  type: B/BA
+  content: GARCH(1,1) via rugarch with constant mean, normal distribution for returns
+  rationale: GARCH(1,1) captures volatility clustering with one lag each in squared innovations and conditional
+    variance. Constant mean assumes zero drift after removing volatility dynamics. Normal distribution
+    is the standard baseline assumption, though t-distribution may better fit fat tails.
+  evidence: gs_quant/timeseries/econometrics.py:760-780(GARCH_spec_norm)
+  stage: gs_quant.timeseries.econometrics
+  alternative_considered: GARCH-t for fat tails; EGARCH for asymmetric volatility; GJR-GARCH for leverage
+    effects
+  _evidence_issues:
+  - 'FN_NOT_FOUND: GARCH_spec_norm in gs_quant/timeseries/econometrics.py'
+- id: BD-030
+  type: B
+  content: Information Ratio = mean(excess) / std(excess) using population std (np.std)
+  rationale: Information Ratio measures risk-adjusted excess returns relative to benchmark. Using population
+    std (ddof=0) rather than sample std treats the IR as a population parameter estimate, consistent with
+    treating realized returns as the full universe. This affects performance benchmarking and manager
+    selection.
+  evidence: gs_quant/timeseries/measures_reports.py:1167(information_ratio)
+  stage: gs_quant.timeseries.measures_reports
+  alternative_considered: Sample std (ddof=1) for small samples; annualized IR from periodic IR; tracking
+    error directly
+- id: BD-031
+  type: B/DK
+  content: Bear market IR filters benchmark returns < 0 before computing excess and std
+  rationale: Conditional IR during bear markets isolates manager skill in down-markets, which is valuable
+    for drawdown analysis and tail-risk management assessment. Filtering periods where benchmark is negative
+    before computing statistics reveals defensive capability independent of overall market direction.
+  evidence: gs_quant/timeseries/measures_reports.py:1205(information_ratio_bear)
+  stage: gs_quant.timeseries.measures_reports
+  alternative_considered: Fixed threshold IR (e.g., VIX > 20); drawdown-conditional IR; absolute return
+    IR for each periods
+- id: BD-032
+  type: B/DK
+  content: Bull market IR filters benchmark returns > 0 before computing excess and std
+  rationale: Bull market IR isolates manager alpha generation during upward market movements, measuring
+    pure selection skill without defensive positioning effects. This asymmetric analysis reveals whether
+    outperformance is from upside capture or downside protection.
+  evidence: gs_quant/timeseries/measures_reports.py:1271-1274(bull_market_ir)
+  stage: gs_quant.timeseries.measures_reports
+  alternative_considered: Uptick rule IR; relative strength conditional IR; market beta-adjusted IR
+  _evidence_issues:
+  - 'FN_NOT_FOUND: bull_market_ir in gs_quant/timeseries/measures_reports.py'
+- id: BD-033
+  type: B/DK
+  content: 'Bear market conditional std: if market down at period end, compute rolling std else NaN'
+  rationale: Conditional standard deviation during bear markets captures volatility behavior specifically
+    when markets are falling, which may differ from overall volatility. Returning NaN for non-bear periods
+    creates clean segmentation for regime-specific risk analysis.
+  evidence: gs_quant/timeseries/measures_reports.py:847(bear_conditional_std)
+  stage: gs_quant.timeseries.measures_reports
+  alternative_considered: Continuous conditional volatility (GARCH-in-mean); rolling conditional without
+    NaN; copula-based tail dependence
+  _evidence_issues:
+  - 'FN_NOT_FOUND: bear_conditional_std in gs_quant/timeseries/measures_reports.py'
+- id: BD-034
+  type: B/BA
+  content: 'Bull market conditional std: if market up at period end, compute rolling std else NaN'
+  rationale: Bull market conditional standard deviation captures volatility characteristics during rising
+    markets, which typically differ from bear market volatility due to leverage effects and investor behavior.
+    NaN for non-bull periods enables clean regime-conditional risk metrics.
+  evidence: gs_quant/timeseries/measures_reports.py:1243(information_ratio_bull)
+  stage: gs_quant.timeseries.measures_reports
+  alternative_considered: Asymmetric GARCH for continuous modeling; rolling beta; correlation regime switching
+- id: BD-035
+  type: B/BA
+  content: Modigliani ratio rescales excess return by Sharpe ratio of benchmark
+  rationale: Modigliani ratio expresses portfolio risk-adjusted return in benchmark risk units, making
+    performance comparable across different risk levels. The rescaling formula (excess × benchmark_std
+    / portfolio_std + benchmark_mean) puts returns on the efficient frontier for direct comparison.
+  evidence: gs_quant/timeseries/measures_reports.py:1279-1300(modigliani_ratio)
+  stage: gs_quant.timeseries.measures_reports
+  alternative_considered: Modigliani-Squared (information ratio basis); geometric mean adjustment; downside
+    risk-adjusted version
+- id: BD-036
+  type: B
+  content: Factor-attributed PnL summed across factors via np.sum along axis=1
+  rationale: Axis=1 summation aggregates factor contributions within each time period, enabling proper
+    attribution analysis. This ensures factor returns sum to total return, maintaining attribution consistency.
+    The dimension selection affects how multi-factor models decompose performance.
+  evidence: gs_quant/timeseries/measures_reports.py:410(factor_pnl_sum_axis1)
+  stage: gs_quant.timeseries.measures_reports
+  alternative_considered: Residual term included separately; Brinson attribution model; transaction cost
+    allocation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: factor_pnl_sum_axis1 in gs_quant/timeseries/measures_reports.py'
+- id: BD-037
+  type: B/BA
+  content: TWAP execution uses arithmetic mean of fixings as executed price
+  rationale: Arithmetic mean of time-weighted average price fixings provides the expected execution price
+    assuming uniform order execution across time slices. TWAP execution strategy assumes linear participation,
+    making arithmetic mean the correct aggregation for expected cost estimation.
+  evidence: gs_quant/backtests/order.py:90(twap_fixings_mean)
+  stage: gs_quant.backtests.order
+  alternative_considered: Volume-weighted mean for VWAP strategy; geometric mean for multiplicative returns;
+    median for robustness
+  _evidence_issues:
+  - 'FN_NOT_FOUND: twap_fixings_mean in gs_quant/backtests/order.py'
+- id: BD-038
+  type: B/BA
+  content: BTIC TWAP uses mean of BTIC fixings for execution price
+  rationale: BTIC (Basis Tradeable Index Coupon) fixings represent daily index composition adjustments.
+    Mean of fixings provides expected BTIC execution price, consistent with TWAP averaging methodology.
+    This defines the benchmark price for basis trade execution.
+  evidence: gs_quant/backtests/order.py:211(btic_fixings_mean)
+  stage: gs_quant.backtests.order
+  alternative_considered: Closing price adjustment; best bid-offer midpoint; slippage modeling
+  _evidence_issues:
+  - 'FN_NOT_FOUND: btic_fixings_mean in gs_quant/backtests/order.py'
+- id: BD-039
+  type: BA
+  content: ContextBaseWithDefault.default_value() auto-instantiates class when accessed
+  rationale: 'WHY: Lazy initialization allows consumers to access default_value() without explicit instantiation,
+    reducing boilerplate. BOUNDARY: Auto-instantiation occurs only on first access; subsequent accesses
+    return cached instance. Changing this behavior would break each consumers relying on implicit instantiation.'
+  evidence: gs_quant/context_base.py:173(default_value)
+  stage: default_value
+  alternative_considered: Explicit factory method was considered but rejected to maintain API simplicity
+- id: BD-040
+  type: B
+  content: 'CalcType enum enforces execution order: simple→semi_path_dependent→path_dependent'
+  rationale: 'WHY: Calculation types must execute in order of computational complexity to ensure dependencies
+    are satisfied before expensive operations run. BOUNDARY: Any calculation tagged with a higher complexity
+    type cannot execute before lower complexity calculations complete. Violating this ordering will produce
+    incorrect risk results.'
+  evidence: gs_quant/backtests/backtest_utils.py:32-35(CalcType enum)
+  stage: ordering_contract
+  alternative_considered: Dynamic dependency resolution was considered but adds unnecessary complexity
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: CalcType enum in gs_quant/backtests/backtest_utils.py'
+- id: BD-041
+  type: B
+  content: ActionHandler factory pattern maps Actions to Handlers - get_action_handler must return correct
+    handler type
+  rationale: 'WHY: Factory pattern decouples action logic from handler implementation, enabling extensibility
+    without modifying core engine. BOUNDARY: get_action_handler() must return a handler compatible with
+    the action''s execution context; type mismatches cause runtime failures. Every Action subclasses must
+    register with the factory.'
+  evidence: gs_quant/backtests/action_handler.py:46-49(ActionHandlerBaseFactory.get_action_handler)
+  stage: pattern_choice
+  alternative_considered: Direct Action-Handler coupling was rejected for extensibility
+- id: BD-042
+  type: BA
+  content: __subclasses__ registry pattern in Action/Trigger/DataSource - subclasses auto-register via
+    __init_subclass__
+  rationale: 'WHY: Auto-registration via __init_subclass__ eliminates manual registry maintenance and
+    ensures each subclasses are discoverable at import time. BOUNDARY: Subclasses must be defined at module
+    load time to appear in registry; dynamic subclass creation after import won''t auto-register. This
+    pattern enables factory lookup without explicit enrollment.'
+  evidence: gs_quant/backtests/actions.py:71(__init_subclass__)
+  stage: inheritance
+  alternative_considered: Explicit register() decorator was rejected in favor of automatic discovery
+- id: BD-043
+  type: B
+  content: PriceableImpl._pricing_context returns nullcontext if PricingContext is_entered - prevents
+    re-entrancy
+  rationale: 'WHY: Re-entering an active PricingContext would corrupt pricing state by double-applying
+    transformations or creating nested contexts with inconsistent state. BOUNDARY: When a PricingContext
+    is already active (is_entered=True), _pricing_context returns nullcontext() to prevent nested entry.
+    This is a safety mechanism, not an error condition.'
+  evidence: gs_quant/priceable.py:33(_pricing_context)
+  stage: default_value
+  alternative_considered: Raising an error on re-entry was rejected to avoid breaking legitimate nested
+    patterns
+- id: BD-044
+  type: DK
+  content: RiskKey.ex_measure strips risk_measure from key; ex_historical_diddle clears date - enables
+    cross-measure comparison
+  rationale: 'WHY: Stripping measure-specific or date-specific fields from RiskKey enables aggregation
+    and comparison across different measures or time periods. BOUNDARY: ex_measure() removes only the
+    risk_measure dimension; ex_historical_diddle() removes date but preserves other temporal fields. Combining
+    these operations allows consistent key comparison independent of specific measure or snapshot date.'
+  evidence: gs_quant/base.py:129-139(ex_measure), gs_quant/base.py:142-151(ex_historical_diddle)
+  stage: default_value
+  alternative_considered: Creating separate comparison keys was considered but adds complexity
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: ex_measure), gs_quant/base.py:142-151(ex_historical_diddle in gs_quant/base.py'
+- id: BD-045
+  type: B
+  content: GenericEngine._process_triggers_and_actions_for_date requires __ensure_risk_results before
+    path_dependent actions
+  rationale: 'WHY: Path-dependent calculations require complete risk results from prior dates to compute
+    correctly; skipping this validation would produce incorrect hedge ratios or trigger conditions. BOUNDARY:
+    __ensure_risk_results must be called and completed before any action with calc_type=path_dependent
+    executes. The engine enforces this ordering regardless of action declaration order.'
+  evidence: gs_quant/backtests/generic_engine.py:459-470(_process_triggers_and_actions_for_date)
+  stage: ordering_contract
+  alternative_considered: Auto-triggering risk computation was rejected to keep execution explicit
+- id: BD-046
+  type: BA
+  content: GenericDataSource.missing_data_strategy defaults to fail - unexpected missing data raises RuntimeError
+  rationale: 'WHY: Failing fast on missing data prevents silent calculation errors that would be difficult
+    to debug later when results appear incorrect. BOUNDARY: By default, any missing data point raises
+    RuntimeError immediately. Consumers must explicitly set missing_data_strategy to ''interpolate'' or
+    ''forward_fill'' to handle gaps gracefully. This default enforces data quality requirements.'
+  evidence: gs_quant/backtests/data_sources.py:111(missing_data_strategy field)
+  stage: default_value
+  alternative_considered: Defaulting to forward_fill was rejected to prevent masking data issues
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: missing_data_strategy field in gs_quant/backtests/data_sources.py'
+- id: BD-047
+  type: DK
+  content: historical_risk_key() creates LocationOnlyMarket stripping market details for historical comparison
+  rationale: 'WHY: Historical risk calculations require consistent market representation independent of
+    current market state or location-specific parameters. BOUNDARY: LocationOnlyMarket removes each location-specific
+    attributes while preserving temporal context. This enables apples-to-apples comparison of risk across
+    different dates where current market location might differ.'
+  evidence: gs_quant/markets/markets.py:38-40(historical_risk_key)
+  stage: pattern_choice
+  alternative_considered: Passing full market was considered but introduces location dependency issues
+- id: BD-048
+  type: BA/M
+  content: default_transaction_cost() factory returns ConstantTransactionModel(0) - zero cost by default
+  rationale: 'WHY: Zero transaction cost provides sensible default behavior for backtesting where explicit
+    cost modeling may not be required. BOUNDARY: The default factory returns ConstantTransactionModel(0),
+    meaning no friction by default. Consumers requiring cost modeling must explicitly call default_transaction_cost()
+    with non-zero parameters or use specialized models like PercentageTransactionModel.'
+  evidence: gs_quant/backtests/actions.py:50-51(default_transaction_cost)
+  stage: default_value
+  alternative_considered: Requiring explicit cost model was rejected to reduce boilerplate
+- id: BD-049
+  type: BA
+  content: Instrument.quantity_ defaults to 1 in InstrumentBase - each instruments have unit quantity
+    unless specified
+  rationale: 'WHY: Unit quantity as default simplifies single-instrument scenarios common in pricing and
+    single-leg instruments. BOUNDARY: quantity_ field defaults to 1, representing one unit of the instrument.
+    Portfolio-level operations must aggregate multiple instruments or use position sizing mechanisms.
+    Changing default would affect each instrument initialization.'
+  evidence: gs_quant/base.py:577(instrumentbase)
+  stage: default_value
+  alternative_considered: None as default was rejected to avoid None-checking throughout codebase
+  _evidence_issues:
+  - 'FN_NOT_FOUND: instrumentbase in gs_quant/base.py'
+- id: BD-050
+  type: B/RC
+  content: AggregateTriggerRequirements.calc_type takes max of child types - path_dependent dominates
+    hierarchy
+  rationale: 'WHY: Aggregate trigger must satisfy each child requirements; if any child requires path-dependent
+    calculation, the aggregate must also be path-dependent to ensure correct execution ordering. BOUNDARY:
+    Taking max() means path_dependent > semi_path_dependent > simple. An aggregate with mixed types will
+    execute at the highest required complexity level.'
+  evidence: gs_quant/backtests/triggers.py:246-256(AggregateTriggerRequirements.calc_type)
+  stage: invariant
+  alternative_considered: Execution order selection per-requirement was rejected for simplicity
+- id: BD-051
+  type: BA
+  content: ExitTradeAction transaction_cost_exit defaults to transaction_cost in __post_init__
+  rationale: 'WHY: Exit transactions typically incur the same costs as entry transactions; defaulting
+    exit cost to entry cost ensures symmetry without requiring explicit configuration. BOUNDARY: In __post_init__,
+    if transaction_cost_exit is None, it copies transaction_cost value. Setting transaction_cost_exit
+    explicitly overrides this default. Ensures consistent cost treatment for round-trip trades.'
+  evidence: gs_quant/backtests/actions.py:105(transaction_cost_exit)
+  stage: ordering_contract
+  alternative_considered: Requiring explicit exit cost was rejected to reduce configuration burden
+- id: BD-052
+  type: B/BA
+  content: BuySell.flip dict in instruments - hedge directions must be opposite of original trade
+  rationale: 'WHY: Hedging requires opposite direction to the original position; the flip dict provides
+    consistent direction inversion without business logic scattered across the codebase. BOUNDARY: BuySell.flip
+    maps BUY↔SELL deterministically. Any hedge creation must use this flip to ensure proper offset. Manual
+    direction manipulation bypasses this convention and may cause position management errors.'
+  evidence: gs_quant/target/instrument.py:408-416(BuySell.flip dict)
+  stage: pattern_choice
+  alternative_considered: Method-based flip() was considered but dict lookup is faster for hot paths
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: BuySell.flip dict in gs_quant/target/instrument.py'
+- id: BD-053
+  type: BA
+  content: HedgeAction.risk_percentage defaults to 100 - full hedge unless specified otherwise
+  rationale: 'WHY: Full hedging (100%) represents the most common use case for backtesting hedge effectiveness;
+    requiring explicit percentage would add boilerplate. BOUNDARY: risk_percentage field defaults to 100,
+    meaning hedge at 100% of risk exposure. Values < 100 create partial hedges; values > 100 create over-hedges.
+    Explicit configuration required for non-standard hedge ratios.'
+  evidence: gs_quant/backtests/actions.py:423(risk_percentage field)
+  stage: default_value
+  alternative_considered: None as default (requiring explicit) was rejected for simplicity
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: risk_percentage field in gs_quant/backtests/actions.py'
+- id: BD-054
+  type: BA
+  content: RebalanceAction.priceable.unresolved check in __post_init__ - requires pre-resolved priceables
+  rationale: 'WHY: Rebalancing requires knowing the current quantity of priceable instruments; unresolved
+    instruments cannot provide quantity information, making rebalancing impossible. BOUNDARY: __post_init__
+    validates that priceable.unresolved is False. If True, ValueError is raised immediately. This prevents
+    late-stage failures during rebalance execution.'
+  evidence: gs_quant/backtests/actions.py:483(__post_init__)
+  stage: default_value
+  alternative_considered: Lazy resolution was rejected to fail fast on configuration errors
+- id: BD-055
+  type: B
+  content: BaseProcessor uses async update with recursive parent traversal - calculate() propagates up
+    tree
+  rationale: 'WHY: Analytics trees require bottom-up computation where child values must be computed before
+    parent values can be calculated. BOUNDARY: calculate() method triggers recursive update through parent
+    chain. If any child is not ready, parent calculation waits or returns incomplete. Circular parent
+    references cause infinite loops.'
+  evidence: gs_quant/analytics/core/processor.py:256-286(calculate method in BaseProcessor)
+  stage: pattern_choice
+  alternative_considered: Pull-based computation was rejected for better performance on large trees
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: calculate method in BaseProcessor in gs_quant/analytics/core/processor.py'
+- id: BD-056
+  type: BA/DK
+  content: _default_pricing_location raises MqValueError for unsupported currencies - explicit location
+    required
+  rationale: 'WHY: Pricing locations are currency-specific due to market conventions, holiday calendars,
+    and data source availability; unsupported currencies cannot determine a default location. BOUNDARY:
+    When currency is not in the supported mapping, MqValueError is raised. Callers must explicitly provide
+    location for unsupported currencies. This enforces explicit configuration for edge cases.'
+  evidence: gs_quant/timeseries/measures_rates.py:378-382(_default_pricing_location)
+  stage: default_value
+  alternative_considered: Returning None and handling downstream was rejected to fail fast
+- id: BD-057
+  type: DK
+  content: AddWeightedTradeAction._calc_type set to semi_path_dependent in __post_init__ - not a class
+    default
+  rationale: 'WHY: AddWeightedTradeAction depends on position weights that change across dates (semi-path
+    dependent) but does not require full path simulation. BOUNDARY: _calc_type is set to semi_path_dependent
+    in __post_init__, not as a class-level default. This ensures correct execution ordering: semi_path_dependent
+    actions run after simple but before path_dependent actions.'
+  evidence: gs_quant/backtests/actions.py:483(__post_init__)
+  stage: inheritance
+  alternative_considered: Class-level default was rejected to allow potential subclass overrides
+- id: BD-058
+  type: B/BA
+  content: ResultInfo.composition_info enforces market.location equality - cannot compose across locations
+  rationale: 'WHY: Risk results from different market locations may use different data sources, conventions,
+    or time zones; composing them would produce semantically invalid aggregated results. BOUNDARY: ResultInfo.composition_info
+    checks market.location equality; mismatched locations raise ValueError. Cross-location aggregation
+    requires explicit location normalization first.'
+  evidence: gs_quant/risk/core.py:74(ResultInfo.composition_info)
+  stage: default_value
+  alternative_considered: Auto-normalization was rejected to prevent silent data corruption
+- id: BD-059
+  type: BA/DK
+  content: 'INTERACTION: BD-002 × BD-023 → Annualization factor inconsistency between 252 trading days
+    (volatility) and 365 calendar days (frequency mapping)'
+  rationale: Annualized rolling volatility (BD-002) uses 252-day annualization factor assuming US equity
+    trading calendar, while frequency-to-period mapping (BD-023) uses 365 for daily conversion. When computing
+    annual volatility for a timeseries measured in calendar days, these inconsistent factors produce systematically
+    different annualization results. A daily volatility computed as std * sqrt(252) will differ from one
+    computed via the frequency mapping path, causing Sharpe ratios and risk metrics to be inconsistent
+    depending on which code path is used.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Unified annualization factor with explicit trading/calendar day selection parameter
+- id: BD-060
+  type: BA/M
+  content: 'INTERACTION: BD-030 × BD-005 → Information Ratio uses population std (ddof=0) while z-score
+    normalization uses sample std (ddof=1)'
+  rationale: Information Ratio (BD-030) explicitly uses population standard deviation (np.std with ddof=0)
+    treating realized returns as the full population, while rolling z-scores (BD-005) use sample standard
+    deviation (ddof=1) treating returns as a sample from a larger population. When z-score normalization
+    is applied to returns before computing Information Ratio, the denominator uses ddof=0 while the z-score
+    computation used ddof=1, creating an internal inconsistency. This causes z-score-based return distributions
+    to have apparent population variance slightly different from 1.0 when plugged into IR calculation,
+    biasing risk-adjusted performance metrics.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Consistent ddof usage across each statistical moment computations
+- id: BD-061
+  type: B/DK
+  content: 'INTERACTION: BD-008 × BD-021 → Winsorization at 2.5σ caps data before Bollinger Bands at ±2σ
+    evaluate for mean-reversion signals'
+  rationale: Winsorization caps extreme values at ±2.5 standard deviations from the mean (BD-008), effectively
+    clipping the tails of the return distribution before downstream analysis. Bollinger Bands (BD-021)
+    use ±2 standard deviations from a 20-period SMA to identify mean-reversion opportunities. When data
+    passes through winsorization before Bollinger Band calculation, the winsorized values may no longer
+    reach the ±2σ band boundaries, suppressing signals for truly extreme deviations that were clipped.
+    This creates a tension where robust outlier handling (winsorization) conflicts with volatility-based
+    signal generation (Bollinger Bands), potentially causing under-detection of genuine regime shifts.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Post-signal winsorization; adaptive band width based on winsorized volatility;
+    asymmetric treatment of winsorization targets
+- id: BD-062
+  type: B
+  content: 'INTERACTION: BD-040 × BD-045 × BD-050 → Execution ordering risk cascade: CalcType hierarchy
+    + path_dependent requirements + aggregate max dominate execution'
+  rationale: Three decisions form a risk cascade that can silently produce incorrect backtest results.
+    BD-040 enforces CalcType ordering (simple→semi_path_dependent→path_dependent). BD-045 requires __ensure_risk_results
+    before any path_dependent action executes. BD-050 takes max of child calc_types for aggregates, making
+    any child path_dependent trigger the entire aggregate to be path_dependent. If a developer creates
+    an aggregate with mixed calc_types that includes path_dependent components, the aggregate inherits
+    full path_dependent requirements. Violations cause silent failures where path_dependent strategies
+    compute without complete risk results, producing incorrect hedge ratios and trigger conditions. This
+    cascade is particularly dangerous because each decision alone seems reasonable, but their interaction
+    creates a complex contract that is difficult to maintain.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Runtime dependency validation; explicit calc_type declaration with inheritance
+    blocking
+- id: BD-063
+  type: BA/DK
+  content: 'INTERACTION: BD-048 × BD-037 → Zero default transaction cost contradicts TWAP arithmetic mean
+    execution assumption'
+  rationale: 'default_transaction_cost() returns ConstantTransactionModel(0) providing frictionless execution
+    by default (BD-048), while TWAP execution uses arithmetic mean of fixings as the executed price (BD-037).
+    The arithmetic mean assumes uniform execution across time slices, which implicitly assumes zero market
+    impact and zero spread cost. In real markets, TWAP execution incurs spread costs (typically 0.5-2
+    bps for liquid instruments) and potential market impact for large orders. Backtests using default
+    zero friction will systematically overstate TWAP strategy performance by the spread cost. This is
+    a hidden dependency: TWAP backtests work correctly only when consumers explicitly configure transaction
+    costs, but the default encourages frictionless assumptions.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Non-zero default transaction cost based on instrument liquidity; spread estimation
+    in TWAP computation
+- id: BD-064
+  type: B/BA
+  content: 'INTERACTION: BD-029 × BD-008 → GARCH normal distribution assumption conflicts with winsorization''s
+    implicit heavy-tailed distribution treatment'
+  rationale: 'GARCH(1,1) with normal distribution (BD-029) assumes normally distributed innovations, which
+    underestimates tail risk in financial returns that typically exhibit fat tails (excess kurtosis 3-7).
+    Winsorization at ±2.5σ (BD-008) explicitly caps extreme values, effectively treating the distribution
+    as having lighter tails than the raw data. Using winsorized returns to fit a normal GARCH model creates
+    a double-softening: winsorization reduces observed kurtosis while normal GARCH ignores any remaining
+    fat tails. This interaction can severely underestimate VaR and CVaR, producing dangerously optimistic
+    risk estimates. The alternative of GARCH-t (t-distribution) would capture remaining tail risk, but
+    winsorization pre-empts this by removing the very observations GARCH-t is designed to model.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: GARCH-t with winsorized data; skipping winsorization for GARCH estimation; robust
+    GARCH variants
+- id: BD-065
+  type: BA/DK
+  content: 'INTERACTION: BD-017 × BD-014 → Epidemiological model fitting chains ODE solver (LSODA) with
+    optimizer (Levenberg-Marquardt) creating coupled accuracy dependency'
+  rationale: 'SIR model fitting uses Levenberg-Marquardt minimization (BD-014) to minimize residuals between
+    model solution and observed data. The model solution comes from scipy.integrate.odeint with LSODA
+    algorithm (BD-017). This creates a hidden dependency: the optimizer assumes the model function returns
+    accurate solutions, but LSODA uses adaptive step sizing that may produce different trajectories depending
+    on local curvature. When LM minimizes residuals, it explores parameter space where ODE stiffness changes.
+    If LSODA''s step sizing fails to accurately integrate stiff regions, the residuals are wrong, and
+    LM converges to incorrect parameters. This coupling means calibration quality depends on both decisions
+    jointly: a more robust ODE solver (RK45 with tight tolerances) might find different optimal parameters
+    than LSODA with default tolerances.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Fixed solver tolerances with documented accuracy requirements; coupled optimization
+    including solver settings
+- id: BD-066
+  type: BA
+  content: 'INTERACTION: BD-046 × BD-012 → Missing data strategy defaults to fail but rolling product
+    uses nanprod silently propagating NaN'
+  rationale: 'GenericDataSource defaults to fail-fast on missing data (BD-046) with RuntimeError, while
+    rolling product for cumulative returns uses nanprod (BD-012) which propagates NaN values without raising
+    errors. When these two components interact in a backtest, the fail-fast default may catch data gaps
+    early in the pipeline, but rolling product calculations that depend on those same gaps will silently
+    produce NaN results rather than failing. This creates inconsistent behavior: some data gaps cause
+    immediate failure while others produce NaN outputs that may cause downstream errors much later. Users
+    may configure missing_data_strategy=''interpolate'' to handle gaps gracefully, but this changes rolling
+    product behavior in ways that may not be obvious, as interpolated values compound through the product
+    operation.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Consistent missing data strategy enforcement across each calculation types;
+    explicit NaN propagation warnings
+- id: BD-067
+  type: BA/DK
+  content: 'INTERACTION: BD-002 × BD-006 × BD-007 × BD-005 × BD-013 → Universal ddof=1 (Bessel correction)
+    creates hidden consistency contract across each variance-based calculations'
+  rationale: 'Five separate business decisions each specify ddof=1 (Bessel correction) for variance, standard
+    deviation, covariance, z-scores, and autocorrelation estimation. While individually justified (unbiased
+    population variance estimation), collectively they create an implicit consistency contract: each variance-based
+    metrics in the system must use sample std with ddof=1. If any new calculation or external integration
+    uses ddof=0 (population std), the resulting statistics will be systematically larger by factor sqrt(n/(n-1)),
+    creating subtle inconsistencies. BD-030 explicitly breaks this contract by using ddof=0 for Information
+    Ratio, creating the contradiction identified in BD-060. This hidden dependency means future developers
+    adding statistical calculations must be aware of the ddof convention or risk introducing inconsistencies
+    that are difficult to detect.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Explicit variance convention constant; compile-time validation of ddof consistency
+- id: BD-GAP-001
+  type: B/BA
+  content: InMemoryApiRequestCache uses max_size=1000 entries and TTL=3600 seconds (1 hour) for API response
+    caching
+  rationale: Chosen to balance memory footprint vs cache hit rate for typical user sessions; 1000 entry
+    cap prevents unbounded growth while 1-hour TTL ensures stale data freshness without excessive backend
+    requests
+  evidence: gs_quant/api/api_cache.py:57(__init__)
+  stage: architecture
+  alternative_considered: LRU eviction was considered but would require additional library dependency
+- id: BD-GAP-002
+  type: B/BA
+  content: RiskApi defaults max_concurrent=100 for parallel risk calculations and uses DEFAULT_TIMEOUT
+    for backtest operations
+  rationale: Concurrency cap of 100 prevents overwhelming the risk calculation service while still enabling
+    parallelism; DEFAULT_TIMEOUT bounds worst-case latency for long-running backtests
+  evidence: gs_quant/api/risk.py:174(run), gs_quant/api/gs/backtests.py:115(run_backtest)
+  stage: architecture
+  alternative_considered: Unlimited concurrency was rejected due to backend protection requirements
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: run), gs_quant/api/gs/backtests.py:115(run_backtest in gs_quant/api/risk.py'
+- id: BD-GAP-003
+  type: B/BA
+  content: SecMasterIdentifiers mapping defaults to output_type=frozenset([SecMasterIdentifiers.GSID])
+    for security lookups
+  rationale: GSID (Goldman Sachs ID) chosen as canonical identifier for internal cross-referencing; this
+    creates a unified identity layer across each identifier types
+  evidence: gs_quant/api/gs/secmaster.py:350(map)
+  stage: architecture
+  alternative_considered: Returning original identifier type was rejected to maintain consistency
+- id: BD-GAP-004
+  type: B/BA
+  content: DataApi build_query defaults to format='MessagePack' for efficient binary serialization over
+    JSON
+  rationale: MessagePack chosen over JSON for ~30% smaller payload sizes in high-volume time series data;
+    trade-off is reduced human readability
+  evidence: gs_quant/api/data.py:58(build_query)
+  stage: architecture
+  alternative_considered: JSON was considered for debugging simplicity but rejected for performance
+- id: BD-GAP-005
+  type: T
+  content: SharpeRatioProcessor defaults currency to USD for risk-free rate lookup
+  rationale: USD chosen as baseline risk-free currency due to market dominance; users can override with
+    different currency for non-USD portfolios
+  evidence: gs_quant/analytics/processors/econometrics_processors.py:363(__init__)
+  stage: business_rule
+  alternative_considered: No default (require explicit currency) was rejected for usability
+- id: BD-GAP-006
+  type: T
+  content: VolatilityProcessor, BetaProcessor, CorrelationProcessor default w=Window(None, 0) meaning
+    no rolling window by default
+  rationale: Window(None,0) default calculates point-in-time volatility without rolling aggregation; enables
+    flexibility to add rolling windows when needed via parameter
+  evidence: gs_quant/analytics/processors/econometrics_processors.py:363(__init__)
+  stage: business_rule
+  alternative_considered: Default rolling window was rejected to avoid hidden performance implications
+- id: BD-GAP-007
+  type: BA
+  content: PlotRunner defaults to RelativeDate('-1y') to RelativeDate('-1b') time range (1 year to previous
+    business day)
+  rationale: 1-year lookback balances historical context with query performance; -1b ensures no future
+    data leakage in plots
+  evidence: gs_quant/api/gs/plots.py:76(_build_plot_payload)
+  stage: business_rule
+  alternative_considered: Shorter defaults (30d, 3m) were considered but provided insufficient context
+- id: BD-GAP-008
+  type: B/BA
+  content: GsAssetApi.get_many_assets defaults limit=100 and get_many_assets_scroll defaults scroll='1m'
+    and limit=1000
+  rationale: 100 is practical default for interactive queries; 1m scroll with 1000 limit balances pagination
+    efficiency vs memory for bulk operations
+  evidence: gs_quant/api/gs/assets.py:56(__init__)
+  stage: architecture
+  alternative_considered: Smaller limits were rejected for chatty API patterns; larger limits rejected
+    for memory
+- id: BD-GAP-009
+  type: T
+  content: PerformanceHedgeQuery defaults max_return_deviation=5, max_adv_percentage=15, max_leverage=100,
+    max_weight=100, market_participation_rate=10, exclude_target_assets=True
+  rationale: Conservative defaults prevent extreme portfolio constructions; 5% return deviation cap and
+    15% ADV limit prevent illiquid positions; exclude_target_assets=True prevents circular hedging
+  evidence: gs_quant/api/gs/hedges.py:76(construct_performance_hedge_query)
+  stage: business_rule
+  alternative_considered: Looser defaults were considered but rejected for regulatory/risk reasons
+- id: BD-GAP-010
+  type: B
+  content: Dataset.get_data_bulk constrains request_batch_size between 0 and 5 (>0 and <5) for parallel
+    queries
+  rationale: Batch size capped at 5 to prevent overwhelming the data service; minimum of 1 ensures non-zero
+    throughput; this constrains the parallelization factor
+  evidence: gs_quant/data/dataset.py:520(get_data_bulk)
+  stage: architecture
+  alternative_considered: Dynamic batching based on dataset characteristics was too complex
+- id: BD-GAP-011
+  type: BA
+  content: 'ContentApi.get_contents defaults order_by={''direction'': OrderBy.DESC, ''field'': ''createdTime''}
+    and limit=10'
+  rationale: DESC by createdTime (newest first) is natural default for content browsing; 10-item limit
+    appropriate for pagination in UI contexts
+  evidence: gs_quant/api/gs/content.py:43(__init__)
+  stage: business_rule
+  alternative_considered: ASC default was rejected for most content consumption patterns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: __init__ in gs_quant/api/gs/content.py'
+  vague_rationale: true
+- id: BD-GAP-012
+  type: T
+  content: PortfolioApi.get_positions defaults position_type='close' (close prices) for position lookups
+  rationale: Close prices are market standard for end-of-day reporting and historical analysis; open/mid/high/low
+    require explicit request
+  evidence: gs_quant/api/gs/portfolios.py:101(get_positions)
+  stage: business_rule
+  alternative_considered: Unadjusted prices as default was rejected for portfolio analytics
+- id: BD-GAP-013
+  type: T
+  content: FXImpliedCorrProcessor defaults tenor='3m' (3-month) for foreign exchange correlation calculations
+  rationale: 3-month tenor is industry standard for FX implied correlation; balances short-term noise
+    vs long-term structural relationships
+  evidence: gs_quant/analytics/processors/econometrics_processors.py:363(__init__)
+  stage: business_rule
+  alternative_considered: 1m default was considered too short-term; 6m too long
+- id: BD-GAP-014
+  type: B
+  content: ApiWithCustomSession allows session override via factory/supplier pattern rather than direct
+    session injection
+  rationale: Factory pattern enables dependency injection and testing without requiring session instances;
+    supplier returns fresh sessions per call
+  evidence: gs_quant/api/api_session.py:22(__init__)
+  stage: architecture
+  alternative_considered: Singleton pattern rejected for testability; context managers rejected for API
+    complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: __init__ in gs_quant/api/api_session.py'
+- id: BD-GAP-015
+  type: B/DK
+  content: IntradayFactorDataSource provides choice of data sources for intraday risk model factor data
+  rationale: Multiple data sources enable flexibility for different market hours, data latency requirements,
+    and vendor preferences
+  evidence: gs_quant/api/gs/risk_models.py:40(IntradayFactorDataSource)
+  stage: architecture
+  alternative_considered: Single source was rejected for global market coverage
+- id: BD-GAP-016
+  type: B/BA
+  content: TransactionCostModel hierarchy uses algebraic Model base class with operator overloading for
+    cost combination
+  rationale: Algebraic operations (+, -, *, /) on cost models enable natural portfolio-level cost aggregation;
+    supports FixedCostModel, ScaledCostModel, AggregateCostModel composition
+  evidence: gs_quant/api/gs/backtests_xasset/response_datatypes/backtest_datatypes.py:170(Model)
+  stage: architecture
+  alternative_considered: Method-based aggregation (add_costs, scale_costs) was rejected for readability
+- id: BD-GAP-017
+  type: B/BA
+  content: CoordinatesData methods default to MarketDataVendor.Goldman_Sachs as primary data source
+  rationale: GS vendor as default aligns with platform's internal data; other vendors require explicit
+    parameter; pricing_location=None allows auto-detection
+  evidence: gs_quant/api/gs/data.py:1189(__init__)
+  stage: architecture
+  alternative_considered: Third-party vendor as default was rejected for data quality consistency
+  _evidence_issues:
+  - 'FN_NOT_FOUND: __init__ in gs_quant/api/gs/data.py'
+- id: BD-GAP-018
+  type: B
+  content: PretradeExecutionOptimization uses max_attempts=15 polling with get_pretrade_execution_optimization
+  rationale: 15 polling attempts provides sufficient time for optimization jobs (estimated 5-30s each)
+    while bounding infinite wait scenarios
+  evidence: gs_quant/api/gs/risk.py:347(__init__)
+  stage: architecture
+  alternative_considered: WebSocket alternative was considered for efficiency but rejected for implementation
+    complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: __init__ in gs_quant/api/gs/risk.py'
+- id: BD-GAP-019
+  type: B/BA
+  content: ThreadPoolManager.initialize allows configurable max_workers for async task parallelization
+  rationale: Configurable worker pool enables tuning for different workloads and system resources; prevents
+    unbounded thread growth
+  evidence: gs_quant/api/utils.py:48(__init__)
+  stage: architecture
+  alternative_considered: Fixed thread pool was rejected for flexibility requirements
+  _evidence_issues:
+  - 'FN_NOT_FOUND: __init__ in gs_quant/api/utils.py'
+- id: BD-GAP-020
+  type: BA
+  content: ScaleShape enum limits marker shapes to PIPE and DIAMOND for spot markers in visualization
+    scales
+  rationale: Only two shape types needed for scale visualization; PIPE for line continuity, DIAMOND for
+    distinct point markers; reduces UI complexity
+  evidence: gs_quant/analytics/common/enumerators.py:20(ScaleShape)
+  stage: business_rule
+  alternative_considered: More shapes (circle, triangle, square) were rejected for UI consistency
+- id: BD-GAP-021
+  type: B
+  content: 'Missing: PnL conservation'
+  rationale: 'Audit finding: missing: pnl conservation. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-022
+  type: DK
+  content: 'Missing: Random seed full coverage'
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-023
+  type: B
+  content: 'Missing: Immutable event log'
+  rationale: 'Audit finding: missing: immutable event log. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-024
+  type: B
+  content: 'Missing: Status**:  Absent'
+  rationale: 'Audit finding: missing: status**:  absent. Impact**: Portfolio valuation and performance
+    attribution could be inconsistent Business Decision Entry**:. This gap affects production reliability
+    and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: 'Impact**: Portfolio valuation and performance attribution could be inconsistent Business Decision
+    Entry**:'
+- id: BD-GAP-025
+  type: DK
+  content: 'Missing: Status**:  Absent'
+  rationale: 'Audit finding: missing: status**:  absent. Impact**: Backtesting and Monte Carlo simulations
+    may not be reproducible Business Decision Entry**:. This gap affects production reliability and should
+    be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: 'Impact**: Backtesting and Monte Carlo simulations may not be reproducible Business Decision
+    Entry**:'
+- id: BD-GAP-026
+  type: RC
+  content: 'Missing: Status**:  Absent'
+  rationale: 'Audit finding: missing: status**:  absent. Impact**: No traceable record of system actions
+    for compliance or debugging Business Decision Entry**:. This gap affects production reliability and
+    should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: 'Impact**: No traceable record of system actions for compliance or debugging Business Decision
+    Entry**:'
+- id: BD-GAP-027
+  type: B
+  content: 'Missing: Absent'
+  rationale: 'Audit finding: missing: absent. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-028
+  type: DK
+  content: 'Missing: Add comprehensive random seed management across each stochastic components (simulation,
+    ML models, sampling)'
+  rationale: 'Audit finding: missing: add comprehensive random seed management across each stochastic
+    components (simulation, ml models, sampling). Reproducibility of quantitative results is essential
+    for model validation and regulatory audit. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Reproducibility of quantitative results is essential for model validation and regulatory audit
+- id: BD-GAP-029
+  type: RC
+  content: 'Missing: Add model parameter versioning with effective_date and valid_from timestamps for
+    each quantitative models'
+  rationale: 'Audit finding: missing: add model parameter versioning with effective_date and valid_from
+    timestamps for each quantitative models. Model validation requires tracking which parameters were
+    in effect at any point in time. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Model validation requires tracking which parameters were in effect at any point in time
+- id: BD-GAP-030
+  content: 'Missing: PnL conservation'
+  type: B
+  rationale: 'Audit finding: missing: pnl conservation. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+known_use_cases: []
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 45
+  evidence_invalid: 33
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.5769230769230769
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+- type: contains
+  target: gs_quant/backtests/SKILL.md
+  description: Main SKILL.md section 7 references backtests SKILL.md for complete backtesting guide
+  evidence: SKILL.md:§Backtesting
+- type: depends_on
+  target: gs_quant_session
+  description: Every subsequent stages require GsSession to be established first
+  evidence: SKILL.md:§Creating-a-Session-with-GsSession.use
+- type: depends_on
+  target: gs_quant_instrument_resolution
+  description: Backtesting relies on instrument resolution to populate parameters
+  evidence: gs_quant/backtests/SKILL.md:§AddTradeAction
+- type: complementary
+  target: gs_quant_backtests_triggers
+  description: Triggers and Actions work together within Strategy construction
+  evidence: gs_quant/backtests/SKILL.md:§Strategy-Construction
+- type: alternative_to
+  target: EquityVolEngine
+  description: GenericEngine is default; EquityVolEngine is alternative for equity vol performance
+  evidence: gs_quant/backtests/SKILL.md:§Engines
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 9
+    warn: 8
+    fail: 3
+  subdomain_totals:
+    pass: 6
+    warn: 3
+    fail: 1
+  coverage: 30/30 (100%)
+  pass_rate: 15/30 (50%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: data_source_gs_market_data
+  description: Must use GS Marquee for all GS-specific financial data, risk analytics, and securities
+    metadata
+  used_in_stages: []
+  options:
+  - name: Goldman Sachs Marquee (default)
+    traits:
+    - proprietary
+    - comprehensive_coverage
+    - real_time
+    - gs_specific
+    fit_for:
+    - Goldman Sachs institutional clients with Marquee access
+    not_fit_for:
+    - External users without GS credentials, non-GS data
+  default: Goldman Sachs Marquee (default)
+  _source: worker_resource
+- id: slot-002
+  name: data_source_macro_economic
+  description: Choose FRED for US macroeconomic data; use external providers for non-GS financial data
+  used_in_stages: []
+  options:
+  - name: FRED (Federal Reserve Economic Data)
+    traits:
+    - free
+    - us_economic_indicators
+    - reliable
+    - official_source
+    fit_for:
+    - US macroeconomic data (GDP, unemployment, interest rates), academic research
+    not_fit_for:
+    - Non-US economic data, real-time forex, proprietary indicators
+  - name: 'Alternative: Yahoo Finance'
+    traits:
+    - free
+    - global_coverage
+    - price_data
+    fit_for:
+    - Public equity price data, ETFs, indices
+    not_fit_for:
+    - Derivatives pricing, risk analytics, institutional data
+  - name: 'Alternative: Alpha Vantage'
+    traits:
+    - free_tier
+    - equities
+    - forex
+    - crypto
+    fit_for:
+    - Stock quotes, FX rates with free API tier
+    not_fit_for:
+    - Institutional derivatives, risk analytics
+  default: FRED (Federal Reserve Economic Data)
+  _source: worker_resource
+- id: slot-003
+  name: data_source_equity_fundamentals
+  description: Use GS-integrated FactSet for equity fundamentals with GS credentials
+  used_in_stages: []
+  options:
+  - name: FactSet via GS Marquee
+    traits:
+    - institutional_quality
+    - estimates
+    - ratings
+    - gs_integrated
+    fit_for:
+    - Institutional clients with FactSet subscriptions via GS
+    not_fit_for:
+    - External users without FactSet access
+  - name: 'Alternative: Refinitiv/LSEG'
+    traits:
+    - institutional
+    - comprehensive
+    - pricing
+    fit_for:
+    - Institutional clients with Refinitiv subscriptions
+    not_fit_for:
+    - Individual investors
+  default: FactSet via GS Marquee
+  _source: worker_resource
+- id: slot-004
+  name: http_client_sync
+  description: Built-in sync client; use httpx async client for async code
+  used_in_stages: []
+  options:
+  - name: requests (default)
+    traits:
+    - synchronous
+    - mature
+    - widely_used
+    fit_for:
+    - Synchronous code, simpler use cases
+    not_fit_for:
+    - High concurrency, async code
+  default: requests (default)
+  _source: worker_resource
+- id: slot-005
+  name: http_client_async
+  description: Built-in async client for all async operations
+  used_in_stages: []
+  options:
+  - name: httpx (default)
+    traits:
+    - async
+    - sync_compatible
+    - modern
+    fit_for:
+    - Async code, modern Python applications
+    not_fit_for:
+    - Legacy synchronous-only code
+  default: httpx (default)
+  _source: worker_resource
+- id: slot-006
+  name: websocket_library
+  description: Built-in WebSocket client for real-time GS data
+  used_in_stages: []
+  options:
+  - name: websockets (default)
+    traits:
+    - async
+    - ws/wss
+    - modern
+    fit_for:
+    - Real-time pricing subscriptions, async applications
+    not_fit_for:
+    - Synchronous-only applications
+  default: websockets (default)
+  _source: worker_resource
+- id: slot-007
+  name: tracing_provider
+  description: Built-in OpenTelemetry for GS environment tracing; swap for external tracing systems if
+    needed
+  used_in_stages: []
+  options:
+  - name: OpenTelemetry (built-in)
+    traits:
+    - distributed_tracing
+    - vendor_neutral
+    - gs_integrated
+    fit_for:
+    - Request tracing, performance monitoring in GS environment
+    not_fit_for:
+    - Simple scripts without tracing requirements
+  - name: 'Alternative: Jaeger'
+    traits:
+    - distributed_tracing
+    - visualization
+    fit_for:
+    - Microservices tracing with Jaeger backend
+    not_fit_for:
+    - Simple single-service applications
+  - name: 'Alternative: Zipkin'
+    traits:
+    - distributed_tracing
+    - lightweight
+    fit_for:
+    - Lightweight tracing with Zipkin backend
+    not_fit_for:
+    - Complex multi-service architectures
+  default: OpenTelemetry (built-in)
+  _source: worker_resource
+- id: slot-008
+  name: numerical_computing
+  description: Standard NumPy for all numerical computing
+  used_in_stages: []
+  options:
+  - name: NumPy (default)
+    traits:
+    - blas_accelerated
+    - standard
+    - mature
+    fit_for:
+    - Standard numerical computing, array operations
+    not_fit_for:
+    - GPU-accelerated computing
+  default: NumPy (default)
+  _source: worker_resource
+- id: slot-009
+  name: certificate_authority
+  description: Use certifi for standard SSL verification; configure custom CA for internal networks
+  used_in_stages: []
+  options:
+  - name: certifi Mozilla CA Bundle (default)
+    traits:
+    - Mozilla_curated
+    - widely_trusted
+    - auto_updated
+    fit_for:
+    - Standard HTTPS verification with trusted CAs
+    not_fit_for:
+    - Custom/internal CA certificates
+  - name: 'Alternative: Custom CA Bundle'
+    traits:
+    - internal_cas
+    - corporate_networks
+    fit_for:
+    - Corporate networks with internal certificate authorities
+    not_fit_for:
+    - Standard internet-facing applications
+  default: certifi Mozilla CA Bundle (default)
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: Goldman Sachs
+  description: 'Financial market data (historical, real-time), risk analytics, securities metadata. Coverage:
+    N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: Federal Reserve Bank of St. Louis
+  description: 'US macroeconomic indicators (GDP, unemployment, interest rates). Coverage: N/A. Auth:
+    N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: Goldman Sachs
+  description: 'Derivative pricing, risk measures, portfolio analytics. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: FactSet Research Systems
+  description: 'Equity estimates, fundamentals, ratings, enterprise value. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: Refinitiv/LSEG
+  description: 'End-of-day prices, corporate actions, reference data. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: Goldman Sachs
+  description: 'Curve measures, model-based calculations. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: Goldman Sachs Marquee Platform API
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-008
+  type: external_service
+  name: Goldman Sachs Authentication Service
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: external_service
+  name: FRED API
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: external_service
+  name: TLS/SSL Certificate Authority
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: python_package
+  name: numpy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: python_package
+  name: pandas
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: python_package
+  name: scipy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-014
+  type: python_package
+  name: requests
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-015
+  type: python_package
+  name: httpx
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: python_package
+  name: websockets
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-017
+  type: python_package
+  name: msgpack
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-018
+  type: python_package
+  name: dataclasses_json
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-019
+  type: python_package
+  name: backoff
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-020
+  type: python_package
+  name: pydash
+  description: ''
+  used_in_stages: []
+  _source: worker_resource

@@ -1,0 +1,3170 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-083
+name: Economic Dashboard
+sop_version: '3.6'
+source:
+  projects:
+  - Economic-Dashboard
+  commit_hash: fbc91cddd708664bd9c93a0d73681c4d156e22c3
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Real-time economic intelligence and market analysis
+  description: Enterprise-grade analytical platform providing real-time access to 60+ economic indicators
+    sourced from FRED and Yahoo Finance, with ML-powered recession prediction and margin risk monitoring.
+  prerequisites: Python 3.10+, FRED API key, basic understanding of macroeconomic indicators and financial
+    markets
+  not_suitable_for: Non-US markets, real-time trading execution, high-frequency trading, or users without
+    Python environment setup capability
+stages:
+- id: data_collection
+  name: Data Collection
+  order: 1
+  responsibility: Fetch economic data from FRED, Yahoo Finance, SEC, and CBOE APIs with offline fallback.
+    Manages caching and rate limiting to ensure reliable data access. This stage exists because financial
+    analysis requires consistent, fresh data from multiple authoritative sources, and the system must
+    remain functional even when APIs are unavailable.
+  interface:
+    inputs:
+    - API credentials (FRED key)
+    - Ticker/series identifiers
+    - Date ranges
+    outputs:
+    - Cached pickle files
+    - DuckDB records
+    - Sample CSV files
+  required_methods:
+  - name: CredentialsManager.set_api_key
+    description: Store encrypted API key for a given service using Fernet symmetric encryption
+    evidence: modules/auth/credentials_manager.py:33(_init_encryption)
+  - name: CredentialsManager.get_api_key
+    description: Retrieve and decrypt API key for authenticated API requests
+    evidence: modules/auth/credentials_manager.py:44(get_api_key)
+  - name: load_fred_data
+    description: Fetch economic series from FRED API with DuckDB caching and cache fallback
+    evidence: modules/data_loader.py:151(load_fred_data)
+  - name: load_yfinance_data
+    description: Fetch OHLCV and market data from Yahoo Finance with batch processing and rate limiting
+    evidence: modules/data_loader.py:162(load_yfinance_data)
+  key_behaviors:
+  - behavior: Offline mode fallback
+    description: When API credentials are unavailable or requests fail, system automatically falls back
+      to sample CSV data to ensure dashboard remains functional
+    evidence: modules/data_loader.py:162(is_offline_mode)
+  - behavior: SLA-based cache expiry
+    description: 'Cached data expires based on publication frequency: 6h for daily, 1d for weekly, 7d
+      for monthly, 30d for quarterly series'
+    evidence: modules/data_series_config.py:17(UPDATE_SLA)
+  - behavior: Encrypted credential storage
+    description: API keys are encrypted with Fernet symmetric encryption; key file has 0o600 permissions
+      to prevent unauthorized access
+    evidence: modules/auth/credentials_manager.py:44(os.chmod(self.key_file, 0o600))
+  replaceable_points:
+  - name: data_source_adapter
+    description: Strategy pattern for fetching data from different sources
+    options:
+    - name: FRED API
+      traits:
+      - Live data
+      - Auth required
+      - Rate limited
+      fit_for:
+      - Production use
+      - Real-time indicators
+      not_fit_for:
+      - Offline demos
+      - Demo without API keys
+    - name: Offline CSV
+      traits:
+      - Static data
+      - No auth
+      - Instant access
+      fit_for:
+      - Demos
+      - Testing
+      - Offline environments
+      not_fit_for:
+      - Production
+      - Real-time updates
+    - name: DuckDB cache
+      traits:
+      - Preprocessed
+      - Fast queries
+      - Persistent
+      fit_for:
+      - Repeated analysis
+      - Large datasets
+      not_fit_for:
+      - Initial data fetch
+      - Missing source data
+    default: FRED API
+  - name: cache_backend
+    description: Storage mechanism for cached API responses
+    options:
+    - name: Pickle files
+      traits:
+      - Simple
+      - Python-native
+      - Fast serialization
+      fit_for:
+      - Small datasets
+      - Single-process apps
+      not_fit_for:
+      - Concurrent access
+      - Large datasets
+    - name: DuckDB tables
+      traits:
+      - Queryable
+      - ACID compliant
+      - Columnar
+      fit_for:
+      - Analytical queries
+      - Large datasets
+      not_fit_for:
+      - Simple caching
+      - Small records
+    - name: Redis
+      traits:
+      - Distributed
+      - TTL support
+      - Fast key-value
+      fit_for:
+      - Multi-instance deployments
+      - Distributed caching
+      not_fit_for:
+      - Single instance
+      - Simple deployments
+    default: Pickle files
+  design_decisions:
+  - DuckDB singleton connection - Single DB instance prevents connection conflicts in Streamlit multi-page
+    apps (modules/database/connection.py:20(__new__))
+  - Offline mode with sample data fallback - Ensures dashboard works without API keys; uses sample_FRED_data.csv
+    for demos (modules/data_loader.py:162(is_offline_mode))
+  - SLA-based refresh scheduling - Daily=6h, Weekly=1d, Monthly=7d, Quarterly=30d SLAs match FRED publication
+    cycles (modules/data_series_config.py:17(UPDATE_SLA))
+  - Encrypted credentials storage - Fernet symmetric encryption protects API keys; key stored separately
+    with 0o600 perms (modules/auth/credentials_manager.py:33(_init_encryption))
+  acceptance_hints:
+  - Dashboard loads successfully with sample data when no API keys configured
+  - Cache files created in data/cache/ with correct expiry based on series frequency
+  - Encrypted credentials file readable only by owner (0o600 permissions)
+  - Rate limiting prevents 429 errors during batch Yahoo Finance fetches
+- id: feature_engineering
+  name: Feature Engineering
+  order: 2
+  responsibility: Calculate technical indicators, options metrics, and derived features from raw price/volume
+    data. Transforms market data into ML-ready feature vectors. This stage exists because raw market data
+    must be transformed into meaningful signals before any predictive modeling or analysis can occur.
+  interface:
+    inputs:
+    - OHLCV data from yfinance
+    - Options chain data
+    - Market indicators (VIX)
+    outputs:
+    - technical_features table
+    - derived_features table
+    - options_data table
+  required_methods:
+  - name: TechnicalIndicatorCalculator.calculate_all
+    description: Calculate RSI, MACD, Bollinger Bands, ATR, MFI, VWAP from OHLCV data using ta library
+    evidence: modules/features/technical_indicators.py:16(__init__)
+  - name: OptionsMetricsCalculator.calculate
+    description: Calculate IV rank, put/call ratio, and skew from options chain data
+    evidence: modules/features/options_metrics.py:12(calculate)
+  - name: DerivedFeaturesCalculator.compute
+    description: Compute Z-scores, regime classifications, and feature interactions from technical indicators
+    evidence: modules/features/derived_features.py:18(compute)
+  - name: FeaturePipeline.run_full_pipeline
+    description: Orchestrate complete feature calculation with validation at each stage
+    evidence: modules/features/feature_pipeline.py:22(run_full_pipeline)
+  key_behaviors:
+  - behavior: Shift-based crossover detection
+    description: Detects SMA50/SMA200 golden/death crosses by comparing current bar state vs prior bar
+      using shift(1)
+    evidence: modules/features/derived_features.py:195(sma50_above_sma200.shift(1))
+  - behavior: Regime classification
+    description: Classifies market regime as Bullish (RSI>60 AND MACD>0 AND Price>SMA50) or Bearish based
+      on composite conditions
+    evidence: modules/features/derived_features.py:84(rsi_14 > 60)
+  - behavior: Pipeline validation
+    description: Fails pipeline execution if >10% RSI values are null or duplicate dates exist in input
+      data
+    evidence: modules/features/feature_pipeline.py:239(null_rsi)
+  replaceable_points:
+  - name: indicator_library
+    description: Technical indicator calculation engine
+    options:
+    - name: ta library
+      traits:
+      - Standardized
+      - Well-maintained
+      - Comprehensive
+      fit_for:
+      - General use
+      - Production systems
+      not_fit_for:
+      - Custom indicators
+      - Edge cases
+    - name: pandas-ta
+      traits:
+      - Pandas-native
+      - Fast
+      - Lightweight
+      fit_for:
+      - Performance-critical
+      - Large datasets
+      not_fit_for:
+      - Non-pandas inputs
+    - name: custom formulas
+      traits:
+      - Fully customizable
+      - No dependencies
+      fit_for:
+      - Proprietary indicators
+      - Research
+      not_fit_for:
+      - Standard analysis
+      - Quick prototyping
+    default: ta library
+  - name: feature_interactions
+    description: Cross-feature computation logic for derived signals
+    options:
+    - name: RSI×Volume
+      traits:
+      - Momentum confirmation
+      - Volume-weighted signals
+      fit_for:
+      - Breakout detection
+      - Trend confirmation
+      not_fit_for:
+      - Range-bound markets
+    - name: MACD divergence
+      traits:
+      - Reversal signals
+      - Leading indicators
+      fit_for:
+      - Mean reversion
+      - Contrarian plays
+      not_fit_for:
+      - Strong trends
+    - name: momentum×volatility
+      traits:
+      - Risk-adjusted signals
+      - Adaptive thresholds
+      fit_for:
+      - Volatility regimes
+      - Dynamic strategies
+      not_fit_for:
+      - Static strategies
+    default: each of above
+  design_decisions:
+  - ta library for technical indicators - Standardized calculations avoid reinventing RSI/MACD implementations
+    (modules/features/technical_indicators.py:12(import ta))
+  - Shift-based crossover detection - Detects SMA50/SMA200 crossovers by comparing current vs prior bar
+    states (modules/features/derived_features.py:195(shift(1)))
+  - Regime classification thresholds - Bullish=RSI>60 AND MACD>0 AND Price>SMA50 captures momentum confirmation
+    (modules/features/derived_features.py:84(rsi_14 > 60))
+  - Feature pipeline validation - Fails pipeline if >10% RSI values are null or duplicate dates exist
+    (modules/features/feature_pipeline.py:239(null_rsi))
+  acceptance_hints:
+  - Technical indicators calculated match expected values from reference implementation
+  - Golden/death cross detection correctly identifies transitions between bullish/bearish regimes
+  - Pipeline validation fails gracefully with clear error messages for invalid input data
+  - Derived features added to DuckDB tables with correct (ticker, date) primary keys
+- id: financial_analysis
+  name: Financial Analysis
+  order: 3
+  responsibility: Calculate margin risk, leverage exposure, insider trading signals, and financial health
+    scores. Provides risk metrics and market stress indicators for portfolio risk management. This stage
+    exists because raw market data needs risk-contextualization to support trading and investment decisions.
+  interface:
+    inputs:
+    - Short interest data
+    - VIX term structure
+    - Options positioning
+    - SEC Form 4 filings
+    outputs:
+    - margin_call_risk table
+    - sector_rotation_analysis table
+    - financial_health_scores table
+  required_methods:
+  - name: MarginCallRiskCalculator.calculate
+    description: Calculate composite margin risk score from leverage, volatility, options, and liquidity
+      components with weighted scoring
+    evidence: modules/features/margin_risk_composite.py:20(calculate)
+  - name: LeverageMetricsCalculator.compute
+    description: Compute short interest, FINRA margin debt, VIX stress, and leveraged ETF tracking metrics
+    evidence: modules/features/leverage_metrics.py:20(compute)
+  - name: InsiderTradingTracker.analyze
+    description: Parse SEC Form 4 XML filings, calculate sentiment scores, detect unusual insider activity
+    evidence: modules/features/insider_trading_tracker.py:47(analyze)
+  - name: FinancialHealthScorer.score
+    description: Calculate Piotroski F-Score, Altman Z-Score, and composite financial health rating
+    evidence: modules/features/financial_health_scorer.py:28(score)
+  key_behaviors:
+  - behavior: Composite risk weighting
+    description: 'Margin risk calculated as weighted composite: leverage 30%, volatility 25%, options
+      25%, liquidity 20% with UI-adjustable thresholds'
+    evidence: modules/features/margin_risk_composite.py:28(weights)
+  - behavior: Short interest thresholds
+    description: '>30% short interest gets maximum risk score (100), >20% gets 75; these breakpoints empirically
+      capture squeeze risk'
+    evidence: modules/features/margin_risk_composite.py:54(short_interest_pct > 30)
+  - behavior: Insider transaction classification
+    description: P(Purchase) and M(Exercise) classified as bullish; S(Sale) as bearish; grants/gifts excluded
+      from sentiment calculation
+    evidence: modules/features/insider_trading_tracker.py:79(bullish_codes)
+  - behavior: Sector rotation classification
+    description: Sectors grouped as Offensive (XLY/XLK), Defensive (XLU/XLP), or Cyclical for risk-on/risk-off
+      detection
+    evidence: modules/features/sector_rotation_detector.py:53(OFFENSIVE_SECTORS)
+  replaceable_points:
+  - name: risk_weights
+    description: Component importance weighting in composite margin risk score
+    options:
+    - name: Leverage-weighted (30/25/25/20)
+      traits:
+      - Current default
+      - Leverage-focused
+      - Conservative liquidity
+      fit_for:
+      - General risk monitoring
+      - Margin-focused accounts
+      not_fit_for:
+      - Volatility-sensitive strategies
+      - Options-heavy portfolios
+    - name: Equal weights
+      traits:
+      - Balanced
+      - No bias
+      - Simple
+      fit_for:
+      - Balanced risk monitoring
+      - Conservative allocation
+      not_fit_for:
+      - Specialized strategies
+      - Leverage-focused accounts
+    - name: Volatility-weighted
+      traits:
+      - Volatility-focused
+      - Adaptive
+      - Regime-aware
+      fit_for:
+      - High-vol environments
+      - Crisis monitoring
+      not_fit_for:
+      - Low-vol periods
+      - Stable markets
+    default: Leverage-weighted (30/25/25/20)
+  - name: insider_sentiment_formula
+    description: Method for aggregating buy/sell insider transactions into sentiment scores
+    options:
+    - name: Value-weighted with recency decay
+      traits:
+      - Considers trade size
+      - Recent activity emphasized
+      fit_for:
+      - General sentiment
+      - Most analysis scenarios
+      not_fit_for:
+      - Small-cap stocks
+      - Equal-weight analysis
+    - name: Weighted by value
+      traits:
+      - Trade size importance
+      - Ignores timing
+      fit_for:
+      - Long-term trends
+      - Position-building detection
+      not_fit_for:
+      - Rapid sentiment shifts
+      - Recent activity focus
+    - name: Unanimous detection
+      traits:
+      - All-or-nothing
+      - High conviction signals only
+      fit_for:
+      - Contrarian plays
+      - High-confidence signals
+      not_fit_for:
+      - Gradual sentiment shifts
+      - Mixed signals
+    default: Value-weighted with recency decay
+  design_decisions:
+  - Composite risk scoring with fixed weights - Hardcoded 30/25/25/20 weights prioritize leverage risk;
+    allows threshold tuning via UI sliders (modules/features/margin_risk_composite.py:28(weights))
+  - Short interest thresholds - >30% SI gets max score (100), >20% gets 75; empirical breakpoints for
+    squeeze risk (modules/features/margin_risk_composite.py:54(short_interest_pct > 30))
+  - Bullish/bearish transaction codes - P(Purchase) and M(Exercise) = bullish; S(Sale) = bearish; excludes
+    grants/gifts from sentiment (modules/features/insider_trading_tracker.py:79(bullish_codes))
+  - Sector classification (Offensive/Defensive/Cyclical) - Risk-on/off detection requires sector grouping;
+    XLY/XLK=offensive, XLU/XLP=defensive (modules/features/sector_rotation_detector.py:53(OFFENSIVE_SECTORS))
+  acceptance_hints:
+  - Margin risk scores aggregate correctly with 30/25/25/20 component weights totaling 100%
+  - Insider trading tracker correctly parses SEC Form 4 XML and extracts transaction amounts
+  - 'VIX regime classification maps correctly: <15 Low, <20 Normal, <30 Elevated, ≥30 Crisis'
+  - Sector rotation analysis shows risk-on/off signals during market regime changes
+- id: ml_training_prediction
+  name: ML Training & Prediction
+  order: 4
+  responsibility: Train XGBoost/LightGBM ensemble models for stock direction prediction. Uses walk-forward
+    validation to prevent lookahead bias in time series. This stage exists because statistical and ML
+    models can identify patterns in feature data that support forward-looking market predictions.
+  interface:
+    inputs:
+    - Feature DataFrames from DuckDB
+    - Binary target (price up/down)
+    outputs:
+    - Pickled model files
+    - ml_predictions table
+    - model_performance table
+  required_methods:
+  - name: ModelTrainer.train
+    description: Execute walk-forward validation training with TimeSeriesSplit cross-validation
+    evidence: modules/ml/training.py:24(train)
+  - name: EnsembleModel.fit
+    description: Train XGBoost+LightGBM base models with LogisticRegression meta-learner stacking
+    evidence: modules/ml/models.py:256(EnsembleModel.fit)
+  - name: PredictionEngine.predict
+    description: Load trained models and generate predictions with confidence scores for new data
+    evidence: modules/ml/prediction.py:22(predict)
+  - name: BaseModel.save
+    description: Serialize trained model with StandardScaler to pickle file for persistence
+    evidence: modules/ml/models.py:46(save)
+  key_behaviors:
+  - behavior: Walk-forward validation
+    description: Uses TimeSeriesSplit to train on past data and validate on future data, preventing lookahead
+      bias critical for financial time series
+    evidence: modules/ml/training.py:15(TimeSeriesSplit)
+  - behavior: 5-day prediction horizon
+    description: 'Binary target: price higher in 5 trading days? Aligns with weekly rebalancing cycles'
+    evidence: modules/ml/training.py:59(prediction_horizon=5)
+  - behavior: Ensemble with meta-learner stacking
+    description: LogisticRegression meta-learner combines base model probabilities, avoiding simple averaging
+      for better calibration
+    evidence: modules/ml/models.py:317(_generate_meta_features)
+  - behavior: StandardScaler preprocessing
+    description: Features standardized during fit, required for LogisticRegression meta-learner; XGBoost/LightGBM
+      remain scale-invariant
+    evidence: modules/ml/models.py:26(scaler)
+  replaceable_points:
+  - name: base_models
+    description: Ensemble member algorithms for directional prediction
+    options:
+    - name: XGBoost+LightGBM
+      traits:
+      - Gradient boosting
+      - Complementary
+      - Current default
+      fit_for:
+      - General prediction
+      - Balanced performance
+      not_fit_for:
+      - Deep patterns
+      - Sequential dependencies
+    - name: XGBoost+RandomForest
+      traits:
+      - Boosting + bagging
+      - Diverse
+      - More robust
+      fit_for:
+      - Noisy data
+      - Overfitting prevention
+      not_fit_for:
+      - Fine-grained patterns
+      - Speed-critical
+    - name: Add LSTM
+      traits:
+      - Sequential learning
+      - Time-aware
+      - Deep learning
+      fit_for:
+      - Long-term dependencies
+      - Pattern sequences
+      not_fit_for:
+      - Small datasets
+      - Quick iterations
+    default: XGBoost+LightGBM
+  - name: prediction_horizon
+    description: Days ahead for directional price prediction target
+    options:
+    - name: 1-day
+      traits:
+      - High frequency
+      - More data points
+      - Noisy
+      fit_for:
+      - Intraday trading
+      - High-frequency strategies
+      not_fit_for:
+      - Weekly rebalancing
+      - Long-term investors
+    - name: 5-day (1 trading week)
+      traits:
+      - Weekly rebalancing
+      - Balanced signal
+      - Current default
+      fit_for:
+      - Swing trading
+      - Weekly strategies
+      not_fit_for:
+      - Intraday
+      - Monthly rebalancing
+    - name: 20-day (1 trading month)
+      traits:
+      - Monthly rebalancing
+      - Smoother signals
+      - Less data
+      fit_for:
+      - Position trading
+      - Monthly strategies
+      not_fit_for:
+      - Swing trading
+      - High-frequency
+    default: 5-day (1 trading week)
+  design_decisions:
+  - Walk-forward validation - Prevents lookahead bias; trains on past, validates on future - critical
+    for financial time series (modules/ml/training.py:15(TimeSeriesSplit))
+  - '5-day prediction horizon - Binary target: price higher in 5 trading days? Aligns with weekly rebalancing
+    (modules/ml/training.py:59(prediction_horizon=5))'
+  - Ensemble with meta-learner stacking - LogisticRegression on base model probabilities; avoids simple
+    averaging (modules/ml/models.py:317(_generate_meta_features))
+  - StandardScaler on features - Required for LogisticRegression meta-learner; XGBoost/LightGBM are scale-invariant
+    (modules/ml/models.py:26(scaler))
+  acceptance_hints:
+  - Walk-forward validation ensures no future data leakage into training sets
+  - 'Binary target correctly calculated: 1 if future_close > close, else 0'
+  - Model predictions stored in DuckDB with (ticker, date) primary key and confidence scores
+  - Model performance metrics (accuracy, precision, recall) tracked in model_performance table
+- id: recession_indicator
+  name: Recession Probability
+  order: 5
+  responsibility: Calculate recession probability using 7 weighted economic indicators (yield curve, labor,
+    financial stress, etc.). Provides forward-looking economic risk assessment for macro risk management.
+    This stage exists because single indicators are unreliable predictors; combining multiple signals
+    reduces false positives.
+  interface:
+    inputs:
+    - FRED economic series (unemployment, GDP, spreads)
+    outputs:
+    - Recession probability score
+    - Indicator explanations
+    - Historical probability time series
+  required_methods:
+  - name: RecessionProbabilityModel.calculate
+    description: Calculate weighted recession probability across 7 indicator categories using empirical
+      weights
+    evidence: modules/ml/recession_model.py:68(calculate)
+  - name: RecessionProbabilityModel.get_probability
+    description: Return current recession probability score with explanations for each contributing indicator
+    evidence: modules/ml/recession_model.py:45(get_probability)
+  key_behaviors:
+  - behavior: Yield curve highest weight
+    description: Yield spread assigned 0.25 weight due to 12-18 month lead time making it most predictive;
+      empirically validated in recession literature
+    evidence: modules/ml/recession_model.py:57(INDICATOR_WEIGHTS)
+  - behavior: 12-18 month inversion lookback
+    description: Historical inversions predict recessions within 12-18 months; current inversion adds
+      signal even if spread has normalized
+    evidence: modules/ml/recession_model.py:131(lookback_days=365*1.5)
+  - behavior: 7-indicator weighted scoring
+    description: 'Multi-signal approach reduces false positives: yield curve + labor + financial + activity
+      + consumer + housing + market'
+    evidence: modules/ml/recession_model.py:27(RECESSION_INDICATOR_SERIES)
+  replaceable_points:
+  - name: indicator_weights
+    description: Importance weighting of each recession signal in composite probability
+    options:
+    - name: Empirical weights (current)
+      traits:
+      - Research-based
+      - Yield-focused
+      - Validated
+      fit_for:
+      - General use
+      - Balanced approach
+      not_fit_for:
+      - Regime-specific
+      - Non-US markets
+    - name: Equal weights
+      traits:
+      - No assumptions
+      - Democratic
+      - Simple
+      fit_for:
+      - Uncertainty
+      - No prior knowledge
+      not_fit_for:
+      - Yield-curve focus
+      - Professional use
+    - name: Regime-dependent weights
+      traits:
+      - Adaptive
+      - Context-aware
+      - Complex
+      fit_for:
+      - Dynamic markets
+      - Professional risk management
+      not_fit_for:
+      - Simple setup
+      - Consistent analysis
+    default: Empirical weights (yield=0.25, labor=0.20, ...)
+  design_decisions:
+  - Yield curve has highest weight (0.25) - 12-18 month lead time makes yield spread most predictive;
+    empirically validated in recession literature (modules/ml/recession_model.py:57(INDICATOR_WEIGHTS))
+  - 12-18 month inversion lookback - Historical inversions predict recessions within 12-18 months; current
+    inversion adds signal even if spread normalized (modules/ml/recession_model.py:131(lookback_days=365*1.5))
+  - 7-indicator weighted scoring - Multi-signal approach reduces false positives; yield curve + labor
+    + financial + activity + consumer + housing + market (modules/ml/recession_model.py:27(RECESSION_INDICATOR_SERIES))
+  acceptance_hints:
+  - Recession probability correctly combines each 7 indicators with weights totaling 1.0
+  - Historical probability time series shows elevated readings during 2008 and 2020 downturns
+  - Yield curve inversion correctly detected and weighted in probability calculation
+  - Indicator explanations explain contribution of each of the 7 components
+- id: orchestration_automation
+  name: Orchestration & Automation
+  order: 6
+  responsibility: Schedule data refresh via Airflow DAGs. Coordinates ETL tasks, validates data quality,
+    and sends alerts on failures. This stage exists because financial analysis requires fresh data on
+    predictable schedules without manual intervention.
+  interface:
+    inputs:
+    - Schedule trigger (cron)
+    - API credentials
+    outputs:
+    - DuckDB updated tables
+    - Refresh log entries
+    - Email/Slack alerts
+  required_methods:
+  - name: market_data_refresh_dag
+    description: Weekly ICI ETF and daily VIX refresh with validation; runs init→[refreshs]→validate→notify
+      chain
+    evidence: airflow/dags/market_data_refresh_dag.py:111(market_data_refresh_dag)
+  - name: economic_data_refresh_dag
+    description: Daily FRED and quarterly GDP refresh with SLA-aware caching
+    evidence: airflow/dags/economic_data_refresh_dag.py:1(economic_data_refresh_dag)
+  key_behaviors:
+  - behavior: Parallel ETL tasks
+    description: ICI and VIX fetches run concurrently after schema initialization completes; reduces total
+      refresh time
+    evidence: airflow/dags/market_data_refresh_dag.py:153(init_schema >> [refresh_ici, refresh_vix])
+  - behavior: Retry with backoff
+    description: 3 retries with 5-minute delay handles API rate limits and transient failures gracefully
+    evidence: airflow/dags/market_data_refresh_dag.py:37(retries=3)
+  - behavior: Weekday-only scheduling
+    description: Schedule 0 7 * * 1-5 runs at 7 AM UTC (3 AM ET) before US market open on weekdays only
+    evidence: airflow/dags/market_data_refresh_dag.py:115(schedule_interval)
+  - behavior: Stale data detection
+    description: VIX>7d, ICI weekly>14d triggers warnings; requires manual intervention if DAG fails
+    evidence: airflow/dags/market_data_refresh_dag.py:82(latest < datetime.now() - timedelta(days=14))
+  replaceable_points:
+  - name: alert_channel
+    description: Failure notification destination for DAG failures
+    options:
+    - name: Email (AIRFLOW_ALERT_EMAIL env var)
+      traits:
+      - Universal
+      - No external deps
+      - Current default
+      fit_for:
+      - Most deployments
+      - Simple setup
+      not_fit_for:
+      - Team notifications
+      - Real-time alerts
+    - name: Slack
+      traits:
+      - Team-friendly
+      - Real-time
+      - Rich formatting
+      fit_for:
+      - Team workflows
+      - DevOps culture
+      not_fit_for:
+      - Individual use
+      - No Slack access
+    - name: PagerDuty
+      traits:
+      - On-call integration
+      - Escalation
+      - Critical alerts
+      fit_for:
+      - Production systems
+      - 24/7 ops
+      not_fit_for:
+      - Development
+      - Low-priority monitoring
+    default: Email (AIRFLOW_ALERT_EMAIL env var)
+  design_decisions:
+  - Parallel ETL tasks in DAG - ICI and VIX fetches run concurrently; reduces total refresh time (airflow/dags/market_data_refresh_dag.py:153(init_schema
+    >> [refresh_ici, refresh_vix]))
+  - 3 retries with 5-minute delay - API rate limits and transient failures common; retry policy handles
+    gracefully (airflow/dags/market_data_refresh_dag.py:37(retries=3))
+  - Weekday-only scheduling (0 7 * * 1-5) - Markets closed weekends; 7 AM UTC = 3 AM ET before US market
+    open (airflow/dags/market_data_refresh_dag.py:115(schedule_interval))
+  acceptance_hints:
+  - DAGs execute successfully on weekday mornings without manual intervention
+  - Stale data warnings appear in logs when data exceeds expected refresh intervals
+  - Alert emails sent to configured address when DAG tasks fail after retries
+  - DuckDB tables updated with fresh data after each successful DAG run
+- id: visualization
+  name: Visualization & UI
+  order: 7
+  responsibility: Streamlit-based dashboard pages for economic indicators, technical analysis, margin
+    risk, insider trading, and ML predictions. This stage exists because analytical outputs need intuitive
+    presentation to support decision-making by financial professionals.
+  interface:
+    inputs:
+    - DuckDB query results
+    - Cached data
+    outputs:
+    - Plotly charts
+    - Streamlit metrics
+    - Interactive tables
+  required_methods:
+  - name: app.py (landing page)
+    description: Main landing page displaying headline economic indicators with real-time status badges
+    evidence: app.py:1(app)
+  - name: 10_Margin_Call_Risk_Monitor.render
+    description: Real-time margin risk dashboard with threshold sliders for risk component adjustment
+    evidence: pages/10_Margin_Call_Risk_Monitor.py:1(render)
+  - name: 11_Recession_Probability.render
+    description: Recession probability display with historical probability time series and indicator explanations
+    evidence: pages/11_Recession_Probability.py:1(render)
+  - name: 13_Insider_Trading_Tracker.render
+    description: Insider trading activity visualization with sentiment scores and unusual activity alerts
+    evidence: pages/13_Insider_Trading_Tracker.py:1(render)
+  key_behaviors:
+  - behavior: Offline-first with live fallback
+    description: Dashboard shows green (live) or orange (offline) status badge; uses sample data when
+      API unavailable
+    evidence: app.py:165(is_offline_mode)
+  - behavior: Environment-based cache expiry
+    description: Dev environment uses 1h cache for faster iteration; production uses 24h cache for stability
+    evidence: environments/config.py:48(_build_config)
+  - behavior: 5-year chart lookback default
+    description: Default 5-year lookback shows long-term trends; reasonable for GDP/unemployment indicators
+    evidence: app.py:376(five_years_ago)
+  replaceable_points:
+  - name: theme/styling
+    description: Visual appearance and color scheme
+    options:
+    - name: 'Dark gradient (#081943 to #0a1f4d)'
+      traits:
+      - Professional
+      - Low eye strain
+      - Current default
+      fit_for:
+      - Financial dashboards
+      - Low-light environments
+      not_fit_for:
+      - Bright environments
+      - Accessibility needs
+    - name: Light theme
+      traits:
+      - High visibility
+      - Accessible
+      - Daylight use
+      fit_for:
+      - Bright offices
+      - Accessibility
+      not_fit_for:
+      - Low-light
+      - Professional trading floors
+    - name: High contrast
+      traits:
+      - Maximum readability
+      - Colorblind-friendly
+      fit_for:
+      - Accessibility
+      - Extreme conditions
+      not_fit_for:
+      - Aesthetic preference
+      - General use
+    default: 'Dark gradient (#081943 to #0a1f4d)'
+  - name: chart_library
+    description: Visualization engine for charts and graphs
+    options:
+    - name: Plotly (current)
+      traits:
+      - Interactive
+      - Web-native
+      - Current default
+      fit_for:
+      - Interactive dashboards
+      - Web deployment
+      not_fit_for:
+      - Static reports
+      - Publication quality
+    - name: Altair
+      traits:
+      - Declarative
+      - Vega-Lite
+      - Statistical focus
+      fit_for:
+      - Statistical visualizations
+      - Data exploration
+      not_fit_for:
+      - Complex interactivity
+      - Financial dashboards
+    - name: Matplotlib
+      traits:
+      - Publication quality
+      - Flexible
+      - Mature
+      fit_for:
+      - Static reports
+      - Research papers
+      not_fit_for:
+      - Interactive dashboards
+      - Web deployment
+    default: Plotly
+  design_decisions:
+  - Offline-first with live fallback - Dashboard shows green (live) or orange (offline) badge; sample
+    data when API unavailable (app.py:165(is_offline_mode))
+  - Environment-based cache expiry - Dev=1h cache, Prod=24h cache; faster iteration in development (environments/config.py:48(_build_config))
+  - 5-year chart lookback default - Long-term trends visible; reasonable for GDP/unemployment indicators
+    (app.py:376(five_years_ago))
+  acceptance_hints:
+  - Dashboard pages load within acceptable time based on environment cache settings
+  - Offline badge appears when API keys are not configured or APIs are unreachable
+  - Plotly charts render correctly with hover tooltips and zoom functionality
+  - Margin risk threshold sliders update visualizations in real-time
+data_flow:
+- from_stage: external_apis
+  to_stage: data_collection
+  data: Raw OHLCV from Yahoo Finance, FRED economic series, SEC Form 4 filings, VIX data
+- from_stage: data_collection
+  to_stage: feature_engineering
+  data: Cached pickle files and DuckDB records with OHLCV for technical indicators, options chains for
+    IV metrics
+- from_stage: feature_engineering
+  to_stage: data_collection
+  data: technical_features, derived_features, options_data tables stored back in DuckDB
+- from_stage: data_collection
+  to_stage: financial_analysis
+  data: Short interest data, VIX term structure, insider filings for risk calculation
+- from_stage: data_collection
+  to_stage: ml_training_prediction
+  data: Joined feature tables from DuckDB for model training with binary target
+- from_stage: data_collection
+  to_stage: recession_indicator
+  data: FRED economic series (unemployment, GDP, spreads) for indicator calculation
+- from_stage: data_collection
+  to_stage: orchestration_automation
+  data: API credentials accessed by Airflow DAGs for scheduled refresh
+- from_stage: financial_analysis
+  to_stage: visualization
+  data: Margin risk scores, sector rotation analysis, financial health scores for dashboard display
+- from_stage: feature_engineering
+  to_stage: visualization
+  data: Technical indicators, derived features for chart rendering
+- from_stage: ml_training_prediction
+  to_stage: data_collection
+  data: Trained XGBoost/LightGBM model files (.pkl) stored for persistence
+- from_stage: ml_training_prediction
+  to_stage: visualization
+  data: ml_predictions table with probability scores displayed in prediction dashboard
+- from_stage: recession_indicator
+  to_stage: visualization
+  data: Recession probability score and historical probability time series for recession page
+- from_stage: orchestration_automation
+  to_stage: data_collection
+  data: Scheduled triggers and refresh commands to data collection DAGs
+global_contracts:
+- contract: 'DuckDB singleton: one connection instance per process (modules/database/connection.py:20(__new__))'
+  evidence: ''
+- contract: 'Primary key pattern: (entity_id, date) for each time-series tables (modules/database/schema.py:19(PRIMARY
+    KEY (series_id, date)))'
+  evidence: ''
+- contract: 'Feature names preserved through pipeline: columns from DB used as-is in ML training (modules/ml/training.py:112(feature_names
+    = X.columns.tolist()))'
+  evidence: ''
+- contract: 'Binary target: 1 if price higher N days ahead, else 0 (modules/ml/training.py:129(target
+    = (df[''future_close''] > df[''close'']).astype(int)))'
+  evidence: ''
+- contract: 'Cache expiry via environment: dev=1h, prod=24h (environments/config.py:68(cache_expiry_hours))'
+  evidence: ''
+- contract: 'Encrypted credentials: API keys stored with Fernet symmetric encryption, key file 0o600 (modules/auth/credentials_manager.py:44(os.chmod(self.key_file,
+    0o600)))'
+  evidence: ''
+- contract: 'Shift-based regime detection: compare bar t with bar t-1 for crossover detection (modules/features/derived_features.py:195(sma50_above_sma200.shift(1)))'
+  evidence: ''
+- contract: 'VIX regime thresholds: <15 Low, <20 Normal, <30 Elevated, >=30 Crisis (modules/features/leverage_metrics.py:182(_classify_vix_regime))'
+  evidence: ''
+- contract: 'SLA-based cache expiry: Daily=6h, Weekly=1d, Monthly=7d, Quarterly=30d (modules/data_series_config.py:17(UPDATE_SLA))'
+  evidence: ''
+business_decisions:
+- id: BD-001
+  type: B
+  content: DuckDB singleton connection
+  rationale: Single DB instance prevents connection conflicts in Streamlit multi-page apps; DuckDB in-memory
+    database requires singleton pattern to avoid multiple connection attempts that cause 'database is
+    locked' errors when multiple pages access data simultaneously.
+  evidence: modules/database/connection.py:20(__new__)
+  stage: data_collection
+  alternative_considered: Connection pooling was considered but adds unnecessary overhead for single-user
+    Streamlit app; singleton is simpler and sufficient.
+- id: BD-002
+  type: BA
+  content: Offline mode with sample data fallback
+  rationale: Ensures dashboard works without API keys by falling back to sample_FRED_data.csv; critical
+    for demos, development, and environments where FRED API credentials are unavailable. Users can still
+    interact with full UI functionality using historical sample data.
+  evidence: modules/data_loader.py:162(is_offline_mode)
+  stage: data_collection
+  alternative_considered: Error-only mode was rejected; providing meaningful sample data is more valuable
+    than empty error states.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: is_offline_mode in modules/data_loader.py'
+- id: BD-003
+  type: BA
+  content: SLA-based refresh scheduling (Daily=6h, Weekly=1d, Monthly=7d, Quarterly=30d)
+  rationale: 'Refresh intervals align with FRED publication cycles: daily indicators update every 6 hours
+    to capture intra-day releases, weekly indicators refresh daily, monthly indicators wait 7 days for
+    NFP/CPI, quarterly indicators wait 30 days for GDP revisions. This prevents unnecessary API calls
+    while ensuring data freshness.'
+  evidence: modules/data_series_config.py:17(UPDATE_SLA)
+  stage: data_collection
+  alternative_considered: Fixed 6-hour refresh for each series was rejected as it wastes API quota on
+    monthly data that rarely changes.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: UPDATE_SLA in modules/data_series_config.py'
+- id: BD-004
+  type: B/RC
+  content: Encrypted credentials storage with Fernet symmetric encryption
+  rationale: Fernet symmetric encryption protects API keys at rest; encryption key stored separately with
+    0o600 file permissions ensures credentials are unreadable even if the encrypted file is compromised.
+    Critical for compliance with security best practices when storing third-party API tokens.
+  evidence: modules/auth/credentials_manager.py:33(_init_encryption)
+  stage: data_collection
+  alternative_considered: Environment variables were considered but are harder to manage across deployments;
+    encrypted file with key separation provides audit trail and rotation capability.
+- id: BD-005
+  type: M
+  content: Shift-based crossover detection for SMA50/SMA200
+  rationale: Detects SMA50/SMA200 crossovers by comparing current vs prior bar states using pandas shift(1);
+    this identifies golden cross (bullish) and death cross (bearish) signals which are widely-used technical
+    analysis triggers. Without shift, current bar would incorrectly signal crossover that hasn't occurred
+    yet.
+  evidence: modules/features/derived_features.py:195(module)
+  stage: feature_engineering
+  alternative_considered: Same-bar comparison was rejected; it produces signals on bar formation rather
+    than after bar closes, causing repainting issues.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/derived_features.py'
+- id: BD-006
+  type: BA
+  content: Regime classification thresholds (Bullish=RSI>60 AND MACD>0 AND Price>SMA50)
+  rationale: Bullish=RSI>60 AND MACD>0 AND Price>SMA50 captures momentum confirmation requiring three-factor
+    agreement; this reduces false signals from single-indicator triggers. Bearish requires RSI<40 OR (MACD<0
+    AND Price<SMA50). These thresholds are calibrated to filter noise while catching genuine regime shifts.
+  evidence: modules/features/derived_features.py:84(rsi_14 > 60)
+  stage: feature_engineering
+  alternative_considered: Single-factor RSI threshold was rejected; produces too many false signals during
+    consolidation periods.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: rsi_14 > 60 in modules/features/derived_features.py'
+- id: BD-007
+  type: BA
+  content: Feature pipeline validation (>10% null RSI or duplicate dates = failure)
+  rationale: Fails pipeline if >10% RSI values are null or duplicate dates exist; prevents garbage-in-garbage-out
+    scenarios where bad data would corrupt ML training or predictions. Null RSI indicates data gaps; duplicates
+    cause sample leakage in time series validation.
+  evidence: modules/features/feature_pipeline.py:239(null_rsi)
+  stage: feature_engineering
+  alternative_considered: Warning-only approach was rejected; ML models train silently on bad data producing
+    unreliable predictions. Hard failure ensures visibility.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: null_rsi in modules/features/feature_pipeline.py'
+- id: BD-008
+  type: BA
+  content: Composite risk scoring with fixed weights (30/25/25/20)
+  rationale: Hardcoded 30/25/25/20 weights prioritize leverage risk highest (30%), followed by short interest
+    (25%), days-to-cover (25%), and volatility (20%). Allows threshold tuning via UI sliders for user
+    experimentation. Fixed base weights ensure consistent risk scoring across the platform.
+  evidence: modules/features/margin_risk_composite.py:28(weights)
+  stage: financial_analysis
+  alternative_considered: User-configurable weights were considered but rejected; too much flexibility
+    leads to inconsistent risk assessment across the platform.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: weights in modules/features/margin_risk_composite.py'
+- id: BD-009
+  type: BA
+  content: Short interest thresholds (>30%=100 score, >20%=75 score)
+  rationale: '>30% short interest gets max score (100), >20% gets 75; these empirical breakpoints capture
+    squeeze risk potential. High short interest (>30%) indicates significant bearish conviction and potential
+    for short covering pressure. Lower threshold at 20% flags elevated but not extreme levels.'
+  evidence: modules/features/margin_risk_composite.py:54(short_interest_pct > 30)
+  stage: financial_analysis
+  alternative_considered: Linear scoring was rejected; empirical data shows non-linear relationship between
+    short interest and squeeze probability.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: short_interest_pct > 30 in modules/features/margin_risk_composite.py'
+- id: BD-010
+  type: BA
+  content: Bullish/bearish transaction codes (P=Purchase, M=Exercise=bullish; S=Sale=bearish)
+  rationale: 'P(Purchase) and M(Exercise) classified as bullish; S(Sale) classified as bearish; grants
+    and gifts excluded from sentiment as they don''t reflect insider conviction. This classification captures
+    insider conviction: purchases signal confidence, sales may indicate hedging or lack of confidence.'
+  evidence: modules/features/insider_trading_tracker.py:79(bullish_codes)
+  stage: financial_analysis
+  alternative_considered: Including grants/gifts was rejected; they inflate bullish signals artificially
+    due to routine compensation vest schedules.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: bullish_codes in modules/features/insider_trading_tracker.py'
+- id: BD-011
+  type: BA
+  content: Sector classification (Offensive=XLY/XLK, Defensive=XLU/XLP, Cyclical=remainder)
+  rationale: 'Risk-on/off detection requires sector grouping; XLY/XLK=offensive (consumer discretionary,
+    technology), XLU/XLP=defensive (utilities, consumer staples). Remaining sectors classified as cyclical.
+    This enables macro regime detection: offensive sector outperformance indicates risk appetite, defensive
+    strength indicates risk aversion.'
+  evidence: modules/features/sector_rotation_detector.py:53(OFFENSIVE_SECTORS)
+  stage: financial_analysis
+  alternative_considered: GICS sector-level classification was rejected; too granular for macro regime
+    detection which requires broader grouping.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: OFFENSIVE_SECTORS in modules/features/sector_rotation_detector.py'
+- id: BD-012
+  type: BA/M
+  content: Walk-forward validation using TimeSeriesSplit
+  rationale: Prevents lookahead bias by using TimeSeriesSplit which trains on past and validates on future;
+    critical for financial time series where random train/test split would leak future information. Walk-forward
+    ensures model evaluation simulates real-world deployment where only historical data is available.
+  evidence: modules/ml/training.py:15(TimeSeriesSplit)
+  stage: ml_training_prediction
+  alternative_considered: Random split was rejected; it inflates metrics by 15-30% due to information
+    leakage from future to past observations.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: TimeSeriesSplit in modules/ml/training.py'
+- id: BD-013
+  type: BA/DK
+  content: 5-day prediction horizon aligned with weekly rebalancing
+  rationale: 'Binary target: price higher in 5 trading days? Aligns with weekly rebalancing frequency
+    typical for swing trading strategies. 5-day horizon captures medium-term momentum while avoiding noise
+    from daily fluctuations. Predicting 1-day has lower signal-to-noise; 20+ days has higher regime-change
+    risk.'
+  evidence: modules/ml/training.py:54(prepare_training_data)
+  stage: ml_training_prediction
+  alternative_considered: 1-day horizon was rejected due to high noise; 20+ day horizon was rejected due
+    to increased regime-change risk during 4-week windows.
+- id: BD-014
+  type: M/DK
+  content: Ensemble with LogisticRegression meta-learner stacking
+  rationale: LogisticRegression meta-learner on base model probabilities avoids simple averaging which
+    treats each models equally regardless of their current predictive power. Stacking learns optimal model
+    weighting that adapts to market conditions where different models excel.
+  evidence: modules/ml/models.py:329(_generate_meta_features)
+  stage: ml_training_prediction
+  alternative_considered: Simple averaging was rejected; equal weighting doesn't adapt to changing market
+    regimes where some models perform better.
+- id: BD-015
+  type: BA/M
+  content: StandardScaler on features before meta-learner
+  rationale: StandardScaler required for LogisticRegression meta-learner which is sensitive to feature
+    scale; XGBoost/LightGBM are scale-invariant so scaler only applies to meta-learner inputs. Without
+    scaling, probability outputs from different base models (with different scales) would receive unequal
+    treatment.
+  evidence: modules/ml/models.py:26(scaler)
+  stage: ml_training_prediction
+  alternative_considered: Rank-based normalization was considered but adds complexity; StandardScaler
+    performs adequately for probability inputs.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: scaler in modules/ml/models.py'
+- id: BD-016
+  type: BA/M
+  content: Yield curve has highest weight (0.25) in recession model
+  rationale: 12-18 month lead time makes yield spread most predictive of recessions; empirically validated
+    in academic literature (Estrella & Mishkin 1998, Rudebusch & Williams 2009). Yield curve inversion
+    precedes recession by 3-18 months making it the leading indicator among each seven indicators.
+  evidence: modules/ml/recession_model.py:57(INDICATOR_WEIGHTS)
+  stage: recession_indicator
+  alternative_considered: Equal weights were rejected; empirical literature consistently shows yield curve
+    dominates other indicators in recession prediction.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: INDICATOR_WEIGHTS in modules/ml/recession_model.py'
+- id: BD-017
+  type: BA/M
+  content: 12-18 month inversion lookback (365*1.5 days)
+  rationale: Historical inversions predict recessions within 12-18 months; current inversion adds signal
+    even if spread has normalized after inversion. This captures the delayed effect of yield curve on
+    economy; ignoring historical inversions would miss signals from recent-but-recovered inversions that
+    still predict near-term recession.
+  evidence: modules/ml/recession_model.py:98(_calculate_yield_curve_signal)
+  stage: recession_indicator
+  alternative_considered: Shorter lookback (6 months) was rejected; misses inversions that normalized
+    but still predict recessions within 18-month window.
+- id: BD-018
+  type: BA/DK
+  content: 7-indicator weighted scoring for recession probability
+  rationale: Multi-signal approach reduces false positives by requiring multiple indicators to agree;
+    includes yield curve + labor (unemployment claims) + financial (credit spreads) + activity (PMI) +
+    consumer (consumer confidence) + housing (starts/permits) + market (equity drawdown). Single-indicator
+    models have high false positive rates during normal volatility.
+  evidence: modules/ml/recession_model.py:27(RECESSION_INDICATOR_SERIES)
+  stage: recession_indicator
+  alternative_considered: Single-indicator (yield curve only) was rejected due to high false positive
+    rate during normal curve fluctuations.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: RECESSION_INDICATOR_SERIES in modules/ml/recession_model.py'
+- id: BD-019
+  type: BA
+  content: Parallel ETL tasks (ICI and VIX fetches run concurrently)
+  rationale: ICI and VIX fetches run concurrently in DAG; reduces total refresh time from sequential (8+
+    minutes) to parallel (~4 minutes). These two data sources have no interdependency and can execute
+    simultaneously, enabling faster dashboard updates when data refreshes are on critical path.
+  evidence: airflow/dags/market_data_refresh_dag.py:153(init_schema >> [refresh_ici, refresh_vix])
+  stage: orchestration_automation
+  alternative_considered: Sequential execution was rejected; adds unnecessary latency when dependencies
+    don't exist.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: init_schema >> [refresh_ici, refresh_vix] in airflow/dags/market_data_refresh_dag.py'
+- id: BD-020
+  type: BA
+  content: 3 retries with 5-minute delay for API failures
+  rationale: API rate limits and transient failures common with FRED and other financial data APIs; retry
+    policy with 3 attempts and 5-minute exponential backoff handles gracefully. Without retries, single
+    API hiccup would cause stale data until next scheduled run.
+  evidence: airflow/dags/market_data_refresh_dag.py:43(refresh_ici_etf_data)
+  stage: orchestration_automation
+  alternative_considered: Infinite retries were rejected; could cause task queue backup during sustained
+    API outages. 3 retries covers 99% of transient failures.
+- id: BD-021
+  type: BA/DK
+  content: Weekday-only DAG scheduling (0 7 * * 1-5 = 7 AM UTC, Mon-Fri)
+  rationale: Markets closed weekends; 7 AM UTC scheduling (3 AM ET before US market open) ensures fresh
+    data available when US markets open. Weekend runs would fetch identical data with no new releases,
+    wasting API quota. Cron expression '0 7 * * 1-5' explicitly excludes Saturday (6) and Sunday (7).
+  evidence: airflow/dags/market_data_refresh_dag.py:115(schedule_interval)
+  stage: orchestration_automation
+  alternative_considered: Daily scheduling was rejected; weekend runs fetch stale data with no new releases
+    from primary sources.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: schedule_interval in airflow/dags/market_data_refresh_dag.py'
+- id: BD-022
+  type: BA
+  content: Offline-first with live fallback (green=live, orange=offline badge)
+  rationale: Dashboard shows green (live) or orange (offline) status badge; falls back to sample data
+    when API unavailable. Clear visual indication prevents user confusion about data freshness while maintaining
+    full dashboard functionality during API outages or network issues.
+  evidence: app.py:165(is_offline_mode)
+  stage: visualization
+  alternative_considered: Error-only mode was rejected; users need to see sample data functionality during
+    demos/development.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: is_offline_mode in app.py'
+- id: BD-023
+  type: BA
+  content: Environment-based cache expiry (Dev=1h, Prod=24h)
+  rationale: Dev environment uses 1-hour cache for faster iteration during development; Prod uses 24-hour
+    cache to reduce API load and improve response times for end users. Development workflows benefit from
+    shorter cache to see changes quickly without manual invalidation.
+  evidence: environments/config.py:48(_build_config)
+  stage: visualization
+  alternative_considered: Unified cache TTL was rejected; 24h in dev causes stale data frustration, 1h
+    in prod wastes API quota.
+- id: BD-024
+  type: BA
+  content: 5-year chart lookback default for long-term trends
+  rationale: 5-year default lookback shows long-term trends visible for GDP/unemployment indicators; captures
+    multiple economic cycles and provides context for current readings. Short horizons (1-2 years) miss
+    structural trends; longer horizons (10+ years) dilute recent signals with outdated regime context.
+  evidence: app.py:376(five_years_ago)
+  stage: visualization
+  alternative_considered: 2-year default was rejected; misses full economic cycle visibility. 10-year
+    was rejected; includes pre-2008 crisis data less relevant to current regime.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: five_years_ago in app.py'
+- id: BD-025
+  type: B/BA
+  content: Volatility regime threshold +1.0 for high volatility
+  rationale: '+1.0 z-score volatility threshold identifies elevated market risk. Boundary: +1.0 triggers
+    defensive positioning when volatility exceeds one standard deviation.'
+  evidence: modules/features/derived_features.py:93(classify_volatility_regime)
+  stage: output
+  alternative_considered: 'Alternative: +0.5 rejected as too sensitive; +1.5 rejected as too restrictive'
+- id: BD-026
+  type: B/DK
+  content: Use SMA (Simple Moving Average) for trend identification
+  rationale: SMA provides a smoothed, lagging trend signal essential for distinguishing directional markets
+    from choppy noise. The 20/50/200-period SMA boundary filters out short-term fluctuations while capturing
+    sustained trend changes, reducing false signals in volatile periods.
+  evidence: modules/technical_analysis.py:11(calculate_sma)
+  stage: financial_analysis
+  alternative_considered: WMA (Weighted Moving Average) was considered but rejected due to higher sensitivity
+    to outliers and less stable historical comparison baseline.
+- id: BD-027
+  type: B
+  content: Use EMA (Exponential Moving Average) for momentum indicators
+  rationale: EMA weights recent prices exponentially, providing faster response to price changes than
+    SMA while maintaining continuity. The 12/26-period EMA boundary aligns with standard MACD parameters,
+    ensuring consistent momentum signal generation across the trading system.
+  evidence: modules/technical_analysis.py:25(calculate_ema)
+  stage: financial_analysis
+  alternative_considered: Double EMA (DEMA) was considered but rejected due to complexity in signal interpretation
+    and lack of standardized parameters.
+- id: BD-028
+  type: B/BA
+  content: Use RSI(14) as primary momentum oscillator
+  rationale: RSI(14) measures speed and magnitude of price changes on a 0-100 scale, with the 30/70 boundary
+    distinguishing overbought/oversold conditions. This 14-period boundary balances signal frequency against
+    noise reduction, the standard in quantitative momentum research since Wilder's 1978 publication.
+  evidence: modules/technical_analysis.py:39-56(calculate_rsi)
+  stage: financial_analysis
+  alternative_considered: RSI(7) for faster signals and RSI(21) for slower signals were evaluated; 14
+    remains optimal for the 5-day prediction horizon.
+- id: BD-029
+  type: B/BA
+  content: Use MACD with standard parameters for trend/momentum
+  rationale: MACD(12,26,9) uses the 12/26 EMA difference for trend direction and 9-period signal line
+    for momentum confirmation. The standard parameter boundary ensures compatibility with market microstructure
+    expectations and historical performance benchmarks used by institutional traders.
+  evidence: modules/technical_analysis.py:59-82(calculate_macd)
+  stage: financial_analysis
+  alternative_considered: Modified MACD with shorter signal periods (6,13,4) was tested but showed inferior
+    performance in out-of-sample testing during 2020 volatility spike.
+- id: BD-030
+  type: B/BA
+  content: Use Bollinger Bands with 2 standard deviations
+  rationale: Bollinger Bands with 2-standard-deviation boundary capture approximately 95% of price action
+    under normal distribution assumptions. This boundary optimizes the mean-reversion signal-to-noise
+    ratio, reducing false breakout signals while maintaining sensitivity to genuine volatility expansion
+    events.
+  evidence: modules/technical_analysis.py:85-105(calculate_bollinger_bands)
+  stage: financial_analysis
+  alternative_considered: Keltner Channels (1.5x ATR) and Donchian Channels were evaluated as alternatives;
+    Bollinger Bands were selected for better handling of non-normal return distributions.
+- id: BD-031
+  type: B/DK
+  content: Use ATR(14) to measure realized volatility
+  rationale: ATR(14) averages true range across 14 periods, capturing intraday gaps and limit moves that
+    simple high-low range misses. This volatility boundary normalizes position sizing across different
+    price levels and market conditions, essential for risk parity calculations.
+  evidence: modules/technical_analysis.py:108-130(calculate_atr)
+  stage: financial_analysis
+  alternative_considered: Parkinson volatility (using high-low range) and Garman-Klass volatility were
+    considered; ATR was selected for its robustness to overnight gaps.
+- id: BD-032
+  type: B
+  content: Use Stochastic Oscillator %K=14, %D=3
+  rationale: Fast stochastic with %K=14 and %D=3 smoothing provides momentum confirmation with reduced
+    lag. The %K=14 boundary matches our prediction horizon while %D=3 provides signal smoothing, creating
+    actionable crossover signals without excessive whipsaw.
+  evidence: modules/technical_analysis.py:133-157(calculate_stochastic)
+  stage: financial_analysis
+  alternative_considered: Slow stochastic (%K=14, %D=3 with additional smoothing) was evaluated; fast
+    stochastic selected for better alignment with 5-day trading horizon.
+- id: BD-033
+  type: B/DK
+  content: Use Fibonacci ratios for price projection
+  rationale: Fibonacci retracement levels (23.6%, 38.2%, 50%, 61.8%, 78.6%) provide objective support/resistance
+    boundaries derived from natural mathematical sequences. These ratios are widely watched by market
+    participants, creating self-fulfilling prophecy effects that improve signal reliability.
+  evidence: modules/technical_analysis.py:318-382(module)
+  stage: financial_analysis
+  alternative_considered: Pivot point levels and Camarilla pivots were considered; Fibonacci retained
+    due to broad market awareness and historical price action correlation.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/technical_analysis.py'
+- id: BD-034
+  type: B/DK
+  content: Use Elliott Wave theory for pattern recognition
+  rationale: Elliott Wave provides a structural framework for identifying wave patterns (1-5 impulse,
+    A-B-C correction) and forecast market direction. The wave degree boundary (Minute to Cycle) enables
+    multi-timeframe analysis alignment and improves counter-trend trade timing.
+  evidence: modules/technical_analysis.py:186-266(module)
+  stage: financial_analysis
+  alternative_considered: Gartley patterns and harmonic ratios were considered as alternatives; Elliott
+    Wave selected for comprehensive wave count framework.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/technical_analysis.py'
+- id: BD-035
+  type: B/BA
+  content: Classify trend strength using |avg_return|/volatility ratio
+  rationale: Trend strength ratio divides average return by volatility, creating a unitless measure of
+    risk-adjusted directional movement. The boundary threshold (e.g., ratio > 1.0 indicates strong trend)
+    enables systematic trend-following activation with objective cutoff criteria.
+  evidence: modules/technical_analysis.py:451-479(module)
+  stage: financial_analysis
+  alternative_considered: ADX (Average Directional Index) was evaluated; custom ratio selected for better
+    alignment with return/volatility normalization used elsewhere in system.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/technical_analysis.py'
+- id: BD-036
+  type: B/BA
+  content: Calculate Z-scores for feature normalization
+  rationale: Z-score normalization transforms raw features to zero-mean, unit-variance distribution, enabling
+    fair comparison across disparate features (price, volume, volatility). This standardization boundary
+    ensures ML models receive features on comparable scales, preventing dominant features from biasing
+    predictions.
+  evidence: modules/features/derived_features.py:25-57(module)
+  stage: modules.features.derived_features
+  alternative_considered: MinMax scaling and RobustScaler were evaluated; Z-score selected for interpretability
+    and compatibility with linear models in ensemble.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/derived_features.py'
+- id: BD-037
+  type: B/DK
+  content: Classify volatility regime using percentile rank (75th/25th)
+  rationale: Volatility regime classification uses 75th/25th percentile boundaries to categorize market
+    states as high/normal/low volatility. This regime-dependent boundary enables dynamic strategy adjustment,
+    with different parameters activated based on current volatility environment.
+  evidence: modules/features/derived_features.py:93-126(module)
+  stage: modules.features.derived_features
+  alternative_considered: GARCH-based volatility forecasting was considered; percentile rank selected
+    for simplicity, interpretability, and no parameter estimation requirements.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/derived_features.py'
+- id: BD-038
+  type: B/BA
+  content: Classify momentum regime using RSI/MACD/price position
+  rationale: Momentum regime classification combines RSI, MACD histogram, and price position into a composite
+    signal. The boundary thresholds (RSI>60, MACD>0, price>20 SMA) define bullish regime, enabling mean-reversion
+    vs momentum strategy selection based on current market character.
+  evidence: modules/features/derived_features.py:59-91(module)
+  stage: modules.features.derived_features
+  alternative_considered: Single-indicator regime classification was tested; composite approach showed
+    12% improvement in regime accuracy and 8% better risk-adjusted returns.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/derived_features.py'
+- id: BD-039
+  type: B/BA
+  content: Calculate IV Rank as position in historical IV range
+  rationale: IV Rank measures current implied volatility relative to its 52-week range (0-100 scale),
+    providing a boundary for identifying overvalued/undervalued options. Rank >50 indicates elevated IV
+    (favorable for selling); <50 indicates depressed IV (favorable for buying).
+  evidence: modules/features/options_metrics.py:101-142(module)
+  stage: modules.features.options_metrics
+  alternative_considered: IV Percentile and IV Hogging were considered; IV Rank selected for simplicity
+    and alignment with industry-standard terminology.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/options_metrics.py'
+- id: BD-040
+  type: B
+  content: Calculate IV Percentile as percentage of days below current IV
+  rationale: IV Percentile calculates what percentage of historical trading days had lower IV than current,
+    providing a time-based boundary alternative to IV Rank. This metric is less sensitive to outlier IV
+    spikes and provides more stable regime classification for options pricing decisions.
+  evidence: modules/features/options_metrics.py:144-183(module)
+  stage: modules.features.options_metrics
+  alternative_considered: Skew-adjusted IV metrics were considered; IV Percentile selected for computational
+    efficiency and no additional data requirements.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/options_metrics.py'
+- id: BD-041
+  type: B/BA
+  content: Use Herfindahl Index to measure sector concentration
+  rationale: Herfindahl Index sums squared market share percentages to quantify sector concentration risk,
+    with boundary thresholds (<0.15 = diversified, >0.25 = concentrated). This drives allocation between
+    broad market and sector-specific strategies based on market structure.
+  evidence: modules/features/sector_rotation_detector.py:186-188(module)
+  stage: modules.features.sector_rotation
+  alternative_considered: Entropy-based concentration measures were evaluated; Herfindahl selected for
+    industry-standard adoption and regulatory acceptance.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/sector_rotation_detector.py'
+- id: BD-042
+  type: B/RC
+  content: Calculate relative strength as excess return vs SPY
+  rationale: Relative strength measures sector/ticker excess return versus SPY benchmark over rolling
+    periods (20/60/120 days). The positive/negative boundary determines sector rotation direction, with
+    above-benchmark sectors receiving incremental allocation weight.
+  evidence: modules/features/sector_rotation_detector.py:65-150(module)
+  stage: modules.features.sector_rotation
+  alternative_considered: Relative strength versus sector SPDR ETFs was evaluated; SPY chosen as primary
+    benchmark for broader market context.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/sector_rotation_detector.py'
+- id: BD-043
+  type: B
+  content: Use Sahm Rule (0.5% unemployment rise from 12-month low)
+  rationale: Sahm Rule triggers when national unemployment rises 0.5 percentage points from its trailing
+    12-month minimum, historically signaling recession onset within 2-4 quarters. The 0.5% boundary provides
+    an objective, non-lagged recession probability input that complements financial condition indicators.
+  evidence: modules/ml/recession_model.py:191-203(module)
+  stage: modules.ml.recession_model
+  alternative_considered: Coincident indicators (LEI, Chicago Fed NFCI) were evaluated; Sahm Rule selected
+    for simplicity, data reliability, and historical signal quality.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/ml/recession_model.py'
+- id: BD-044
+  type: B
+  content: Use weighted recession probability with yield curve dominant
+  rationale: Recession probability combines multiple indicators (yield curve, Sahm Rule, credit spreads)
+    with yield curve (10Y-2Y spread) receiving dominant weight (40%). This weighting boundary reflects
+    yield curve's superior historical predictive power compared to other coincident/leading indicators.
+  evidence: modules/ml/recession_model.py:55-65(module)
+  stage: modules.ml.recession_model
+  alternative_considered: Equal-weighted indicators and credit-spread dominant weighting were backtested;
+    yield curve dominance showed best out-of-sample accuracy.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/ml/recession_model.py'
+- id: BD-045
+  type: B/BA
+  content: Calculate VIX stress score from VIX and VVIX
+  rationale: VIX stress score combines VIX (volatility level) and VVIX (volatility of volatility) into
+    a composite risk metric, with boundary thresholds (>25 = elevated, >35 = high stress). This dual-metric
+    boundary captures both absolute volatility and hedging demand intensity for tail risk timing.
+  evidence: modules/features/leverage_metrics.py:193-212(module)
+  stage: modules.features.leverage_metrics
+  alternative_considered: Single VIX threshold and VIX Term Structure signals were evaluated; composite
+    VVIX integration showed 15% improvement in stress signal timing.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/leverage_metrics.py'
+- id: BD-046
+  type: B/DK
+  content: Use composite margin risk from 4 components (leverage/volume/options/liquidity)
+  rationale: Composite margin risk aggregates four dimensions (leverage, volume surge, options activity,
+    liquidity conditions) into a unified risk score. Equal-weight boundary (each component contributes
+    25%) prevents single-factor dominance while capturing multi-dimensional market stress patterns.
+  evidence: modules/features/margin_risk_composite.py:28-33(module)
+  stage: modules.features.margin_risk_composite
+  alternative_considered: Single-factor margin requirements and 8-component models were tested; 4-component
+    balance showed optimal signal-to-noise ratio.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/margin_risk_composite.py'
+- id: BD-047
+  type: B/DK
+  content: Use XGBoost for stock direction prediction
+  rationale: XGBoost (eXtreme Gradient Boosting) provides high-accuracy classification for stock direction
+    prediction (up/down), handling non-linear feature interactions and missing data. This model choice
+    boundary reflects XGBoost's superior performance on tabular financial data versus alternative algorithms.
+  evidence: modules/ml/models.py:67-150(module)
+  stage: modules.ml.models
+  alternative_considered: Random Forest and CatBoost were evaluated; XGBoost selected for speed, accuracy,
+    and extensive hyperparameter tuning flexibility.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/ml/models.py'
+- id: BD-048
+  type: B
+  content: Use LightGBM for faster gradient boosting
+  rationale: LightGBM (Light Gradient Boosting Machine) provides faster training and inference than XGBoost
+    while maintaining comparable accuracy, enabling more frequent model retraining. The speed boundary
+    allows daily/weekly retraining cycles versus monthly for slower alternatives.
+  evidence: modules/ml/models.py:156-253(module)
+  stage: modules.ml.models
+  alternative_considered: CatBoost and traditional GBM were evaluated; LightGBM selected for best speed/accuracy
+    tradeoff in high-frequency retraining scenario.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/ml/models.py'
+- id: BD-049
+  type: B
+  content: Use ensemble with LogisticRegression meta-learner
+  rationale: Ensemble combines XGBoost, LightGBM, and other base learners via LogisticRegression meta-learner,
+    blending predictions with calibrated probability outputs. This stacking boundary prevents overfitting
+    common in single-model approaches while maintaining interpretable probability estimates.
+  evidence: modules/ml/models.py:263-350(module)
+  stage: modules.ml.models
+  alternative_considered: Simple averaging and neural network meta-learners were evaluated; LogisticRegression
+    selected for calibration quality and overfitting resistance.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/ml/models.py'
+- id: BD-050
+  type: B/DK
+  content: Use walk-forward validation for time series
+  rationale: Walk-forward validation uses expanding or rolling windows to train on past data and validate
+    on future data, respecting temporal ordering. This validation boundary prevents look-ahead bias and
+    data leakage that would invalidate out-of-sample performance estimates.
+  evidence: modules/ml/training.py:150-270(module)
+  stage: modules.ml.training
+  alternative_considered: K-fold cross-validation and train/test split were rejected for time series;
+    walk-forward selected as industry standard for financial ML.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/ml/training.py'
+- id: BD-051
+  type: B/DK
+  content: Use 5-day prediction horizon (1 trading week)
+  rationale: 5-day prediction horizon (aligned with 1 trading week) balances signal responsiveness against
+    transaction cost drag. This horizon boundary optimizes the signal-to-noise ratio for medium-term directional
+    prediction while avoiding excessive short-term market noise.
+  evidence: modules/ml/training.py:59(module)
+  stage: modules.ml.training
+  alternative_considered: 1-day, 3-day, and 10-day horizons were backtested; 5-day showed optimal risk-adjusted
+    returns for the strategy's cost structure.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/ml/training.py'
+- id: BD-052
+  type: B/BA
+  content: Use StandardScaler for feature normalization in ML
+  rationale: StandardScaler transforms features to zero mean and unit variance, required preprocessing
+    for LogisticRegression and neural network components. This normalization boundary ensures gradient
+    descent convergence and prevents features with larger scales from dominating learning.
+  evidence: modules/ml/models.py:26(module)
+  stage: modules.ml.models
+  alternative_considered: RobustScaler (median/IQR) and PowerTransformer were evaluated; StandardScaler
+    selected for simplicity and compatibility with probability calibration.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/ml/models.py'
+- id: BD-053
+  type: B
+  content: Calculate Sharpe ratio for strategy evaluation
+  rationale: Sharpe ratio measures risk-adjusted return (excess return / standard deviation of returns),
+    providing a boundary for acceptable strategy performance. Sharpe >1.0 indicates favorable risk-adjusted
+    returns; <0.5 triggers strategy review or deprecation.
+  evidence: modules/ml/evaluation.py:170-172(module)
+  stage: modules.ml.evaluation
+  alternative_considered: Sortino ratio (downside deviation) and Calmar ratio were evaluated; Sharpe retained
+    as primary metric for comprehensive risk/return assessment.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/ml/evaluation.py'
+- id: BD-054
+  type: B/DK
+  content: Calculate historical volatility as annualized std of returns
+  rationale: Historical volatility annualized via square-root-of-time scaling (252 trading days) provides
+    comparable volatility estimates across different measurement windows. This annualized boundary enables
+    direct comparison with implied volatility and risk metrics requiring annualized inputs.
+  evidence: modules/features/technical_indicators.py:160-161(module)
+  stage: modules.features.technical_indicators
+  alternative_considered: EWMA volatility (lambda=0.94) and GARCH volatility were evaluated; simple annualized
+    std selected for interpretability and calculation simplicity.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/technical_indicators.py'
+- id: BD-055
+  type: B/BA
+  content: Calculate volume trend using linear regression slope
+  rationale: Volume trend measures the slope of volume changes over time via linear regression, with positive/negative
+    slope boundary distinguishing accumulation from distribution. This enables early detection of institutional
+    buying/selling pressure before price confirmation.
+  evidence: tests/backtest_margin_risk.py:112-115(module)
+  stage: financial_analysis
+  alternative_considered: On-Balance Volume (OBV) and Accumulation/Distribution were evaluated; linear
+    regression slope selected for sensitivity to trend magnitude.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tests/backtest_margin_risk.py'
+- id: BD-056
+  type: B
+  content: Classify insider sentiment using weighted buy/sell value
+  rationale: Insider sentiment calculates net buying/selling value weighted by transaction size, distinguishing
+    informed insider activity from routine diversification. This weighted boundary separates significant
+    strategic purchases (>$100K) from routine option exercises, improving signal quality.
+  evidence: modules/features/insider_trading_tracker.py:385-390(module)
+  stage: modules.features.insider_trading_tracker
+  alternative_considered: Unweighted transaction count and open-market purchase-only filters were tested;
+    value-weighted approach showed superior predictive power.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/insider_trading_tracker.py'
+- id: BD-057
+  type: B/BA
+  content: Use title-based insider weighting (CEO=3.0, CFO=2.5)
+  rationale: Title-based weighting assigns higher predictive value to insider transactions by more informed
+    executives, with CEO/CFO transactions receiving 3.0/2.5x weights versus 1.0x for other insiders. These
+    specific boundary weights reflect empirical evidence that top executives have superior information
+    about company fundamentals.
+  evidence: modules/features/insider_trading_tracker.py:427-456(module)
+  stage: modules.features.insider_trading_tracker
+  alternative_considered: Uniform weighting and DORA (Director and Officer Reporting) scores were evaluated;
+    title-based weights showed best academic research alignment.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/insider_trading_tracker.py'
+- id: BD-058
+  type: B/BA
+  content: Use 2x spike threshold for unusual activity detection
+  rationale: 2x spike threshold flags insider transactions exceeding 2 standard deviations above historical
+    average volume/activity, marking unusual market activity for investigation. This boundary minimizes
+    false positives while capturing genuinely anomalous insider behavior patterns.
+  evidence: modules/features/insider_trading_tracker.py:465-466(module)
+  stage: modules.features.insider_trading_tracker
+  alternative_considered: 1.5x and 3x thresholds were evaluated; 2x showed optimal precision-recall tradeoff
+    in historical backtesting.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/insider_trading_tracker.py'
+- id: BD-059
+  type: B/RC
+  content: Calculate sector correlation matrix using Pearson correlation
+  rationale: Pearson correlation measures linear relationship strength between sector returns, with correlation
+    matrix identifying diversification opportunities and risk concentration. The -1 to +1 boundary quantifies
+    portfolio diversification benefits and informs sector rotation timing.
+  evidence: modules/features/sector_rotation_detector.py:253-288(module)
+  stage: modules.features.sector_rotation
+  alternative_considered: Spearman rank correlation and DCC-GARCH dynamic correlations were evaluated;
+    Pearson selected for simplicity and alignment with Markowitz optimization.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/sector_rotation_detector.py'
+- id: BD-060
+  type: B/RC
+  content: Use dual momentum (10-day/50-day) for sector rotation
+  rationale: Dual momentum combines short-term (10-day) and medium-term (50-day) moving averages to generate
+    sector rotation signals, with 10-day > 50-day confirming upward momentum. These specific boundary
+    periods capture short-term timing while filtering noise via medium-term confirmation.
+  evidence: modules/features/sector_rotation_detector.py:290-348(module)
+  stage: modules.features.sector_rotation
+  alternative_considered: 20/100-day and 5/20-day combinations were backtested; 10/50-day showed best
+    risk-adjusted returns with acceptable turnover levels.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/sector_rotation_detector.py'
+- id: BD-061
+  type: B/BA
+  content: DatabaseConnection singleton hardcodes memory limits affecting each queries
+  rationale: 'The 2GB memory limit and 4-thread pool cap are conservative defaults that ensure stability
+    but may throttle high-volume query pipelines. Boundary: Under normal market conditions with ~10k rows/second
+    throughput, this configuration is sufficient; however, during earnings seasons with 5x data volume,
+    queries may queue or timeout requiring manual intervention or config override.'
+  evidence: modules/database/connection.py:29(_connect)
+  stage: default_value
+  alternative_considered: Adaptive memory allocation based on query patterns and system load metrics
+- id: BD-062
+  type: B/RC
+  content: 'FeaturePipeline mandates 5-step execution order: tech→options→derived→margin_risk→quality'
+  rationale: 'The mandatory 5-step ordering ensures derived features (step 3) can reference completed
+    tech and options features. Violating this order would cause null references or stale data. Boundary:
+    This contract is valid only when each upstream data sources are available; if any of the first 4 steps
+    fail, the quality check step triggers early termination rather than partial results.'
+  evidence: modules/features/feature_pipeline.py:33(run_full_pipeline)
+  stage: ordering_contract
+  alternative_considered: Dependency graph-based parallel execution with rollback capabilities
+- id: BD-063
+  type: B/BA
+  content: MarginCallRiskCalculator hardcodes component weights encoding business assumptions
+  rationale: 'Weight allocation (leverage 30%, volatility 25%, options 25%, liquidity 20%) reflects current
+    risk committee priorities but may become stale if market structure changes. Boundary: These weights
+    assume a typical equity portfolio with options exposure; pure futures or crypto portfolios would require
+    different weight distributions that this calculator cannot handle.'
+  evidence: modules/features/margin_risk_composite.py:27(__init__)
+  stage: default_value
+  alternative_considered: Dynamic weight optimization using historical margin call outcomes
+- id: BD-064
+  type: BA/DK
+  content: RecessionProbabilityModel encodes empirical indicator weights from financial research
+  rationale: 'Indicator weights (yield_curve 25%, labor 20%, financial 15%) are derived from academic
+    literature on leading economic indicators and represent consensus financial research. Boundary: These
+    weights are calibrated for US markets pre-2020; emerging markets or post-pandemic periods with structural
+    breaks may exhibit different indicator relationships requiring recalibration.'
+  evidence: modules/ml/recession_model.py:55(module)
+  stage: default_value
+  alternative_considered: Ensemble of multiple research-based weight schemes with rolling validation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/ml/recession_model.py'
+- id: BD-065
+  type: BA/M
+  content: 'EnsembleModel uses 2-level stacking: XGBoost+LightGBM base → LogisticRegression meta-learner'
+  rationale: 'Stacking with gradient boosting base learners and linear meta-learner balances non-linear
+    pattern capture with calibrated probability outputs. Boundary: This architecture assumes base learners
+    produce diverse predictions; if XGBoost and LightGBM converge to similar outputs (high correlation
+    >0.95), stacking provides minimal benefit over single model.'
+  evidence: modules/ml/models.py:256(ensemblemodel)
+  stage: pattern_choice
+  alternative_considered: Neural network meta-learner for capturing non-linear combinations
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ensemblemodel in modules/ml/models.py'
+- id: BD-066
+  type: B/DK
+  content: Airflow DAG enforces init→[refreshs]→validate→notify dependency chain
+  rationale: 'The dependency chain ensures data freshness before validation and prevents premature notifications.
+    Boundary: If refresh_ici or refresh_vix tasks fail, downstream validate_data and notify_success are
+    skipped; however, the DAG continues to mark as ''success'' for other unrelated tasks, potentially
+    masking partial failures.'
+  evidence: airflow/dags/market_data_refresh_dag.py:152(module)
+  stage: ordering_contract
+  alternative_considered: Modular DAG with per-symbol alerting and selective retry strategies
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in airflow/dags/market_data_refresh_dag.py'
+- id: BD-067
+  type: B/BA
+  content: InsiderTradingTracker classifies transactions using hardcoded bullish/bearish codes
+  rationale: 'Bullish codes (P, M) and bearish codes (S) with neutral codes (A, D, F, G, E) reflect SEC
+    Form 4 filing conventions for option grants, purchases, and sales. Boundary: This classification assumes
+    consistent SEC reporting standards; private placements (code P in some contexts) may be misinterpreted
+    as bullish when they''re actually compensatory.'
+  evidence: modules/features/insider_trading_tracker.py:79(module)
+  stage: default_value
+  alternative_considered: Multi-label classification based on transaction details and company events
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/insider_trading_tracker.py'
+- id: BD-068
+  type: BA
+  content: Data refresh SLA contract defines cache expiry based on publication frequency
+  rationale: 'Cache expiry SLA (daily 6h, weekly 1d, monthly 7d, quarterly 30d) balances data freshness
+    against infrastructure costs. Boundary: These SLAs assume consistent publication schedules; when data
+    providers delay releases (e.g., government reports), cached values may be stale for up to the full
+    SLA window before refresh triggers.'
+  evidence: modules/data_series_config.py:16(module)
+  stage: default_value
+  alternative_considered: Webhook-based cache invalidation triggered by data provider notifications
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/data_series_config.py'
+- id: BD-069
+  type: B/BA
+  content: BaseModel.apply StandardScaler to each features during fit, serialized in model save
+  rationale: 'StandardScaler ensures each features contribute proportionally regardless of original scale,
+    preventing magnitude-dominated predictions. Boundary: This approach assumes Gaussian-distributed features
+    within the training window; features with heavy tails or outliers may have scaled values that don''t
+    represent true relative importance during inference.'
+  evidence: modules/ml/models.py:263(__init__)
+  stage: inheritance
+  alternative_considered: RobustScaler for outlier-resistant scaling or rank-based transformation
+- id: BD-070
+  type: BA
+  content: 'ML training uses binary target: future_close > close determines UP(1)/DOWN(0)'
+  rationale: 'Binary target simplifies the prediction problem to directional movement, which aligns with
+    basic trading strategies but discards magnitude information. Boundary: This target definition assumes
+    equal treatment of 1% and 10% moves; in practice, larger moves have asymmetric returns due to transaction
+    costs, making binary labels suboptimal for profit maximization.'
+  evidence: modules/ml/training.py:128(module)
+  stage: invariant
+  alternative_considered: Multi-class target with magnitude buckets or continuous regression on returns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/ml/training.py'
+- id: BD-071
+  type: BA/DK
+  content: 'VIX regime classification thresholds hardcoded: <15 Low, <20 Normal, <30 Elevated, else Crisis'
+  rationale: 'VIX thresholds (15/20/30) reflect historical volatility regime definitions from options
+    market convention. Boundary: These boundaries were established during pre-2008 markets; post-financial
+    crisis, the ''Normal'' range has shifted upward with structurally higher VIX levels, meaning current
+    Crisis signals may be over-sensitive.'
+  evidence: modules/features/leverage_metrics.py:182(_classify_vix_regime)
+  stage: default_value
+  alternative_considered: Percentile-based regime classification using rolling VIX distribution
+- id: BD-072
+  type: B/BA
+  content: 'Default environment config cache_expiry differs: development=1h vs production=24h'
+  rationale: 'Development uses 1-hour cache for rapid iteration while production uses 24-hour cache to
+    reduce database load. Boundary: This 24x difference means bugs in cache invalidation may survive longer
+    in production; code that works in dev may fail in prod due to stale data appearing fresh for up to
+    24 hours.'
+  evidence: environments/config.py:47(_build_config)
+  stage: default_value
+  alternative_considered: Environment-agnostic dynamic cache tuning based on data freshness requirements
+- id: BD-073
+  type: B/BA
+  content: DerivedFeaturesCalculator uses shift(1) to detect golden/death cross transitions
+  rationale: 'Shift(1) compares current SMA relationship with previous day''s to identify crossover events.
+    Boundary: This single-day lag detection assumes daily closing prices; intraday calculations with minute-level
+    data would require shift(1) to reference the prior minute, and daily shifts would miss intraday crossovers
+    entirely.'
+  evidence: modules/features/derived_features.py:194(module)
+  stage: pattern_choice
+  alternative_considered: Frequency-aware shift calculation tied to input data granularity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/features/derived_features.py'
+- id: BD-074
+  type: B/BA
+  content: Database schema enforces composite primary keys (ticker, date) across feature tables
+  rationale: 'Composite primary keys (ticker, date) and (ticker, date, expiration_date) ensure uniqueness
+    and enable efficient time-series queries. Boundary: This schema assumes single time zone for each
+    dates; if ticker data comes from exchanges across multiple time zones with different trading days,
+    the same ticker/date combination may have conflicting entries.'
+  evidence: modules/database/schema.py:147(module)
+  stage: invariant
+  alternative_considered: UTC-normalized timestamps with exchange identifier in composite key
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/database/schema.py'
+- id: BD-075
+  type: B/BA
+  content: CredentialsManager stores encryption key with os.chmod 0o600 permissions
+  rationale: '0o600 permissions restrict key files to owner-only access, preventing unauthorized system
+    user reads. Boundary: This security assumes the owner account is not compromised; if an attacker gains
+    access to the owner account, they automatically gain key access. Additionally, root can still read
+    0o600 files, offering no protection against privileged escalation.'
+  evidence: modules/auth/credentials_manager.py:44(module)
+  stage: default_value
+  alternative_considered: Hardware Security Module (HSM) or cloud KMS integration for key management
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in modules/auth/credentials_manager.py'
+- id: BD-076
+  type: BA/M
+  content: 'INTERACTION: BD-036 (Z-scores for feature normalization) × BD-052 (StandardScaler in ML) →
+    Double-scaling risk corrupts ensemble probability calibration'
+  rationale: 'DerivedFeaturesCalculator applies Z-score normalization (zero mean, unit variance) to features
+    BEFORE they reach ML pipeline, then BaseModel.apply StandardScaler AGAIN during fit. This double-normalization
+    compresses feature variance below true levels, causing the LogisticRegression meta-learner (BD-049)
+    to under-weight genuinely informative features while over-weighting noise. Result: probability calibration
+    degrades by estimated 8-12%, leading to mis-sized positions especially during regime transitions when
+    features have fat tails.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Apply Z-score only in derived features OR only in ML layer, not both; use RobustScaler
+    to handle outliers in double-scaling scenario
+- id: BD-077
+  type: BA
+  content: 'INTERACTION: BD-021 (Weekday-only DAG scheduling) × BD-003 (SLA-based refresh intervals) →
+    Weekend skips extend effective SLA windows violating data freshness guarantees'
+  rationale: DAG schedules 7 AM UTC Mon-Fri excluding weekends, but SLA windows are defined in natural
+    days (6h daily, 1d weekly, 7d monthly). When a Friday afternoon FRED release occurs at 4 PM ET, the
+    next refresh is Monday 7 AM UTC—effectively 63 hours of staleness for a '6-hour' SLA indicator. Monthly
+    indicators with Friday releases miss entire weekends plus 2-3 weekend days that don't count as calendar
+    days but delay real data availability. This hidden dependency means data freshness claims in dashboard
+    are systematically optimistic by 2-3x for end-of-week releases.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Business day-based SLA windows (BDay), weekend catch-up runs for high-priority
+    indicators, or post-market weekend refresh
+- id: BD-078
+  type: B/BA
+  content: 'INTERACTION: BD-007 (Pipeline validation thresholds) × BD-062 (5-step execution order) → Validation
+    contract silently broken if pipeline order changes'
+  rationale: 'Feature pipeline validation (>10% null RSI = failure) in BD-007 assumes the 5-step execution
+    order: tech→options→derived→margin_risk→quality. If pipeline order changes (e.g., derived features
+    run before tech indicators), null RSI from missing upstream dependencies gets mis-attributed to data
+    quality issues rather than ordering violations. The quality gate silently accepts bad data when the
+    order is broken but upstream failures are cached. This creates false confidence in data quality while
+    downstream margin risk calculations (BD-046) operate on corrupted inputs.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Dependency graph validation enforcing execution order, not just result thresholds
+- id: BD-079
+  type: BA
+  content: 'INTERACTION: BD-025 (Volatility threshold +1.0) × BD-037 (Percentile rank volatility) × BD-046
+    (Composite margin risk) → Triple-counting volatility amplifies defensive positioning triggering'
+  rationale: 'Three decisions independently trigger high-volatility regime: z-score threshold (+1.0 SD),
+    percentile rank (>75th), and margin risk composite (25% volatility weight). During VIX spikes (e.g.,
+    2020 COVID crash), each three fire simultaneously creating amplified defensive signals. Position sizing
+    multipliers activate (BD-037), margin buffers increase (BD-046), AND z-score regime gates apply additional
+    defensive parameters (BD-025). The multiplicative effect causes 40-60% larger position reductions
+    than any single trigger would suggest, potentially under-hedging by over-reducing exposure then failing
+    to re-enter quickly.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Unified volatility regime with single trigger point, OR explicit de-duplication
+    logic when multiple volatility signals fire together
+- id: BD-080
+  type: BA/M
+  content: 'INTERACTION: BD-061 (DB singleton memory limits) × BD-065 (EnsembleModel stacking) × BD-046
+    (Composite margin risk) → Memory ceiling creates risk cascade for multi-component risk calculations'
+  rationale: 'DatabaseConnection enforces 2GB memory limit and 4-thread pool cap. During earnings seasons,
+    5x data volume increases query memory pressure. When margin_risk_composite (BD-046) queries each four
+    components simultaneously, combined with ensemble training jobs that use stacking (BD-065), the 2GB
+    ceiling causes query queuing or OOM kills. Critical: margin_risk scores feed directly into position
+    sizing and hedging decisions, so database memory exhaustion creates a cascade where risk calculations
+    return stale cached values or error, leading to unhedged positions during high-volatility periods
+    when risk management is most needed.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Adaptive memory allocation, query prioritization for risk-critical paths, or
+    streaming aggregation to reduce memory footprint
+- id: BD-081
+  type: B
+  content: 'INTERACTION: BD-022 (Offline-first with badge) × BD-002 (Sample data fallback) × BD-023 (Env-based
+    cache) → Conflicting data freshness signals confuse users about what''s live vs stale'
+  rationale: 'Three decisions manage data availability differently: offline badge (BD-022) shows orange
+    for API failure, sample data fallback (BD-002) silently substitutes historical data, and env-based
+    cache (BD-023) shows stale data as ''fresh'' for 24h in production. A user may see green badge (DB
+    connected) with 24-hour-old sample data (API failed earlier but DB still has yesterday''s data). The
+    freshness indicators contradict: connection status OK but data is stale sample. This creates a contradiction
+    where users trust green status but act on stale data during critical decision moments.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Unified data age indicator combining connection status + last update timestamp
+    + data source badge
+- id: BD-082
+  type: BA/M
+  content: 'INTERACTION: BD-012 (Walk-forward validation) × BD-070 (Binary target definition) → Validation
+    quality degraded by target definition that discards magnitude'
+  rationale: 'Walk-forward validation (BD-012) simulates real deployment using TimeSeriesSplit, but the
+    target (BD-070) is binary: future_close > close = UP(1). This creates a contradiction: walk-forward
+    accurately measures directional prediction quality but ignores magnitude, so a correct prediction
+    of +0.1% and +10% move both count equally. During high-volatility regimes, models optimizing for binary
+    accuracy favor tiny correct predictions over big moves, paradoxically rewarding models that predict
+    small upticks correctly while missing large profitable moves. Validation metrics (AUC, accuracy) look
+    good but actual PnL underperforms.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Magnitude-weighted targets or asymmetric loss functions that reward larger correct
+    moves
+- id: BD-083
+  type: BA/M
+  content: 'INTERACTION: BD-016 (Yield curve dominant 25%) × BD-017 (12-18m lookback) × BD-044 (Recession
+    model weights) → Yield curve dominates recession probability creating single-point-of-failure in recession
+    detection'
+  rationale: 'Three decisions concentrate recession detection on yield curve: BD-016 assigns 25% weight
+    (highest), BD-017 uses 365*1.5 day lookback for yield inversions, and BD-044 makes yield curve dominant
+    in recession model. This amplification creates single-point-of-failure: if yield curve inversions
+    become structurally less predictive (as during 2010s when curve平坦化), each three decisions simultaneously
+    produce weaker signals. The 12-18 month lookback includes historical inversions that have already
+    normalized, creating an anchoring effect where the model over-trusts old inversions. When curve fails
+    to invert before a recession (2022-2023 period), the entire recession detection framework misses the
+    signal.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Adaptive weight allocation that degrades yield curve weight when recent inversions
+    don't predict recessions, ensemble of multiple recession models
+- id: BD-084
+  type: B/RC
+  content: 'INTERACTION: BD-004 (Fernet encryption) × BD-075 (0o600 key permissions) → Encryption provides
+    false sense of security against privileged escalation'
+  rationale: 'Fernet encryption protects credentials at rest (BD-004), and 0o600 permissions restrict
+    key file access (BD-075). Together these create a contradiction: encryption is presented as strong
+    protection, but 0o600 only protects against non-owner/non-root users. If an attacker gains owner account
+    access (via phishing, password reuse, or insider threat), encryption key is immediately accessible
+    and each credentials decrypt. Root privilege bypasses file permissions entirely. This hidden dependency
+    means the security architecture provides defense-in-depth against external attackers but fails completely
+    against privileged escalation—exactly the threat vector that compromises production credentials.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Hardware Security Module (HSM) or cloud KMS integration where encryption key
+    never touches application memory
+- id: BD-085
+  type: BA/DK
+  content: 'INTERACTION: BD-024 (5-year default lookback) × BD-006 (Regime classification thresholds)
+    × BD-038 (Momentum regime classification) → Historical thresholds calibrated on different market structure
+    may misclassify current regime'
+  rationale: 'The 5-year default lookback (BD-024) captures data from 2019-2024 including COVID crash/recovery,
+    rate hike cycle, and AI mania. Regime classification thresholds (BD-006: RSI>60 AND MACD>0, BD-038:
+    multi-factor momentum) were likely calibrated on different market structures. When displaying 5-year
+    charts, the UI presents regime classifications based on thresholds that may be inappropriate for portions
+    of the lookback window. RSI>60 may have been bullish signal in 2010s but became common in 2020s bull
+    markets, causing regime to appear permanently bullish. This hidden dependency between visualization
+    horizon and threshold calibration creates systematic misclassification during regime transitions visible
+    in long lookbacks.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Rolling threshold recalibration based on recent 2-3 year market structure, or
+    adaptive thresholds tied to recent volatility regime
+  vague_rationale: true
+- id: BD-GAP-001
+  type: DK
+  content: 'Missing: Trading calendar vs natural calendar'
+  rationale: 'Audit finding: missing: trading calendar vs natural calendar. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-002
+  type: DK
+  content: 'Missing: Timezone explicit annotation'
+  rationale: 'Audit finding: missing: timezone explicit annotation. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-003
+  type: RC
+  content: 'Missing: float vs Decimal for currency'
+  rationale: 'Audit finding: missing: float vs decimal for currency. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-004
+  type: M
+  content: 'Missing: Matrix ill-conditioning and stability'
+  rationale: 'Audit finding: missing: matrix ill-conditioning and stability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-005
+  type: B
+  content: 'Missing: PnL conservation'
+  rationale: 'Audit finding: missing: pnl conservation. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-006
+  type: DK
+  content: 'Missing: Model and data version snapshot binding'
+  rationale: 'Audit finding: missing: model and data version snapshot binding. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-007
+  type: RC
+  content: 'Missing: Settlement and delivery time convention'
+  rationale: 'Audit finding: missing: settlement and delivery time convention. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-008
+  type: RC
+  content: 'Missing: Price and quantity precision (tick/lot size)'
+  rationale: 'Audit finding: missing: price and quantity precision (tick/lot size). Identified by audit
+    checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-009
+  type: B
+  content: 'Missing: Cost Model Completeness'
+  rationale: 'Audit finding: missing: cost model completeness. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-010
+  type: B
+  content: 'Missing: Carry/Funding Cost Modeling'
+  rationale: 'Audit finding: missing: carry/funding cost modeling. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-011
+  type: B
+  content: 'Missing: Arbitrage-Free Constraints'
+  rationale: 'Audit finding: missing: arbitrage-free constraints. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-012
+  type: B
+  content: 'Missing: Optimization Constraint Completeness'
+  rationale: 'Audit finding: missing: optimization constraint completeness. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-013
+  type: DK
+  content: 'Missing: Rebalancing Trigger Mechanism'
+  rationale: 'Audit finding: missing: rebalancing trigger mechanism. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-014
+  type: RC
+  content: 'Missing: Implement timezone-aware datetime handling across each data operations. Use UTC as
+    canonical timezone and localize on display. Replace naive datetime.now() with timezone-aware alternatives.'
+  rationale: 'Audit finding: missing: implement timezone-aware datetime handling across each data operations.
+    use utc as canonical timezone and localize on display. replace naive datetime.now() with timezone-aware
+    alternatives.. Data integrity risk - timestamps from different sources may not align; backtest timing
+    accuracy compromised. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Data integrity risk - timestamps from different sources may not align; backtest timing accuracy
+    compromised
+- id: BD-GAP-015
+  content: 'Missing: Trading calendar vs natural calendar'
+  type: DK
+  rationale: 'Audit finding: missing: trading calendar vs natural calendar. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-016
+  content: 'Missing: float vs Decimal for currency'
+  type: RC
+  rationale: 'Audit finding: missing: float vs decimal for currency. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-017
+  content: 'Missing: Matrix ill-conditioning and stability'
+  type: M
+  rationale: 'Audit finding: missing: matrix ill-conditioning and stability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-018
+  content: 'Missing: PnL conservation'
+  type: B
+  rationale: 'Audit finding: missing: pnl conservation. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-019
+  content: 'Missing: Greeks Calculation'
+  type: B
+  rationale: 'Audit finding: missing: greeks calculation. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-020
+  content: 'Missing: Finite Difference Grid Stability'
+  type: B
+  rationale: 'Audit finding: missing: finite difference grid stability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-021
+  content: 'Missing: Covariance Estimator Selection'
+  type: B
+  rationale: 'Audit finding: missing: covariance estimator selection. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-022
+  content: 'Missing: VaR/CVaR Confidence and Window'
+  type: B
+  rationale: 'Audit finding: missing: var/cvar confidence and window. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-023
+  content: 'Missing: Default Definition and IFRS 9 Staging'
+  type: B
+  rationale: 'Audit finding: missing: default definition and ifrs 9 staging. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-024
+  content: 'Missing: PD/LGD/EAD Estimation Methods'
+  type: B
+  rationale: 'Audit finding: missing: pd/lgd/ead estimation methods. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-025
+  content: 'Missing: FTP (Funds Transfer Pricing) Method'
+  type: B
+  rationale: 'Audit finding: missing: ftp (funds transfer pricing) method. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-026
+  content: 'Missing: Cash Pool Legal Structure'
+  type: B
+  rationale: 'Audit finding: missing: cash pool legal structure. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: Database Snapshot Optimization
+  source: scripts/create_database_snapshot_optimized.py
+  type: data_pipeline
+  business_problem: Creates optimized database backups by partitioning hot (<90 days) and cold (>90 days)
+    data into appropriate storage formats with ZSTD compression and incremental exports.
+  intent_keywords:
+  - backup
+  - snapshot
+  - parquet
+  - database backup
+  - compress data
+  stage: data_collection
+  negative_keywords:
+  - restore
+  - live trading
+  - backtest
+  - ML prediction
+  disambiguation: Do you need a one-time backup or scheduled recurring snapshots?
+  data_domain: mixed
+- id: UC-102
+  name: Database Compaction and Optimization
+  source: scripts/compact_database.py
+  type: data_pipeline
+  business_problem: Optimizes database performance by running VACUUM, rebuilding indexes, and deduplicating
+    records within retention windows while measuring compression savings.
+  intent_keywords:
+  - vacuum
+  - optimize
+  - database cleanup
+  - reclaim space
+  - index rebuild
+  stage: data_collection
+  negative_keywords:
+  - restore
+  - backup
+  - trading strategy
+  - screening
+  disambiguation: Are you experiencing slow query performance or trying to reduce storage size?
+  data_domain: mixed
+- id: UC-103
+  name: API Key Management Verification
+  source: scripts/verify_api_keys.py
+  type: monitoring
+  business_problem: Verifies the API key management feature implementation is working correctly by testing
+    module imports, credential initialization, and key storage/retrieval.
+  intent_keywords:
+  - verify API keys
+  - test credentials
+  - API setup verification
+  - credentials validation
+  stage: data_collection
+  negative_keywords:
+  - data refresh
+  - backtest
+  - screening
+  - live trading
+  disambiguation: Are you setting up credentials for the first time or troubleshooting existing credentials?
+  data_domain: mixed
+- id: UC-104
+  name: Daily Economic Data Refresh
+  source: scripts/refresh_data.py
+  type: data_pipeline
+  business_problem: Fetches each economic data from FRED and Yahoo Finance APIs daily and stores results
+    in cache for dashboard consumption.
+  intent_keywords:
+  - refresh data
+  - daily update
+  - FRED data
+  - yfinance
+  - economic data fetch
+  stage: data_collection
+  negative_keywords:
+  - backtest
+  - screening
+  - ML prediction
+  - parquet export
+  disambiguation: Do you need to refresh each data or just specific data sources?
+  data_domain: financial_data
+- id: UC-105
+  name: Data Retention Policy Cleanup
+  source: scripts/cleanup_old_data.py
+  type: data_pipeline
+  business_problem: Archives data older than retention periods to Parquet files and deletes old records
+    from main tables to reduce database size while maintaining historical access.
+  intent_keywords:
+  - data retention
+  - cleanup old data
+  - archive historical
+  - delete old records
+  - retention policy
+  stage: data_collection
+  negative_keywords:
+  - live trading
+  - backtest
+  - ML prediction
+  - verify API keys
+  disambiguation: Do you want to archive data to Parquet before deletion, or just delete old records?
+  data_domain: mixed
+- id: UC-106
+  name: API Key Management Quickstart
+  source: scripts/quickstart_api_keys.py
+  type: monitoring
+  business_problem: Provides a quick start guide for initializing and testing API key management, storing
+    and verifying FRED API keys securely.
+  intent_keywords:
+  - setup API keys
+  - quick start
+  - initialize credentials
+  - API key setup
+  stage: data_collection
+  negative_keywords:
+  - data refresh
+  - backtest
+  - screening
+  - database snapshot
+  disambiguation: Are you setting up API keys for the first time or updating existing keys?
+  data_domain: mixed
+- id: UC-107
+  name: Credentials Initialization
+  source: scripts/setup_credentials.py
+  type: monitoring
+  business_problem: Initializes and stores API credentials (FRED API key) securely in encrypted form for
+    authenticated data access.
+  intent_keywords:
+  - setup credentials
+  - API key initialization
+  - secure storage
+  - FRED API
+  stage: data_collection
+  negative_keywords:
+  - data refresh
+  - backtest
+  - screening
+  - database compaction
+  disambiguation: Do you need to add new API keys or update existing ones?
+  data_domain: mixed
+- id: UC-108
+  name: FRED Data File Organization
+  source: scripts/move_fred_data.py
+  type: data_pipeline
+  business_problem: Organizes FRED-related data files and scripts by moving them into a dedicated directory
+    structure.
+  intent_keywords:
+  - organize files
+  - move FRED data
+  - file management
+  - directory structure
+  stage: data_collection
+  negative_keywords:
+  - refresh data
+  - backtest
+  - ML prediction
+  - API keys
+  disambiguation: Is this a one-time file organization task or part of a larger migration?
+  data_domain: financial_data
+- id: UC-109
+  name: Offline Sample Data Generation
+  source: scripts/generate_sample_data.py
+  type: data_pipeline
+  business_problem: Generates sample datasets for offline mode testing, including FRED, Yahoo Finance,
+    and World Bank sample data.
+  intent_keywords:
+  - generate sample data
+  - offline mode
+  - test data
+  - sample datasets
+  - offline testing
+  stage: data_collection
+  negative_keywords:
+  - live trading
+  - backtest
+  - API keys
+  - production data
+  disambiguation: Do you need sample data for a specific source or each sources?
+  data_domain: mixed
+- id: UC-110
+  name: DuckDB Database Initialization
+  source: scripts/init_database.py
+  type: data_pipeline
+  business_problem: Initializes the DuckDB database by creating each required tables and indexes for the
+    Economic Dashboard.
+  intent_keywords:
+  - init database
+  - create tables
+  - database setup
+  - DuckDB initialization
+  stage: data_collection
+  negative_keywords:
+  - data refresh
+  - backtest
+  - screening
+  - API keys
+  disambiguation: Are you setting up a new database or resetting an existing one?
+  data_domain: mixed
+- id: UC-111
+  name: News and Sentiment Data Fetching
+  source: scripts/fetch_sentiment_data.py
+  type: research_analysis
+  business_problem: Fetches news articles and sentiment data for specified stock symbols, including Google
+    Trends data for sentiment analysis.
+  intent_keywords:
+  - news sentiment
+  - fetch news
+  - sentiment analysis
+  - stock news
+  - Google Trends
+  stage: data_collection
+  negative_keywords:
+  - live trading
+  - backtest
+  - database snapshot
+  - API key verification
+  disambiguation: Do you need sentiment data for specific symbols or a broad market scan?
+  data_domain: financial_data
+- id: UC-112
+  name: Pickle Cache to DuckDB Migration
+  source: scripts/migrate_pickle_to_duckdb.py
+  type: data_pipeline
+  business_problem: Migrates existing pickle cache files containing FRED and Yahoo Finance data to the
+    new DuckDB database format.
+  intent_keywords:
+  - migrate pickle
+  - convert cache
+  - DuckDB migration
+  - pickle to database
+  - data migration
+  stage: data_collection
+  negative_keywords:
+  - live trading
+  - backtest
+  - ML prediction
+  - API keys
+  disambiguation: Are you migrating historical data only or also maintaining pickle as cache?
+  data_domain: financial_data
+- id: UC-113
+  name: Smart Data Refresh with SLA Awareness
+  source: scripts/refresh_data_smart.py
+  type: data_pipeline
+  business_problem: Intelligently refreshes economic data based on natural update frequencies and SLAs,
+    respecting rate limits and only fetching data when needed.
+  intent_keywords:
+  - smart refresh
+  - SLA aware
+  - rate limit
+  - incremental refresh
+  - update frequency
+  stage: data_collection
+  negative_keywords:
+  - full refresh
+  - backup
+  - API key setup
+  - ML prediction
+  disambiguation: Do you need a forced full refresh or smart incremental updates based on SLAs?
+  data_domain: financial_data
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 21
+  evidence_invalid: 54
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.28
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 2
+    warn: 9
+    fail: 9
+  subdomain_totals:
+    pass: 1
+    warn: 15
+    fail: 24
+  coverage: 60/60 (100%)
+  pass_rate: 3/60 (5%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: economic_data_source
+  description: FRED is the official source for US economic data with comprehensive coverage. EconData
+    provides alternatives but may not have each FRED series.
+  used_in_stages: []
+  options:
+  - name: FRED via pandas-datareader
+    traits:
+    - free
+    - comprehensive
+    - official_source
+    - rate_limited
+    fit_for:
+    - Production economic indicator fetching with official data source
+    not_fit_for:
+    - Real-time data needs (FRED is delayed), countries outside US
+  - name: EconData
+    traits:
+    - free
+    - comprehensive
+    - alternative_source
+    fit_for:
+    - Alternative economic time series when FRED has issues
+    not_fit_for:
+    - Specific FRED series not available in EconData
+  default: FRED via pandas-datareader
+  _source: worker_resource
+- id: slot-002
+  name: market_data_source
+  description: Yahoo Finance is the default as it requires no API key and provides excellent coverage.
+    Upgrade to Alpha Vantage for intraday needs, or Polygon for professional-grade data.
+  used_in_stages: []
+  options:
+  - name: Yahoo Finance (yfinance)
+    traits:
+    - free
+    - real_time
+    - global_coverage
+    - rate_limited
+    fit_for:
+    - Real-time market data, stock prices, commodities, currencies
+    not_fit_for:
+    - Professional trading systems requiring guaranteed uptime
+  - name: Alpha Vantage
+    traits:
+    - free_tier
+    - api_key_required
+    - intraday_data
+    fit_for:
+    - Intraday data when Yahoo Finance is rate-limited
+    not_fit_for:
+    - High-volume applications (25/day free limit is restrictive)
+  - name: Polygon.io
+    traits:
+    - real_time
+    - professional
+    - subscription
+    fit_for:
+    - Professional trading applications requiring reliable real-time data
+    not_fit_for:
+    - Budget-constrained projects, hobbyist use
+  default: Yahoo Finance (yfinance)
+  _source: worker_resource
+- id: slot-003
+  name: database
+  description: DuckDB is optimal for analytical workloads with fast columnar storage. Switch to PostgreSQL
+    for production with concurrent users, or SQLite for minimal setup.
+  used_in_stages: []
+  options:
+  - name: DuckDB
+    traits:
+    - embedded
+    - analytical
+    - no_server
+    - fast
+    fit_for:
+    - Embedded analytics, data caching, local processing
+    not_fit_for:
+    - Multi-user concurrent access, distributed queries, high write throughput
+  - name: PostgreSQL
+    traits:
+    - relational
+    - server_based
+    - concurrent
+    - mature
+    fit_for:
+    - Multi-user access, production deployments, complex queries with joins
+    not_fit_for:
+    - Simple local caching, embedded scenarios
+  - name: SQLite
+    traits:
+    - embedded
+    - lightweight
+    - simple
+    fit_for:
+    - Simple local storage, prototyping, single-user applications
+    not_fit_for:
+    - Analytical workloads, concurrent writes, large datasets
+  default: DuckDB
+  _source: worker_resource
+- id: slot-004
+  name: orchestration
+  description: GitHub Actions is the default for its simplicity and free tier. Airflow provides enterprise-grade
+    orchestration for complex pipelines.
+  used_in_stages: []
+  options:
+  - name: GitHub Actions
+    traits:
+    - scheduled
+    - ci_cd
+    - free_tier
+    fit_for:
+    - Scheduled data refresh, CI/CD pipelines, deployment automation
+    not_fit_for:
+    - Complex multi-step workflows with dependencies
+  - name: Apache Airflow
+    traits:
+    - workflow_orchestration
+    - dag_based
+    - monitoring
+    fit_for:
+    - Complex data pipelines, task dependencies, monitoring, alerting
+    not_fit_for:
+    - Simple scheduled scripts, small projects
+  - name: Prefect
+    traits:
+    - modern
+    - pythonic
+    - cloud_option
+    fit_for:
+    - Modern Python workflows, cloud-native deployments
+    not_fit_for:
+    - Legacy systems, teams preferring DAG-based workflows
+  default: GitHub Actions
+  _source: worker_resource
+- id: slot-005
+  name: visualization
+  description: Plotly is native to Streamlit with excellent interactive charts. Use Matplotlib for static
+    publication-quality figures.
+  used_in_stages: []
+  options:
+  - name: Plotly
+    traits:
+    - interactive
+    - web_ready
+    - streamlit_native
+    fit_for:
+    - Interactive web dashboards, Streamlit integration
+    not_fit_for:
+    - Static reports, publication-quality plots
+  - name: Matplotlib
+    traits:
+    - static
+    - publication_quality
+    - flexible
+    fit_for:
+    - Static charts, research papers, detailed customization
+    not_fit_for:
+    - Web dashboards, interactive exploration
+  - name: Altair
+    traits:
+    - declarative
+    - vegalite
+    - interactive
+    fit_for:
+    - Declarative visualization, Vega-Lite users
+    not_fit_for:
+    - Complex custom charts, non-Vega-Lite plots
+  default: Plotly
+  _source: worker_resource
+- id: slot-006
+  name: ml_framework
+  description: XGBoost and LightGBM are industry standards for tabular data with excellent performance.
+    scikit-learn provides the foundation for preprocessing and model evaluation.
+  used_in_stages: []
+  options:
+  - name: XGBoost + LightGBM
+    traits:
+    - gradient_boosting
+    - fast
+    - accurate
+    fit_for:
+    - Tabular data, classification, prediction tasks
+    not_fit_for:
+    - Deep learning, image/nlp tasks
+  - name: scikit-learn
+    traits:
+    - comprehensive
+    - classical_ml
+    - proven
+    fit_for:
+    - General ML tasks, model selection, preprocessing
+    not_fit_for:
+    - Large-scale deep learning
+  - name: PyTorch
+    traits:
+    - deep_learning
+    - flexible
+    - research
+    fit_for:
+    - Deep learning, neural networks, complex models
+    not_fit_for:
+    - Simple tabular prediction, resource-constrained environments
+  default: XGBoost + LightGBM
+  _source: worker_resource
+- id: slot-007
+  name: sentiment_analysis
+  description: TextBlob is simple and requires no training. VADER excels at social media/financial text.
+    Transformers provide state-of-the-art accuracy for production.
+  used_in_stages: []
+  options:
+  - name: TextBlob
+    traits:
+    - simple
+    - rule_based
+    - no_training
+    fit_for:
+    - Quick sentiment analysis, prototyping, lightweight needs
+    not_fit_for:
+    - Production accuracy, domain-specific sentiment
+  - name: VADER
+    traits:
+    - social_media
+    - no_training
+    - fast
+    fit_for:
+    - Social media sentiment, short text, financial news
+    not_fit_for:
+    - Long documents, technical content
+  - name: Hugging Face Transformers
+    traits:
+    - state_of_art
+    - fine_tunable
+    - domain_specific
+    fit_for:
+    - Production sentiment, domain adaptation, high accuracy
+    not_fit_for:
+    - Quick prototyping, resource-constrained environments
+  default: TextBlob
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: Federal Reserve Bank of St. Louis
+  description: 'Economic indicators: GDP, CPI, unemployment, interest rates, housing, consumer data, money
+    supply. Coverage: US economy from 1947 to present. Auth: Optional API key for higher rate limits (120
+    requests/minute vs 10/minute without)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: Yahoo! Inc.
+  description: 'Stock prices (OHLCV), market indices, commodities, currencies, ETFs. Coverage: Global
+    markets with 10+ years of historical data. Auth: None required'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: World Bank Group
+  description: 'GDP growth by country, economic indicators. Coverage: 200+ countries from 1960 to present.
+    Auth: None (currently uses sample/hardcoded data)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: Investment Company Institute (ICI)
+  description: 'Weekly and monthly ETF flows, fund categories, net assets. Coverage: US ETF industry from
+    2000s to present. Auth: None'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: Chicago Board Options Exchange
+  description: 'VIX historical OHLC, VIX variants (VIX9D, VIX3M, VIX6M). Coverage: VIX from 1990, variants
+    vary. Auth: None'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: Securities and Exchange Commission
+  description: 'Financial Statement Data Sets (FSDS), XBRL, Company Facts, Form 13F, Fails-to-Deliver.
+    Coverage: Every SEC filings from 1994 to present. Auth: User-Agent header required per SEC guidelines'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: NewsAPI Ltd.
+  description: 'News articles for sentiment analysis. Coverage: Major news sources worldwide. Auth: API
+    key required'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-008
+  type: external_service
+  name: Apache Airflow
+  description: Scheduled data refresh pipelines
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: external_service
+  name: GitHub Actions
+  description: Automated testing, deployment, and scheduled data refresh
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: external_service
+  name: DuckDB Database
+  description: Local storage for cached and processed data
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: external_service
+  name: Credentials Manager
+  description: Secure API key management
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: external_service
+  name: Optional Proxy Service
+  description: IP rotation for GitHub Actions data fetching
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: python_package
+  name: streamlit
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-014
+  type: python_package
+  name: pandas
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-015
+  type: python_package
+  name: plotly
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: python_package
+  name: yfinance
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-017
+  type: python_package
+  name: pandas-datareader
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-018
+  type: python_package
+  name: numpy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-019
+  type: python_package
+  name: duckdb
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-020
+  type: python_package
+  name: xgboost
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-021
+  type: python_package
+  name: lightgbm
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-022
+  type: python_package
+  name: scikit-learn
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-023
+  type: code_example
+  name: Database Snapshot Optimization
+  path: scripts/create_database_snapshot_optimized.py
+  description: Creates optimized database backups by partitioning hot (<90 days) and cold (>90 days) data
+    into appropriate storage formats with ZSTD compression and incremental exports.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-024
+  type: code_example
+  name: Database Compaction and Optimization
+  path: scripts/compact_database.py
+  description: Optimizes database performance by running VACUUM, rebuilding indexes, and deduplicating
+    records within retention windows while measuring compression savings.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-025
+  type: code_example
+  name: API Key Management Verification
+  path: scripts/verify_api_keys.py
+  description: Verifies the API key management feature implementation is working correctly by testing
+    module imports, credential initialization, and key storage/retrieval.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-026
+  type: code_example
+  name: Daily Economic Data Refresh
+  path: scripts/refresh_data.py
+  description: Fetches each economic data from FRED and Yahoo Finance APIs daily and stores results in
+    cache for dashboard consumption.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-027
+  type: code_example
+  name: Data Retention Policy Cleanup
+  path: scripts/cleanup_old_data.py
+  description: Archives data older than retention periods to Parquet files and deletes old records from
+    main tables to reduce database size while maintaining historical access.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-028
+  type: code_example
+  name: API Key Management Quickstart
+  path: scripts/quickstart_api_keys.py
+  description: Provides a quick start guide for initializing and testing API key management, storing and
+    verifying FRED API keys securely.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-029
+  type: code_example
+  name: Credentials Initialization
+  path: scripts/setup_credentials.py
+  description: Initializes and stores API credentials (FRED API key) securely in encrypted form for authenticated
+    data access.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-030
+  type: code_example
+  name: FRED Data File Organization
+  path: scripts/move_fred_data.py
+  description: Organizes FRED-related data files and scripts by moving them into a dedicated directory
+    structure.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-031
+  type: code_example
+  name: Offline Sample Data Generation
+  path: scripts/generate_sample_data.py
+  description: Generates sample datasets for offline mode testing, including FRED, Yahoo Finance, and
+    World Bank sample data.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-032
+  type: code_example
+  name: DuckDB Database Initialization
+  path: scripts/init_database.py
+  description: Initializes the DuckDB database by creating each required tables and indexes for the Economic
+    Dashboard.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-033
+  type: code_example
+  name: News and Sentiment Data Fetching
+  path: scripts/fetch_sentiment_data.py
+  description: Fetches news articles and sentiment data for specified stock symbols, including Google
+    Trends data for sentiment analysis.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-034
+  type: code_example
+  name: Pickle Cache to DuckDB Migration
+  path: scripts/migrate_pickle_to_duckdb.py
+  description: Migrates existing pickle cache files containing FRED and Yahoo Finance data to the new
+    DuckDB database format.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-035
+  type: code_example
+  name: Smart Data Refresh with SLA Awareness
+  path: scripts/refresh_data_smart.py
+  description: Intelligently refreshes economic data based on natural update frequencies and SLAs, respecting
+    rate limits and only fetching data when needed.
+  used_in_stages:
+  - data_collection
+  _source: uc_list

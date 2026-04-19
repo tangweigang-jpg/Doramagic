@@ -1,0 +1,2335 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-066
+name: wealthbot.io
+sop_version: '3.6'
+source:
+  projects:
+  - wealthbot
+  commit_hash: 0f9738aa2c5b72b58777b65bc2fc1039cccae88e
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Automated portfolio rebalancing and wealth management
+  description: Open source wealth management platform that automates portfolio rebalancing, tax loss harvesting,
+    and trade execution for registered investment advisors (RIAs) serving mass affluent clients
+  prerequisites: Users need understanding of portfolio management, tax-advantaged investing, and brokerage
+    API integration. Requires Tradier API credentials for live trading or sandbox environment for testing.
+  not_suitable_for: High-frequency trading strategies, non-US markets without Tradier support, real-time
+    streaming price feeds, direct integration with custodians other than Tradier
+stages:
+- id: price_collection
+  name: Price Collection
+  order: 1
+  responsibility: Fetch and store current security prices from Tradier API; ensures each securities have
+    latest market prices for portfolio valuation
+  interface:
+    inputs:
+    - name: security_entities
+      description: Every tradable securities from client portfolios
+    outputs:
+    - name: security_price_records
+      description: SecurityPrice records with datetime, price, source='tradier', and is_current flag
+  required_methods:
+  - name: Rebalancer.updateSecurities
+    description: Fetches current prices for each securities from Tradier API and updates local records
+    evidence: src/Api/Rebalancer.php:19(implements updateSecurities)
+  - name: BaseRebalancer.getPricesDiff
+    description: Retrieves the 2 most recent prices for each security to calculate price change ratio
+    evidence: src/Api/BaseRebalancer.php:107(getPricesDiff)
+  - name: Rebalancer.setIsCurrent
+    description: Marks only the most recent price record as current (is_current=true)
+    evidence: src/Api/Rebalancer.php:207(setIsCurrent)
+  key_behaviors:
+  - behavior: Entity-level price isolation
+    description: Each security maintains its own price history independently, enabling per-security price
+      tracking
+    evidence: src/Entity/SecurityPrice.php:9(SecurityPrice entity)
+  - behavior: Current/Historical price separation
+    description: Only the most recent price is marked as is_current=true; older records serve as historical
+      reference for change calculations
+    evidence: src/Api/Rebalancer.php:207(setIsCurrent)
+  - behavior: Dual price retention
+    description: Stores both current and previous prices by fetching 2 most recent records, enabling price/old_price
+      ratio calculation
+    evidence: src/Api/BaseRebalancer.php:107(getPricesDiff)
+  replaceable_points:
+  - name: price_source
+    description: External price data provider for fetching security prices
+    options:
+    - name: tradier
+      traits:
+      - REST API
+      - US equities focus
+      - Real-time quotes
+      fit_for:
+      - US-based RIAs
+      - Equity portfolios
+      - Production trading
+      not_fit_for:
+      - International markets
+      - Cryptocurrency
+      - Fixed income heavy portfolios
+    - name: alpaca
+      traits:
+      - REST API
+      - Commission-free trading
+      - US equities
+      fit_for:
+      - Cost-sensitive implementations
+      - Simple equity portfolios
+      not_fit_for:
+      - Multi-custodian setups
+      - Complex option strategies
+    - name: custom
+      traits:
+      - User-implemented adapter
+      - Full flexibility
+      fit_for:
+      - Proprietary data sources
+      - Non-standard securities
+      - Custom pricing models
+      not_fit_for:
+      - Standard implementations
+      - Quick deployments
+    default: tradier
+  design_decisions:
+  - 'Store both current and previous prices by fetching 2 most recent records (evidence: src/Api/BaseRebalancer.php:107(getPricesDiff))
+    — Enables price change calculation; compares price/old_price ratio to determine buy/sell actions'
+  - 'Mark only most recent price as is_current=true (evidence: src/Api/Rebalancer.php:207(setIsCurrent))
+    — Maintains single source of truth for latest price; older records serve as historical reference'
+  acceptance_hints:
+  - Security prices successfully fetched from Tradier API
+  - prices_diff correctly calculated as current_price/old_price ratio
+  - Only one SecurityPrice per security marked as is_current=true
+  - API gateway correctly resolves to https://api.tradier.com/
+- id: portfolio_analysis
+  name: Portfolio Analysis
+  order: 2
+  responsibility: Calculate portfolio value, model deviation, and determine required rebalancing actions
+    based on target allocations
+  interface:
+    inputs:
+    - name: ce_model
+      description: CeModel entity containing target allocation (modelEntities with percent, securityAssignment,
+        taxLossHarvesting flags)
+    - name: client_portfolio
+      description: ClientPortfolio with current holdings
+    - name: client_portfolio_value
+      description: Current portfolio valuation data
+    - name: security_prices
+      description: SecurityPrice records from price collection stage
+    outputs:
+    - name: rebalancer_action_queue
+      description: 'RebalancerAction queue with job tracking (type: REQUIRED_CASH, FULL_AND_TLH, NO_ACTIONS,
+        INITIAL)'
+  required_methods:
+  - name: CeModel.getModelEntities
+    description: Retrieves target allocation entities with percent, securityAssignment, and tax_loss_harvesting
+      flags
+    evidence: src/Entity/CeModel.php:16(CeModel class)
+  - name: Rebalancer.updatePortfolioValues
+    description: Calculates post-rebalance portfolio value and creates ClientPortfolioValue record
+    evidence: src/Api/Rebalancer.php:165(updatePortfolioValues)
+  - name: Job.getRebalanceType
+    description: Returns rebalance type constant (FULL_AND_TLH, REQUIRED_CASH, etc.) to determine processing
+      strategy
+    evidence: src/Entity/Job.php:56(const REBALANCE_TYPE_*)
+  key_behaviors:
+  - behavior: Risk tolerance calculation from client questionnaire
+    description: Risk tolerance (point) calculated as (sum of answers / 100) + 1, affecting threshold
+      comparison and rebalancing aggressiveness
+    evidence: src/Api/Rebalancer.php:39(point calculation)
+  - behavior: Model deviation comparison against threshold
+    description: Compares current allocation deviation against 4% threshold to determine if rebalancing
+      is required
+    evidence: src/Api/Rebalancer.php:179(setModelDeviation)
+  - behavior: Rebalance type classification via integer constants
+    description: Type-safe enum pattern using integer constants (REQUIRED_CASH=1, FULL_AND_TLH=2) allows
+      switch statements without string comparisons
+    evidence: src/Entity/Job.php:56-60(REBALANCE_TYPE_*)
+  replaceable_points:
+  - name: rebalance_type
+    description: Rebalancing strategy determining which actions are taken
+    options:
+    - name: REQUIRED_CASH
+      traits:
+      - Minimal intervention
+      - Cash-only flows
+      fit_for:
+      - Income distributions
+      - Recurring withdrawals
+      - Minimal trading
+      not_fit_for:
+      - Full rebalancing needed
+      - Tax loss harvesting desired
+    - name: FULL_AND_TLH
+      traits:
+      - Complete rebalance
+      - Tax optimization
+      fit_for:
+      - Periodic rebalancing
+      - Taxable accounts
+      - Long-term investors
+      not_fit_for:
+      - Tax-advantaged accounts only
+      - Minimal trading preference
+    - name: NO_ACTIONS
+      traits:
+      - Read-only
+      - Analysis only
+      fit_for:
+      - Portfolio review
+      - Reporting periods
+      - Simulation mode
+      not_fit_for:
+      - Active management
+      - Trade execution required
+    - name: INITIAL
+      traits:
+      - First-time allocation
+      - Account setup
+      fit_for:
+      - New accounts
+      - Model deployment
+      - Initial funding
+      not_fit_for:
+      - Existing portfolios
+      - Recurring rebalancing
+    default: FULL_AND_TLH
+  design_decisions:
+  - 'Rebalance types encoded as integer constants in Job entity (evidence: src/Entity/Job.php:56(const
+    REBALANCE_TYPE_REQUIRED_CASH)) — Type-safe enum pattern; allows switch on rebalance_type without string
+    comparisons'
+  - 'Risk tolerance calculated from client questionnaire answers (evidence: src/Api/Rebalancer.php:39(point
+    calculation)) — Adjusts rebalancing aggressiveness: point = (sum answers / 100) + 1 affects threshold
+    comparison'
+  - 'Model deviation hardcoded to 4% (evidence: src/Api/Rebalancer.php:179(setModelDeviation)) — TODO:
+    Should be configurable per RIA; current hardcode limits flexibility for different client risk profiles'
+  acceptance_hints:
+  - Job records created with correct REBALANCE_TYPE constant values
+  - CeModel properly referenced with modelEntities containing target percent allocations
+  - Model deviation correctly calculated and compared against threshold
+  - ClientPortfolioValue records created for each rebalance action
+  - getClientAccounts()->first() succeeds without runtime error
+- id: trade_decision
+  name: Trade Decision Engine
+  order: 3
+  responsibility: Determine which securities to buy or sell based on price movements and risk tolerance
+    thresholds
+  interface:
+    inputs:
+    - name: price_movement_data
+      description: Data array containing prices_diff (price change ratio), amounts, security_id, percent
+        for each security
+    outputs:
+    - name: trade_decisions
+      description: Buy/sell decisions with symbol, side, quantity, and price for execution
+  required_methods:
+  - name: Trade.buyOrSell
+    description: Main decision logic that evaluates price movements against thresholds to determine buy
+      or sell actions
+    evidence: src/Api/Trade.php:30(buyOrSell)
+  - name: TradeData.getTradeData
+    description: Retrieves trade execution parameters including order type, quantity, and price
+    evidence: src/Model/TradeData.php:7(TradeData class)
+  key_behaviors:
+  - behavior: Threshold-based trade triggers
+    description: Trades triggered when point - prices_diff > 0.15 (15% deviation tolerance band); prevents
+      excessive turnover
+    evidence: src/Api/Trade.php:47(if point - $datum['prices_diff'] > 0.15)
+  - behavior: Risk-adjusted threshold amplification
+    description: Higher risk tolerance increases the point value, requiring larger deviations to trigger
+      trades; looser thresholds for aggressive portfolios
+    evidence: src/Api/Trade.php:44(point = ($point / 100) + 1)
+  - behavior: Price movement filtering
+    description: Only trades when prices change >15% (prices_diff > 1.15 for sell, < 0.85 for buy); no
+      action when prices_diff between 0.85-1.15
+    evidence: src/Api/Trade.php:48-55(prices_diff comparison)
+  replaceable_points:
+  - name: deviation_threshold
+    description: Portfolio drift tolerance before triggering rebalancing actions
+    options:
+    - name: '0.10'
+      traits:
+      - Conservative
+      - Frequent rebalancing
+      fit_for:
+      - Low risk tolerance
+      - Small accounts
+      - Tax-advantaged accounts
+      not_fit_for:
+      - Taxable accounts with frequent trading concerns
+      - Large portfolios with transaction costs
+    - name: '0.15'
+      traits:
+      - Moderate
+      - Balanced rebalancing
+      fit_for:
+      - Standard portfolios
+      - Most client profiles
+      - Default setting
+      not_fit_for:
+      - Very conservative or aggressive clients
+    - name: '0.20'
+      traits:
+      - Aggressive
+      - Minimal rebalancing
+      fit_for:
+      - Tax-sensitive accounts
+      - Large portfolios
+      - Long-term holders
+      not_fit_for:
+      - Small accounts needing precise allocation
+      - Active management
+    default: '0.15'
+  - name: price_threshold_buy
+    description: Price drop threshold to trigger buy actions
+    options:
+    - name: '0.85'
+      traits:
+      - Moderate drop
+      - 15% decline triggers buy
+      fit_for:
+      - Standard tax loss harvesting
+      - Value investing
+      not_fit_for:
+      - Volatile securities
+      - Small caps
+    - name: '0.80'
+      traits:
+      - Larger drop
+      - 20% decline triggers buy
+      fit_for:
+      - Defensive strategies
+      - High volatility securities
+      not_fit_for:
+      - Active rebalancing
+      - Low volatility portfolios
+    - name: '0.75'
+      traits:
+      - Significant drop
+      - 25% decline triggers buy
+      fit_for:
+      - Deep value
+      - Contrarian strategies
+      not_fit_for:
+      - Most standard portfolios
+      - Tax loss harvesting focus
+    default: '0.85'
+  - name: price_threshold_sell
+    description: Price rise threshold to trigger sell actions
+    options:
+    - name: '1.15'
+      traits:
+      - Moderate rise
+      - 15% gain triggers sell
+      fit_for:
+      - Standard rebalancing
+      - Tax efficient
+      not_fit_for:
+      - Momentum strategies
+      - Strong bull markets
+    - name: '1.20'
+      traits:
+      - Larger rise
+      - 20% gain triggers sell
+      fit_for:
+      - Growth portfolios
+      - Lower turnover preference
+      not_fit_for:
+      - Rebalancing needs
+      - Value strategies
+    - name: '1.25'
+      traits:
+      - Significant rise
+      - 25% gain triggers sell
+      fit_for:
+      - Long-term holding
+      - Momentum strategies
+      not_fit_for:
+      - Active rebalancing
+      - Risk management focus
+    default: '1.15'
+  design_decisions:
+  - 'Hardcoded 15% deviation threshold: point - prices_diff > 0.15 triggers action (evidence: src/Api/Trade.php:47(if
+    point - $datum[''prices_diff''] > 0.15)) — Determines if portfolio drift warrants rebalancing; 0.15
+    = 15% tolerance band'
+  - 'Hardcoded 1.15/0.85 price thresholds for sell/buy triggers (evidence: src/Api/Trade.php:48(if $datum[''prices_diff'']
+    > 1.15)) — Prices must change >15% to trigger trades; prevents excessive turnover in volatile markets'
+  - 'Risk tolerance amplifies threshold: higher risk = looser threshold (evidence: src/Api/Trade.php:44(point
+    = ($point / 100) + 1)) — Higher risk portfolios have larger point values, requiring larger deviations
+    to trigger trades'
+  - 'No-op when prices_diff between 0.85-1.15 (evidence: src/Api/Trade.php:55(do nothing, keep assets))
+    — Avoids transaction costs; only trades when meaningful price movement'
+  acceptance_hints:
+  - buyOrSell returns correct buy/sell decisions based on price movements
+  - 'Deviation threshold correctly applied: point - prices_diff > 0.15 triggers action'
+  - 'Price thresholds correctly applied: prices_diff > 1.15 for sell, < 0.85 for buy'
+  - Risk tolerance point correctly calculated and applied to threshold
+  - No unnecessary trades when prices within 0.85-1.15 band
+- id: trade_execution
+  name: Trade Execution
+  order: 4
+  responsibility: Place orders via Tradier API and record resulting transactions, lots, and positions
+  interface:
+    inputs:
+    - name: trade_decisions
+      description: Trade decisions with symbol, side, quantity, price from trade decision engine
+    outputs:
+    - name: transaction_records
+      description: Transaction, Lot, Position records persisted to database with cost basis and wash sale
+        tracking
+  required_methods:
+  - name: Requests.placeOrder
+    description: POSTs order to Tradier API with symbol, side, quantity, order type, and duration
+    evidence: src/Api/Requests.php:103(placeOrder)
+  - name: Trade.buy
+    description: Executes buy order and persists new Lot and Position records with cost basis
+    evidence: src/Api/Trade.php:161(buy)
+  - name: Trade.sell
+    description: Executes sell order with wash sale tracking and updates existing Position records
+    evidence: src/Api/Trade.php:81(sell)
+  key_behaviors:
+  - behavior: Market order with day duration
+    description: Orders use type=market and duration=day; ensures orders fill at reasonable prices and
+      expire if not filled same day
+    evidence: src/Api/Requests.php:106(type=market&duration=day)
+  - behavior: Tax lot accounting per purchase
+    description: New Lot/Position created on each buy; maintains complete audit trail and enables tax
+      lot accounting
+    evidence: src/Api/Trade.php:191(new Lot/new Position)
+  - behavior: Wash sale tracking
+    description: Sell operations track wash sale eligibility flag; current implementation hardcodes wash_sale=false
+      (incomplete)
+    evidence: src/Api/Trade.php:130(setWashSale(false))
+  - behavior: Position aggregation from lots
+    description: Position entity aggregates multiple lots for same account+security+date, providing consolidated
+      view
+    evidence: 'src/Entity/Position.php:10(comment: aggregates from lots)'
+  replaceable_points:
+  - name: order_type
+    description: Order type sent to broker for execution
+    options:
+    - name: market
+      traits:
+      - Immediate execution
+      - Best effort pricing
+      fit_for:
+      - Liquid securities
+      - Standard rebalancing
+      - Time-sensitive orders
+      not_fit_for:
+      - Illiquid securities
+      - Limit pricing needed
+      - Stop-loss requirements
+    - name: limit
+      traits:
+      - Price specified
+      - May not execute
+      fit_for:
+      - Price-sensitive trades
+      - Illiquid securities
+      - Volatile markets
+      not_fit_for:
+      - Urgent execution
+      - Time-sensitive rebalancing
+    - name: stop
+      traits:
+      - Trigger-based
+      - Conditional execution
+      fit_for:
+      - Risk management
+      - Downside protection
+      - Trailing stops
+      not_fit_for:
+      - Standard rebalancing
+      - Predictable execution needed
+    default: market
+  - name: duration
+    description: Order time-in-force determining how long order remains active
+    options:
+    - name: day
+      traits:
+      - Same-day only
+      - Auto-cancel EOD
+      fit_for:
+      - Intraday rebalancing
+      - Current market conditions
+      - Simple orders
+      not_fit_for:
+      - Waiting for specific conditions
+      - Extended timelines
+    - name: gtc
+      traits:
+      - Good-til-canceled
+      - Manual cancellation
+      fit_for:
+      - Limit orders
+      - Waiting for price levels
+      - Extended execution
+      not_fit_for:
+      - Quick rebalancing
+      - Market timing sensitive
+    - name: gtc60
+      traits:
+      - Good-til-canceled 60 days
+      - Auto-expire
+      fit_for:
+      - Longer execution windows
+      - Partial fills
+      not_fit_for:
+      - Short-term rebalancing
+      - Rapid market changes
+    default: day
+  design_decisions:
+  - 'Market orders with day duration and stop price set to current price (evidence: src/Api/Requests.php:106(type=market&duration=day))
+    — Simplifies execution; ensures orders fill at reasonable prices; expires if not filled same day'
+  - 'New Lot/Position created on each buy (evidence: src/Api/Trade.php:191(new Lot/new Position)) — Maintains
+    complete audit trail; enables tax lot accounting and wash sale tracking'
+  - 'Cost basis recorded at purchase price (evidence: src/Api/Trade.php:208(setCostBasis)) — Required
+    for gain/loss calculations; wash sale flag set to false (enabled later)'
+  - 'Hardcoded wash sale=false (evidence: src/Api/Trade.php:130(setWashSale(false))) — TODO: Should detect
+    wash sale violations (buy/sell within 30 days); current implementation is incomplete'
+  - 'TransactionType created dynamically per trade (evidence: src/Api/Trade.php:99(new TransactionType))
+    — Should use existing TransactionType records; creating duplicates wastes database rows'
+  acceptance_hints:
+  - Orders correctly POSTed to Tradier API endpoint
+  - Lot records created with correct cost_basis on buys
+  - Position aggregates multiple lots per account+security
+  - Transaction records persisted with correct side and quantity
+  - Account numbers correctly prefixed with 'VA' for broker integration
+  - Security symbols used as primary identifier in API calls
+- id: portfolio_value_update
+  name: Portfolio Value Update
+  order: 5
+  responsibility: Record post-trade portfolio valuation for historical tracking and billing calculations
+  interface:
+    inputs:
+    - name: client_portfolio
+      description: ClientPortfolio entity for which value is being recorded
+    - name: post_trade_value
+      description: Post-trade total value and each cash component amounts
+    outputs:
+    - name: client_portfolio_value_record
+      description: ClientPortfolioValue snapshot with total_value, sas_cash, cash_buffer, billing_cash,
+        model_deviation
+  required_methods:
+  - name: Rebalancer.updatePortfolioValues
+    description: Creates new ClientPortfolioValue record after trade execution with each cash components
+      and model deviation
+    evidence: src/Api/Rebalancer.php:165(updatePortfolioValues)
+  key_behaviors:
+  - behavior: Time-series recording per rebalance
+    description: New ClientPortfolioValue created per rebalance action, maintaining historical record
+      for analysis and billing
+    evidence: src/Api/Rebalancer.php:169(new ClientPortfolioValue)
+  - behavior: Cash component consolidation
+    description: Every cash components (sas_cash, cash_buffer, billing_cash) set equal to total value
+      assuming post-trade money market positioning
+    evidence: src/Api/Rebalancer.php:171(setTotalCashInMoneyMarket)
+  - behavior: Model deviation snapshot
+    description: Model deviation recorded at time of value snapshot for historical comparison against
+      target allocations
+    evidence: src/Api/Rebalancer.php:179(setModelDeviation(4))
+  replaceable_points: []
+  design_decisions:
+  - 'Every cash components set equal to total value (evidence: src/Api/Rebalancer.php:171(setTotalCashInMoneyMarket))
+    — Simplified accounting: assumes each cash flows to money market after trades'
+  - 'New ClientPortfolioValue created per rebalance (evidence: src/Api/Rebalancer.php:169(new ClientPortfolioValue))
+    — Time-series record for historical analysis and billing; enables reconciliation against custodian'
+  acceptance_hints:
+  - ClientPortfolioValue record created with total_value equal to sum of each cash components
+  - Model deviation correctly recorded (4% hardcoded)
+  - Historical time-series maintained for billing calculations
+  - Job status updated with finished_at timestamp and is_error flag set appropriately
+data_flow:
+- from_stage: price_collection
+  to_stage: portfolio_analysis
+  data: SecurityPrice records with current/old prices, prices_diff ratios for each security
+- from_stage: portfolio_analysis
+  to_stage: trade_decision
+  data: Data array containing prices_diff, amounts, security_id, percent for each security needing evaluation
+- from_stage: trade_decision
+  to_stage: trade_execution
+  data: 'Trade decisions: symbol, side, quantity, price for each buy or sell action'
+- from_stage: trade_execution
+  to_stage: portfolio_value_update
+  data: Executed trade confirmation with final amounts, Lot/Position/Transaction records
+- from_stage: portfolio_analysis
+  to_stage: portfolio_value_update
+  data: ClientPortfolio reference and model deviation for value recording
+global_contracts:
+- contract: Every Rebalancer classes use Tradier API endpoint https://api.tradier.com/
+  evidence: src/Api/BaseRebalancer.php:25(apiGateway=https://api.tradier.com/)
+- contract: Account numbers prefixed with 'VA' for broker integration
+  evidence: src/Api/Rebalancer.php:100(account_id = 'VA' . $accountNumber)
+- contract: Security symbols used as primary identifier in external API calls
+  evidence: src/Api/Rebalancer.php:102(getSymbol())
+- contract: Job status tracked via started_at, finished_at, is_error flags for audit trail
+  evidence: src/Entity/Job.php:27(started_at), :32(finished_at), :37(is_error)
+- contract: Position entity aggregates multiple Lots for same account+security+date combination
+  evidence: 'src/Entity/Position.php:10(comment: aggregates from lots)'
+- contract: 'Rebalance type constants ordered: FULL(0)→REQUIRED_CASH(1)→FULL_AND_TLH(2)→NO_ACTIONS(3)→INITIAL(4)'
+  evidence: src/Entity/Job.php:56-60(REBALANCE_TYPE_*)
+- contract: 'Client workflow status progression: DEFAULT(0)→ENVELOPE_CREATED(1)→...→ACCOUNT_FUNDED(7)'
+  evidence: src/Model/Workflow.php:131-148(CLIENT_STATUS_*)
+- contract: Doctrine ORM used for each data access without repository pattern abstraction
+  evidence: src/Api/Rebalancer.php:53(findAll())
+- contract: Trait composition (Requests, Trade) used for code reuse across Rebalancer classes
+  evidence: src/Api/Rebalancer.php:21-22(uses Requests, Trade)
+business_decisions:
+- id: BD-001
+  type: B/RC
+  content: Trade execution follows strict SELL before BUY ordering within each rebalancer action
+  rationale: Sell-before-buy ordering prevents cash account overdrafts and ensures settlement integrity.
+    The boundary is enforced within each atomic rebalancer action, not across separate actions, ensuring
+    each repositioning completes in a logically consistent state. This prevents partial executions that
+    could leave accounts in unintended positions.
+  evidence: src/Entity/RebalancerQueue.php:61(STATUS_SELL)
+  stage: trading
+  alternative_considered: Allowing interleaved SELL/BUY was rejected due to settlement risk
+- id: BD-002
+  type: B/BA
+  content: 'Default minimum trade sizes: $50 buy, $150 initial buy, $50 sell for equity securities'
+  rationale: Minimum trade sizes prevent fee dilution on small transactions and reduce settlement noise.
+    Initial buys require higher minimum ($150) to ensure meaningful portfolio establishment. The boundary
+    prevents dust transactions while remaining accessible for typical investor contributions. These defaults
+    apply to equity securities only.
+  evidence: N/A:0(see_rationale)
+  stage: trading
+  alternative_considered: No minimum was rejected to prevent fee dilution; uniform $100 was rejected due
+    to initial purchase barrier
+- id: BD-003
+  type: B/BA
+  content: Security transaction fees include fixed ($250) and percentage (10%) components
+  rationale: Dual-component fee structure (fixed + percentage) ensures transaction cost recovery on large
+    trades while maintaining minimum fee thresholds. The boundary combines $250 fixed cost with 10% variable
+    component to align with typical securities processing overhead and regulatory compliance costs.
+  evidence: N/A:0(see_rationale)
+  stage: trading
+  alternative_considered: Percentage-only was rejected for large trade cost recovery
+- id: BD-004
+  type: B/BA
+  content: Redemption penalties apply for 21-day holding period with 15 fixed + 5% fee
+  rationale: 21-day holding period penalty discourages short-term redemption while maintaining reasonable
+    liquidity. The $15 + 5% penalty structure creates meaningful friction without being punitive. Boundary
+    is the 21-day threshold; penalties apply to redemptions within this window for equity securities.
+  evidence: N/A:0(see_rationale)
+  stage: trading
+  alternative_considered: 30-day standard was rejected as too restrictive; no penalty rejected for investor
+    protection
+- id: BD-005
+  type: RC
+  content: Short-term capital gains threshold is 365 days per IRS regulations
+  rationale: IRS regulations define short-term vs long-term capital gains classification based on holding
+    period. The regulatory boundary is exactly 365 days; assets held less than 365 days are short-term
+    gains taxed as ordinary income. This classification is mandated by federal tax code.
+  evidence: N/A:0(see_rationale)
+  stage: tax
+  alternative_considered: Alternative holding periods would violate IRS regulations
+- id: BD-006
+  type: B/BA
+  content: Capital gains classification implemented using 365-day threshold in Lot entity
+  rationale: Implementation boundary applies 365-day threshold to calculate gain/loss classification.
+    The system distinguishes short-term from long-term gains at lot level for tax lot accounting. Boundary
+    is precisely 365 days to comply with IRS holding period requirements.
+  evidence: src/Entity/Lot.php:427(getShortTermGain)
+  stage: tax
+  alternative_considered: FIFO/LIFO selection is separate concern handled by lot selection algorithm
+- id: BD-007
+  type: B/BA
+  content: 'Lot status tracking: INITIAL=1, IS_OPEN=2, CLOSED=3, DIVIDED=4'
+  rationale: Lot status state machine governs tax lot lifecycle from creation through closure. INITIAL
+    represents newly purchased lots awaiting settlement. IS_OPEN indicates active holding. CLOSED indicates
+    fully liquidated. DIVIDED enables partial sale scenarios. Boundary transitions are controlled and
+    validated to maintain accounting integrity.
+  evidence: N/A:0(see_rationale)
+  stage: accounting
+  alternative_considered: Status-based filtering ensures only valid state transitions occur
+- id: BD-008
+  type: B/BA
+  content: 'Position status: INITIAL=1, IS_OPEN=2, IS_CLOSE=3, NOT_VERIFIED=4'
+  rationale: Position status tracks security position state for accounting reconciliation. IS_CLOSE indicates
+    closing transaction initiated. NOT_VERIFIED flags positions pending external confirmation. The boundary
+    ensures positions are correctly classified for portfolio valuation and trade settlement.
+  evidence: N/A:0(see_rationale)
+  stage: accounting
+  alternative_considered: Verified-only positions would delay accounting updates
+- id: BD-009
+  type: B/RC
+  content: 'Transaction statuses: IN_PROGRESS, PLACED, VERIFIED, NOT_POSTED'
+  rationale: Transaction status enumeration tracks execution lifecycle from submission through settlement.
+    IN_PROGRESS indicates pending execution. PLACED confirms broker receipt. VERIFIED indicates custodian
+    confirmation. NOT_POSTED flags pending settlement. Boundary ensures transaction state integrity across
+    trading partners.
+  evidence: N/A:0(see_rationale)
+  stage: trading
+  alternative_considered: Real-time settlement tracking requires intermediate states
+- id: BD-010
+  type: B
+  content: Asset class types limited to STOCKS and BONDS enumeration
+  rationale: Restricted asset class enumeration ensures portfolio model consistency and reporting alignment.
+    Limiting to STOCKS and BONDS provides clear categorization without over-fragmentation. Boundary prevents
+    unrecognized asset class assignments that would break allocation calculations.
+  evidence: N/A:0(see_rationale)
+  stage: portfolio_value_update
+  alternative_considered: Expandable enum was rejected for data integrity; adding CASH/EQUIVALENTS is
+    future enhancement
+- id: BD-011
+  type: B/BA
+  content: Tolerance bands defined per asset class and subclass with default range 2-21%
+  rationale: Tolerance bands define acceptable drift from target allocation before rebalancing triggers.
+    The 2-21% range allows risk-appropriate customization across asset classes. Subclass-level bands provide
+    finer control than asset class alone. Boundary prevents unintended drift while avoiding excessive
+    trading from overly tight bands.
+  evidence: N/A:0(see_rationale)
+  stage: portfolio_value_update
+  alternative_considered: Fixed bands rejected for one-size-fits-all; tolerance-based frequency rejected
+    for complexity
+  vague_rationale: true
+- id: BD-012
+  type: B
+  content: 'Rebalancing methods: Asset Class level (1) or Subclass level (2)'
+  rationale: Rebalancing method selection determines allocation granularity. Asset class level provides
+    broad-stroke rebalancing; subclass level enables precision targeting. The boundary is either-or selection,
+    not hierarchical; choosing subclass implies asset class rebalancing within each class.
+  evidence: N/A:0(see_rationale)
+  stage: portfolio_value_update
+  alternative_considered: Hybrid approach rejected for complexity; single-level rejected for flexibility
+- id: BD-013
+  type: B/BA
+  content: 'Rebalancing frequencies: Quarterly, Semi-Annual, Annual, Tolerance Bands'
+  rationale: Schedule-based rebalancing frequency options provide different management intensities. Tolerance
+    bands mode triggers only when drift exceeds thresholds. The boundary selects between calendar-based
+    and event-based rebalancing strategies to match client service model.
+  evidence: N/A:0(see_rationale)
+  stage: portfolio_value_update
+  alternative_considered: Monthly frequency rejected for cost; pure drift-only rejected for compliance
+    concerns
+- id: BD-014
+  type: B/BA
+  content: 'Job rebalance types: FULL=0, REQUIRED_CASH=1, FULL_AND_TLH=2, NO_ACTIONS=3, INITIAL=4'
+  rationale: Job rebalance type enumeration controls rebalancer behavior scope. FULL performs complete
+    reallocation. REQUIRED_CASH addresses distributions only. FULL_AND_TLH adds tax-loss harvesting. NO_ACTIONS
+    validates without trading. INITIAL establishes baseline positions. Boundary ensures rebalancer executes
+    appropriate action set.
+  evidence: N/A:0(see_rationale)
+  stage: trading
+  alternative_considered: Separate job types rejected; unified enum provides better audit trail
+  vague_rationale: true
+- id: BD-015
+  type: B/BA
+  content: Risk tolerance scoring starts at 50 points base, adds question points
+  rationale: 50-point baseline ensures non-zero starting score before questionnaire contributions. Adding
+    question points produces final score on defined scale. Boundary produces score range that maps to
+    model risk ratings. Baseline prevents extreme scores from minimal questionnaire engagement.
+  evidence: N/A:0(see_rationale)
+  stage: risk
+  alternative_considered: Zero baseline rejected for edge cases; different base values would shift entire
+    scale
+- id: BD-016
+  type: B/BA
+  content: Portfolio model selection by closest risk rating match
+  rationale: Client risk score maps to nearest available portfolio model risk rating. Closest-match algorithm
+    ensures clients receive model appropriate to their risk tolerance. Boundary is mathematical distance;
+    ties resolve to lower risk. This provides continuous coverage across risk spectrum.
+  evidence: N/A:0(see_rationale)
+  stage: risk
+  alternative_considered: Exact-match-only rejected for uncovered scores; interpolation rejected for complexity
+  vague_rationale: true
+- id: BD-017
+  type: B
+  content: Billing specs support TIER=1 (percentage of AUM) and FLAT=2 (fixed) fee types
+  rationale: Fee type selection determines billing calculation method. TIER charges percentage of assets
+    under management; FLAT charges fixed periodic amount. Boundary determines which calculation path executes.
+    RIAs select fee structure matching their business model.
+  evidence: N/A:0(see_rationale)
+  stage: billing
+  alternative_considered: Hybrid fee rejected for complexity; per-trade fees handled separately
+- id: BD-018
+  type: B
+  content: Fee tier infinity defined as 1000000000000 (1 trillion) for unbounded top tier
+  rationale: INFINITY constant enables tiered fee structures without upper bound. Using 1 trillion as
+    numeric ceiling prevents NULL/infinity edge cases in calculations while representing effectively unbounded.
+    Boundary allows highest tier to cover any AUM size without special-case handling.
+  evidence: N/A:0(see_rationale)
+  stage: billing
+  alternative_considered: NULL rejected for calculation errors; actual infinity rejected for numeric overflow
+- id: BD-019
+  type: B/BA
+  content: Minimum billing fee enforced as floor on calculated tiered fees
+  rationale: Minimum fee clause ensures RIA receives baseline compensation regardless of low AUM. Floor
+    applies after tiered calculation, not before. Boundary prevents fees below minimum even if percentage
+    calculation produces lower result. Protects RIA economics on small accounts.
+  evidence: N/A:0(see_rationale)
+  stage: billing
+  alternative_considered: No floor rejected for economics; percentage-only rejected for small account
+    handling
+- id: BD-020
+  type: B
+  content: RIA fees calculated per quarter using account value at period end date
+  rationale: Quarterly billing aligns with industry standard and provides regular revenue cadence. Period-end
+    valuation captures final account value for billing period. Boundary calculates fee on closing balance,
+    not average. Ensures consistent billing timing across clients.
+  evidence: N/A:0(see_rationale)
+  stage: billing
+  alternative_considered: Monthly rejected for billing overhead; average balance rejected for valuation
+    complexity
+- id: BD-021
+  type: B/BA
+  content: Tax loss harvesting enabled with configurable threshold (dollar and percent)
+  rationale: TLH activation requires configurable thresholds to avoid harvesting trivial losses. Dollar
+    threshold prevents small loss harvesting with disproportionate wash sale risk. Percent threshold prevents
+    harvesting in minor downturns. Boundary activates TLH only when thresholds are exceeded.
+  evidence: N/A:0(see_rationale)
+  stage: tax
+  alternative_considered: No threshold rejected for wash sale risk; fixed threshold rejected for AUM variance
+- id: BD-022
+  type: B/RC
+  content: Wash sale tracking flagged at lot level
+  rationale: Lot-level wash sale tracking enables IRS compliance and gain/loss adjustment. Wash sale rules
+    disallow loss deduction when substantially identical security purchased within 30 days. Boundary flags
+    affected lots for subsequent gain/loss calculations. Prevents disallowed loss claims.
+  evidence: N/A:0(see_rationale)
+  stage: tax
+  alternative_considered: Position-level tracking rejected for precision; real-time 30-day window monitoring
+    required
+- id: BD-023
+  type: B/DK
+  content: 'Account managed levels: Account=1, Household=2, Account or Household=3'
+  rationale: Managed level determines aggregation scope for rebalancing and reporting. Account-level manages
+    each separately. Household-level aggregates related accounts. Account-or-Household provides flexibility
+    per RIA preference. Boundary affects each downstream calculations including tax lot optimization.
+  evidence: N/A:0(see_rationale)
+  stage: portfolio_value_update
+  alternative_considered: Client-level (across households) rejected for regulatory complexity
+- id: BD-024
+  type: B
+  content: 'Portfolio processing modes: Straight-Through=1, Collaborative=2'
+  rationale: Processing mode determines workflow for portfolio construction. Straight-through processing
+    requires no human intervention; Collaborative involves advisor review. Boundary selects between fully
+    automated and advisor-guided workflows. Matches different RIA operating models.
+  evidence: N/A:0(see_rationale)
+  stage: workflow
+  alternative_considered: More granular workflow states rejected for complexity
+- id: BD-025
+  type: B/RC
+  content: Security assignment allows preferred flag and municipal substitution
+  rationale: Preferred flag allows clients to designate securities as primary within model. Municipal
+    substitution enables tax-aware replacement of taxable bonds with muni equivalents. Boundary enables
+    client customization while maintaining model alignment. Supports both preference and tax optimization
+    use cases.
+  evidence: N/A:0(see_rationale)
+  stage: portfolio_value_update
+  alternative_considered: Forced model adherence rejected for flexibility; unlimited substitution rejected
+    for model integrity
+- id: BD-026
+  type: B
+  content: 'Model types: STRATEGY and CUSTOM with inheritance support'
+  rationale: STRATEGY models provide pre-built allocation templates. CUSTOM models enable advisor modifications.
+    Inheritance allows custom models to derive from strategy templates. Boundary maintains template integrity
+    while enabling customization. Prevents complete divergence from proven strategies.
+  evidence: N/A:0(see_rationale)
+  stage: portfolio_value_update
+  alternative_considered: Copy-only inheritance rejected for update propagation; no customization rejected
+    for flexibility
+- id: BD-027
+  type: B
+  content: Risk rating must be zero or positive, enforced by setter validation
+  rationale: Non-negative risk rating ensures valid portfolio model classification. Negative ratings would
+    break score-mapping algorithms. Setter validation prevents invalid state at object construction. Boundary
+    rejects negative inputs, maintaining score integrity throughout system.
+  evidence: N/A:0(see_rationale)
+  stage: risk
+  alternative_considered: Allowing negative rejected for downstream calculations; validation at read-time
+    rejected for late failure
+- id: BD-028
+  type: B/BA
+  content: CeModel copy preserves assumption settings including commission min/max
+  rationale: Model copying preserves transaction cost assumptions to maintain return projections. Commission
+    min/max affect net return calculations. Boundary copies each assumption categories, not just allocation.
+    Ensures copied models produce consistent return estimates without re-entering parameters.
+  evidence: N/A:0(see_rationale)
+  stage: portfolio_value_update
+  alternative_considered: Default assumptions on copy rejected for precision loss
+- id: BD-029
+  type: B/BA
+  content: Subclass expected performance tracked for return assumptions
+  rationale: Subclass-level expected return enables precise projection modeling. Different asset subclasses
+    have different return profiles. Tracking at subclass level provides granularity not available at asset
+    class level. Boundary feeds return assumptions into portfolio projection calculations.
+  evidence: N/A:0(see_rationale)
+  stage: portfolio_value_update
+  alternative_considered: Asset-class-only rejected for precision; security-level rejected for data requirements
+- id: BD-030
+  type: BA/M
+  content: Client-to-system account type adapter converts account groups to system types
+  rationale: Account type adapter bridges client account classifications with internal system types. Different
+    custodians use different taxonomies; adapter normalizes for system processing. Boundary is translation
+    layer between external and internal representations. Enables multi-custodian support without system
+    changes.
+  evidence: N/A:0(see_rationale)
+  stage: integration
+  alternative_considered: Direct custodian integration rejected for coupling; standardized-only rejected
+    for legacy support
+- id: BD-031
+  type: B/RC
+  content: Trade recon groups by account, subclass, security for aggregation
+  rationale: Trade reconciliation grouping enables accurate position aggregation across accounts. Grouping
+    by account/subclass/security captures each relevant dimensions. Boundary affects reconciliation accuracy
+    and reporting granularity. Missed groupings would produce incorrect positions.
+  evidence: N/A:0(see_rationale)
+  stage: trading
+  alternative_considered: Simpler groupings rejected for reconciliation accuracy
+- id: BD-032
+  type: B/RC
+  content: RebalancerQueue SQL distinguishes 'AS' (each shares) vs 'S' (some shares) quantity types
+  rationale: Quantity type distinction determines whether trade represents full position liquidation or
+    partial adjustment. AS indicates each shares should trade; S indicates specific share quantity. Boundary
+    affects settlement quantity calculation. Wrong type would cause incorrect trade sizing.
+  evidence: N/A:0(see_rationale)
+  stage: trading
+  alternative_considered: Boolean flag rejected for future extensibility
+- id: BD-033
+  type: B/BA
+  content: Expected performance values range from 3% to 10% in fixture data
+  rationale: Expected performance range constrains return assumptions to realistic bounds. 3% floor prevents
+    overly optimistic projections; 10% ceiling reflects long-term market expectations. Boundary ensures
+    projections remain within plausible ranges for planning purposes.
+  evidence: N/A:0(see_rationale)
+  stage: portfolio_value_update
+  alternative_considered: Unbounded rejected for unrealistic projections; tighter range rejected for flexibility
+- id: BD-034
+  type: B/BA
+  content: Subclass priority ordering determines processing sequence
+  rationale: Subclass processing priority controls trade execution order when multiple subclasses require
+    action. Numeric ordering ensures consistent sequence across runs. Boundary affects cash flow timing
+    and settlement order. Priority determines which positions rebalance first when capital is constrained.
+  evidence: N/A:0(see_rationale)
+  stage: trading
+  alternative_considered: Random order rejected for reproducibility; alphabetical rejected for business
+    logic
+- id: BD-035
+  type: B
+  content: 'Relationship types: License Fee (0) vs TAMP (1) for RIA business model'
+  rationale: Business model relationship type determines fee arrangement and service scope. License Fee
+    is direct RIA relationship; TAMP involves third-party manager overlay. Boundary affects billing calculation
+    and reporting requirements. Misclassification would cause incorrect fee treatment.
+  evidence: N/A:0(see_rationale)
+  stage: billing
+  alternative_considered: Additional relationship types rejected for current scope
+- id: BD-036
+  type: B
+  content: FeeManager calculates tiered fees by iterating sorted fee tiers
+  rationale: Tiered fee calculation requires sorted iteration to apply correct marginal rates. Unsorted
+    processing would produce incorrect cumulative fees. Boundary ensures tiered breakpoints apply correctly
+    from lowest to highest. Maintains fee calculation accuracy across each AUM levels.
+  evidence: N/A:0(see_rationale)
+  stage: billing
+  alternative_considered: Cumulative calculation rejected for tier boundary handling
+- id: BD-037
+  type: B
+  content: Questionnaire answers use point-based scoring with withdraw-age special handling
+  rationale: Point-based scoring accumulates responses into risk score. Withdraw-age handling addresses
+    time horizon impact on risk capacity. Special logic for withdrawal age adjusts scoring for liquidity
+    needs. Boundary captures risk capacity more accurately than questionnaire alone.
+  evidence: N/A:0(see_rationale)
+  stage: risk
+  alternative_considered: Age-agnostic rejected for accuracy; complex modeling rejected for simplicity
+- id: BD-038
+  type: B/BA
+  content: System account default source is 'sample' for demo accounts
+  rationale: Sample source designation identifies demo/test accounts versus production. Default ensures
+    new system accounts are properly categorized. Boundary prevents demo accounts from mixing with production
+    data. Enables filtering and compliance controls.
+  evidence: N/A:0(see_rationale)
+  stage: configuration
+  alternative_considered: Production default rejected for safety; random source rejected for categorization
+- id: BD-039
+  type: B/BA
+  content: Client account default process_step starts at 0
+  rationale: Zero-based process step initialization enables workflow state machine. Starting at 0 represents
+    beginning state. Boundary provides consistent workflow entry point. Allows progression through defined
+    workflow states from initialization.
+  evidence: N/A:0(see_rationale)
+  stage: workflow
+  alternative_considered: One-based rejected for zero-index consistency; NULL rejected for state queries
+- id: BD-040
+  type: B/RC
+  content: TLH buy-back original security option controlled by tlh_buy_back_original flag
+  rationale: TLH buy-back control determines whether harvested losses can be reinvested in original security.
+    When enabled, system may repurchase same security after wash sale period. Flag boundary controls this
+    behavior per RIA policy. Supports different tax strategies.
+  evidence: N/A:0(see_rationale)
+  stage: tax
+  alternative_considered: Mandatory same-security rejected for wash sale risk; mandatory different-security
+    rejected for flexibility
+- id: BD-041
+  type: B
+  content: RebalancerAction status uses same constants as Job rebalance_type
+  rationale: Constant consistency between Job and RebalancerAction ensures status alignment across entities.
+    Using same values prevents translation errors. Boundary maintains cross-entity integrity for status
+    reporting. Avoids state mismatch between job specification and execution record.
+  evidence: N/A:0(see_rationale)
+  stage: trading
+  alternative_considered: Separate constants rejected for alignment maintenance
+- id: BD-042
+  type: B/RC
+  content: Cost basis known flag tracks whether purchase price is available
+  rationale: Cost basis availability flag determines whether gain/loss calculation is possible. Unknown
+    cost basis prevents tax reporting but allows position tracking. Boundary distinguishes lots with complete
+    data from those requiring adjustment. Affects tax lot selection algorithms.
+  evidence: N/A:0(see_rationale)
+  stage: tax
+  alternative_considered: Assuming zero cost rejected for incorrect calculations; blocking unknown lots
+    rejected for position tracking
+- id: BD-043
+  type: B/RC
+  content: wasRebalancerDiff flag tracks if lot was modified by rebalancer
+  rationale: Rebalancer modification tracking enables audit trail and undo capabilities. Flag marks lots
+    affected by systematic trading versus manual adjustments. Boundary separates automated from manual
+    changes for reporting and compliance. Supports reconciliation of systematic vs discretionary activity.
+  evidence: N/A:0(see_rationale)
+  stage: accounting
+  alternative_considered: Timestamp-only rejected for boolean queries; full history rejected for complexity
+- id: BD-044
+  type: B/BA
+  content: Fee tiers use INFINITY constant to represent unbounded top tier
+  rationale: INFINITY constant enables fee tier structures without explicit upper bound. Represents maximum
+    tier covering each AUM above previous breakpoint. Boundary simplifies tiered fee implementation by
+    eliminating special-case handling for highest tier.
+  evidence: N/A:0(see_rationale)
+  stage: billing
+  alternative_considered: NULL rejected for calculations; actual infinity rejected for database constraints
+- id: BD-045
+  type: B/RC
+  content: Qualified vs non-qualified account segregation in model entities
+  rationale: Tax account classification separates qualified (tax-advantaged) from non-qualified accounts.
+    Different tax treatment requires separate modeling. Boundary ensures tax-aware allocation across account
+    types. Prevents inappropriate security selection in wrong account type.
+  evidence: N/A:0(see_rationale)
+  stage: portfolio_value_update
+  alternative_considered: Mixed accounts rejected for tax optimization; automatic classification rejected
+    for client preference
+  vague_rationale: true
+- id: BD-046
+  type: B
+  content: RebalancerQueue amount represents target trade value in dollars
+  rationale: Trade value specification in dollars enables precise targeting of dollar amounts. Amount
+    field represents desired position change value. Boundary converts to share quantity using current
+    price. Ensures accurate trade sizing independent of price fluctuations.
+  evidence: N/A:0(see_rationale)
+  stage: trading
+  alternative_considered: Share-based only rejected for dollar-targeting; percentage-based rejected for
+    precision
+- id: BD-047
+  type: B
+  content: RebalancerQueue quantity represents number of shares
+  rationale: Share quantity representation enables precise share-count trading. Quantity field specifies
+    exact share count for execution. Boundary used when AS/S quantity type indicates specific shares.
+    Complements amount field for different trade strategies.
+  evidence: N/A:0(see_rationale)
+  stage: trading
+  alternative_considered: Quantity-only rejected for dollar-targeting use cases
+- id: BD-048
+  type: B/DK
+  content: Account value calculated at period end date for billing
+  rationale: Period-end valuation ensures billing uses confirmed account value. End-of-period pricing
+    reflects settled positions. Boundary determines billing calculation timing. Provides clear audit trail
+    for fee disputes and regulatory review.
+  evidence: N/A:0(see_rationale)
+  stage: billing
+  alternative_considered: Average balance rejected for complexity; mid-period rejected for settlement
+    risk
+- id: BD-049
+  type: B/RC
+  content: Rebalancing at household level aggregates each client accounts
+  rationale: Household-level aggregation enables unified rebalancing across related accounts. Accounts
+    within household share tax optimization and diversification goals. Boundary determines scope of rebalancing
+    calculation. Prevents siloed rebalancing that could create household-level imbalances.
+  evidence: N/A:0(see_rationale)
+  stage: portfolio_value_update
+  alternative_considered: Individual-only rejected for household optimization; firm-wide rejected for
+    scope creep
+- id: BD-050
+  type: B/BA
+  content: Risk question sequence default is 100 for ordering
+  rationale: Question sequence number controls display order in risk questionnaire. Default of 100 provides
+    consistent baseline for ordering. Boundary allows explicit ordering while maintaining sensible defaults.
+    Enables questionnaire customization without mandatory sequence assignment.
+  evidence: N/A:0(see_rationale)
+  stage: risk
+  alternative_considered: Auto-increment rejected for gaps; NULL rejected for sort queries
+- id: BD-051
+  type: B/BA
+  content: Tiered Fee Calculation with proportional tier splitting
+  rationale: Fees are calculated using tiered breakpoints where each tier is applied proportionally to
+    the portion of value within that tier boundary. The tier value equals the amount exceeding the previous
+    tier's ceiling, multiplied by the fee rate for that tier. This ensures accurate fee attribution across
+    graduated rates rather than applying a single rate to the entire amount. Minimum fee floor is enforced
+    after tiered calculation to ensure baseline revenue.
+  evidence: FeeManager.php:229-238(tierValue = x - lastTopTier; feeAmount = tierValue * feeRate)
+  stage: FeeManager
+  alternative_considered: Flat fee rate across entire value was rejected in favor of graduated tier structure
+  _evidence_issues:
+  - 'NOT_FOUND: FeeManager.php'
+- id: BD-052
+  type: B
+  content: Annualized TWR using geometric mean formula
+  rationale: 'Time-Weighted Return is annualized using the geometric mean formula: ((1 + TWR)^(365/interval)
+    - 1) * 100. This normalizes returns across varying periods to a standard annual figure, allowing comparison
+    of performance regardless of measurement interval length. The exponentiation by days-per-year-divided-by-interval
+    adjusts for the actual time elapsed.'
+  evidence: N/A:0(see_rationale)
+  stage: TwrCalculatorManager
+  alternative_considered: Simple annualized return (TWR * 365/days) was rejected for lack of compounding
+    accuracy
+- id: BD-053
+  type: B/BA
+  content: Risk tolerance score with additive points and closest model match
+  rationale: Risk tolerance is computed by summing an additive point value (starting at 50) across each
+    questionnaire answers to create a continuous score. This score is then matched to the closest model
+    risk rating by computing the absolute difference between the client's score and each model's rating.
+    The model with minimum difference is selected. This approach enables precise model assignment from
+    discrete questionnaire inputs.
+  evidence: N/A:0(see_rationale)
+  stage: RiskTolerance
+  alternative_considered: Mode-based matching was rejected for insufficient granularity
+- id: BD-054
+  type: B/RC
+  content: Dollar-to-percent and percent-to-dollar conversions for allocation
+  rationale: Bidirectional conversion between dollar amounts and percentages is required for consistent
+    allocation representation. Dollar-to-percent divides the value by total amount and multiplies by 100.
+    Percent-to-dollar reverses this by multiplying percentage by total amount and dividing by 100. These
+    formulas enable seamless display and calculation in both formats throughout the allocation system.
+  evidence: ClientAllocationValuesManager.php:30(value / totalAmount * 100); ClientAllocationValuesManager.php:35(value
+    * totalAmount / 100)
+  stage: ClientAllocationValuesManager
+  alternative_considered: Separate storage for each format was rejected to avoid synchronization issues
+  _evidence_issues:
+  - 'NOT_FOUND: ClientAllocationValuesManager.php'
+- id: BD-055
+  type: B
+  content: Proportional fee billing based on days worked in period
+  rationale: 'Fees are prorated based on the number of days worked within a billing period using the formula:
+    (fee * daysWorked) / daysInPeriod, rounded to 2 decimal places. This ensures clients only pay for
+    the portion of the billing period during which services were actively provided, particularly important
+    for mid-period account openings or closures.'
+  evidence: N/A:0(see_rationale)
+  stage: FeeManager
+  alternative_considered: Full-period billing with credit system was rejected for complexity
+- id: BD-056
+  type: B/DK
+  content: Gain/Loss percentage calculation using cost basis ratio
+  rationale: 'Gain or loss is expressed as a percentage of the original cost basis using the formula:
+    (marketValue - costBasis) / costBasis. This normalizes gain/loss figures to enable comparison across
+    positions of different sizes and provides a standardized metric for performance reporting, tax calculation
+    triggers, and rebalancing decisions.'
+  evidence: N/A:0(see_rationale)
+  stage: RebalancerQueueRepository
+  alternative_considered: Absolute dollar gain was rejected for lack of scale-normalized comparison
+- id: BD-057
+  type: B/BA
+  content: Short-term vs long-term gain classification by 365-day threshold
+  rationale: Tax lots are classified as short-term or long-term based on whether the holding period exceeds
+    365 days. Positions held 365 days or less are short-term (taxed at ordinary income rates), while those
+    held longer are long-term (eligible for preferential capital gains rates). The boundary is inclusive
+    on the 365th day. This classification directly impacts tax liability calculations and wash sale rules.
+  evidence: 'Lot.php:427($difference > P365D ? shortTerm=0 : shortTerm=gain); Lot.php:495($difference->d
+    <= 365)'
+  stage: Lot
+  alternative_considered: 366-day threshold (1 year + 1 day) was rejected for being overly conservative
+  _evidence_issues:
+  - 'NOT_FOUND: Lot.php'
+- id: BD-058
+  type: B/BA
+  content: Portfolio variance calculation (dollar and percent) vs target
+  rationale: 'Deviation from target allocation is calculated in both absolute dollar terms and relative
+    percentage terms. Dollar variance is the difference between current and target dollar amounts. Percent
+    variance is the difference between current and target percentages. Both metrics are needed: dollar
+    variance for rebalancing trade sizing, and percent variance for drift detection thresholds.'
+  evidence: ClientAllocationValuesManager.php:130(dollarVariance = current - target); ClientAllocationValuesManager.php:131(percentVariance
+    = current% - target%)
+  stage: ClientAllocationValuesManager
+  alternative_considered: Single variance metric was rejected for insufficient actionability
+  _evidence_issues:
+  - 'NOT_FOUND: ClientAllocationValuesManager.php'
+- id: BD-059
+  type: B
+  content: Investment gain = ending value - beginning value - contributions + withdrawals
+  rationale: Investment gain is computed as ending value minus beginning value, minus net contributions,
+    plus net withdrawals. This adjusts the raw change in portfolio value for the effect of cash flows,
+    isolating the actual investment return from the impact of deposits and withdrawals. This net gain
+    figure is essential for accurate performance attribution and TWR calculations.
+  evidence: TwrCalculatorManager.php:161(return ending - beginning - contributions + withdrawals)
+  stage: TwrCalculatorManager
+  alternative_considered: Simple ending minus beginning was rejected for ignoring cash flow impact on
+    returns
+  _evidence_issues:
+  - 'NOT_FOUND: TwrCalculatorManager.php'
+- id: BD-060
+  type: B/BA
+  content: Minimum fee floor enforcement after tiered calculation
+  rationale: After calculating fees through the tiered structure, a minimum fee floor is enforced using
+    a max() function that ensures the final fee is never less than the configured minimum. This guarantees
+    minimum revenue per account regardless of low balances or unusual tier configurations. The floor is
+    applied after tier calculation to preserve graduated rate structure while ensuring baseline compensation.
+  evidence: N/A:0(see_rationale)
+  stage: FeeManager
+  alternative_considered: Minimum applied per-tier was rejected for potential overcharging on small values
+- id: BD-061
+  type: B/BA
+  content: Tax Loss Harvesting savings calculation with differential tax rates
+  rationale: 'Tax loss harvesting savings are estimated using differential tax rates: short-term losses
+    are multiplied by the income tax rate (higher), while long-term losses use the 15% capital gains rate
+    (lower). The net benefit is divided by beginning balance to express as a basis point improvement.
+    This allows comparison of TLH benefits across portfolios of different sizes and supports harvest prioritization
+    decisions.'
+  evidence: N/A:0(see_rationale)
+  stage: RebalancerQueueManager
+  alternative_considered: Equal tax rates for both was rejected for inaccuracy given different treatment
+- id: BD-062
+  type: B/DK
+  content: Security allocation aggregation by subclass using SUM and current price
+  rationale: Positions are aggregated by asset subclass by summing position amounts and joining with current
+    prices to compute total market value per subclass. This aggregation is fundamental to allocation analysis,
+    drift detection, and rebalancing execution. Using current prices ensures market-value-weighted allocation
+    percentages reflect real-time values rather than cost basis.
+  evidence: N/A:0(see_rationale)
+  stage: PositionRepository
+  alternative_considered: Cost-basis aggregation was rejected for misrepresenting current allocation
+- id: BD-063
+  type: B/RC
+  content: Commission range extracted as min/max from model security assignments
+  rationale: Each model security assignment carries a transaction fee, and the model's commission range
+    is determined by finding the minimum and maximum fee across each securities in the model. This range
+    is used for cost estimation and fee disclosure. The min/max extraction enables clients to understand
+    the full cost spectrum associated with a model's trading strategy.
+  evidence: CeModelManager.php:106-107(setCommissionMin/Max from findMinAndMaxTransactionFeeForModel)
+  stage: CeModelManager
+  alternative_considered: Average fee was rejected for masking range of actual transaction costs
+  _evidence_issues:
+  - 'NOT_FOUND: CeModelManager.php'
+- id: BD-064
+  type: B
+  content: Portfolio total value = latest ClientPortfolioValue or sum of ClientAccount values
+  rationale: Portfolio total value is determined by first checking for a pre-computed latest ClientPortfolioValue
+    record. If unavailable, the system falls back to summing the current values of each linked ClientAccounts.
+    This two-tier approach prioritizes efficiency (cached value) while ensuring availability even if the
+    cached value is stale or missing, such as for newly created portfolios.
+  evidence: ClientPortfolioManager.php:243-247(getLastValueByClient, fallback to getAccountsSum)
+  stage: ClientPortfolioManager
+  alternative_considered: Always-sum approach was rejected for performance; always-cache rejected for
+    reliability
+  _evidence_issues:
+  - 'NOT_FOUND: ClientPortfolioManager.php'
+- id: BD-065
+  type: B
+  content: Risk rating adjustment when deleting model parent (child ratings decrement if above parent)
+  rationale: When a parent model is deleted, child models that have risk ratings higher than the deleted
+    parent have their ratings decremented by 1. This prevents orphaned child models from having risk ratings
+    that exceed their new top-level ancestor, maintaining the hierarchical integrity of the risk rating
+    system. Models with ratings at or below the deleted parent are unaffected.
+  evidence: 'CeModelManager.php:370-371(if riskRating > parentRiskRating: child.riskRating - 1)'
+  stage: CeModelManager
+  alternative_considered: Setting each children to parent's rating was rejected for potential drastic
+    changes
+  _evidence_issues:
+  - 'NOT_FOUND: CeModelManager.php'
+- id: BD-066
+  type: B
+  content: Billing sum calculation using average account values and day count
+  rationale: Billing amounts are calculated using average account values across the billing period multiplied
+    by the applicable fee rate, adjusted for the number of days worked. Using averages rather than point-in-time
+    values smooths out volatility and provides fair representation of account size over time. The day
+    count adjustment ensures pro-rata billing for partial periods.
+  evidence: BillManager.php:150-157(uses getAverageAccountValues, feeManager.calculateFeeBilled)
+  stage: BillManager
+  alternative_considered: Ending balance only was rejected for unfairness to accounts with large mid-period
+    deposits
+  _evidence_issues:
+  - 'NOT_FOUND: BillManager.php'
+- id: BD-067
+  type: B
+  content: Account cash calculation as sum of free cash across each accounts before date
+  rationale: Available cash for investment or withdrawal is calculated by iterating through each linked
+    accounts and summing the free cash balance before a specified date. Free cash excludes pending trades,
+    reserved amounts, or funds in transit. This aggregation provides a complete picture of liquid resources
+    across the client's account portfolio for cash flow planning and rebalancing purposes.
+  evidence: 'CashCalculationManager.php:23-34(foreach accounts: sum += getFreeCashBeforeDate)'
+  stage: CashCalculationManager
+  alternative_considered: Total cash including pending was rejected for overstating available funds
+  _evidence_issues:
+  - 'NOT_FOUND: CashCalculationManager.php'
+- id: BD-068
+  type: BA/DK
+  content: Rebalancer uses hardcoded 15% deviation thresholds for buy/sell triggers
+  rationale: 'WHY: These thresholds prevent excessive trading when market fluctuations cause minor deviations,
+    reducing transaction costs and avoiding micromanagement of portfolios. BOUNDARY: The 15% boundary
+    represents a balance between maintaining accurate allocation and avoiding unnecessary trade commissions;
+    if thresholds were tighter (e.g., 5%), more frequent trades would occur, increasing costs; if looser
+    (e.g., 25%), portfolios would drift significantly from targets before rebalancing triggers.'
+  evidence: src/Api/Trade.php:47-61(buyOrSell)
+  stage: portfolio_value_update
+  alternative_considered: Per-client configurable thresholds were considered but not implemented due to
+    complexity; fixed thresholds simplify operations at the cost of flexibility
+- id: BD-069
+  type: BA/M
+  content: Hardcoded model_deviation = 4 in Rebalancer.php:179 for portfolio value updates
+  rationale: 'WHY: The model_deviation value of 4 establishes the tolerance band for portfolio value variance
+    calculations during rebalancing decisions. BOUNDARY: This numeric boundary determines when portfolio
+    models are considered out of alignment; values below 4 would cause more sensitive rebalancing triggers
+    while values above 4 would tolerate greater drift before corrective action.'
+  evidence: src/Api/Rebalancer.php:179(setModelDeviation)
+  stage: portfolio_value_update
+  alternative_considered: Dynamic calculation based on portfolio volatility was considered but complexity
+    outweighed benefits for current use cases
+  vague_rationale: true
+- id: BD-070
+  type: DK
+  content: getClientAccounts()->first() assumes client always has at least one account
+  rationale: 'WHY: This assumption reflects an implicit business invariant that every client must have
+    at least one account before any rebalancing operations can execute. BOUNDARY: If this invariant is
+    violated (new client without accounts yet), the code will throw an exception rather than gracefully
+    handling the missing data; this is a hard boundary that prevents partial operations.'
+  evidence: src/Api/Rebalancer.php:91(initialRebalance)
+  stage: invariant
+  alternative_considered: Returning null/empty result was considered but would require null checks throughout
+    calling code; throwing exception enforces the invariant
+- id: BD-071
+  type: DK
+  content: getGroups()->first() assumes user always belongs to at least one group
+  rationale: 'WHY: This assumes group membership is mandatory for each users, reflecting an authorization
+    model where every user must be assigned to a group for permission resolution. BOUNDARY: Users without
+    groups will cause exceptions when their group name is needed (e.g., for display or authorization checks);
+    this is a hard failure rather than graceful degradation.'
+  evidence: src/Model/User.php:376(getAssignedGroupName)
+  stage: invariant
+  alternative_considered: Returning 'Unassigned' or null was considered but would bypass authorization
+    checks; enforcing mandatory grouping maintains security model
+- id: BD-072
+  type: BA/DK
+  content: Client registration steps are hardcoded arrays with implicit ordering 0-7
+  rationale: 'WHY: The fixed ordering 0-7 enforces a specific sequence for client onboarding steps, ensuring
+    compliance processes complete in the correct order. BOUNDARY: Step 0 must complete before step 1,
+    etc.; skipping steps or reordering would violate the registration contract and potentially create
+    clients in inconsistent states; each step boundary represents a checkpoint where validation must pass
+    before proceeding.'
+  evidence: src/Entity/Profile.php:978-1018(getRiaRegistrationStep)
+  stage: ordering_contract
+  alternative_considered: Database-driven workflow was considered for flexibility but would add complexity
+    and reduce transparency
+- id: BD-073
+  type: B/BA
+  content: 'Workflow client_status progression: DEFAULT(0)→ENVELOPE_CREATED(1)→...→ACCOUNT_FUNDED(7)'
+  rationale: 'WHY: This defines the mandatory progression path for client onboarding through 8 discrete
+    states, ensuring each phase completes before advancing. BOUNDARY: Clients cannot skip states (e.g.,
+    go directly from DEFAULT to FUNDED); the ordinal values enforce linear progression; attempting to
+    set an invalid state transition will fail; this boundary prevents clients from entering inconsistent
+    lifecycle states.'
+  evidence: src/Model/Workflow.php:14(PaymentActivityInterface)
+  stage: ordering_contract
+  alternative_considered: State machine pattern with explicit transition rules was considered but ordinal
+    approach is simpler and sufficient for linear workflow
+- id: BD-074
+  type: B
+  content: Rebalancer extends BaseRebalancer and uses Trade trait for composition
+  rationale: 'WHY: This design uses inheritance for shared rebalancing logic and traits for trade execution
+    capabilities, enabling code reuse without deep inheritance hierarchies. BOUNDARY: Rebalancer inherits
+    each base behaviors and can override specific methods; the Trade trait provides consistent trading
+    interface; composition via trait allows sharing without tight coupling that multiple inheritance would
+    create.'
+  evidence: src/Api/Rebalancer.php:19-22(class Rebalancer)
+  stage: pattern_choice
+  alternative_considered: Pure composition via dependency injection was considered but would require more
+    boilerplate; current approach balances simplicity with reuse
+- id: BD-075
+  type: BA
+  content: AbstractFormHandler defines success() contract; each handlers must implement
+  rationale: 'WHY: The success() contract ensures consistent form submission handling across each form
+    handlers, defining what happens after successful validation. BOUNDARY: Every concrete handler must
+    provide implementation; this enforces boundary that form handling logic cannot skip the success callback;
+    absence of success() would cause abstract method exception at instantiation time.'
+  evidence: src/Form/Handler/AbstractFormHandler.php:23(success)
+  stage: pattern_choice
+  alternative_considered: Interface-based approach was considered but abstract class allows providing
+    base implementation and shared state
+- id: BD-076
+  type: BA
+  content: BaseVoter abstract class defines OWNER/OPERATOR attributes; concrete voters must implement
+    vote()
+  rationale: 'WHY: The BaseVoter establishes authorization attribute types and enforces vote() implementation,
+    providing consistent access control pattern across security decisions. BOUNDARY: Every voters must
+    handle OWNER and OPERATOR attribute types; vote() must be implemented to prevent abstract method exceptions;
+    this creates a contract boundary that authorization logic cannot bypass.'
+  evidence: src/Security/Voter/BaseVoter.php:8-49(class BaseVoter)
+  stage: inheritance
+  alternative_considered: Role-based only approach was considered but attribute-based allows finer-grained
+    permissions; voter pattern chosen for flexibility
+- id: BD-077
+  type: DK
+  content: 'Workflow Entity extends Model/Workflow base class, delegates each methods via parent::'
+  rationale: 'WHY: This inheritance pattern delegates each core workflow logic to the base class, allowing
+    the entity to function as a workflow instance while reusing shared behavior. BOUNDARY: The entity
+    cannot override behavior without breaking the delegation pattern; each state changes flow through
+    parent methods; this boundary ensures consistent workflow state management across each workflow instances.'
+  evidence: src/Entity/Workflow.php:14(class Workflow extends BaseWorkflow)
+  stage: inheritance
+  alternative_considered: Composition over inheritance was considered but current approach is simpler
+    for the use case
+- id: BD-078
+  type: B
+  content: SignableObjectRepositoryInterface implemented by 4 repositories with document signature logic
+  rationale: 'WHY: The interface standardizes signature operations across different document types, ensuring
+    consistent behavior for any signable entity. BOUNDARY: Every implementing repositories must provide
+    complete signature logic; the interface creates a contract that signatures work identically regardless
+    of underlying document type; this boundary enables polymorphic signature operations.'
+  evidence: N/A:0(see_rationale)
+  stage: invariant
+  alternative_considered: Abstract base repository was considered but interface was chosen for flexibility
+    in different inheritance hierarchies
+- id: BD-079
+  type: B/BA
+  content: 'Job REBALANCE_TYPE constants: FULL(0)→REQUIRED_CASH(1)→FULL_AND_TLH(2)→NO_ACTIONS(3)→INITIAL(4)'
+  rationale: 'WHY: These constants define the 5 distinct rebalancing job types, establishing clear taxonomy
+    for portfolio adjustment operations. BOUNDARY: Job scheduling and execution logic depends on correct
+    type values; mixing types could cause incorrect portfolio adjustments; the ordinal ordering suggests
+    increasing complexity from NO_ACTIONS (baseline) to FULL_AND_TLH (most comprehensive).'
+  evidence: src/Entity/Job.php:12(Job)
+  stage: ordering_contract
+  alternative_considered: String-based types were considered but ordinal approach is more compact and
+    enables bitwise operations if needed
+- id: BD-080
+  type: RC
+  content: 'Role-based API key fallback: admin/ria/admin→hardcoded raiden@wealthbot.io account'
+  rationale: 'WHY: The hardcoded fallback ensures API operations can proceed when specific API keys are
+    unavailable, preventing service disruption for privileged roles. BOUNDARY: If no API key is configured
+    for admin/ria/admin roles, the system defaults to a known account rather than failing; this creates
+    a security boundary where fallback usage should be monitored as it bypasses normal credential rotation.'
+  evidence: src/Api/BaseRebalancer.php:77-93(setApiKey)
+  stage: portfolio_value_update
+  alternative_considered: Mandatory API key configuration was considered but would prevent system startup
+    if keys are missing; fallback enables graceful degradation
+- id: BD-081
+  type: BA
+  content: 'RebalancerQueue status constants: STATUS_SELL=''sell'', STATUS_BUY=''buy'''
+  rationale: 'WHY: String-based status constants provide clear semantic meaning for queue operations,
+    replacing magic numbers with readable values. BOUNDARY: Only two valid states exist for rebalancer
+    actions; using any other value would be invalid; this clear boundary prevents confusion between sell
+    and buy operations in queue processing logic.'
+  evidence: src/Entity/RebalancerQueue.php:9(rebalancerqueue)
+  stage: pattern_choice
+  alternative_considered: Boolean flag was considered but string constants are more descriptive and extensible
+    if new statuses are needed
+- id: BD-082
+  type: BA
+  content: 'INTERACTION: BD-003 (fee structure: $250 fixed + 10%) × BD-002 (minimum trade sizes: $50-$150)
+    → Minimum economically viable trade is $2,500 (breakeven point where 10% fee = $250)'
+  rationale: The $250 fixed fee component creates an implicit minimum trade size of $2,500 for economic
+    viability. Trades below this threshold lose money on fees alone. This interaction means the explicit
+    $50 minimum trade size (BD-002) is economically meaningless for most scenarios. Small rebalancing
+    adjustments within the 15% deviation band (BD-068) are likely to be unprofitable. The boundary is
+    $2,500 breakeven; below this, the RIA pays to rebalance rather than earns. This creates a dead zone
+    where drift exceeds tolerance but trade economics prevent correction.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Percentage-only fees would eliminate fixed-cost barrier but risk fee erosion
+    on large trades
+- id: BD-083
+  type: B/BA
+  content: 'INTERACTION: BD-057 (365-day short-term threshold) × BD-022 (wash sale lot-level tracking)
+    × BD-040 (TLH buy-back flag) → Tax lot age determines both gain classification AND wash sale exposure
+    simultaneously'
+  rationale: 'The 365-day threshold serves dual purposes: it determines short-term vs long-term capital
+    gains classification AND it triggers the 30-day wash sale look-forward window. A lot held 340 days
+    has both short-term status AND creates wash sale exposure if repurchased. This interaction means TLH
+    harvesting of recent lots creates wash sale risk that must be tracked across each lots within 30-day
+    windows. The boundary compounds: positions approaching 365 days (335-365) are highest-value for long-term
+    classification but still subject to wash sale rules. Harvesting at wrong time permanently disallows
+    the loss.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Conservative 31-day waiting period before harvest was rejected for opportunity
+    cost
+- id: BD-084
+  type: BA
+  content: 'INTERACTION: BD-011 (tolerance bands 2-21% config) ≠ BD-068 (15% hardcoded thresholds) → Configurable
+    drift bands don''t match actual rebalancing triggers, creating silent override'
+  rationale: The RIA configures tolerance bands (2-21% range per asset class) in BD-011, but the actual
+    rebalancing triggers use hardcoded 15% thresholds in BD-068. This means a subclass configured with
+    5% tolerance band will NOT trigger rebalancing until 15% drift occurs. The configuration is silently
+    overridden. The boundary is 15% hardcoded override; configurable bands below 15% are ineffective.
+    This creates client expectation mismatch where drift exceeds stated tolerance before action. The 15%
+    boundary acts as a ceiling on each configured bands, making tighter bands meaningless.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Dynamic thresholds based on volatility were considered but complexity outweighed
+    benefits
+- id: BD-085
+  type: RC
+  content: 'INTERACTION: BD-080 (hardcoded API key fallback) undermines BD-076 (BaseVoter authorization
+    pattern) → Security bypass negates authorization contract for fallback scenarios'
+  rationale: 'The BaseVoter pattern (BD-076) enforces OWNER/OPERATOR attributes for authorization decisions,
+    creating a security contract. However, BD-080 provides a hardcoded fallback API key (raiden@wealthbot.io)
+    that bypasses normal credential management. When the fallback activates, privileged operations execute
+    under a known account regardless of actual authorization state. This creates a contradiction: authorization
+    checks pass for the fallback account without proper role verification. The boundary is fallback activation
+    bypassing voter checks; this occurs silently when API keys are misconfigured. Production use of fallback
+    credentials creates regulatory exposure and audit trail gaps.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Mandatory proper API key configuration was rejected to prevent startup failures
+- id: BD-086
+  type: B/BA
+  content: 'RISK CASCADE: BD-021 (TLH threshold) → BD-061 (TLH savings formula) → BD-059 (cash flow TWR)
+    → BD-052 (annualized TWR) → BD-064 (portfolio value) → BD-048 (period-end billing) → BD-066 (billing
+    sum) → BD-060 (min fee floor) → BD-019 (min billing fee)'
+  rationale: 'Starting with TLH threshold configuration (BD-021), the estimated savings use differential
+    tax rates (BD-061). These cash flow impacts flow into TWR calculation (BD-059), affecting annualized
+    performance (BD-052). Portfolio value (BD-064) depends on cached or summed account values. Period-end
+    valuation (BD-048) determines billing basis. Billing sums (BD-066) use averages and day counts. The
+    minimum fee floor (BD-060) and minimum billing fee (BD-019) create a floor. This cascade means incorrect
+    TLH savings estimates can cause: (1) overstatement of performance, (2) incorrect fee billing, (3)
+    client dissatisfaction. The failure mode: TLH thresholds too low cause excessive trading with wash
+    sale losses that aren''t captured in savings estimates.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Separate TLH tracking from billing was rejected for integration complexity
+- id: BD-087
+  type: BA
+  content: 'RISK CASCADE: BD-068 (15% threshold) + BD-011 (2-21% bands) + BD-003 ($250 fixed fee) + BD-002
+    ($50 min trades) → Dead zone where drift exceeds tolerance but trades are uneconomical'
+  rationale: 'Drift exceeds configured tolerance band (BD-011) at 2-21% depending on configuration. Rebalancing
+    triggers at 15% hardcoded threshold (BD-068). However, economically viable trades require $2,500 minimum
+    (BD-003). Small accounts or minor rebalancing needs may not meet this threshold. The cascade: configuration
+    allows drift → threshold allows drift → fee structure prevents correction → portfolio remains out
+    of alignment. For small accounts, this creates permanent drift with no resolution path. The boundary
+    is $2,500 trade minimum; accounts below ~$17,000 (assuming 15% drift) cannot economically rebalance.
+    Client sees persistent drift despite system detecting it.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Account-size-adjusted thresholds were considered but complexity outweighed benefits
+- id: BD-088
+  type: B/BA
+  content: 'HIDDEN DEPENDENCY: BD-052 (annualized TWR) depends on BD-059 (investment gain) which depends
+    on BD-064 (portfolio value) which has implicit settlement date dependency without explicit day count
+    convention'
+  rationale: 'The TWR calculation (BD-052) requires accurate investment gain (BD-059), which requires
+    portfolio values (BD-064). Portfolio values depend on positions at specific dates, but the audit found
+    no explicit settlement date convention (T+N) or day count convention (act/360, 30/360). Without these,
+    the date arithmetic in the calculation chain may be inconsistent across custodians or time periods.
+    The boundary is explicit date convention; without it, intervals may be calculated differently. This
+    creates silent inconsistency in TWR for: (1) accounts with different settlement cycles, (2) months
+    with different day counts, (3) years with leap days. TWR comparisons across periods may be comparing
+    inconsistent calculations.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Forcing each calculations to calendar days was rejected for not matching industry
+    conventions
+- id: BD-089
+  type: B/BA
+  content: 'INTERACTION: BD-045 (qualified vs non-qualified segregation) × BD-025 (municipal substitution)
+    × BD-057 (365-day threshold) → Tax-aware model decisions require coordinated lot tracking across account
+    types'
+  rationale: 'Qualified accounts (401k, IRA) and non-qualified accounts require separate modeling (BD-045).
+    Municipal bond substitution (BD-025) is only relevant for taxable accounts. The 365-day threshold
+    (BD-057) determines long-term vs short-term gains differently based on account type (qualified accounts
+    may have different tax treatment). These three decisions interact when determining which securities
+    belong in which accounts. The boundary is account-type-dependent tax treatment; ignoring this causes:
+    (1) municipal bonds in qualified accounts (suboptimal), (2) short-term trades in taxable accounts
+    (higher tax), (3) lot selection without tax awareness across accounts. Coordinated lot tracking across
+    account types is required for household-level tax optimization (BD-049).'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Automatic account classification was rejected for client preference override
+    capability
+- id: BD-090
+  type: BA
+  content: 'INTERACTION: BD-023 (managed level: household/account) × BD-049 (household rebalancing) ×
+    BD-031 (trade recon grouping by account/subclass/security) → Household aggregation creates reconciliation
+    complexity that single-account grouping doesn''t capture'
+  rationale: 'Household-level managed accounts (BD-023) aggregate across accounts for rebalancing (BD-049).
+    Trade reconciliation groups by account, subclass, security (BD-031). When household rebalancing executes
+    cross-account trades (selling in one account, buying in another), the reconciliation grouping creates
+    mismatches: individual account positions may appear correct while household allocation is not. The
+    boundary is cross-account reconciliation; the grouping by account alone doesn''t capture net household
+    positions. This means household rebalancing can produce: (1) individual accounts appearing balanced
+    while household is not, (2) cross-account trades requiring manual reconciliation, (3) tax lot optimization
+    that spans accounts but recon doesn''t aggregate properly. The household-level view may show drift
+    while account-level shows none.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Household-level recon grouping was considered but would require significant
+    recon system changes
+- id: BD-GAP-001
+  type: DK
+  content: 'Missing: as-of vs processing time'
+  rationale: 'Audit finding: missing: as-of vs processing time. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-002
+  type: M
+  content: 'Missing: Matrix ill-conditioning and stability'
+  rationale: 'Audit finding: missing: matrix ill-conditioning and stability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-003
+  type: DK
+  content: 'Missing: Random seed full coverage'
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-004
+  type: DK
+  content: 'Missing: Model and data version snapshot binding'
+  rationale: 'Audit finding: missing: model and data version snapshot binding. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-005
+  type: RC
+  content: 'Missing: Price and quantity precision (tick/lot size)'
+  rationale: 'Audit finding: missing: price and quantity precision (tick/lot size). Identified by audit
+    checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-006
+  type: B
+  content: 'Missing: : 7'
+  rationale: 'Audit finding: missing: : 7. Coverage: 1/20 (5%). This gap affects production reliability
+    and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: 'Coverage: 1/20 (5%)'
+- id: BD-GAP-007
+  type: B
+  content: 'Missing: Backtest Overfitting Protection'
+  rationale: 'Audit finding: missing: backtest overfitting protection. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-008
+  type: B
+  content: 'Missing: Factor IC Demean & Group Alignment'
+  rationale: 'Audit finding: missing: factor ic demean & group alignment. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-009
+  type: M
+  content: 'Missing: Transition Matrix Time-Homogeneity'
+  rationale: 'Audit finding: missing: transition matrix time-homogeneity. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-010
+  type: B
+  content: 'Missing: Provider Priority & Credential Isolation'
+  rationale: 'Audit finding: missing: provider priority & credential isolation. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-011
+  type: B
+  content: 'Missing: Feature Extraction Time Boundaries'
+  rationale: 'Audit finding: missing: feature extraction time boundaries. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-012
+  type: DK
+  content: 'Missing: ** "Add timezone annotation to each datetime fields and implement UTC normalization'
+  rationale: 'Audit finding: missing: ** "add timezone annotation to each datetime fields and implement
+    utc normalization. Identified by audit checklist. This gap affects production reliability and should
+    be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-013
+  type: RC
+  content: 'Missing: ** "Migrate monetary values from float to DECIMAL(19,4) type for precision'
+  rationale: 'Audit finding: missing: ** "migrate monetary values from float to decimal(19,4) type for
+    precision. Identified by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-014
+  type: B
+  content: 'Missing: ** "Implement walk-forward analysis framework with out-of-sample testing'
+  rationale: 'Audit finding: missing: ** "implement walk-forward analysis framework with out-of-sample
+    testing. Identified by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-015
+  type: DK
+  content: 'Missing: ** "Add configurable random seed for each stochastic components'
+  rationale: 'Audit finding: missing: ** "add configurable random seed for each stochastic components.
+    Identified by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-016
+  type: RC
+  content: 'Missing: ** "Add security-specific tick_size and lot_size fields with order quantity validation'
+  rationale: 'Audit finding: missing: ** "add security-specific tick_size and lot_size fields with order
+    quantity validation. Identified by audit checklist. This gap affects production reliability and should
+    be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-017
+  content: 'Missing: : 7'
+  type: B
+  rationale: 'Audit finding: missing: : 7. Coverage: 1/20 (5%). This gap affects production reliability
+    and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  severity: high
+  impact: 'Coverage: 1/20 (5%)'
+  known_gap: true
+- id: BD-GAP-018
+  content: 'Missing: Covariance Matrix PSD Repair'
+  type: M
+  rationale: 'Audit finding: missing: covariance matrix psd repair. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-019
+  content: 'Missing: Covariance Estimator Selection (Ledoit-Wolf vs Sample)'
+  type: B
+  rationale: 'Audit finding: missing: covariance estimator selection (ledoit-wolf vs sample). Identified
+    by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-020
+  content: 'Missing: VaR/CVaR Confidence Level & Window'
+  type: B
+  rationale: 'Audit finding: missing: var/cvar confidence level & window. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-021
+  content: 'Missing: PD/LGD/EAD Estimation (IRB vs Standard)'
+  type: B
+  rationale: 'Audit finding: missing: pd/lgd/ead estimation (irb vs standard). Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-022
+  content: 'Missing: Vasicek Single-Factor Asset Correlation'
+  type: B
+  rationale: 'Audit finding: missing: vasicek single-factor asset correlation. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-023
+  content: 'Missing: Stress Test Scenario Macro Variables'
+  type: B
+  rationale: 'Audit finding: missing: stress test scenario macro variables. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-024
+  content: 'Missing: ** "Implement covariance matrix shrinkage (Ledoit-Wolf) and PSD repair'
+  type: M
+  rationale: 'Audit finding: missing: ** "implement covariance matrix shrinkage (ledoit-wolf) and psd
+    repair. Identified by audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: price_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+known_use_cases: []
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 15
+  evidence_invalid: 10
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.6
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 1
+    warn: 11
+    fail: 8
+  subdomain_totals:
+    pass: 2
+    warn: 14
+    fail: 12
+  coverage: 48/48 (100%)
+  pass_rate: 3/48 (6%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: brokerage_api
+  description: Choose based on market coverage needs (US-only vs international), trading complexity, and
+    API documentation quality
+  used_in_stages: []
+  options:
+  - name: Tradier
+    traits:
+    - brokerage
+    - broker-dealer
+    - market-data
+    - trading
+    fit_for:
+    - Full-service brokerage with built-in market data, order execution, and account management for US
+      equities
+    not_fit_for:
+    - Non-US markets, crypto, options-heavy trading, institutional use cases
+  - name: Alpaca
+    traits:
+    - brokerage
+    - commission-free
+    - market-data
+    - trading
+    fit_for:
+    - Commission-free US equity trading with real-time market data, good for retail-focused applications
+    not_fit_for:
+    - International markets, complex options, managed accounts
+  - name: Interactive Brokers
+    traits:
+    - brokerage
+    - multi-market
+    - professional-grade
+    - trading
+    fit_for:
+    - Professional trading across stocks, options, futures, forex, and international markets
+    not_fit_for:
+    - Simple retail-focused applications, rapid prototyping
+  default: Tradier
+  _source: worker_resource
+- id: slot-002
+  name: electronic_signature
+  description: Consider pricing model (per-envelope vs subscription), compliance certifications needed,
+    template management features, and API ease of use
+  used_in_stages: []
+  options:
+  - name: DocuSign
+    traits:
+    - e-signature
+    - enterprise
+    - templates
+    - audit-trails
+    fit_for:
+    - Enterprise document signing with template management, multi-party workflows, and compliance certifications
+    not_fit_for:
+    - Simple free-tier applications, non-US markets with strict data residency
+  - name: HelloSign (Dropbox Sign)
+    traits:
+    - e-signature
+    - developer-friendly
+    - api
+    fit_for:
+    - Developer-friendly e-signature API with competitive pricing and good documentation
+    not_fit_for:
+    - Large enterprise with complex compliance needs
+  - name: Adobe Sign
+    traits:
+    - e-signature
+    - enterprise
+    - pdf
+    - integration
+    fit_for:
+    - Deep PDF integration and enterprise Adobe ecosystem integration
+    not_fit_for:
+    - Non-Adobe workflows, budget-conscious projects
+  - name: SignNow
+    traits:
+    - e-signature
+    - api
+    - workflows
+    fit_for:
+    - API-first e-signature service with good workflow automation
+    not_fit_for:
+    - Large enterprise deployments requiring extensive audit trails
+  default: DocuSign
+  _source: worker_resource
+- id: slot-003
+  name: email_transport
+  description: Consider deliverability needs, analytics requirements, and whether async processing is
+    needed
+  used_in_stages: []
+  options:
+  - name: SwiftMailer (current)
+    traits:
+    - smtp
+    - php-native
+    - spool
+    fit_for:
+    - PHP-native mailer with flexible SMTP configuration and spooling options
+    not_fit_for:
+    - Modern cloud email services, async processing needs
+  - name: Symfony Mailer
+    traits:
+    - smtp
+    - php-native
+    - modern
+    - async
+    fit_for:
+    - Modern Symfony-native mailer with async support and cloud provider integrations
+    not_fit_for:
+    - Legacy PHP 7.3 support needs
+  - name: SendGrid
+    traits:
+    - cloud-email
+    - api
+    - deliverability
+    - analytics
+    fit_for:
+    - Cloud email API with high deliverability, analytics, and templates
+    not_fit_for:
+    - Self-hosted requirements, strict data residency
+  - name: Mailgun
+    traits:
+    - cloud-email
+    - api
+    - webhooks
+    - analytics
+    fit_for:
+    - Developer-focused email API with good webhooks and analytics
+    not_fit_for:
+    - Simple one-way notifications only
+  default: SwiftMailer (null://localhost in development)
+  _source: worker_resource
+- id: slot-004
+  name: pdf_generation
+  description: Consider PDF complexity (CSS3, JavaScript), memory constraints, and whether pure-PHP is
+    preferred over binaries
+  used_in_stages: []
+  options:
+  - name: wkhtmltopdf
+    traits:
+    - binary
+    - headless-browser
+    - html-to-pdf
+    fit_for:
+    - Mature HTML-to-PDF conversion using headless browser, good CSS support
+    not_fit_for:
+    - Complex JavaScript-rendered content, memory-constrained environments
+  - name: Dompdf
+    traits:
+    - php-library
+    - html-to-pdf
+    - pure-php
+    fit_for:
+    - Pure PHP PDF generator, no external binaries needed
+    not_fit_for:
+    - Complex CSS3 layouts, heavy JavaScript content
+  - name: Snappy/wkhtmltopdf
+    traits:
+    - symfony-bundle
+    - html-to-pdf
+    - wrapper
+    fit_for:
+    - Symfony bundle wrapper around wkhtmltopdf with easy configuration
+    not_fit_for:
+    - Non-Symfony projects, complex JavaScript needs
+  - name: Chrome headless via HTTP client
+    traits:
+    - browser-rendering
+    - html-to-pdf
+    - modern
+    fit_for:
+    - Modern rendering with full CSS/JS support using headless Chrome
+    not_fit_for:
+    - Memory-constrained environments, simple static PDFs
+  default: Snappy with wkhtmltopdf
+  _source: worker_resource
+- id: slot-005
+  name: database
+  description: Consider team expertise, required SQL features, and whether Doctrine ORM compatibility
+    is critical
+  used_in_stages: []
+  options:
+  - name: MySQL
+    traits:
+    - relational
+    - ACID
+    - mature
+    - Doctrine-native
+    fit_for:
+    - Standard LAMP stack, proven reliability, excellent Doctrine ORM support
+    not_fit_for:
+    - Extreme scale, horizontal sharding needs, JSON-heavy workloads
+  - name: MariaDB
+    traits:
+    - relational
+    - MySQL-compatible
+    - open-source
+    - performance
+    fit_for:
+    - Drop-in MySQL replacement with better performance and open-source governance
+    not_fit_for:
+    - Strict Oracle MySQL compatibility requirements
+  - name: PostgreSQL
+    traits:
+    - relational
+    - advanced-SQL
+    - JSON
+    - performance
+    fit_for:
+    - Advanced SQL features, JSONB for hybrid workloads, strong data integrity
+    not_fit_for:
+    - Teams familiar with MySQL only, simple CRUD applications
+  default: MySQL 5.7+
+  _source: worker_resource
+- id: slot-006
+  name: caching
+  description: Scale requirements (single vs multi-server), infrastructure complexity tolerance
+  used_in_stages: []
+  options:
+  - name: Filesystem Cache
+    traits:
+    - default
+    - no-dependency
+    - simple
+    fit_for:
+    - Development, single-server production with moderate load
+    not_fit_for:
+    - Multi-server deployments, high-traffic production
+  - name: Redis
+    traits:
+    - in-memory
+    - distributed
+    - persistent
+    - Symfony-native
+    fit_for:
+    - Production multi-server deployments, session sharing, distributed caching
+    not_fit_for:
+    - Single-server deployments, minimal infrastructure
+  - name: APCu
+    traits:
+    - in-memory
+    - single-server
+    - PHP-native
+    fit_for:
+    - Single-server production with high-performance needs, opcode cache combination
+    not_fit_for:
+    - Multi-server deployments, memory-constrained environments
+  default: Filesystem Cache
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: Tradier Inc.
+  description: '. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: DocuSign
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: MySQL Database
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: SMTP Mailer
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: wkhtmltopdf
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: wkhtmltoimage
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: Redis (Optional)
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-008
+  type: external_service
+  name: Symfony Session Storage
+  description: ''
+  used_in_stages: []
+  _source: worker_resource

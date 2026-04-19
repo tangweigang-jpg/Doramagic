@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import sys
 import tempfile
 from datetime import UTC, datetime
@@ -46,6 +45,28 @@ TARGETS: list[tuple[str, str]] = [
     ("finance-bp-124", "arch"),
     ("finance-bp-130", "tensortrade"),
 ]
+
+
+def _discover_all_targets() -> list[tuple[str, str]]:
+    """Scan knowledge/sources/finance/ and derive (bp_id, slug) from dir names.
+
+    Directory layout: finance-bp-NNN--{slug}. Only returns bp dirs that also
+    have _runs/{bp_id}/artifacts/ present (required for zero-LLM re-enrichment).
+    """
+    sources_root = PROJECT_ROOT / "knowledge" / "sources" / "finance"
+    runs_root = PROJECT_ROOT / "_runs"
+    targets: list[tuple[str, str]] = []
+    for entry in sorted(sources_root.iterdir()):
+        if not entry.is_dir():
+            continue
+        name = entry.name
+        if not name.startswith("finance-bp-") or "--" not in name:
+            continue
+        bp_id, _, slug = name.partition("--")
+        if not (runs_root / bp_id / "artifacts").is_dir():
+            continue
+        targets.append((bp_id, slug))
+    return targets
 
 
 def _repair_worker_resource_json(content: str) -> str:
@@ -263,10 +284,14 @@ def reenrich_blueprint(bp_id: str, slug: str) -> dict:
 
     logger.info("%s: written %s", bp_id, new_bp_path)
 
-    # ── 9. Update LATEST.yaml (symlink-style: copy new version) ──
+    # ── 9. Update LATEST.yaml as relative symlink ──
+    # CRITICAL: must unlink first — if LATEST.yaml is an existing symlink,
+    # shutil.copy2/open-for-write follows it and corrupts the historic vN file.
     latest_path = sources_dir / "LATEST.yaml"
-    shutil.copy2(str(new_bp_path), str(latest_path))
-    logger.info("%s: LATEST.yaml updated", bp_id)
+    if latest_path.is_symlink() or latest_path.exists():
+        latest_path.unlink()
+    latest_path.symlink_to(new_bp_filename)
+    logger.info("%s: LATEST.yaml -> %s", bp_id, new_bp_filename)
 
     # ── 10. Update manifest.json ──
     manifest_path = sources_dir / "manifest.json"
@@ -317,18 +342,37 @@ def main() -> None:
     parser.add_argument(
         "--all",
         action="store_true",
-        help="Re-enrich all 5 target blueprints",
+        help="Re-enrich the 5 hard-coded target blueprints",
+    )
+    parser.add_argument(
+        "--discover",
+        action="store_true",
+        help="Auto-discover every finance-bp-* dir under knowledge/sources/finance/ "
+        "that has matching _runs/{bp}/artifacts/ available",
+    )
+    parser.add_argument(
+        "--exclude",
+        nargs="*",
+        default=[],
+        help="bp_ids to exclude (e.g. already-enriched blueprints)",
     )
     args = parser.parse_args()
 
-    if args.all:
+    if args.discover:
+        targets = _discover_all_targets()
+        if args.exclude:
+            skip = set(args.exclude)
+            targets = [(b, s) for (b, s) in targets if b not in skip]
+    elif args.all:
         targets = TARGETS
     elif args.bp_ids:
-        slug_map = dict(TARGETS)
+        discovered = dict(_discover_all_targets())
+        hardcoded = dict(TARGETS)
+        slug_map = {**discovered, **hardcoded}
         targets = []
         for bp_id in args.bp_ids:
             if bp_id not in slug_map:
-                print(f"ERROR: unknown bp_id {bp_id!r}. Valid: {list(slug_map)}", file=sys.stderr)
+                print(f"ERROR: unknown bp_id {bp_id!r}", file=sys.stderr)
                 sys.exit(1)
             targets.append((bp_id, slug_map[bp_id]))
     else:

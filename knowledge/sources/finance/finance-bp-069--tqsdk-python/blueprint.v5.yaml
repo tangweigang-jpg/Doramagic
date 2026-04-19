@@ -1,0 +1,2486 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-069
+name: TqSdk
+sop_version: '3.6'
+source:
+  projects:
+  - tqsdk-python
+  commit_hash: a3dc0392e466d2551a68989af411d8a10831b386
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: quantitative_trading_strategy_development
+  description: Python library for building quantitative trading strategies with full-stack support from
+    historical data and real-time quotes to backtesting, simulation, and live trading across futures,
+    options, and stocks.
+  prerequisites: Python 3.8+ programming, basic understanding of financial market instruments (futures,
+    options, stocks), concept of trading orders (market/limit, buy/sell, open/close)
+  not_suitable_for: Non-quantitative trading, HFT requiring microsecond latency, direct exchange connectivity
+    without TqSdk gateways, trading outside China A-share and futures markets
+  activation:
+    triggers:
+    - User mentions TqSdk, TqApi, TqAuth
+    - User mentions TqAccount, TqKq, TqKqStock, TqSim, TqSimStock, TqMultiAccount
+    - User mentions TqBacktest, TargetPosTask, TargetPosScheduler
+    - User mentions DataDownloader
+    - User mentions market data, K-line, tick, historical data
+    - User mentions positions, trades, orders, account data
+    - User mentions order placement, cancellation, position adjustment
+    - User mentions field meanings, wait_update, debugging
+    - 'Chinese terms: 行情, K线, 历史数据, 持仓, 成交, 委托, 账户, 下单, 撤单, 调仓, 字段含义, 报错'
+    emphasis:
+    - Use ESPECIALLY when the user is confused by missing data, stale fields, or orders not leaving the
+      client
+    - Use ESPECIALLY when the user asks about wait_update or is_changing
+    - Use ESPECIALLY when the user mixes futures and stock workflows
+    - Use ESPECIALLY when the user hits common TqSdk errors like '需要指定账户实例 account'
+    anti_skip:
+    - Don't skip the account-type matrix even if the user didn't ask explicitly - wrong account type causes
+      most issues
+    - Don't skip explaining wait_update() even if the user didn't ask - it's the root cause of many problems
+    - Don't skip futures vs stock distinction even for simple examples - mixing them causes offset and
+      object-type errors
+stages:
+- id: connection
+  name: WebSocket Connection Management
+  order: 1
+  responsibility: Manages WebSocket connections to market data and trade gateways with automatic reconnection
+    and data synchronization. Provides reliable network transport layer ensuring continuous data flow
+    between TqSdk and external gateways.
+  interface:
+    inputs: WebSocket URLs for MD/TD gateways, connection credentials
+    outputs: Market data packets (quotes, K-lines, ticks), Trade confirmation packets (fills, order status)
+  required_methods:
+  - name: TqConnect.send
+    description: Sends data packets through WebSocket channel to connected gateway
+    evidence: tqsdk/connect.py:75(TqConnect)
+  - name: TqConnect.receive
+    description: Receives data packets from WebSocket channel for local processing
+    evidence: tqsdk/connect.py:75(TqConnect)
+  - name: TqReconnect.reconnect
+    description: Executes reconnection logic with state recovery to resume after network failure
+    evidence: tqsdk/connect.py:252(TqReconnect)
+  - name: MdReconnectHandler._is_all_received
+    description: Verifies each expected market data was received before resuming to prevent gaps
+    evidence: tqsdk/connect.py:325(_is_all_received)
+  - name: TdReconnectHandler._is_all_received
+    description: Checks trade_more_data flag to ensure trade completeness before resuming
+    evidence: tqsdk/connect.py:404(_is_all_received)
+  key_behaviors:
+  - behavior: Entity-level isolation
+    description: Separate MdReconnectHandler and TdReconnectHandler maintain independent state for market
+      data and trading connections, allowing independent reconnection cycles
+    evidence: tqsdk/connect.py:338-431(MdReconnectHandler,TdReconnectHandler)
+  - behavior: Completeness verification before resume
+    description: Reconnect handlers track received data sequence numbers and verify full state recovery
+      before resuming operation, preventing data gaps after reconnection
+    evidence: tqsdk/connect.py:325(_is_all_received)
+  - behavior: Trade transactional integrity
+    description: TdReconnectHandler uses trade_more_data flag from server for explicit completeness acknowledgment
+      since trade data is transactional
+    evidence: tqsdk/connect.py:404(_is_all_received)
+  replaceable_points:
+  - name: ReconnectStrategy
+    description: Custom reconnection behavior when network failure occurs
+    options:
+    - name: default
+      traits:
+      - Automatic retry with exponential backoff
+      - State recovery from last checkpoint
+      fit_for:
+      - Production environments with intermittent connectivity
+      - Standard usage scenarios
+      not_fit_for:
+      - Low-latency critical applications
+      - Environments requiring custom retry policies
+    - name: custom_handler
+      traits:
+      - User-defined reconnection logic
+      - Custom backoff or circuit breaker patterns
+      fit_for:
+      - Advanced users needing custom reconnection behavior
+      - Integration with external monitoring
+      not_fit_for:
+      - Standard production use
+      - Users unfamiliar with TqSdk internals
+    default: default
+  design_decisions:
+  - 'Reconnect handlers track received data to ensure completeness before resuming - Prevents data loss
+    during reconnection by verifying full data state was received. Evidence: tqsdk/connect.py:325(_is_all_received)'
+  - 'TdReconnectHandler checks trade_more_data flag for completeness - Trade data requires explicit completeness
+    signal due to transactional nature. Evidence: tqsdk/connect.py:404(_is_all_received)'
+  - 'Separate MdReconnectHandler and TdReconnectHandler with different completeness criteria - MD and
+    TD have different consistency requirements; MD can infer completeness from data, TD requires server
+    acknowledgment. Evidence: tqsdk/connect.py:338-431'
+  acceptance_hints:
+  - WebSocket connections established successfully to both MD and TD gateways
+  - Reconnection occurs transparently after network interruption without data loss
+  - Market data packets arrive in correct order without gaps
+  - Trade confirmations are not duplicated after reconnection
+- id: data_management
+  name: In-Memory Data Store & Diff Protocol
+  order: 2
+  responsibility: Maintains unified in-memory data store with incremental diff updates and update notifications.
+    Acts as central data hub where each business entities (quotes, positions, orders) are stored and updated
+    via path-based diff protocol.
+  interface:
+    inputs: Diff packets from upstream modules (connection stage for live data, market_data_simulation
+      for backtest data)
+    outputs: Updated Entity objects accessible via path-based access, update notifications via TqChan
+      channels
+  required_methods:
+  - name: Entity.__getitem__
+    description: Access entity data with path-based syntax like data['trade']['accounts']['CNY']
+    evidence: tqsdk/entity.py:10(Entity)
+  - name: Quote.last_price
+    description: Returns last traded price for market data, defaults to float('nan') when no trade occurred
+    evidence: tqsdk/objs.py:61(last_price)
+  - name: Position.orders
+    description: Returns only ALIVE status orders affecting current position state
+    evidence: tqsdk/objs.py:446(orders)
+  - name: Order.trade_records
+    description: Returns each trade records associated with this order
+    evidence: tqsdk/objs.py:458(Order)
+  key_behaviors:
+  - behavior: Path-based hierarchical access
+    description: Entity inherits MutableMapping providing both dict-like iteration and nested path access,
+      enabling data['trade']['accounts']['CNY'] syntax
+    evidence: tqsdk/entity.py:10(__init__)
+  - behavior: Lazy nested instantiation
+    description: _instance_entity creates nested Entity on first access, preventing circular references
+      while maintaining tree structure
+    evidence: tqsdk/objs.py:161(_instance_entity)
+  - behavior: All-tick capture for backtest fidelity
+    description: Quote uses last_only=False to capture each updates, not just latest, ensuring proper
+      backtest accuracy
+    evidence: tqsdk/objs.py:16(__init__)
+  - behavior: NaN-aware price handling
+    description: Quote.last_price defaults to float('nan') requiring nan-check before price comparisons;
+      any code comparing without check produces unexpected results
+    evidence: tqsdk/objs.py:61(last_price)
+  replaceable_points:
+  - name: DataStorage
+    description: Alternative storage backend for business data persistence
+    options:
+    - name: in-memory
+      traits:
+      - Zero latency access
+      - Automatic cleanup
+      - No serialization overhead
+      fit_for:
+      - Real-time trading
+      - Backtesting
+      - Development and testing
+      not_fit_for:
+      - Long-running processes needing persistence
+      - Crash recovery requirements
+    - name: persisted
+      traits:
+      - Durable storage
+      - Crash recovery
+      - State inspection
+      fit_for:
+      - Long-running production systems
+      - Audit requirements
+      not_fit_for:
+      - Low-latency requirements
+      - Simple deployment scenarios
+    default: in-memory
+  design_decisions:
+  - 'Entity inherits MutableMapping for dict-like access with path tracking - Enables both dict syntax
+    and hierarchical path access like data[''trade''][''accounts''][''CNY'']. Evidence: tqsdk/entity.py:10(__init__)'
+  - '_instance_entity creates nested Entity on first access - Lazy instantiation of nested structures;
+    prevents circular references while maintaining tree structure. Evidence: tqsdk/objs.py:161(_instance_entity)'
+  - 'Quote uses last_only=False for channel to capture each updates - Market data requires each ticks,
+    not just latest, for proper backtest fidelity. Evidence: tqsdk/objs.py:16(__init__)'
+  - 'Position.orders() returns only ALIVE status orders - Only active orders affect current position state;
+    finished orders are historical. Evidence: tqsdk/objs.py:446(orders)'
+  - 'Quote.last_price defaults to float(''nan'') - Any code comparing last_price without nan check will
+    produce unexpected results. Evidence: tqsdk/objs.py:61(last_price)'
+  acceptance_hints:
+  - Data structures accessible via both index and path syntax
+  - Diff updates modify only changed paths without full object replacement
+  - NaN checks required for price comparisons work correctly
+  - Position.orders() excludes FINISHED orders
+- id: api_layer
+  name: API Entry Point & Task Scheduling
+  order: 3
+  responsibility: Main user-facing API with event loop management and task coordination. Central coordinator
+    that manages connections, data flow, and scheduling between each components, providing single-threaded
+    deterministic execution.
+  interface:
+    inputs: User strategy code, account configuration, optional backtest/replay parameters
+    outputs: Data updates triggered by market changes, chart data for visualization, performance reports
+  required_methods:
+  - name: TqApi.wait_update
+    description: Blocks until data changes or deadline reached, core event loop driving strategy execution
+    evidence: tqsdk/api.py:1960(wait_update)
+  - name: TqApi.get_quote
+    description: Subscribes to market data for specified symbol, returns Quote object
+    evidence: tqsdk/api.py:92(TqApi)
+  - name: TqApi.get_position
+    description: Returns current position for account and optional symbol
+    evidence: tqsdk/api.py:92(TqApi)
+  - name: TqApi.insert_order
+    description: Submits trading order with risk rule validation
+    evidence: tqsdk/api.py:1277(account._check_valid)
+  - name: TqApi.copy
+    description: Creates thread-safe API clone with shared _data for multi-threaded strategies
+    evidence: tqsdk/api.py:333(copy)
+  key_behaviors:
+  - behavior: Single-threaded deterministic execution
+    description: Single TqApi instance per thread with _run_until_idle bridges sync/async code; synchronous
+      code runs to idle before async tasks proceed
+    evidence: tqsdk/baseApi.py:85(_run_until_idle)
+  - behavior: Event-driven reaction model
+    description: wait_update() blocks until data changes or deadline; strategy code reacts to market changes,
+      not polls
+    evidence: tqsdk/api.py:1960(wait_update)
+  - behavior: Risk rule enforcement via hook pattern
+    description: TqApi.insert_order triggers risk rule _could_insert_order/_on_insert_order hooks before
+      order submission
+    evidence: tqsdk/api.py:1277(account._check_valid)
+  - behavior: Multi-account explicit parameter requirement
+    description: Multi-account mode requires explicit account parameter on each trading operations; omitting
+      raises Exception
+    evidence: tqsdk/api.py:1277(self._account._check_valid)
+  replaceable_points:
+  - name: AccountType
+    description: Trading account type for connection and order routing
+    options:
+    - name: TqSim
+      traits:
+      - Local simulation
+      - No real connectivity
+      - Instant order matching
+      fit_for:
+      - Strategy development
+      - Backtesting
+      - Learning
+      not_fit_for:
+      - Production trading
+      - Real money
+    - name: TqAccount
+      traits:
+      - Real exchange connection
+      - CTP protocol
+      - Full trading functionality
+      fit_for:
+      - Production futures trading
+      - Real account management
+      not_fit_for:
+      - Backtesting
+      - Learning without risk
+    - name: TqKq
+      traits:
+      - 快期模拟账户
+      - Simulated broker with real-like interface
+      fit_for:
+      - Testing before real trading
+      - API compatibility testing
+      not_fit_for:
+      - Actual profit/loss
+    - name: TqMultiAccount
+      traits:
+      - Multiple account coordination
+      - Unified interface across accounts
+      fit_for:
+      - Multi-account strategies
+      - Portfolio management
+      not_fit_for:
+      - Single account scenarios
+    default: TqSim
+  - name: DataMode
+    description: Historical data access mode for backtesting or live
+    options:
+    - name: streaming
+      traits:
+      - Real-time updates
+      - Continuous data flow
+      fit_for:
+      - Live trading
+      - Real-time monitoring
+      not_fit_for:
+      - Historical analysis only
+    - name: historical
+      traits:
+      - Historical data access
+      - Backtest mode
+      fit_for:
+      - Backtesting
+      - Historical analysis
+      not_fit_for:
+      - Real-time trading
+    default: streaming
+  design_decisions:
+  - 'Single TqApi instance per thread with _run_until_idle for sync/async bridge - Ensures deterministic
+    execution; synchronous code runs to idle before async tasks proceed. Evidence: tqsdk/baseApi.py:85(_run_until_idle)'
+  - 'wait_update() blocks until data changes or deadline - Core event loop; strategy code reacts to market
+    changes, not polls. Evidence: tqsdk/api.py:1960(wait_update)'
+  - '_stock=True default enables stock support - Stock trading is increasingly common; enables by default
+    but can be disabled for speed. Evidence: tqsdk/api.py:103(__init__)'
+  - 'TqChan._level controls logging verbosity - Internal channel traffic can flood logs; level-based filtering.
+    Evidence: tqsdk/channel.py:17(__init__)'
+  - 'TargetPosTask singleton per account+symbol prevents conflicting orders - Multiple TargetPosTask for
+    same symbol would issue conflicting orders; singleton enforces mutual exclusion. Evidence: tqsdk/lib/target_pos_task.py:22(TargetPosTaskSingleton)'
+  - 'set_target_volume must precede cancel/insert order calls in same wait_update cycle - Calling cancel/insert
+    before set_target_volume breaks target position logic. Evidence: tqsdk/lib/target_pos_task.py:180-240(_fill_and_check)'
+  acceptance_hints:
+  - TqApi instance created successfully with specified account type
+  - wait_update() returns after data changes, not on timer alone
+  - Orders submitted via insert_order() pass through risk rules
+  - Multi-account operations require explicit account parameter
+- id: market_data_simulation
+  name: Market Data Simulation & Backtest
+  order: 4
+  responsibility: Generates historical market data for backtesting with time advancement and K-line synthesis.
+    Provides tick-level and K-line-level backtesting engine with dividend adjustment and continuous contract
+    mapping.
+  interface:
+    inputs: Historical data requests, trading calendar, quote subscription requests from order_execution
+    outputs: Synthesized quotes and K-lines aligned to backtest time, BtQuote diffs for data_management
+  required_methods:
+  - name: TqBacktest.run
+    description: Executes time-driven backtest with event-driven time advancement
+    evidence: tqsdk/backtest/backtest.py:31(TqBacktest)
+  - name: TqReplay.run
+    description: Live replay server with adjustable speed for live-like experience
+    evidence: tqsdk/backtest/replay.py:18(TqReplay)
+  - name: BtQuote.datetime
+    description: Time-aware quote access returning backtest current time
+    evidence: tqsdk/backtest/backtest.py:24(BtQuote)
+  - name: TqBacktest._generator_diffs
+    description: Generates diff packets with keep_current parameter for time-paused state queries
+    evidence: tqsdk/backtest/backtest.py:331(_generator_diffs)
+  key_behaviors:
+  - behavior: Event-driven time advancement
+    description: Backtest jumps to next event for efficiency; Replay uses continuous time advancement
+      for live-like experience
+    evidence: tqsdk/backtest/replay.py:21(__init__)
+  - behavior: K-line synthesis from ticks
+    description: K-lines generated from tick data with min_period determination ensuring high/low/close
+      come from same tick when subscribed to multiple timeframes
+    evidence: tqsdk/backtest/backtest.py:735(_get_quote_diffs_from_kline)
+  - behavior: Continuous contract mapping
+    description: TqBacktestContinuous provides continuous mapping for main-continuous contracts (KQ.m@*)
+      needing symbol substitution over time
+    evidence: tqsdk/backtest/utils.py:14(TqBacktestContinuous)
+  - behavior: Graceful dividend service fallback
+    description: TqBacktestDividend falls back to quote data on service failure, ensuring backtest runs
+      even if dividend service unavailable
+    evidence: tqsdk/backtest/utils.py:64(_get_dividend)
+  replaceable_points:
+  - name: TimeGenerator
+    description: Time advancement strategy during backtest
+    options:
+    - name: event-driven
+      traits:
+      - Jump to next event
+      - Maximum efficiency
+      - No wasted iterations
+      fit_for:
+      - Fast backtesting
+      - Historical optimization
+      not_fit_for:
+      - Real-time simulation
+      - Debugging time progression
+    - name: fixed-interval
+      traits:
+      - Fixed time step
+      - Predictable progression
+      fit_for:
+      - Fixed-frequency strategies
+      - Educational purposes
+      not_fit_for:
+      - Efficient backtesting
+      - Large historical datasets
+    default: event-driven
+  - name: DataSource
+    description: Historical data provider for backtest
+    options:
+    - name: server
+      traits:
+      - Live server connection
+      - Latest data always available
+      fit_for:
+      - Online backtesting
+      - Recent historical periods
+      not_fit_for:
+      - Offline backtesting
+      - Air-gapped environments
+    - name: cached
+      traits:
+      - Local data cache
+      - Offline capable
+      fit_for:
+      - Offline backtesting
+      - Repeated backtests
+      not_fit_for:
+      - Latest data requirements
+      - First-time backtests
+    default: server
+  design_decisions:
+  - 'Backtest is time-driven (event-driven), Replay is time-driven with speed control - Replay needs continuous
+    time advancement for live-like experience; Backtest optimizes by jumping to next event. Evidence:
+    tqsdk/backtest/replay.py:21(__init__)'
+  - '_generator_diffs with keep_current parameter controls time advancement - User tasks can request time-paused
+    updates for efficient state queries. Evidence: tqsdk/backtest/backtest.py:331(_generator_diffs)'
+  - 'K-lines generated from tick data with min_period determination - Ensures K-line high/low/close come
+    from same tick when subscribed to multiple timeframes. Evidence: tqsdk/backtest/backtest.py:735(_get_quote_diffs_from_kline)'
+  - 'TqBacktestContinuous provides continuous mapping for historical backtests - Main-continuous contracts
+    (KQ.m@*) need symbol substitution over time. Evidence: tqsdk/backtest/utils.py:14(TqBacktestContinuous)'
+  - 'Sim backtest requires insert_order → wait_update → settlement cycle ordering - Skipping settlement
+    breaks next trading day''s position and margin calculations. Evidence: tqsdk/tradeable/sim/basesim.py:1-489(_handle_insert_order,_on_settle)'
+  acceptance_hints:
+  - Backtest produces deterministic results on repeated runs
+  - K-lines aligned with tick data without cross-bar contamination
+  - Continuous contracts map correctly to front-month
+  - Dividend adjustments applied for stock backtests
+- id: trading_algorithms
+  name: Trading Algorithms & Position Management
+  order: 5
+  responsibility: Implements algorithmic trading execution (TWAP, VWAP, TargetPos) with automatic order
+    management. Maintains target positions and generates/chases orders to achieve desired positions over
+    time.
+  interface:
+    inputs: Target position settings from strategy, time schedule (for scheduled algorithms), market data
+      from data_management
+    outputs: Executed orders, fill records, algorithm status updates to order_execution
+  required_methods:
+  - name: TargetPosTask.set_target_volume
+    description: Sets target position volume; subsequent wait_update() triggers execution
+    evidence: tqsdk/lib/target_pos_task.py:76(__init__)
+  - name: TargetPosScheduler.run
+    description: Executes time-table based position targets from DataFrame schedule
+    evidence: tqsdk/lib/target_pos_scheduler.py:19(TargetPosScheduler)
+  - name: Twap.create_order
+    description: Creates time-weighted average price order following time schedule
+    evidence: tqsdk/algorithm/twap.py:18(Twap)
+  - name: InsertOrderTask.insert
+    description: Single order submission task with optional price chasing
+    evidence: tqsdk/lib/target_pos_task.py:625(InsertOrderTask)
+  - name: InsertOrderUntilAllTradedTask.chase
+    description: Chases counterparty price until order fully filled
+    evidence: tqsdk/lib/target_pos_task.py:503(InsertOrderUntilAllTradedTask)
+  key_behaviors:
+  - behavior: Singleton enforcement per account+symbol
+    description: TargetPosTaskSingleton uses id(account)+'#'+symbol as unique key preventing multiple
+      TargetPosTask instances for same symbol from issuing conflicting orders
+    evidence: tqsdk/lib/target_pos_task.py:42(__call__)
+  - behavior: Offset priority for futures position closing
+    description: offset_priority='今昨,开' closes yesterday position before today per Chinese futures convention
+      with different margin rates
+    evidence: tqsdk/lib/target_pos_task.py:68(__init__)
+  - behavior: Decoupled signal and execution
+    description: set_target_volume requires subsequent wait_update() call, decoupling signal generation
+      from execution and allowing batching multiple targets
+    evidence: tqsdk/lib/target_pos_task.py:76(__init__)
+  - behavior: Active vs passive order placement
+    description: Price ACTIVE uses counterparty price (prioritizes fill probability); PASSIVE uses queue
+      price (minimizes market impact)
+    evidence: tqsdk/lib/target_pos_task.py:340(_get_order)
+  replaceable_points:
+  - name: ExecutionStrategy
+    description: Order placement strategy for algorithm execution
+    options:
+    - name: TWAP
+      traits:
+      - Equal time slices
+      - Simple implementation
+      - Volume-agnostic
+      fit_for:
+      - Liquidity stable markets
+      - Simple execution requirements
+      not_fit_for:
+      - Highly volatile markets
+      - Volume-sensitive strategies
+    - name: VWAP
+      traits:
+      - Volume-weighted
+      - Market participation ratio
+      fit_for:
+      - Execution benchmarks
+      - Volume-following strategies
+      not_fit_for:
+      - Low volume instruments
+      - Illiquid markets
+    - name: POV
+      traits:
+      - Percentage of volume
+      - Adaptive to market activity
+      fit_for:
+      - Large orders in liquid markets
+      - Minimal market impact
+      not_fit_for:
+      - Thin markets
+      - Volume-sparse periods
+    - name: IS
+      traits:
+      - Implementation shortfall
+      - Cost-optimized
+      fit_for:
+      - Urgent execution
+      - Cost-sensitive strategies
+      not_fit_for:
+      - Patient execution
+      - Large time horizons
+    default: TWAP
+  - name: OffsetPriority
+    description: Position closing order for futures offset commands
+    options:
+    - name: 今昨,开
+      traits:
+      - Close yesterday first
+      - Standard Chinese convention
+      fit_for:
+      - Most futures strategies
+      - Standard margin optimization
+      not_fit_for:
+      - Specific today-close requirements
+    - name: 今昨,平
+      traits:
+      - Close yesterday first
+      - Prefer closing positions
+      fit_for:
+      - End-of-day position management
+      not_fit_for:
+      - Day trading with today-close only
+    - name: 开,平
+      traits:
+      - Open new first
+      - Preserve existing positions
+      fit_for:
+      - Position accumulation strategies
+      not_fit_for:
+      - Position reduction scenarios
+    default: 今昨,开
+  design_decisions:
+  - 'TargetPosTask singleton per account+symbol prevents conflicting orders - Multiple TargetPosTask for
+    same symbol would issue conflicting orders; singleton enforces mutual exclusion. Evidence: tqsdk/lib/target_pos_task.py:22(TargetPosTaskSingleton)'
+  - 'offset_priority=''今昨,开'' closes yesterday position before today - Standard Chinese futures convention;
+    yesterday positions have different margin rates. Evidence: tqsdk/lib/target_pos_task.py:68(__init__)'
+  - 'TargetPosTask requires subsequent wait_update() call after set_target_volume - Decouples signal generation
+    from execution; allows batching multiple targets before execution. Evidence: tqsdk/lib/target_pos_task.py:76(__init__)'
+  - 'Price ACTIVE uses counterparty price, PASSIVE uses queue price - ACTIVE prioritizes fill probability;
+    PASSIVE minimizes market impact. Evidence: tqsdk/lib/target_pos_task.py:340(_get_order)'
+  - 'TqTimeTable extends DataFrame for pandas compatibility - Allows users to manipulate schedules with
+    pandas operations. Evidence: tqsdk/lib/time_table.py:9(TqTimeTable)'
+  acceptance_hints:
+  - TargetPosTask singleton prevents duplicate orders for same account+symbol
+  - Orders generated achieve target position over scheduled time
+  - Offset commands follow configured priority (今昨,开 by default)
+  - Active orders use counterparty price, passive orders use queue price
+- id: order_execution
+  name: Order Execution & Matching
+  order: 6
+  responsibility: Handles order submission, cancellation, and local order matching for simulated accounts.
+    Provides exchange-matching semantics in simulation including margin calculation, fee computation,
+    and position settlement.
+  interface:
+    inputs: Order packs from trading_algorithms (symbol, direction, volume, price), quote updates for
+      price validation
+    outputs: Trade records, position updates, order status changes (ALIVE/FINISHED) to data_management
+  required_methods:
+  - name: SimTradeBase.insert_order
+    description: Submits order for local matching with price validation
+    evidence: tqsdk/tradeable/sim/trade_base.py:15(SimTradeBase)
+  - name: SimTradeBase.cancel_order
+    description: Cancels pending order by order_id
+    evidence: tqsdk/tradeable/sim/trade_base.py:15(SimTradeBase)
+  - name: SimTrade.match_order
+    description: Executes order matching with market/limit price semantics
+    evidence: tqsdk/tradeable/sim/trade_base.py:256(match_order)
+  - name: SimTradeBase.settle
+    description: Daily settlement updating positions and calculating realized P&L
+    evidence: tqsdk/tradeable/sim/trade_base.py:15(SimTradeBase)
+  - name: BaseSim._ensure_quote
+    description: Waits for both quote info and quote data before matching, preventing NaN calculations
+    evidence: tqsdk/tradeable/sim/basesim.py:181(_ensure_quote)
+  key_behaviors:
+  - behavior: Standard exchange matching semantics
+    description: Market orders match at counterparty price; limit orders match at limit price. Prevents
+      adverse selection on market orders.
+    evidence: tqsdk/tradeable/sim/trade_base.py:256(match_order)
+  - behavior: All-or-nothing fills in simulation
+    description: No partial fills in simulation, simplifying backtest logic. Real exchanges have partial
+      fills but simulation prioritizes simplicity.
+    evidence: tqsdk/tradeable/sim/tqsim.py:26(__init__)
+  - behavior: China A-share stamp tax on sell only
+    description: Stock sell includes stamp tax (0.1%), buy only has commission. Matches China A-share
+      tax rules.
+    evidence: tqsdk/tradeable/sim/utils.py:85(_get_stock_fee)
+  - behavior: Quote data completeness check before matching
+    description: BaseSim._ensure_quote waits for both quote info and quote data; SimTrade requires full
+      quote data (last_price, volume_multiple, margin) before matching
+    evidence: tqsdk/tradeable/sim/basesim.py:181(_ensure_quote)
+  replaceable_points:
+  - name: MatchingEngine
+    description: Order matching algorithm for simulated execution
+    options:
+    - name: standard
+      traits:
+      - FIFO matching
+      - Standard exchange semantics
+      fit_for:
+      - Most backtesting scenarios
+      - Standard futures/stocks
+      not_fit_for:
+      - Auction markets
+      - Special order types
+    - name: auction
+      traits:
+      - Call auction opening/closing
+      - Batch matching
+      fit_for:
+      - Stock markets with auction phases
+      not_fit_for:
+      - Continuous markets
+      - Futures trading
+    - name: VWAP
+      traits:
+      - Volume-weighted average fill simulation
+      fit_for:
+      - VWAP-benchmarked strategies
+      not_fit_for:
+      - Simple backtesting
+      - Market orders
+    default: standard
+  - name: FeeCalculator
+    description: Commission and fee structure for different asset types
+    options:
+    - name: standard
+      traits:
+      - China A-share compliant fees
+      - Futures commission
+      - Stock stamp tax
+      fit_for:
+      - Standard China market backtesting
+      not_fit_for:
+      - Non-China markets
+      - Custom fee structures
+    - name: custom
+      traits:
+      - User-defined fee structure
+      fit_for:
+      - Testing fee sensitivity
+      - Non-standard fee scenarios
+      not_fit_for:
+      - Regulatory compliance
+      - Standard backtesting
+    default: standard
+  design_decisions:
+  - 'SimTradeBase uses 8 abstract methods for extensibility - Separates generic matching logic from asset-type-specific
+    calculations (margin, fees, settlement). Evidence: tqsdk/tradeable/sim/trade_base.py:58-106'
+  - 'Market orders match at counterparty price; limit orders at limit price - Standard exchange matching
+    semantics; prevents adverse selection on market orders. Evidence: tqsdk/tradeable/sim/trade_base.py:256(match_order)'
+  - 'All-or-nothing fills in simulation (no partial fills) - Simplifies backtest logic; real exchanges
+    have partial fills but simulation prioritizes simplicity. Evidence: tqsdk/tradeable/sim/tqsim.py:26(__init__)'
+  - 'Stock sell includes stamp tax (0.1%), buy only has commission - China A-share tax rules: stamp tax
+    only on sell side. Evidence: tqsdk/tradeable/sim/utils.py:85(_get_stock_fee)'
+  - 'init_balance defaults to 10,000,000 CNY - Reasonable starting capital for futures strategies; aligned
+    with typical margin requirements. Evidence: tqsdk/tradeable/sim/trade_base.py:40(__init__)'
+  - 'Option margin uses Shenzhen Exchange formula with 12%/7% coefficients - Formula is exchange-specific;
+    would cause incorrect margin for other exchanges. Evidence: tqsdk/tradeable/sim/utils.py:23(_get_option_margin)'
+  acceptance_hints:
+  - Orders match at correct prices (market=counterparty, limit=limit)
+  - Futures margin calculated correctly including yesterday/today split
+  - Stock fees include stamp tax only on sell side
+  - Settlement occurs between trading days preserving position continuity
+- id: tradeable_interface
+  name: Tradeable Account Abstraction
+  order: 7
+  responsibility: Abstracts account types (live/simulated) with unified interface for pluggable backends.
+    Provides TqModule-based communication pattern for n-to-1 upstream routing with consistent account
+    state representation.
+  interface:
+    inputs: Order requests and quote subscriptions from api_layer via api_send_chan
+    outputs: Account snapshots, fills, state changes via api_recv_chan to api_layer
+  required_methods:
+  - name: Tradeable.send_order
+    description: Sends order through account-specific channel for routing
+    evidence: tqsdk/tradeable/tradeable.py:12(Tradeable)
+  - name: Tradeable.get_position
+    description: Returns position data for account
+    evidence: tqsdk/tradeable/tradeable.py:12(Tradeable)
+  - name: BaseOtg.connect
+    description: Establishes OTG (Open Trading Gateway) connection for live trading
+    evidence: tqsdk/tradeable/otg/base_otg.py:18(BaseOtg)
+  - name: FutureMixin.get_margin
+    description: Returns futures-specific margin data
+    evidence: tqsdk/tradeable/mixin.py:20(FutureMixin)
+  key_behaviors:
+  - behavior: TqModule channel-based communication
+    description: Tradeable inherits TqModule for unified data flow; each accounts use same api_send_chan/api_recv_chan
+      pattern
+    evidence: tqsdk/tradeable/tradeable.py:12(__init__)
+  - behavior: Memory-address-based identity key
+    description: _account_key = str(id(self)) ensures unique identity per object; changes across process
+      restarts affecting cross-process lookups
+    evidence: tqsdk/tradeable/tradeable.py:18(_get_account_key)
+  - behavior: Multi-account order routing via _is_self_trade_pack
+    description: _is_self_trade_pack filters orders by account_key; each Tradeable only processes its
+      own orders
+    evidence: tqsdk/tradeable/tradeable.py:43(_is_self_trade_pack)
+  - behavior: Asset-type-specific mixins
+    description: 'FutureMixin vs StockMixin provide asset-type-specific data models: Futures use Position/Order/Trade;
+      Stocks use SecurityPosition/SecurityOrder/SecurityTrade'
+    evidence: tqsdk/tradeable/mixin.py:20,219
+  replaceable_points:
+  - name: ConnectionBackend
+    description: Trading connection type for live trading
+    options:
+    - name: OTG
+      traits:
+      - Open Trading Gateway
+      - Multi-broker support
+      - Standard CTP protocol
+      fit_for:
+      - Production trading
+      - Most futures brokers
+      not_fit_for:
+      - Direct exchange access
+      - Proprietary protocols
+    - name: CTP
+      traits:
+      - CTP direct connection
+      - Low latency
+      fit_for:
+      - Professional trading
+      - Direct broker connection
+      not_fit_for:
+      - Multi-broker support
+      - Easy setup
+    - name: Sim
+      traits:
+      - Local simulation
+      - No external dependency
+      fit_for:
+      - Backtesting
+      - Strategy development
+      not_fit_for:
+      - Real trading
+    default: OTG
+  - name: AssetClass
+    description: Supported asset types for trading
+    options:
+    - name: futures
+      traits:
+      - Futures contracts
+      - Margin trading
+      - Daily settlement
+      fit_for:
+      - Futures-only trading
+      - Commodity strategies
+      not_fit_for:
+      - Stock trading
+      - Option strategies
+    - name: stocks
+      traits:
+      - China A-shares
+      - T+1 trading
+      - Stamp tax
+      fit_for:
+      - Stock trading
+      - Equity strategies
+      not_fit_for:
+      - Futures trading
+    - name: options
+      traits:
+      - Options contracts
+      - Delta hedging
+      fit_for:
+      - Options strategies
+      - Volatility trading
+      not_fit_for:
+      - Stock-only accounts
+    - name: all
+      traits:
+      - Futures, stocks, options
+      fit_for:
+      - Multi-asset strategies
+      - Portfolio management
+      not_fit_for:
+      - Single-asset simplicity
+    default: futures
+  design_decisions:
+  - 'Tradeable inherits TqModule for channel-based communication - Unified data flow: each accounts use
+    same api_send_chan/api_recv_chan pattern. Evidence: tqsdk/tradeable/tradeable.py:12(__init__)'
+  - '_account_key = str(id(self)) ensures unique identity - Object identity is unique; avoids key collision
+    in multi-account scenarios. Evidence: tqsdk/tradeable/tradeable.py:18(_get_account_key)'
+  - '_is_self_trade_pack filters orders by account_key - Multi-account routing: each Tradeable only processes
+    its own orders. Evidence: tqsdk/tradeable/tradeable.py:43(_is_self_trade_pack)'
+  - 'FutureMixin vs StockMixin provide asset-type-specific data models - Futures use Position/Order/Trade;
+    Stocks use SecurityPosition/SecurityOrder/SecurityTrade. Evidence: tqsdk/tradeable/mixin.py:20,219'
+  - 'TqMultiAccount chain pattern requires accounts in REVERSE order - Reversing account order breaks
+    multi-account message routing and order routing. Evidence: tqsdk/multiaccount.py:132-143(_setup_connection)'
+  acceptance_hints:
+  - Orders routed to correct account in multi-account mode
+  - Account snapshots include each required fields (accounts, positions, orders, trades)
+  - Position data differs correctly between futures (margin) and stocks (securities)
+  - TqKq variants inherit TqAccount behavior correctly with hardcoded broker_id='快期模拟'
+data_flow:
+- from_stage: connection
+  to_stage: data_management
+  data: Diff packets with market quotes, trade confirmations in path-based nested dict structure
+- from_stage: market_data_simulation
+  to_stage: data_management
+  data: Synthesized BtQuote diffs aligned to backtest time with keep_current parameter control
+- from_stage: data_management
+  to_stage: trading_algorithms
+  data: Quote updates via TqChan async channels, Position state via get_position() method
+- from_stage: trading_algorithms
+  to_stage: order_execution
+  data: insert_order packs with symbol, direction, volume, price, offset parameters
+- from_stage: order_execution
+  to_stage: data_management
+  data: Trade diffs, position updates, order status changes (ALIVE/FINISHED) to update Entity state
+- from_stage: api_layer
+  to_stage: tradeable_interface
+  data: Order requests, quote subscriptions via api_send_chan channel
+- from_stage: tradeable_interface
+  to_stage: api_layer
+  data: Account snapshots, fills, state changes via api_recv_chan channel
+- from_stage: order_execution
+  to_stage: market_data_simulation
+  data: Quote subscription requests for matching price validation during backtest
+global_contracts:
+- contract: Every business data inherits from Entity (MutableMapping) providing path-based dict access
+  evidence: tqsdk/entity.py:10(Entity)
+- contract: TqChan is asyncio.Queue wrapper for each inter-component communication
+  evidence: tqsdk/channel.py:16(TqChan)
+- contract: 'SimTradeBase.init_snapshot returns {''trade'': {account_key: {accounts, positions, orders,
+    trades}}}'
+  evidence: tqsdk/tradeable/sim/trade_base.py:108(init_snapshot)
+- contract: Every timestamps are nanosecond integers (int64) for precise time tracking
+  evidence: tqsdk/datetime_state.py:8(__init__)
+- contract: Diff packets use path-based nested dict structure for incremental updates
+  evidence: tqsdk/diff.py:11(_merge_diff)
+- contract: Quote.datetime is string format 'YYYY-MM-DD HH:MM:SS.nnnnnnnnn'
+  evidence: tqsdk/objs.py:13(Quote)
+- contract: 'Order status values: ALIVE (active) or FINISHED (completed/cancelled)'
+  evidence: tqsdk/objs.py:458(Order)
+- contract: 'Direction values: BUY (long) or SELL (short)'
+  evidence: tqsdk/lib/utils.py:32(_check_direction)
+- contract: 'Offset values: OPEN, CLOSE, CLOSETODAY for futures position management'
+  evidence: tqsdk/lib/utils.py:38(_check_offset)
+- contract: Quote.last_price defaults to float('nan') requiring explicit nan-check before comparisons
+  evidence: tqsdk/objs.py:61(last_price)
+- contract: TqModule pattern enables n-to-1 upstream routing with 1-to-1 downstream
+  evidence: tqsdk/baseModule.py:12(_run)
+- contract: TargetPosTask singleton per account+symbol enforced via id(account)+'#'+symbol key
+  evidence: tqsdk/lib/target_pos_task.py:42(__call__)
+- contract: TqMultiAccount accounts must be in REVERSE order for proper message routing
+  evidence: tqsdk/multiaccount.py:132-143(_setup_connection)
+- contract: Stock trading requires offset=None; futures require offset in (OPEN, CLOSE, CLOSETODAY)
+  evidence: tqsdk/api.py:1296-1300(_insert_order validation)
+business_decisions:
+- id: BD-001
+  type: B
+  content: Grid trading uses 0.5% price step (0.005) for both long and short directions
+  rationale: 'Grid trading allocates positions across price levels using a 0.5% (0.005) step interval.
+    This granularity balances order count against price sensitivity: finer steps generate more orders
+    but better fill accuracy; coarser steps reduce costs but create wider gaps. The same 0.005 step applies
+    symmetrically to both long and short grids, ensuring consistent risk distribution regardless of direction.
+    Boundary: step is hardcoded; changing requires code modification.'
+  evidence: tqsdk/demo/example/gridtrading.py:35(wait_price)
+  stage: signal_generation
+  alternative_considered: Variable step size based on volatility was considered but rejected for simplicity
+- id: BD-002
+  type: B/RC
+  content: TargetPosTask singleton enforces one instance per account+symbol, parameter changes rejected
+  rationale: 'TargetPosTask enforces singleton pattern per (account, symbol) pair to prevent conflicting
+    position targets from multiple instances. When a second instance is created for the same account+symbol,
+    the new parameters are rejected and the singleton returns the existing instance. This prevents race
+    conditions where two tasks could simultaneously issue offset orders. Boundary: singleton scope is
+    account+symbol; cross-symbol targeting is allowed via separate instances.'
+  evidence: tqsdk/lib/target_pos_task.py:37(TargetPosTaskSingleton.__call__)
+  stage: data_management
+  alternative_considered: Parameter merging or priority-based resolution was rejected to maintain deterministic
+    behavior
+- id: BD-003
+  type: B/BA
+  content: TargetPosTask default price mode is ACTIVE (opponent price), offset_priority is 今昨,开
+  rationale: 'TargetPosTask defaults to ACTIVE price mode (using opponent/best bid-ask) to ensure fill
+    certainty rather than waiting for passive limit prices. The default offset_priority (今昨开, meaning
+    today-then-yesterday-then-open) optimizes for closing near-day positions first, which typically have
+    lower margin requirements in Chinese futures. This combination prioritizes fill reliability with cost
+    efficiency. Boundary: defaults can be overridden at instantiation; priority sequence affects fill
+    order.'
+  evidence: tqsdk/lib/target_pos_task.py:65(targetpostask)
+  stage: data_management
+  alternative_considered: PASSIVE defaults were rejected as they risk non-execution in fast markets
+  _evidence_issues:
+  - 'FN_NOT_FOUND: targetpostask in tqsdk/lib/target_pos_task.py'
+- id: BD-004
+  type: B/BA
+  content: 'TargetPosTask large order split mode: random volume between min_volume and max_volume per
+    order'
+  rationale: 'When targeting large positions, TargetPosTask splits execution into multiple child orders
+    with volumes randomly selected between min_volume and max_volume bounds. Randomization prevents predictable
+    patterns that market makers could exploit, while bounds ensure each slice remains within reasonable
+    market impact thresholds. This is a behavioral execution algorithm decision affecting market footprint.
+    Boundary: random seed is not configurable; predictability exists within a single session.'
+  evidence: tqsdk/lib/target_pos_task.py:625(insertordertask)
+  stage: order_execution
+  alternative_considered: Fixed-size splits were rejected due to pattern detection risk; pure randomization
+    without bounds was rejected due to market impact concerns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: insertordertask in tqsdk/lib/target_pos_task.py'
+- id: BD-005
+  type: B/DK
+  content: TWAP minimum interval between orders is 3 seconds, duration must not cross trading day
+  rationale: 'TWAP execution enforces a 3-second minimum interval between orders to comply with exchange
+    anti-spoofing rules and prevent excessive message rates. The constraint that duration must not cross
+    trading day boundaries ensures each TWAP schedules complete within a single session, avoiding overnight
+    gap risk and settlement complications. These are regulatory compliance boundaries. Boundary: interval
+    < 3s will be rejected; duration crossing midnight will be rejected.'
+  evidence: tqsdk/algorithm/twap.py:244(_get_volume_list)
+  stage: algorithm_design
+  alternative_considered: Configurable intervals were rejected; 3s is the safe minimum across major exchanges
+- id: BD-006
+  type: B/BA
+  content: TWAP switches from passive to active price after 2/3 of interval or when 2 seconds remaining
+  rationale: 'TWAP execution transitions from passive (limit) to active (market/IOC) pricing when either
+    2/3 of the scheduled interval has elapsed without execution, OR fewer than 2 seconds remain in the
+    interval. This dual trigger balances passive-seeking behavior early in the interval with execution
+    certainty as deadlines approach. The 2-second buffer ensures network/processing time for last-chance
+    fills. Boundary: this is an internal algorithm threshold, not user-configurable.'
+  evidence: tqsdk/algorithm/twap.py:178(_get_deadline_timestamp)
+  stage: order_execution
+  alternative_considered: Single-trigger (time-only or elapsed-only) approaches were rejected for less
+    adaptive behavior
+- id: BD-007
+  type: B/BA
+  content: SimTradeBase default initial balance is 10,000,000 CNY, market orders use opponent price
+  rationale: 'SimTradeBase initializes backtest accounts with 10,000,000 CNY default balance, representing
+    a mid-size institutional trader in Chinese futures markets. Market orders in simulation execute at
+    opponent (best bid/ask) price, simulating realistic immediate fill costs without the spread uncertainty
+    of limit orders. This models institutional-grade execution assumptions. Boundary: balance is configurable;
+    opponent price assumption may understate actual slippage for large orders.'
+  evidence: tqsdk/sim/trade_base.py:16(simtradebase)
+  stage: market_data_simulation
+  alternative_considered: Smaller default balance was rejected as it misrepresents institutional strategies;
+    larger was rejected as it inflates position capacity unrealistically
+  _evidence_issues:
+  - 'FN_NOT_FOUND: simtradebase in tqsdk/sim/trade_base.py'
+- id: BD-008
+  type: B
+  content: Turtle strategy unit = (balance * 0.01) / (volume_multiple * ATR), stop loss at 2N, add at
+    0.5N
+  rationale: 'The Turtle trading system calculates position size as 1% of account balance divided by the
+    volatility-adjusted notional (volume_multiple * ATR). This produces position sizes that expand in
+    low-volatility environments and contract in high-volatility periods, maintaining consistent risk per
+    trade. Stop loss at 2N (2 ATR units) and pyramid addition at 0.5N intervals implement the classic
+    Turtle risk management rules. Boundary: these are demo parameters; production use requires validation.'
+  evidence: tqsdk/demo/example/turtle.py:114(strategy)
+  stage: trading_algorithms
+  alternative_considered: Fixed lot sizing was rejected for lack of volatility adjustment; dynamic ATR
+    multipliers were considered but rejected for complexity
+- id: BD-009
+  type: B
+  content: Turtle uses Donchian channel for entry (20-day) and exit (10-day)
+  rationale: 'The Turtle strategy identifies entries when price breaks above the 20-day Donchian high
+    (long) or below the 20-day low (short), and exits when price retraces to the 10-day extreme. This
+    channel-based approach catches sustained trends while providing relatively tight breakout confirmation.
+    The asymmetric 20/10 lookback periods implement the classic Turtle trend-following logic. Boundary:
+    lookback periods are fixed; adaptive channels could behave differently.'
+  evidence: tqsdk/demo/example/turtle.py:51-54(donchian_channel)
+  stage: signal_generation
+  alternative_considered: Shorter lookbacks (e.g., 10/5) were rejected for excessive false signals; longer
+    (40/20) were rejected for reduced trend capture
+  _evidence_issues:
+  - 'FN_NOT_FOUND: donchian_channel in tqsdk/demo/example/turtle.py'
+- id: BD-010
+  type: B/BA
+  content: Dual Thrust range = max(HH-LC, HC-LL) with K=0.2 for both buy and sell lines
+  rationale: 'Dual Thrust calculates the trading range as the maximum of (Highest High minus Last Close)
+    and (Highest Close minus Lowest Low), then adds this range times K=0.2 to the previous close for buy
+    lines, and subtracts from previous close for sell lines. The symmetric K=0.2 applies equal buffer
+    to both directions, creating balanced breakout thresholds. This parameter controls sensitivity: higher
+    K widens the channel, reducing false signals but missing early moves. Boundary: K is symmetrical;
+    asymmetri'
+  evidence: tqsdk/demo/example/dualthrust.py:28-36(dual_thrust)
+  stage: signal_generation
+  alternative_considered: Asymmetric K values were considered but rejected to maintain simplicity; K=0.5
+    was rejected as too wide
+- id: BD-011
+  type: B/BA
+  content: R-Breaker closes positions at 14:50, stop loss at 10 price points
+  rationale: 'The R-Breaker strategy enforces end-of-day position closure at 14:50 (10 minutes before
+    standard Chinese futures close at 15:00) to avoid overnight exposure and settlement risk. The 10-price-point
+    stop loss implements a fixed-point risk management rule rather than ATR-based sizing, simplifying
+    position management for this specific strategy. Boundary: these are hardcoded constants; closing time
+    may not suit each contract sessions.'
+  evidence: tqsdk/demo/example/rbreaker2.py:22(get_index_line)
+  stage: data_management
+  alternative_considered: Dynamic stop based on volatility was rejected for strategy simplicity; later
+    close time (14:55) was rejected for settlement risk
+- id: BD-012
+  type: B
+  content: Escalator opens when K-line close in top/bottom 25% with MA alignment
+  rationale: 'The Escalator strategy initiates positions when price closes in the extreme quartiles (top
+    25% for longs, bottom 25% for shorts) combined with moving average alignment confirmation. This dual-filter
+    approach reduces false signals by requiring both momentum extremes and trend confirmation. The 25%
+    boundary controls signal frequency and requires strong momentum to trigger. Boundary: boundary is
+    symmetric; tightening to 10% would reduce signals further.'
+  evidence: tqsdk/demo/example/escalator.py:29(kline_range)
+  stage: signal_generation
+  alternative_considered: Tighter 10% boundary was rejected for reduced signal count; wider 40% was rejected
+    for signal quality degradation
+- id: BD-013
+  type: B/BA
+  content: 'Momentum AR strategy: long when 110<AR<150, short when 50<AR<90, exit at AR thresholds'
+  rationale: 'The AR (Activity Ratio) momentum strategy enters longs when AR is between 110-150 (moderate
+    overheating) and shorts when AR is between 50-90 (moderate weakness). These asymmetric ranges acknowledge
+    that markets can sustain overheating longer than they can sustain weakness. Exit thresholds are symmetric
+    around neutral, implementing mean-reversion take-profits. Boundary: AR bands are fixed; different
+    thresholds could produce different timing.'
+  evidence: tqsdk/demo/example/momentum.py:24(ar)
+  stage: signal_generation
+  alternative_considered: Symmetric entry ranges (e.g., 90-110 vs 90-110) were rejected due to empirical
+    observation of asymmetric market behavior
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ar in tqsdk/demo/example/momentum.py'
+- id: BD-014
+  type: B/BA
+  content: VWAP uses 10-day history to predict volume distribution, splits 58s passive then 2s active
+  rationale: 'VWAP execution builds volume distribution forecasts from 10 trading days of historical data,
+    providing sufficient sample size for stable patterns while remaining responsive to recent market structure
+    changes. The 58-second passive followed by 2-second active split allocates most interval time to limit
+    orders while reserving a short aggressive window for completion assurance. Boundary: history window
+    and time split are not adaptive; volatile days may distort predictions.'
+  evidence: tqsdk/demo/example/vwap.py:17,76-78,91-92(module)
+  stage: algorithm_design
+  alternative_considered: Shorter history (5 days) was rejected for noise; longer (20 days) was rejected
+    for staleness; pure passive was rejected for completion risk
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tqsdk/demo/example/vwap.py'
+- id: BD-015
+  type: B/DK
+  content: TWAP time table generator requires minimum 3-second interval per segment
+  rationale: 'The time table generator enforces a 3-second minimum interval between execution segments
+    to comply with exchange message rate limits and prevent potential signal generation penalties. This
+    constraint affects the granularity of TWAP schedules: a 60-second execution could have at most 20
+    segments. Boundary: intervals < 3 seconds will cause schedule generation failure; this is a hard constraint.'
+  evidence: tqsdk/algorithm/time_table_generater.py:121-124(module)
+  stage: algorithm_design
+  alternative_considered: Zero minimum was rejected for exchange compliance; 5-second minimum was rejected
+    as unnecessarily restrictive
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tqsdk/algorithm/time_table_generater.py'
+- id: BD-016
+  type: B/BA
+  content: VWAP time table requires duration as multiple of 60 seconds
+  rationale: 'VWAP schedules require total duration to be a multiple of 60 seconds to align with the minute-based
+    volume distribution model used for forecast generation. This constraint ensures clean division into
+    minute buckets for volume prediction. Boundary: non-multiple-60 durations will be rejected; this is
+    a hard constraint aligned with VWAP algorithm assumptions.'
+  evidence: tqsdk/algorithm/time_table_generater.py:206-207(module)
+  stage: algorithm_design
+  alternative_considered: Arbitrary duration support was rejected as it would break volume distribution
+    alignment
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tqsdk/algorithm/time_table_generater.py'
+- id: BD-017
+  type: B/BA
+  content: Fractal trend uses 2-period window, confirms with 6/12 MA, 1.2x ATR stop, 1.8x TP ratio
+  rationale: 'Fractal trend detection uses a 2-period price window for fractal identification, confirmed
+    by 6/12 moving average crossover for trend direction. Risk management employs 1.2x ATR for stop loss
+    placement and 1.8x ATR for take-profit targets, creating a favorable risk-reward ratio of approximately
+    1.5:1. These parameters define the strategy''s risk profile. Boundary: parameters are fixed; fractal
+    detection is sensitive to price noise.'
+  evidence: tqsdk/demo/example/fractal-trend.py:20,23-24,29-30(module)
+  stage: signal_generation
+  alternative_considered: Tighter stop (1.0x ATR) was rejected for higher whipsaw; looser TP (2.0x) was
+    rejected for reduced win rate
+- id: BD-018
+  type: B/DK
+  content: 'Kalman filter pairs trading: obs_var=0.01, state_var=0.0001, OPEN at Z±2.0, CLOSE at Z±0.5'
+  rationale: 'Kalman filter pairs trading uses observation variance of 0.01 and state variance of 0.0001,
+    representing a filter that responds slowly to price changes (low state variance) while allowing moderate
+    measurement noise (higher obs variance). Entry triggers at Z-score ±2.0 (2 standard deviations) and
+    exit at ±0.5 (near-zero deviation), implementing mean reversion with statistical confidence. Boundary:
+    variance ratios determine filter responsiveness; different markets may require tuning.'
+  evidence: tqsdk/demo/example/kalman_filter_pairs_trading.py:9-10,14-17(module)
+  stage: signal_generation
+  alternative_considered: Faster filter (higher state_var) was rejected for noise sensitivity; tighter
+    entry (1.5 Z-score) was rejected for false signal risk
+- id: BD-019
+  type: B
+  content: 'Z-Score mean reversion: entry at ±1.8, exit at ±0.4, stop loss at ±2.5, time stop 8 days'
+  rationale: 'Z-Score mean reversion strategy enters when the price spread Z-score exceeds ±1.8 standard
+    deviations, exits near mean at ±0.4, and stops out at ±2.5. The 0.7-unit buffer between entry and
+    stop (2.5-1.8) provides 1.75x risk reward on stop-based exits. The 8-day time stop forces closure
+    of positions that fail to mean-revert, preventing indefinite holding. Boundary: time stop is calendar-based;
+    could expire mid-session.'
+  evidence: tqsdk/demo/example/z_score.py:18-21,23(module)
+  stage: data_management
+  alternative_considered: Tighter entry (2.5 Z-score) was rejected for insufficient signals; looser time
+    stop (15 days) was rejected for risk accumulation
+- id: BD-020
+  type: B/BA
+  content: Report annualization uses 250 trading days/year, 21 trading days/month
+  rationale: 'Performance reporting annualizes returns using 250 trading days (standard for Chinese equity/futures
+    markets) and 21 trading days per month (derived from ~21 trading days per month average). These constants
+    convert raw returns to annualized equivalents for comparison across different holding periods and
+    strategies. Boundary: constants assume continuous trading; actual trading days vary by exchange/contract.'
+  evidence: tqsdk/report.py:16(tqreport)
+  stage: reporting
+  alternative_considered: 252 trading days (US standard) was rejected as it misrepresents Chinese market
+    structure
+  _evidence_issues:
+  - 'FN_NOT_FOUND: tqreport in tqsdk/report.py'
+- id: BD-021
+  type: B/BA
+  content: Winning rate calculated by volume, profit/loss ratio uses contract multiplier
+  rationale: 'Performance reporting calculates winning rate as the percentage of volume traded in profitable
+    trades, not count-based. This weights performance by actual capital deployment. Profit/loss ratio
+    incorporates contract multipliers to express gains/losses in monetary terms rather than tick or price-point
+    terms, enabling accurate cross-instrument comparison. Boundary: volume-weighted win rate may differ
+    from count-weighted; multiplier must be correctly configured per contract.'
+  evidence: tqsdk/report.py:196-203(module)
+  stage: reporting
+  alternative_considered: Count-based win rate was rejected as it ignores position sizing; nominal P&L
+    without multipliers was rejected for cross-instrument incomparability
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tqsdk/report.py'
+- id: BD-022
+  type: B/BA
+  content: Backtest auto-subscribes 1-minute K-line if no K-line or K-line period > minute
+  rationale: 'The backtest engine automatically subscribes to 1-minute K-line data when no user-provided
+    K-lines exist or when user data has period longer than 1 minute. This ensures minimum bar resolution
+    for strategies that may not explicitly request data but require timestamps for execution logic. Boundary:
+    auto-subscription uses default 1-minute; user subscription overrides this behavior.'
+  evidence: tqsdk/backtest/backtest.py:47-48(module)
+  stage: data_management
+  alternative_considered: No auto-subscription was rejected as it would break strategies expecting implicit
+    data; longer default (5-min) was rejected for precision loss
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tqsdk/backtest/backtest.py'
+- id: BD-023
+  type: B/BA
+  content: Backtest advances market time by maximum one tick per wait_update call
+  rationale: 'The backtest simulation advances simulated market time by at most one quote tick per wait_update()
+    call, ensuring that strategies see each relevant price updates and do not skip market states. This
+    guarantees deterministic execution where order of operations matches real-world expectations. Boundary:
+    single-tick advancement means backtests may be slower for strategies that trigger frequently.'
+  evidence: tqsdk/backtest/backtest.py:58(module)
+  stage: market_data_simulation
+  alternative_considered: Multi-tick advancement was rejected for state-skipping risk; event-driven (jump
+    to next trigger) was rejected for complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tqsdk/backtest/backtest.py'
+- id: BD-024
+  type: B/BA
+  content: Double MA uses 30/60 period SMA, 3-lot position size
+  rationale: 'The Double MA strategy uses 30-period and 60-period simple moving averages for crossover
+    signals, representing a medium-term trend-following approach. Fixed 3-lot position size provides consistent
+    order sizing regardless of account balance or volatility, simplifying the strategy but potentially
+    varying risk profile. Boundary: position size is fixed; leverage varies inversely with balance.'
+  evidence: tqsdk/demo/example/doublema.py:12-14,33(module)
+  stage: signal_generation
+  alternative_considered: Shorter MA (10/20) was rejected for noise; longer (50/100) was rejected for
+    lag; dynamic sizing was rejected for complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tqsdk/demo/example/doublema.py'
+- id: BD-025
+  type: B/BA
+  content: Grid uses 10 levels in each direction, position increases linearly per level
+  rationale: 'The grid strategy creates 10 price levels above and below the reference price, each holding
+    equal position increments. Linear position sizing creates a symmetric risk profile where losses accumulate
+    proportionally with distance from reference. This is a fundamental grid architecture decision affecting
+    capital utilization and drawdown characteristics. Boundary: 10 levels is fixed; changing requires
+    strategy modification.'
+  evidence: tqsdk/demo/example/gridtrading.py:16,21-22(module)
+  stage: trading_algorithms
+  alternative_considered: Exponential sizing (increasing per level) was rejected for complexity; fewer
+    levels (5) was rejected for insufficient grid coverage
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tqsdk/demo/example/gridtrading.py'
+- id: BD-026
+  type: B/DK
+  content: 'SimTradeBase order matching: market orders fill at opponent price, limit orders fill if price
+    >= opponent'
+  rationale: 'Simulation order matching treats market orders as guaranteed fills at best bid/ask (opponent)
+    price, assuming immediate execution. Limit orders only fill when the limit price is favorable relative
+    to opponent (buy limit >= opponent ask, sell limit <= opponent bid), accurately modeling passive order
+    behavior. This distinction is critical for backtest realism. Boundary: market order fills do not consider
+    position size impact; large orders still receive single-price fills.'
+  evidence: tqsdk/sim/trade_base.py:250-260(module)
+  stage: market_data_simulation
+  alternative_considered: Market orders at mid-price were rejected as unrealistic; random slippage was
+    considered but rejected for reproducibility
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tqsdk/sim/trade_base.py'
+  vague_rationale: true
+- id: BD-027
+  type: B
+  content: TargetPosTask waits for position to stabilize before proceeding to next offset priority
+  rationale: 'TargetPosTask implements sequential offset targeting where each offset priority (e.g., close
+    today, close yesterday, open new) waits for position confirmation before moving to the next. This
+    stabilization wait ensures accurate position tracking and prevents ordering conflicts where later
+    offset tasks would be based on stale position data. Boundary: wait timeout is not configurable; indefinite
+    holding of stale positions is possible if fills fail.'
+  evidence: tqsdk/lib/target_pos_task.py:388-392(module)
+  stage: data_management
+  alternative_considered: Parallel execution was rejected for position tracking complexity; immediate
+    next-step without confirmation was rejected for race conditions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tqsdk/lib/target_pos_task.py'
+- id: BD-028
+  type: T
+  content: TqBaseApi creates SelectorEventLoop by default, not default loop
+  rationale: 'TqBaseApi initializes with SelectorEventLoop (asyncio selectors-based event loop) rather
+    than Python''s default loop, providing better cross-platform compatibility and performance for I/O-bound
+    operations typical in trading systems. This is an infrastructure decision ensuring consistent async
+    behavior. Boundary: this is internal implementation; user code should not depend on loop type directly.'
+  evidence: tqsdk/baseApi.py:25(module)
+  stage: async_engine
+  alternative_considered: Default loop usage was rejected for Windows compatibility issues; ProactorEventLoop
+    was rejected for edge cases
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tqsdk/baseApi.py'
+- id: BD-029
+  type: B/BA
+  content: SimTradeBase uses max quote datetime as current time for trading decisions
+  rationale: 'Simulation uses the maximum timestamp from received quotes as the current market time, ensuring
+    that each data up to that point is considered for decisions. This prevents decisions based on stale
+    or out-of-order data. Boundary: this assumes quotes arrive in temporal order; out-of-sequence quotes
+    may cause unexpected time handling.'
+  evidence: tqsdk/sim/trade_base.py:52-55(module)
+  stage: market_data_simulation
+  alternative_considered: System clock was rejected for non-deterministic behavior; explicit time parameter
+    was rejected for user burden
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tqsdk/sim/trade_base.py'
+  vague_rationale: true
+- id: BD-030
+  type: B/RC
+  content: TargetPosScheduler final task waits indefinitely for target position, non-final tasks respect
+    interval
+  rationale: 'TargetPosScheduler treats the final offset priority task differently from intermediate tasks:
+    the last required offset (e.g., opening new positions) waits indefinitely for fill confirmation, while
+    intermediate offsets respect scheduled intervals to avoid excessive order rates. This prioritizes
+    completion of the overall position target while maintaining rate discipline for partial fills. Boundary:
+    indefinite wait could cause task to hang if fills never occur.'
+  evidence: tqsdk/lib/target_pos_scheduler.py:140-145(module)
+  stage: data_management
+  alternative_considered: Every tasks with indefinite wait was rejected for rate control; each with timeout
+    was rejected for completion risk
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tqsdk/lib/target_pos_scheduler.py'
+- id: BD-031
+  type: B/BA
+  content: VWAP generates time table with 2-second ACTIVE segment at end of each interval
+  rationale: 'VWAP time table generation appends a 2-second aggressive (ACTIVE) segment at the end of
+    each scheduled interval to ensure execution completion even if passive orders fail to fill. This is
+    a risk management feature ensuring VWAP schedules complete on time. Boundary: 2-second buffer is fixed;
+    very short intervals may have proportionally large active windows.'
+  evidence: tqsdk/algorithm/time_table_generater.py:265-266(module)
+  stage: algorithm_design
+  alternative_considered: No active buffer was rejected for completion risk; longer buffer (5s) was rejected
+    for market impact
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tqsdk/algorithm/time_table_generater.py'
+- id: BD-032
+  type: B/DK
+  content: SimTradeBase IOC orders cancel immediately if cannot fill at required price
+  rationale: 'Immediate-Or-Cancel (IOC) orders in simulation immediately cancel and return if the required
+    fill price is not available, accurately modeling exchange IOC behavior. This ensures strategies using
+    IOC orders do not receive unintended fills at worse prices. Boundary: partial fills are not supported;
+    IOC orders are all-or-nothing within the simulation.'
+  evidence: tqsdk/sim/trade_base.py:256-258(module)
+  stage: market_data_simulation
+  alternative_considered: Partial fill support was rejected for complexity; FOK simulation was rejected
+    for behavioral difference
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tqsdk/sim/trade_base.py'
+- id: BD-033
+  type: BA
+  content: Hook pattern via _could_insert_order/_on_insert_order in TqRiskRule for pre/post order checks
+  rationale: Hook pattern in TqRiskRule allows risk checks to be extended without modifying core insert_order
+    flow. The _could_insert_order/_on_insert_order hooks define the boundary where custom risk logic executes
+    before order submission, enabling third-party risk modules to veto orders safely.
+  evidence: tqsdk/risk_rule.py:16(tqriskrule)
+  stage: pattern_choice
+  _evidence_issues:
+  - 'FN_NOT_FOUND: tqriskrule in tqsdk/risk_rule.py'
+- id: BD-034
+  type: DK
+  content: Nanjing datetime assumption with hardcoded CST offset (+8 hours) in datetime.py
+  rationale: Hardcoded CST offset assumes each trading occurs in Nanjing timezone. This creates a boundary
+    condition for international users or when exchange data uses different timezone representations, potentially
+    causing trading day calculations to shift by 24 hours.
+  evidence: tqsdk/datetime.py:22(_convert_to_cst_datetime)
+  stage: default_value
+- id: BD-035
+  type: T
+  content: 'TargetPosTask: set_target_volume must precede cancel/insert order calls in same wait_update
+    cycle'
+  rationale: set_target_volume ordering within wait_update cycle ensures target position is calculated
+    before subsequent order operations. The boundary is each wait_update cycle - if insert/cancel orders
+    execute before set_target_volume, position synchronization logic will use stale targets, causing incorrect
+    order sizing.
+  evidence: tqsdk/lib/target_pos_task.py:244(set_target_volume)
+  stage: ordering_contract
+- id: BD-036
+  type: BA
+  content: Quote.last_price defaults to float('nan') requiring nan-check before price comparisons
+  rationale: NaN default for last_price reflects the reality that quotes may not be available at connection
+    start. The boundary is any price comparison - developers must explicitly check math.isnan() before
+    using last_price in calculations, or risk silent logical errors where each comparisons return False.
+  evidence: tqsdk/objs.py:61(last_price)
+  stage: invariant
+  _evidence_issues:
+  - 'FN_NOT_FOUND: last_price in tqsdk/objs.py'
+- id: BD-037
+  type: BA
+  content: 'TqMultiAccount chain pattern: accounts must be in REVERSE order for proper message routing'
+  rationale: Reverse account ordering in TqMultiAccount chain is required for correct message routing
+    in multi-account scenarios. The boundary is the account registration order - if accounts are added
+    in forward order, the message routing logic will deliver orders to the wrong account due to chain
+    traversal semantics.
+  evidence: tqsdk/multiaccount.py:132-143(_setup_connection)
+  stage: ordering_contract
+- id: BD-038
+  type: BA/DK
+  content: TqKq/TqKqStock inherit from TqAccount but hardcode broker_id='快期模拟' in __init__
+  rationale: Hardcoded broker_id='快期模拟' in TqKq/TqKqStock reflects the simulation environment's identity.
+    The boundary is account initialization - changing this hardcode would break connectivity to the simulation
+    broker, as the server expects this specific broker identifier for simulation mode authentication.
+  evidence: tqsdk/account.py:16(tqaccount)
+  stage: inheritance
+  _evidence_issues:
+  - 'FN_NOT_FOUND: tqaccount in tqsdk/account.py'
+- id: BD-039
+  type: BA
+  content: 'Strategy pattern: TargetPosTask wraps target_pos_scheduler with per-symbol dispatch'
+  rationale: TargetPosTask strategy pattern wraps the scheduler with per-symbol dispatch. The boundary
+    is symbol-level position management - each symbol gets its own scheduler instance via self._account,
+    ensuring position calculations don't interfere across different contracts in multi-position strategies.
+  evidence: tqsdk/lib/target_pos_task.py:203(self._account)
+  stage: pattern_choice
+  _evidence_issues:
+  - 'FN_NOT_FOUND: self._account in tqsdk/lib/target_pos_task.py'
+- id: BD-040
+  type: RC
+  content: Sim backtest requires insert_order → wait_update → settlement cycle ordering
+  rationale: 'Simulation backtest requires strict ordering: insert_order → wait_update → settlement. The
+    boundary is each simulation cycle - violating this order causes settlement to use unupdated positions,
+    leading to incorrect P&L calculations and mismatched fills that don''t reflect actual market execution.'
+  evidence: tqsdk/tradeable/sim/basesim.py:24(basesim)
+  stage: invariant
+  _evidence_issues:
+  - 'FN_NOT_FOUND: basesim in tqsdk/tradeable/sim/basesim.py'
+- id: BD-041
+  type: DK
+  content: Tradeable._account_key = str(id(self)) uses memory address as identity key
+  rationale: Memory address as _account_key provides unique identity without database persistence. The
+    boundary is process lifetime - if an account object is garbage collected and recreated, it receives
+    a new identity key, potentially breaking references stored in other components that depend on stable
+    account identity.
+  evidence: tqsdk/tradeable/tradeable.py:17(_get_account_key)
+  stage: default_value
+- id: BD-042
+  type: BA/DK
+  content: Stock trading requires offset=None; futures require offset in (OPEN, CLOSE, CLOSETODAY)
+  rationale: Offset parameter semantics differ by asset class due to market conventions. The boundary
+    is the instrument type - stocks have no offset concept (always None), while futures require explicit
+    OPEN/CLOSE specification to distinguish position opening from closing, which affects risk calculation
+    and margin requirements.
+  evidence: tqsdk/api.py:4356(_offset_to_x)
+  stage: ordering_contract
+- id: BD-043
+  type: BA
+  content: 'Template Method pattern in TqRiskRule: hooks called by TqApi insert_order flow'
+  rationale: Template method pattern in TqRiskRule centralizes risk check invocation. The boundary is
+    the TqApi insert_order flow - subclasses define _could_insert_order (pre-check) and _on_insert_order
+    (post-check) hooks, allowing custom risk rule implementations without modifying core flow, enabling
+    extensible risk management.
+  evidence: tqsdk/risk_rule.py:16(tqriskrule)
+  stage: pattern_choice
+  _evidence_issues:
+  - 'FN_NOT_FOUND: tqriskrule in tqsdk/risk_rule.py'
+- id: BD-044
+  type: DK
+  content: risk_rule.py uses time.monotonic/CLOCK_MONOTONIC instead of exchange time for rate limiting
+  rationale: Monotonic clock for rate limiting decouples from system clock adjustments. The boundary is
+    rate limit window - if wall clock is adjusted backward during trading, monotonic time ensures rate
+    limits still enforce correct throttling without allowing burst violations that would occur with wall
+    clock-based limiting.
+  evidence: tqsdk/risk_rule.py:480-489(_get_boot_time)
+  stage: default_value
+- id: BD-045
+  type: BA
+  content: Multi-account mode requires explicit account parameter on each trading operations
+  rationale: Explicit account parameter in multi-account mode prevents ambiguity in order routing. The
+    boundary is the active account context - without explicit parameter, orders would route to the default
+    account, potentially executing on wrong broker in multi-account configurations where multiple accounts
+    are active.
+  evidence: tqsdk/api.py:1592(get_account)
+  stage: ordering_contract
+- id: BD-046
+  type: BA
+  content: 'Observer pattern: TqApi.wait_update triggers risk rule _could_insert_order hooks'
+  rationale: Observer pattern in TqApi.wait_update propagates state changes to risk rule notifications.
+    The boundary is state change notification - risk rules register as observers, receiving callbacks
+    when quote/order state changes, enabling real-time risk assessment without polling and ensuring risk
+    checks execute at appropriate sync points.
+  evidence: tqsdk/api.py:1960(wait_update)
+  stage: pattern_choice
+  vague_rationale: true
+- id: BD-047
+  type: B/BA
+  content: 'INTERACTION: BD-007 (10M default balance) × BD-008 (Turtle 1% unit) → amplified position sizing
+    creating implicit leverage exposure'
+  rationale: The 10,000,000 CNY default balance multiplied by the 1% Turtle unit calculation produces
+    positions sized at balance*0.01/(volume_multiple*ATR). This creates an implicit leverage multiplier
+    where low-ATR contracts receive larger notional positions. If balance is increased without adjusting
+    unit percentage, leverage amplification occurs silently. The combination of these two decisions determines
+    the strategy's effective risk exposure in ways neither decision explicitly acknowledges.
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-048
+  type: B/BA
+  content: 'INTERACTION: BD-003 (ACTIVE price default) × BD-026 (opponent price fill) → guaranteed fill
+    assumption silently depends on simulation accuracy'
+  rationale: 'TargetPosTask defaults to ACTIVE price mode assuming opponent-side fills, and SimTradeBase
+    implements opponent price execution for market orders. This creates a hidden dependency: if the simulation''s
+    opponent price fill assumption (BD-026) changes to include slippage or liquidity modeling, the ACTIVE
+    mode''s fill reliability guarantee would degrade silently. The default was chosen assuming BD-026''s
+    behavior, creating silent coupling between these decisions that could break if either changes.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-049
+  type: B/DK
+  content: 'INTERACTION: BD-022 (auto-subscribe 1-min K-line) × BD-023 (one tick per wait_update) → compounded
+    backtest slowdown with data volume inflation'
+  rationale: 'Auto-subscription of 1-minute K-lines (BD-022) inflates the data volume received by each
+    wait_update call, while BD-023 limits advancement to one tick per call. These decisions compound:
+    more data ticks means more wait_update iterations needed to advance through a given time period, creating
+    non-linear backtest slowdown. A strategy receiving 60 1-minute bars per hour would require 60x more
+    wait_update calls than a strategy with only 1 bar, but this relationship is unstated and could cause
+    unexpe'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-050
+  type: BA
+  content: 'INTERACTION: BD-036 (NaN default for last_price) × BD-003 (ACTIVE mode) → silent fill execution
+    risk when NaN propagates to price calculations'
+  rationale: Quote.last_price defaults to NaN (BD-036), and TargetPosTask uses ACTIVE price mode which
+    pulls opponent prices for fills (BD-003). If a quote's last_price is NaN but bid/ask prices are valid,
+    the ACTIVE mode would use opponent prices correctly. However, if price comparison logic uses last_price
+    before checking for NaN, the comparison could produce unexpected True/False results, potentially causing
+    orders to execute at stale or incorrect prices when the system relies on last_price rather than op
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-051
+  type: B/RC
+  content: 'INTERACTION: BD-005 (TWAP 3s interval) × BD-015 (TimeTableGenerator 3s minimum) → redundant
+    constraint creates hard coupling where violation causes failure in both layers'
+  rationale: 'Both TWAP algorithm (BD-005) and TimeTableGenerator (BD-015) independently enforce the same
+    3-second minimum interval constraint. This creates redundant validation: if a user attempts to create
+    a schedule with intervals < 3s, they receive errors from both layers. The redundancy means error messages
+    may be confusing, and the coupling means changes to one constraint would ideally require changes to
+    both to maintain consistency. This is a risk cascade waiting to happen if the constraints ever need '
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-052
+  type: B/DK
+  content: 'INTERACTION: BD-030 (final task waits indefinitely) × BD-027 (position stabilization) → indefinite
+    wait compounds stabilization delay creating potential deadlock'
+  rationale: TargetPosScheduler's final offset task waits indefinitely for fill (BD-030), while TargetPosTask
+    waits for position stabilization before proceeding (BD-027). When combined, if a fill never confirms
+    due to exchange issues or network problems, the final task's indefinite wait combined with the stabilization
+    requirement creates a potential deadlock scenario where the system hangs indefinitely rather than
+    timing out gracefully. Neither decision accounts for the other's behavior, creating emergent bl
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-053
+  type: BA/DK
+  content: 'INTERACTION: BD-045 (explicit account parameter) × BD-037 (reverse account order) → contradiction
+    between explicit routing requirement and implicit order dependency'
+  rationale: 'BD-045 requires explicit account parameters in multi-account mode to prevent wrong-account
+    execution, while BD-037 requires accounts to be added in reverse order for correct message routing.
+    These decisions contradict: BD-045 implies users should have full control over account specification,
+    but BD-037 places routing correctness in the hands of registration order, which users must get right
+    without explicit guidance. If users follow BD-045''s safety guidance but miss BD-037''s ordering requirement'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-054
+  type: B/BA
+  content: 'INTERACTION: BD-001 (0.5% grid step) × BD-025 (10 levels) → 5% total coverage creates implicit
+    directional bias at range boundaries'
+  rationale: 'Grid trading uses 0.5% step size across 10 levels in each direction (BD-001, BD-025), creating
+    total coverage of approximately 5% above and below the reference price. This combination creates an
+    implicit boundary effect: when price moves beyond the grid''s edge, positions become entirely one-directional.
+    The grid''s risk profile is not symmetric with the market''s potential range, creating directional
+    bias near extremes. The combination of these decisions amplifies the gap risk at grid boundaries b'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-055
+  type: B/BA
+  content: 'INTERACTION: BD-019 (Z-Score ±1.8 entry) × BD-018 (Kalman Z±2.0 entry) → different entry thresholds
+    create inconsistent signal timing across mean-reversion strategies'
+  rationale: 'Z-Score strategy enters at ±1.8 standard deviations while Kalman filter pairs trading enters
+    at ±2.0. Both are mean-reversion strategies operating on similar statistical concepts, yet their entry
+    thresholds differ by 0.2 sigma. This inconsistency creates contradictory signals: on the same market
+    data showing ±1.9 Z-score, Z-Score would enter while Kalman would wait. Users running both strategies
+    simultaneously could receive conflicting signals, causing confusion about which statistical model
+    to '
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-056
+  type: B
+  content: 'INTERACTION: BD-029 (max quote datetime) × BD-023 (one tick per wait_update) → timing accuracy
+    vs simulation speed trade-off creates hidden performance cost'
+  rationale: 'SimTradeBase uses max quote datetime as current time (BD-029) while backtest limits advancement
+    to one tick per wait_update (BD-023). These decisions interact: BD-029 ensures temporal accuracy by
+    tracking quote-based time, but BD-023 limits progress to single ticks, meaning the simulation''s ''current
+    time'' only advances when wait_update is called with new quotes. If a strategy has a long computational
+    delay between wait_update calls, the simulation time may not advance proportionally, creating a '
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-057
+  type: B/BA
+  content: 'RISK CASCADE: BD-011 (14:50 close) → BD-040 (insert_order→wait_update→settlement cycle) →
+    BD-023 (one tick per wait_update) → backtest results become unreliable near daily close'
+  rationale: 'R-Breaker enforces position closure at 14:50 (BD-011) requiring orders to be placed and
+    confirmed within a tight window before market close. This order insertion must complete the insert_order→wait_update→settlement
+    cycle (BD-040), and each wait_update only advances one tick (BD-023). If the strategy has computation
+    delays or the tick frequency is low near close, the order may not confirm before settlement, causing
+    the position to persist overnight unexpectedly. This creates systemic risk where '
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-058
+  type: BA
+  content: 'RISK CASCADE: BD-035 (set_target_volume ordering) → BD-027 (position stabilization) → BD-002
+    (singleton enforcement) → stale position targets could persist across singleton instances'
+  rationale: The ordering contract requiring set_target_volume before insert/cancel (BD-035) depends on
+    position stabilization before next steps (BD-027), which occurs within the singleton enforcement per
+    account+symbol (BD-002). If a new TargetPosTask instance is created for the same account+symbol while
+    an existing instance has pending orders, the singleton returns the existing instance. However, if
+    the new parameters are rejected and stale targets persist, subsequent position operations may use
+    outdated t
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-GAP-001
+  type: B/RC
+  content: Password segments in URLs are replaced with fixed placeholder 'xxx' during logging, preserving
+    URL structure for readability while preventing credential leakage
+  rationale: Security-first approach to log sanitization prevents accidental credential exposure in log
+    files and debugging output; breaks when URL structure itself contains sensitive path segments that
+    cannot be distinguished from the password portion
+  evidence: tqsdk/tradeable/otg/base_otg.py:20(_mask_sm_password_in_url)
+  stage: security
+  alternative_considered: Full URL redaction was rejected to preserve log debugging value
+- id: BD-GAP-002
+  type: T
+  content: OTG communication uses exactly 4 separate async channels (api_send, api_recv, md_send, md_recv)
+    to decouple trading commands from market data streams
+  rationale: Separation of concerns between command/response flow and market data subscription prevents
+    head-of-line blocking; breaks when latency-sensitive strategies need co-located channel processing
+    or when channel count exceeds OS file descriptor limits in high-connection scenarios
+  evidence: tqsdk/tradeable/otg/base_otg.py:126(_run)
+  stage: architecture
+  alternative_considered: Unified channel with message-type routing was rejected for complexity
+- id: BD-GAP-003
+  type: T
+  content: Account types use mixin pattern (FutureMixin, StockMixin) rather than inheritance hierarchy
+    to enable flexible composition of trading capabilities
+  rationale: Mixins allow orthogonal capabilities (futures vs stocks) to be combined without diamond inheritance
+    problems; breaks when new capability dimensions require cross-mixin coordination or when third-party
+    plugins need to extend mixin behavior
+  evidence: tqsdk/tradeable/otg/tqkq.py:11(TqKq), tqsdk/tradeable/otg/tqkq.py:102(TqKqStock)
+  stage: architecture
+  alternative_considered: Single class with capability flags was rejected for extensibility
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: TqKq), tqsdk/tradeable/otg/tqkq.py:102(TqKqStock in tqsdk/tradeable/otg/tqkq.py'
+- id: BD-GAP-004
+  type: B
+  content: Simulation accounts support numbered sub-accounts 1-99, where each number represents a completely
+    independent data environment
+  rationale: Fixed range (1-99) balances usability with resource management; enables parallel strategy
+    testing; breaks when more than 99 independent environments needed or when sub-account state needs
+    to be shared across numbers
+  evidence: tqsdk/tradeable/otg/tqkq.py:14(__init__), tqsdk/tradeable/otg/tqkq.py:102(__init__)
+  stage: business
+  alternative_considered: Dynamic allocation was rejected for predictability
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: __init__), tqsdk/tradeable/otg/tqkq.py:102(__init__ in tqsdk/tradeable/otg/tqkq.py'
+- id: BD-GAP-005
+  type: B/BA
+  content: Direct CTP broker connections (TqCtp, TqYida, TqJees, TqRohon) require explicit app_id and
+    auth_code parameters beyond standard credentials
+  rationale: AppID/auth_code enforces vendor-level authentication for institutional-grade trading; breaks
+    when broker updates auth requirements without SDK update or when auth codes expire and cannot be refreshed
+    programmatically
+  evidence: tqsdk/tradeable/otg/tqctp.py:14(__init__), tqsdk/tradeable/otg/tqyida.py:14(__init__)
+  stage: business
+  alternative_considered: Broker-hosted auth was rejected for data sovereignty
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: __init__), tqsdk/tradeable/otg/tqyida.py:14(__init__ in tqsdk/tradeable/otg/tqctp.py'
+- id: BD-GAP-006
+  type: B
+  content: Stock simulation (TqKqStock) is gated behind professional tier requiring trial application
+    or purchase, unlike futures simulation which is freely available
+  rationale: Revenue protection for stock trading features which have higher commercial value; breaks
+    when competitive pressure forces stock sim to be free or when professional tier pricing becomes uncompetitive
+  evidence: tqsdk/tradeable/otg/tqkq.py:102(__init__)
+  stage: business
+  alternative_considered: Freemium model with limited contracts was rejected
+- id: BD-GAP-007
+  type: T
+  content: WebSocket protocol (ws://) chosen for 众期 broker connection instead of raw TCP like other CTP-based
+    brokers
+  rationale: WebSocket provides NAT traversal, firewall friendliness, and browser compatibility advantages;
+    breaks when WebSocket overhead impacts low-latency trading or when broker infrastructure fails to
+    handle WebSocket connections at scale
+  evidence: tqsdk/tradeable/otg/tqzq.py:14(__init__)
+  stage: architecture
+  alternative_considered: Raw TCP rejected for firewall compatibility
+- id: BD-GAP-008
+  type: B/BA
+  content: Sub-account tags default to calling filename plus account_id, enabling automatic strategy attribution
+    in multi-account trading
+  rationale: Zero-configuration tagging reduces operational overhead for strategy management; breaks when
+    multiple strategies run from same file or when filename changes invalidate historical attribution
+  evidence: tqsdk/tradeable/otg/tqtradingunit.py:16(__init__)
+  stage: business
+  alternative_considered: UUID-based tags were rejected for human readability
+- id: BD-GAP-009
+  type: T
+  content: 'Login process split into three-stage flow: _account_info → _account_auth → _send_login_pack,
+    allowing per-broker customization at each stage'
+  rationale: Staged authentication allows broker-specific quirks to be handled without protocol pollution;
+    breaks when brokers require stateful multi-step auth or when auth stages have circular dependencies
+  evidence: tqsdk/tradeable/otg/base_otg.py:66(_account_info), tqsdk/tradeable/otg/base_otg.py:74(_send_login_pack)
+  stage: architecture
+  alternative_considered: Single unified login was rejected for flexibility
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: _account_info), tqsdk/tradeable/otg/base_otg.py:74(_send_login_pack in tqsdk/tradeable/otg/base_otg.py'
+- id: BD-GAP-010
+  type: T
+  content: TCP:// protocol format enforced for CTP broker front_url, ensuring compatibility with CTP middleware
+    infrastructure
+  rationale: CTP protocol specification requires TCP transport; breaks when brokers migrate to TLS or
+    WebSocket without SDK update
+  evidence: tqsdk/tradeable/otg/tqctp.py:14(__init__)
+  stage: architecture
+  alternative_considered: HTTP/S tunnel rejected for latency
+- id: BD-GAP-011
+  type: M
+  content: 'Missing: Matrix ill-conditioning'
+  rationale: 'Audit finding: missing: matrix ill-conditioning. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: connection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-012
+  type: B
+  content: 'Missing: Volatility Surface Interpolation'
+  rationale: 'Audit finding: missing: volatility surface interpolation. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: connection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-013
+  type: M
+  content: 'Missing: Model Calibration Residuals'
+  rationale: 'Audit finding: missing: model calibration residuals. PRC-7 | Finite Difference Grid Stability
+    | N/A | Not using finite difference methods. This gap affects production reliability and should be
+    addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: connection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: PRC-7 | Finite Difference Grid Stability | N/A | Not using finite difference methods
+- id: BD-GAP-014
+  type: B
+  content: 'Missing: Pipeline Fit/Transform Isolation'
+  rationale: 'Audit finding: missing: pipeline fit/transform isolation. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: connection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-015
+  type: RC
+  content: 'Missing: Replace float with Decimal for each monetary values (balance, pnl, commission, margin)
+    to prevent rounding errors'
+  rationale: 'Audit finding: missing: replace float with decimal for each monetary values (balance, pnl,
+    commission, margin) to prevent rounding errors. Penny discrepancies in settlement, audit trail mismatch.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: connection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Penny discrepancies in settlement, audit trail mismatch
+- id: BD-GAP-016
+  content: 'Missing: Convergence criteria'
+  type: M
+  rationale: 'Audit finding: missing: convergence criteria. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: connection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-017
+  content: 'Missing: Model Calibration Residuals'
+  type: M
+  rationale: 'Audit finding: missing: model calibration residuals. PRC-7 | Finite Difference Grid Stability
+    | N/A | Not using finite difference methods. This gap affects production reliability and should be
+    addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: connection
+  status: missing
+  severity: high
+  impact: PRC-7 | Finite Difference Grid Stability | N/A | Not using finite difference methods
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: Basic Quote Retrieval Demo
+  source: doc/demo/notebooks/demo.ipynb
+  type: extension_example
+  business_problem: Demonstrates basic TqSdk library usage by connecting to a simulated trading account
+    and retrieving real-time quote data for a futures contract.
+  intent_keywords:
+  - demo
+  - quote
+  - price
+  - basic
+  - tqsdk
+  stage: data_collection
+  negative_keywords:
+  - strategy
+  - backtest
+  - factor
+  - analysis
+  - trading algorithm
+  disambiguation: Are you looking for a basic introduction to using TqSdk to retrieve market data, or
+    do you need a complete trading strategy or analysis implementation?
+  data_domain: market_data
+- id: UC-102
+  name: Time-Dependent Volatility BS Pricing Model
+  source: doc/demo/notebooks/factor.ipynb
+  type: research_analysis
+  business_problem: Analyzes time-dependent volatility patterns in CSI 300 index to extend the standard
+    Black-Scholes option pricing model for improved accuracy.
+  intent_keywords:
+  - volatility
+  - BS pricing
+  - option
+  - time-dependent
+  - volatility term structure
+  stage: factor_computation
+  negative_keywords:
+  - trading signal
+  - screening criteria
+  - backtest
+  - live trading
+  - machine learning
+  disambiguation: Are you trying to analyze volatility patterns for research purposes, or do you need
+    a volatility-based factor for trading signals? This use case focuses on modeling volatility for option
+    pricing, not generating trading signals.
+  data_domain: financial_data
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 25
+  evidence_invalid: 31
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.44642857142857145
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+- type: contains
+  target: references/wait-update-and-update-loop.md
+  description: Core update loop reference is a required sub-document
+  evidence: SKILL.md:§Route-The-Request-1
+- type: contains
+  target: references/market-data.md
+  description: Market data reference is a required sub-document
+  evidence: SKILL.md:§Route-The-Request-2
+- type: contains
+  target: references/account-type-matrix.md
+  description: Account type matrix is a required sub-document
+  evidence: SKILL.md:§Route-The-Request-3
+- type: contains
+  target: references/accounts-and-trading.md
+  description: Accounts and trading reference is a required sub-document
+  evidence: SKILL.md:§Route-The-Request-4
+- type: contains
+  target: references/order-functions-and-position-tools.md
+  description: Order functions reference is a required sub-document
+  evidence: SKILL.md:§Route-The-Request-5
+- type: contains
+  target: references/object-fields.md
+  description: Object fields reference is a required sub-document
+  evidence: SKILL.md:§Route-The-Request-6
+- type: contains
+  target: references/simulation-and-backtest.md
+  description: Simulation and backtest reference is a required sub-document
+  evidence: SKILL.md:§Route-The-Request-7
+- type: contains
+  target: references/error-faq.md
+  description: Error FAQ is a required sub-document
+  evidence: SKILL.md:§Route-The-Request-8
+- type: contains
+  target: references/example-map.md
+  description: Example map is a required sub-document
+  evidence: SKILL.md:§Route-The-Request-9
+- type: complementary
+  target: references/account-type-matrix.md
+  description: Read account-type-matrix.md first when user is choosing account class
+  evidence: references/accounts-and-trading.md:§Table-Of-Contents-17
+- type: complementary
+  target: references/object-fields.md
+  description: Read object-fields.md when user asks what field means
+  evidence: references/accounts-and-trading.md:§Table-Of-Contents-18
+- type: complementary
+  target: references/order-functions-and-position-tools.md
+  description: Read order-functions reference for insert_order/cancel_order/TargetPosTask
+  evidence: references/accounts-and-trading.md:§Table-Of-Contents-19
+- type: complementary
+  target: references/simulation-and-backtest.md
+  description: Use simulation-and-backtest.md together when user is confused by backtest timing
+  evidence: references/wait-update-and-update-loop.md:§Backtest-Specific-Notes-106
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 6
+    warn: 8
+    fail: 6
+  subdomain_totals:
+    pass: 5
+    warn: 16
+    fail: 3
+  coverage: 44/44 (100%)
+  pass_rate: 11/44 (25%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: market_data_source
+  description: This is the only data source built into TqSdk. The _md_url can be overridden via TQ_MD_URL
+    env var or constructor params.
+  used_in_stages: []
+  options:
+  - name: ShinnyTech Market Data Gateway (default)
+    traits:
+    - real-time
+    - tick-level
+    - historical-klines
+    - multi-asset
+    - china-futures-focused
+    fit_for:
+    - Standard futures/options/stock trading with ShinnyTech account
+    not_fit_for:
+    - Non-Chinese markets, users who want to use their own data feed
+  default: ShinnyTech Market Data Gateway
+  _source: worker_resource
+- id: slot-002
+  name: trading_account_type
+  description: 'Choose based on: (1) whether real trading or simulation, (2) broker support, (3) compliance
+    requirements, (4) latency needs, (5) professional tier access'
+  used_in_stages: []
+  options:
+  - name: TqAccount (standard broker via ShinnyTech relay)
+    traits:
+    - standard
+    - relay-based
+    - ctp
+    - supports-90%-brokers
+    fit_for:
+    - Users with standard futures accounts at CTP-enabled brokers
+    not_fit_for:
+    - Direct CTP, proprietary desks, capital management accounts
+  - name: TqSim / TqSimStock (local simulation)
+    traits:
+    - simulated
+    - no-real-broker
+    - match-engine
+    - all-assets
+    fit_for:
+    - Backtesting, strategy development, paper trading
+    not_fit_for:
+    - Production trading
+  - name: TqKq / TqKqStock (KuaiQi simulation)
+    traits:
+    - simulated
+    - broker-simulated
+    - shinnytech-backend
+    fit_for:
+    - Simulated trading with realistic fills via ShinnyTech
+    not_fit_for:
+    - Direct exchange access
+  - name: TqCtp (direct CTP connection)
+    traits:
+    - direct-ctp
+    - no-relay
+    - high-frequency
+    - compliance
+    fit_for:
+    - HFT traders, users needing direct exchange access, compliance reporting
+    not_fit_for:
+    - Non-CTP brokers, users without CTP authorization
+  - name: TqRohon (融航资管)
+    traits:
+    - capital-management
+    - rohon-backend
+    fit_for:
+    - Traders using Ronghang capital management system
+    not_fit_for:
+    - Non-Ronghang users
+  - name: TqJees (杰宜斯资管)
+    traits:
+    - capital-management
+    - jees-backend
+    fit_for:
+    - Traders using Jees capital management system
+    not_fit_for:
+    - Non-Jees users
+  - name: TqYida (易达高速柜台)
+    traits:
+    - high-speed-counter
+    - yida-backend
+    fit_for:
+    - High-frequency traders needing low-latency fills
+    not_fit_for:
+    - Standard users
+  - name: TqTradingUnit (众期交易单元)
+    traits:
+    - sub-account
+    - zhongsure-backend
+    - multi-strategy
+    fit_for:
+    - Multi-strategy operations, sub-account isolation
+    not_fit_for:
+    - Standard single-account trading
+  default: TqSim (local simulation)
+  _source: worker_resource
+- id: slot-003
+  name: authentication_provider
+  description: TqAuth is mandatory for real-time market data. Auth URL can be overridden via TQ_AUTH_URL
+    env var.
+  used_in_stages: []
+  options:
+  - name: ShinnyTech TqAuth (default)
+    traits:
+    - oauth2
+    - password-grant
+    - jwt-tokens
+    - feature-grants
+    fit_for:
+    - Every users with ShinnyTech (快期) accounts
+    not_fit_for:
+    - Users wanting to avoid ShinnyTech account dependency
+  default: ShinnyTech TqAuth
+  _source: worker_resource
+- id: slot-004
+  name: http_client
+  description: Both are core dependencies and are used for different purposes. requests for blocking auth/HTTP
+    calls, aiohttp for async data queries and web server.
+  used_in_stages: []
+  options:
+  - name: requests (synchronous HTTP)
+    traits:
+    - sync
+    - blocking
+    - connection-pooling
+    fit_for:
+    - Synchronous API calls (auth, broker config, calendar downloads)
+    not_fit_for:
+    - Async code paths that need non-blocking HTTP
+  - name: aiohttp (asynchronous HTTP)
+    traits:
+    - async
+    - non-blocking
+    - websocket-server
+    fit_for:
+    - Async data queries (settlement, rankings, EDB), web GUI server
+    not_fit_for:
+    - Sync-only environments
+  default: Both used in parallel (requests for sync, aiohttp for async)
+  _source: worker_resource
+- id: slot-005
+  name: websocket_library
+  description: websockets is the only WebSocket client used. Version compatibility handling is in connect.py.
+  used_in_stages: []
+  options:
+  - name: websockets (Python websockets library)
+    traits:
+    - async
+    - wss
+    - wss-compression
+    - backpressure
+    fit_for:
+    - Every real-time market and trading connections
+    not_fit_for:
+    - Python <3.8
+  default: websockets
+  _source: worker_resource
+- id: slot-006
+  name: web_gui_renderer
+  description: Web GUI is optional (enabled via web_gui=True). Static assets are embedded in tqsdk/web/.
+    aiohttp serves them locally.
+  used_in_stages: []
+  options:
+  - name: Embedded Vue.js SPA (default)
+    traits:
+    - vue.js
+    - d3.js
+    - offline-capable
+    - static-files
+    fit_for:
+    - Local visualization without external dependencies
+    not_fit_for:
+    - Users wanting custom UI or cloud-hosted dashboards
+  default: Embedded Vue.js SPA
+  _source: worker_resource
+- id: slot-007
+  name: trading_day_calendar
+  description: Determines trading days for backtesting and session management. Can be overridden via TQ_CHINESE_HOLIDAY_URL.
+  used_in_stages: []
+  options:
+  - name: ShinnyTech Chinese Holiday Calendar (default)
+    traits:
+    - china-holidays
+    - cached
+    - annual-updates
+    fit_for:
+    - Every Chinese futures/stock trading strategies
+    not_fit_for:
+    - Non-Chinese markets
+  default: ShinnyTech Chinese Holiday Calendar
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: ShinnyTech (信易科技)
+  description: 'Real-time quotes, tick data, kline data. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: ShinnyTech
+  description: 'Account info, orders, trades, positions, risk management. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: ShinnyTech
+  description: 'Market data gateway URLs, broker configuration. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: ShinnyTech
+  description: 'Contract metadata (symbol list, exchanges, product classes). Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: ShinnyTech
+  description: 'Broker-specific gateway URLs, authentication requirements. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: ShinnyTech
+  description: 'Trading day calendar, holiday definitions. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: ShinnyTech
+  description: 'Main-continuous contract mappings for backtesting. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-008
+  type: external_service
+  name: ShinnyTech
+  description: 'Daily settlement prices by symbol. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-009
+  type: external_service
+  name: ShinnyTech
+  description: 'Member position rankings, OI data. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-010
+  type: external_service
+  name: ShinnyTech
+  description: 'Non-price economic indicators. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-011
+  type: external_service
+  name: ShinnyTech
+  description: 'OAuth2/OpenID Connect token issuance, user grants. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-012
+  type: external_service
+  name: ShinnyTech
+  description: 'Historical replay session management. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-013
+  type: external_service
+  name: ShinnyTech
+  description: 'Expired contract data schema. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-014
+  type: external_service
+  name: ShinnyTech
+  description: 'Version changelog, system notifications. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-015
+  type: external_service
+  name: ShinnyTech Authentication (快期账户认证)
+  description: User authentication, feature grants, account linking
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: external_service
+  name: Broker Gateway Services (期货公司网关)
+  description: Live trading, order management, position tracking
+  used_in_stages: []
+  _source: worker_resource
+- id: res-017
+  type: external_service
+  name: CTP Direct Connection (直连CTP)
+  description: Direct CTP trading bypassing ShinnyTech relay
+  used_in_stages: []
+  _source: worker_resource
+- id: res-018
+  type: external_service
+  name: Zhongsure Trading Unit (众期交易单元)
+  description: Sub-account management with Zhongsure back-office
+  used_in_stages: []
+  _source: worker_resource
+- id: res-019
+  type: external_service
+  name: Ronghang Capital Management (融航资管)
+  description: Capital management system trading
+  used_in_stages: []
+  _source: worker_resource
+- id: res-020
+  type: external_service
+  name: Jees Capital Management (杰宜斯资管)
+  description: Capital management system trading
+  used_in_stages: []
+  _source: worker_resource
+- id: res-021
+  type: external_service
+  name: Yida柜台 (易达)
+  description: High-speed柜台 trading
+  used_in_stages: []
+  _source: worker_resource
+- id: res-022
+  type: external_service
+  name: National Crypto Service (国密服务)
+  description: Encrypted broker authentication via national crypto
+  used_in_stages: []
+  _source: worker_resource
+- id: res-023
+  type: external_service
+  name: KqSim Trading (快期模拟)
+  description: Paper trading with simulated fills
+  used_in_stages: []
+  _source: worker_resource
+- id: res-024
+  type: external_service
+  name: Web GUI Server
+  description: Strategy visualization, backtest reports, K-line charting
+  used_in_stages: []
+  _source: worker_resource
+- id: res-025
+  type: python_package
+  name: websockets
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-026
+  type: python_package
+  name: requests
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-027
+  type: python_package
+  name: numpy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-028
+  type: python_package
+  name: pandas
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-029
+  type: python_package
+  name: scipy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-030
+  type: python_package
+  name: simplejson
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-031
+  type: python_package
+  name: aiohttp
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-032
+  type: python_package
+  name: certifi
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-033
+  type: python_package
+  name: pyjwt
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-034
+  type: python_package
+  name: psutil
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-035
+  type: code_example
+  name: Basic Quote Retrieval Demo
+  path: doc/demo/notebooks/demo.ipynb
+  description: Demonstrates basic TqSdk library usage by connecting to a simulated trading account and
+    retrieving real-time quote data for a futures contract.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-036
+  type: code_example
+  name: Time-Dependent Volatility BS Pricing Model
+  path: doc/demo/notebooks/factor.ipynb
+  description: Analyzes time-dependent volatility patterns in CSI 300 index to extend the standard Black-Scholes
+    option pricing model for improved accuracy.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list

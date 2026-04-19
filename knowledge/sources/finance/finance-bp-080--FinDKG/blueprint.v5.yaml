@@ -1,0 +1,3429 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-080
+name: FinDKG / KGTransformer
+sop_version: '3.6'
+source:
+  projects:
+  - FinDKG
+  commit_hash: bd75205b7ca15681fb071b2f7ac3d1cdf2044118
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Temporal Knowledge Graph Completion and Link Prediction
+  description: A dynamic knowledge graph library implementing KGTransformer for temporal knowledge graphs
+    in the financial domain, enabling temporal link prediction and inter-event time forecasting over evolving
+    entity relationships.
+  prerequisites: Python 3.8+, PyTorch 1.8+, DGL 0.8+, CUDA 11.0+ for GPU training; familiarity with knowledge
+    graphs, GNNs, and temporal modeling concepts
+  not_suitable_for: Static knowledge graphs without temporal dimensions, real-time streaming predictions,
+    non-graph-based time series forecasting, or applications requiring interpretable rule-based reasoning
+stages:
+- id: data_loading
+  name: Data Loading & Temporal Graph Construction
+  order: 1
+  responsibility: Loads temporal knowledge graph data from files and constructs DGL graph with temporal
+    edge masks for train/val/test splits. Temporal KGs require time-ordered processing to prevent data
+    leakage from future events.
+  interface:
+    inputs:
+    - graph_name (str) - dataset identifier, data_root (path) - directory containing TSV files
+    outputs:
+    - 'DGLGraph with edata: rel_type, time, train_mask, val_mask, test_mask; ndata: node_type; attributes:
+      num_relations, num_all_nodes, time_interval'
+  required_methods:
+  - name: load_temporal_knowledge_graph
+    description: Main loader function that reads TSV files and constructs a DGL graph with temporal edges,
+      node types, and time-based train/val/test splits
+    evidence: DKG/data.py:15(load_temporal_knowledge_graph)
+  - name: load_data_table
+    description: Loads tabular data from TSV files using pandas with column validation for head, rel,
+      tail, time
+    evidence: DKG/data.py:76(load_data_table)
+  - name: get_edge_mask
+    description: Creates binary masks for train/val/test splits based on chronological ordering of edge
+      timestamps
+    evidence: DKG/data.py:81(get_edge_mask)
+  key_behaviors:
+  - behavior: Time-based train/val/test split
+    description: Edges are sorted by timestamp and split chronologically to ensure no future data leakage.
+      This is critical for temporal KG evaluation where predicting past events from future information
+      would be invalid.
+    evidence: DKG/data.py:60-67(G.train_times)
+  - behavior: Multi-entity type handling for FinDKG
+    description: FinDKG dataset contains 12 different entity types (companies, events, metrics, etc.)
+      requiring type-aware graph construction, while other datasets use single node type
+    evidence: DKG/data.py:45-54(G.num_node_types)
+  - behavior: Time interval normalization
+    description: Stores time_interval as minimum difference between unique timestamps, used as normalization
+      factor for temporal encoding in inter-event time calculations
+    evidence: DKG/data.py:57-58(G.time_interval)
+  replaceable_points:
+  - name: data_format
+    description: Input file format for knowledge graph edges
+    options:
+    - name: TSV
+      traits:
+      - tab-separated
+      - human-readable
+      - standard for knowledge graphs
+      fit_for:
+      - small to medium datasets
+      - debugging and inspection
+      not_fit_for:
+      - large-scale production data
+      - compressed storage needs
+    - name: Parquet
+      traits:
+      - columnar format
+      - compressed
+      - fast read
+      fit_for:
+      - large datasets
+      - cloud storage optimization
+      not_fit_for:
+      - quick manual inspection
+      - legacy systems
+    - name: Neo4j export
+      traits:
+      - graph database format
+      - native graph structure
+      fit_for:
+      - database integration
+      - graph querying before modeling
+      not_fit_for:
+      - Direct PyTorch/DGL pipeline integration
+    default: TSV
+  design_decisions:
+  - Time-based train/val/test split using edge timestamps prevents data leakage from future events (DKG/data.py:60-67)
+  acceptance_hints:
+  - DGLGraph has num_relations, num_all_nodes, and time_interval attributes set correctly
+  - Every edges are sorted by time with train_edges < val_edges < test_edges temporally
+  - Edge masks are boolean tensors with correct shapes
+  - Time values are float32 and node types are integer types
+- id: collation
+  name: Data Collocation
+  order: 2
+  responsibility: Creates prior/batch/cumulative graphs from time-sliced edges for temporal training.
+    Temporal KG training requires processing edges in chronological order with proper context windows.
+  interface:
+    inputs:
+    - batch_times (timestamps) - timestamps for edges in this batch, G (entire graph) - full DGLGraph
+      with each temporal edges
+    outputs:
+    - prior_G (edges strictly before batch window), batch_G (edges in batch window), cumul_G (each edges
+      up to batch end), batch_times
+  required_methods:
+  - name: collate_fn
+    description: 'Creates subgraph views for each training batch: prior graph for context, batch graph
+      for prediction targets, cumulative graph for evolving state'
+    evidence: DKG/utils/model_utils.py:7(collate_fn)
+  key_behaviors:
+  - behavior: Triple subgraph architecture
+    description: Prior graph provides historical context before the batch window; batch graph contains
+      the target edges to predict; cumulative graph tracks evolving entity state throughout the sequence
+    evidence: DKG/utils/model_utils.py:18-28(edge_subgraph)
+  - behavior: Orphan node exclusion
+    description: Batch graph excludes orphaned nodes (preserve_nodes=False) to reduce graph size for efficient
+      batch processing while maintaining structural connectivity
+    evidence: DKG/utils/model_utils.py:22(preserve_nodes=False)
+  - behavior: Degree normalization pre-computation
+    description: Pre-computes degree normalization for RGCN which is shared across each GNN layers, avoiding
+      redundant computation during forward passes
+    evidence: DKG/utils/model_utils.py:19(comp_deg_norm)
+  replaceable_points:
+  - name: batch_time_window
+    description: How many timestamps are grouped per training batch
+    options:
+    - name: multiple_timestamps
+      traits:
+      - DataLoader-based batching
+      - efficient GPU utilization
+      fit_for:
+      - Standard training scenarios
+      - balanced batch sizes
+      not_fit_for:
+      - Single event prediction
+      - fine-grained temporal modeling
+    - name: single_timestamp
+      traits:
+      - Event-by-event processing
+      - maximum temporal resolution
+      fit_for:
+      - Fine-grained temporal analysis
+      - event sequence modeling
+      not_fit_for:
+      - Large graphs
+      - computational efficiency
+    default: multiple_timestamps via DataLoader
+  design_decisions:
+  - 'Strict temporal ordering: prior_G < batch_G <= cumul_G ensures correct temporal semantics for prediction
+    (DKG/utils/model_utils.py:7-30)'
+  acceptance_hints:
+  - prior_G edges have strictly earlier timestamps than batch_G edges
+  - cumul_G contains each edges from prior_G and batch_G
+  - Graph attributes (num_relations, num_all_nodes, time_interval) are copied to each subgraph views
+- id: embedding_updater
+  name: Dynamic Embedding Updater
+  order: 3
+  responsibility: Updates entity and relation embeddings by processing batch graphs through structural
+    and temporal GNN-RNN layers. Captures both graph structure evolution and temporal dynamics in separate
+    embedding spaces.
+  interface:
+    inputs:
+    - prior_G, batch_G, cumul_G (subgraphs), cumul_dynamic_emb (previous state), static_emb (frozen),
+      dynamic_relation_emb, node_latest_event_time
+    outputs:
+    - MultiAspectEmbedding namedtuple with .structural and .temporal fields for entities and relations
+  required_methods:
+  - name: EmbeddingUpdater.forward
+    description: Main orchestrator that coordinates structural and temporal GNN layers plus relation RNN
+      to produce updated multi-aspect embeddings
+    evidence: DKG/model/embedding.py:22(EmbeddingUpdater)
+  - name: GraphStructuralRNNConv.forward
+    description: GNN layer (RGCN or KGTransformer) followed by RNN for capturing structural dynamics over
+      time
+    evidence: DKG/model/embedding.py:176(GraphStructuralRNNConv)
+  - name: GraphTemporalRNNConv.forward
+    description: GNN layer with inter-event time encoding for temporal dynamics, tracking when events
+      occur vs structural patterns of who connects
+    evidence: DKG/model/embedding.py:258(GraphTemporalRNNConv)
+  - name: RelationRNN.update
+    description: Updates relation embeddings by aggregating entity embeddings per relation type using
+      attention-weighted mean
+    evidence: DKG/model/embedding.py:372(RelationRNN)
+  - name: EventTimeHelper.compute_inter_event_times
+    description: Computes inter-event times between consecutive events for each entity, maintaining node_latest_event_time
+      tensor for temporal encoding
+    evidence: DKG/model/embedding.py:424(EventTimeHelper)
+  key_behaviors:
+  - behavior: Dual embedding architecture
+    description: Structural embeddings capture patterns of who connects to whom (static graph topology),
+      while temporal embeddings capture when events occur (temporal dynamics). These evolve differently
+      and require separate update mechanisms.
+    evidence: DKG/model/embedding.py:71-96(graph_structural_conv vs graph_temporal_conv)
+  - behavior: Bidirectional temporal tracking
+    description: node_latest_event_time tensor has shape [num_nodes, num_nodes+1, 2] where [...,0] tracks
+      events as recipient and [...,1] tracks events as sender. Entity dynamics differ based on whether
+      they initiated or received an event.
+    evidence: DKG/model/model.py:100-103(node_latest_event_time)
+  - behavior: Log transform normalization
+    description: Inter-event times are right-skewed; log transform makes distribution more Gaussian for
+      better neural network learning. This is assumed throughout the temporal modeling pipeline.
+    evidence: DKG/model/time_interval_transform.py:28-29(log_transform)
+  - behavior: Dynamic embeddings on CPU
+    description: Dynamic embeddings must stay on CPU except during batch forward passes. This is a memory
+      optimization invariant - large temporal graphs with many nodes would cause OOM if embeddings were
+      kept on GPU.
+    evidence: DKG/model/embedding.py:120(assert emb.device == torch.device('cpu'))
+  replaceable_points:
+  - name: gnn_architecture
+    description: Graph convolution layer type for message passing
+    options:
+    - name: KGTransformer
+      traits:
+      - Multi-head attention
+      - typed projections
+      - 100 basis for RGCN
+      fit_for:
+      - Typed knowledge graphs like FinDKG
+      - complex relational patterns
+      not_fit_for:
+      - Simple homogeneous graphs
+      - Memory-constrained environments
+    - name: RGCN
+      traits:
+      - Basis decomposition
+      - 50 bases for GDELT, 100 for others
+      fit_for:
+      - Standard knowledge graphs
+      - resource-limited settings
+      not_fit_for:
+      - Multi-entity typed graphs
+      - fine-grained relation modeling
+    - name: None (identity)
+      traits:
+      - No transformation
+      - passes through embeddings
+      fit_for:
+      - Ablation studies
+      - testing structural vs temporal contributions
+      not_fit_for:
+      - Production use
+      - any graph with structure
+    default: KGTransformer
+  - name: rnn_cell_type
+    description: Recurrent cell type for temporal dynamics
+    options:
+    - name: RNN
+      traits:
+      - Simple recurrent
+      - single gate
+      fit_for:
+      - Standard temporal modeling
+      - faster training
+      not_fit_for:
+      - Long-term dependencies
+      - complex temporal patterns
+    - name: GRU
+      traits:
+      - Gated recurrent
+      - better long-term memory
+      fit_for:
+      - Complex temporal dependencies
+      - improved gradient flow
+      not_fit_for:
+      - Simple sequences
+      - computational efficiency priority
+    default: RNN
+  - name: inter_event_time_mode
+    description: How to compute inter-event times between consecutive entity events
+    options:
+    - name: node2node_inter_event_times
+      traits:
+      - Pair-wise times
+      - sender-recipient specific
+      fit_for:
+      - Detailed temporal modeling
+      - entity-pair specific predictions
+      not_fit_for:
+      - Coarse temporal granularity
+      - simpler time modeling
+    - name: min_inter_event_times
+      traits:
+      - Minimum time to any event
+      - simpler aggregation
+      fit_for:
+      - Fast computation
+      - coarse temporal patterns
+      not_fit_for:
+      - Fine-grained pair-specific predictions
+    default: node2node_inter_event_times
+  design_decisions:
+  - Separate structural and temporal embeddings with different update mechanisms capture different aspects
+    of knowledge graph evolution (DKG/model/embedding.py:71-96)
+  - Bidirectional temporal encoding using [sender, recipient] pair structure is required by TPP model
+    and RelationRNN (DKG/model/embedding.py:357-359)
+  acceptance_hints:
+  - MultiAspectEmbedding namedtuple contains both .structural and .temporal fields
+  - Dynamic embeddings are on CPU after forward pass completion
+  - node_latest_event_time tensor has shape [num_nodes, num_nodes+1, 2]
+  - Log-transformed inter-event times are within expected numerical ranges
+- id: gnn_convolution
+  name: Graph Neural Network Convolution
+  order: 4
+  responsibility: Performs message passing on knowledge graphs with typed edges and nodes. Different relation
+    types require different message functions and attention patterns to capture heterogeneous graph structure.
+  interface:
+    inputs:
+    - DGLGraph, node_embeddings, node_types, edge_types, edge_norm (optional)
+    outputs:
+    - Updated node embeddings after graph convolution with type-aware transformations
+  required_methods:
+  - name: RGCN.forward
+    description: Relational Graph Convolutional Network using basis decomposition to share parameters
+      across relation types while maintaining type-specific transformations
+    evidence: DKG/model/gnn/rgcn.py:7(RGCN)
+  - name: KGTransformer.forward
+    description: Multi-layer Knowledge Graph Transformer with typed attention where each relation type
+      has separate key/query projections and priority scores
+    evidence: DKG/model/gnn/kgt.py:24(KGTransformer)
+  - name: GraphTransformer.layer
+    description: Single transformer layer with TypedLinear projections for nodes and edges, implementing
+      relation-aware attention with learnable skip weights
+    evidence: DKG/model/gnn/kgt.py:95(GraphTransformer)
+  key_behaviors:
+  - behavior: Type-specific linear projections
+    description: TypedLinear applies different linear transformations per node/edge type, allowing different
+      entity types (e.g., company vs event) to have different semantic role representations
+    evidence: DKG/model/gnn/kgt.py:171-173(TypedLinear)
+  - behavior: Relation-aware attention
+    description: Attention mechanism uses relation_pri (priority), separate K/Q projections per relation
+      (relation_att), and relation-specific message functions (relation_msg) to modulate how much attention
+      to pay to incoming messages
+    evidence: DKG/model/gnn/kgt.py:181-195(relation_pri, relation_att, relation_msg)
+  - behavior: Learnable skip connections
+    description: Residual connections with learnable skip weight per node type allow the model to learn
+      when to use transformed vs original features, adaptive to each entity type
+    evidence: DKG/model/gnn/kgt.py:196,272-276(skip)
+  - behavior: Time decay factor
+    description: 'Edge normalization in temporal convolution applies time decay: longer time since last
+      interaction means weaker influence on current embedding'
+    evidence: DKG/model/embedding.py:319(edge_norm)
+  replaceable_points:
+  - name: gnn_layer
+    description: Message passing mechanism for node feature aggregation
+    options:
+    - name: KGTransformer (TypedLinear attention)
+      traits:
+      - Multi-head typed attention
+      - learnable skip weights
+      - SiLU activation
+      fit_for:
+      - FinDKG and multi-entity graphs
+      - complex relational patterns
+      not_fit_for:
+      - Homogeneous graphs
+      - simple structure
+    - name: RelGraphConv (RGCN)
+      traits:
+      - Basis decomposition
+      - efficient for many relations
+      fit_for:
+      - Standard knowledge graphs
+      - memory efficiency
+      not_fit_for:
+      - Typed entity graphs
+      - fine-grained type differences
+    default: KGTransformer
+  design_decisions:
+  - SiLU (Swish) activation instead of ReLU provides smooth gradients and often outperforms on transformer
+    architectures (DKG/model/gnn/kgt.py:47)
+  acceptance_hints:
+  - Output embeddings maintain the same dimension as input (200 by default)
+  - Type-specific projections are applied correctly for FinDKG's 12 node types
+  - Attention weights sum to 1.0 across valid edges
+  - Skip weights are in valid range [0, 1] after sigmoid
+- id: embedding_combination
+  name: Static-Dynamic Embedding Combination
+  order: 5
+  responsibility: Combines structural and temporal embeddings into unified representations for prediction.
+    Both static patterns and temporal dynamics contribute to link prediction quality.
+  interface:
+    inputs:
+    - static_emb (structural), dynamic_emb (temporal), DGLGraph (optional for second-pass convolution)
+    outputs:
+    - Combined embedding of dimension static_emb_dim + dynamic_emb_dim (or variants based on mode)
+  required_methods:
+  - name: Combiner.forward
+    description: Orchestrates graph convolution and static-dynamic combination, optionally applying a
+      second GNN pass after combination to refine representations
+    evidence: DKG/model/model.py:244(Combiner)
+  - name: StaticDynamicCombiner.combine
+    description: 'Implements different combination modes: concatenation, static-only selection, or dynamic-only
+      selection for different inference scenarios'
+    evidence: DKG/model/model.py:293(StaticDynamicCombiner)
+  - name: GraphReadout.readout
+    description: Aggregates node embeddings into graph-level representation using weighted sum with learnable
+      gating for soft node selection
+    evidence: DKG/model/model.py:328(GraphReadout)
+  key_behaviors:
+  - behavior: Configurable combination modes
+    description: Supports concat (both), static_only, and dynamic_only modes to balance between static
+      structural patterns and dynamic temporal information based on dataset characteristics
+    evidence: DKG/model/model.py:300-313(mode)
+  - behavior: Optional second-pass convolution
+    description: After initial combination, an optional graph convolution pass can refine representations
+      using graph structure on the combined embeddings
+    evidence: DKG/model/model.py:253-264(graph_conv)
+  - behavior: Weighted sum with gating
+    description: Graph readout uses learnable gating to softly select which nodes contribute most to the
+      graph-level embedding, adaptive to the prediction task
+    evidence: DKG/model/model.py:346-352(weighted_sum)
+  replaceable_points:
+  - name: combination_mode
+    description: How to merge static and dynamic embeddings
+    options:
+    - name: concat
+      traits:
+      - Preserves both aspects
+      - larger embedding dimension
+      fit_for:
+      - Standard use
+      - maximum information retention
+      not_fit_for:
+      - Memory-constrained
+      - fast inference
+    - name: static_only
+      traits:
+      - Fixed embeddings
+      - no temporal evolution
+      fit_for:
+      - Ablation studies
+      - static graph comparison
+      not_fit_for:
+      - Temporal prediction tasks
+    - name: dynamic_only
+      traits:
+      - Evolving embeddings
+      - temporal context only
+      fit_for:
+      - Time-only evaluation
+      - simpler model
+      not_fit_for:
+      - Link prediction with structural context
+    default: concat
+  - name: graph_readout_operation
+    description: Aggregation function for combining node embeddings into graph-level representation
+    options:
+    - name: max
+      traits:
+      - Element-wise max
+      - captures strongest signals
+      fit_for:
+      - Default readout
+      - robust to outliers
+      not_fit_for:
+      - Need for average behavior
+    - name: min
+      traits:
+      - Element-wise min
+      - captures weakest signals
+      fit_for:
+      - Anomaly detection
+      - rare pattern identification
+      not_fit_for:
+      - General purpose
+    - name: mean
+      traits:
+      - Average pooling
+      - balanced aggregation
+      fit_for:
+      - Uniform node contributions
+      not_fit_for:
+      - Weighted importance needed
+    - name: weighted_sum
+      traits:
+      - Learnable weights
+      - adaptive aggregation
+      fit_for:
+      - Task-specific optimization
+      - complex node importance
+      not_fit_for:
+      - Simplicity priority
+      - quick prototyping
+    default: max
+  design_decisions:
+  - Multi-head attention uses 8 heads by default for parallel capture of different relation patterns (DKG/model/model.py:54)
+  acceptance_hints:
+  - Combined embedding dimension matches expected size based on combination mode
+  - Weighted sum weights are normalized and sum to approximately 1.0
+  - Second-pass convolution produces stable gradients
+- id: link_prediction
+  name: Temporal Link Prediction
+  order: 6
+  responsibility: Predicts links (head, relation, tail) in the knowledge graph using learned embeddings.
+    Core task for knowledge graph completion over time, treating it as multi-class classification.
+  interface:
+    inputs:
+    - DGLGraph, combined_emb, static_emb, dynamic_emb, dynamic_relation_emb, edge_ids
+    outputs:
+    - Log probabilities for head prediction (num_edges, num_nodes), relation prediction (num_edges, num_relations),
+      tail prediction (num_edges, num_nodes)
+  required_methods:
+  - name: EdgeModel.forward
+    description: Dynamic edge prediction using combined embeddings and relation embeddings to compute
+      log probabilities for head, relation, and tail entities
+    evidence: DKG/model/model.py:371(EdgeModel)
+  - name: StaticEdgeModel.forward
+    description: Static-only edge prediction baseline that ignores temporal dynamics for comparison
+    evidence: DKG/model/model.py:468(StaticEdgeModel)
+  key_behaviors:
+  - behavior: Decomposed prediction
+    description: 'Treats knowledge graph completion as three separate classification subtasks: log_prob_head,
+      log_prob_rel, log_prob_tail. This enables analysis of which aspect of prediction fails and targeted
+      improvement.'
+    evidence: DKG/model/model.py:408-435
+  - behavior: Weighted loss combination
+    description: Tail prediction (weight=1.0) is most important as primary link completion target; relation
+      prediction (weight=0.2) provides intermediate signal; head prediction (weight=0.1) is easiest due
+      to symmetry so lower weight
+    evidence: DKG/model/model.py:459(log_prob)
+  - behavior: Graph-level context integration
+    description: Graph-level embedding from readout is concatenated with edge embeddings to incorporate
+      global context for disambiguating local patterns
+    evidence: DKG/model/model.py:437-438(graph_emb)
+  replaceable_points:
+  - name: edge_model_type
+    description: Whether to use dynamic or static edge prediction model
+    options:
+    - name: EdgeModel (dynamic)
+      traits:
+      - Uses combined embeddings
+      - temporal context
+      fit_for:
+      - Standard temporal link prediction
+      - FinDKG evaluation
+      not_fit_for:
+      - Static graph comparison baseline
+    - name: StaticEdgeModel
+      traits:
+      - Static embeddings only
+      - no temporal evolution
+      fit_for:
+      - Baseline comparison
+      - non-temporal graphs
+      not_fit_for:
+      - Temporal knowledge graphs
+    default: EdgeModel
+  design_decisions:
+  - Cross-entropy loss for multi-class entity/relation classification frames link prediction as classification
+    over each possible entities/relations (DKG/model/model.py:406)
+  acceptance_hints:
+  - Log probabilities sum to valid values (log of probability mass)
+  - Tail prediction has highest weight and dominates the loss
+  - Graph context embedding is correctly sized and concatenated
+  - Loss weights tail=1.0, rel=0.2, head=0.1 are applied as expected
+- id: temporal_prediction
+  name: Inter-Event Time Prediction (TPP)
+  order: 7
+  responsibility: Predicts when the next event will occur given current graph state. Temporal KGs need
+    to model event timing for complete temporal reasoning beyond just what links form.
+  interface:
+    inputs:
+    - DGLGraph, temporal_dynamic_emb, temporal_static_emb, relation_emb, node_latest_event_time
+    outputs:
+    - log_prob_density (for evaluation), log_prob_interval (for training), expected_event_time
+  required_methods:
+  - name: InterEventTimeModel.forward
+    description: Wrapper that combines embeddings into context vector and delegates to TPP model for time
+      prediction
+    evidence: DKG/model/model.py:540(InterEventTimeModel)
+  - name: LogNormMixTPP.forward
+    description: Temporal Point Process using LogNormal mixture distribution to model inter-event time
+      probability
+    evidence: DKG/model/tpp/log_norm_mix_tpp.py:11(LogNormMixTPP)
+  - name: LogNormalMixtureDistribution.sample/log_prob
+    description: PyTorch distribution implementing mixture of log-normals with affine transforms for flexible
+      temporal distribution modeling
+    evidence: DKG/model/tpp/log_norm_mix_tpp.py:200(LogNormalMixtureDistribution)
+  key_behaviors:
+  - behavior: LogNormal mixture distribution
+    description: Inter-event times are positive and right-skewed; log-normal distribution captures this
+      well. Mixture of 128 components provides high capacity for modeling complex temporal patterns across
+      different relation types.
+    evidence: DKG/model/tpp/log_norm_mix_tpp.py:54-72
+  - behavior: Pair-specific context
+    description: Context vector for TPP is constructed from [sender_emb, recipient_emb, rel_emb, dyn_rel_emb],
+      acknowledging that event timing depends on who interacts with whom and the nature of their relationship
+    evidence: DKG/model/tpp/log_norm_mix_tpp.py:123-124(context)
+  - behavior: Interval-based probability training
+    description: Training uses CDF difference for interval probability (P(t < event <= t+dt)) which is
+      more robust than point probability, accounting for discrete time intervals in the data
+    evidence: DKG/model/tpp/log_norm_mix_tpp.py:160-166(prob_interval)
+  - behavior: Separate density and interval methods
+    description: log_prob_density used for time prediction evaluation (gradient-based); log_prob_interval
+      used for training loss (more stable with discrete time bins)
+    evidence: DKG/model/model.py:557-567
+  replaceable_points:
+  - name: tpp_distribution_family
+    description: Probability distribution family for modeling inter-event times
+    options:
+    - name: LogNormMixTPP
+      traits:
+      - Log-normal mixture
+      - 128 components
+      - affine transforms
+      fit_for:
+      - Standard temporal prediction
+      - right-skewed time distributions
+      not_fit_for:
+      - Multi-modal time distributions
+      - non-positive times
+    default: LogNormMixTPP
+  - name: inter_event_time_mode
+    description: How to aggregate sender/recipient times for context
+    options:
+    - name: node2node_inter_event_times
+      traits:
+      - Pair-specific times
+      - fine-grained
+      fit_for:
+      - Entity-pair specific predictions
+      - detailed temporal modeling
+      not_fit_for:
+      - GDELT dataset
+      - computational efficiency
+    - name: min_inter_event_times
+      traits:
+      - Minimum time aggregation
+      - coarse
+      fit_for:
+      - Fast computation
+      - simple temporal patterns
+      not_fit_for:
+      - Fine-grained predictions
+    default: node2node_inter_event_times
+  design_decisions:
+  - LogNormal mixture with 128 components provides high capacity for modeling complex temporal patterns
+    (DKG/model/model.py:51)
+  acceptance_hints:
+  - Inter-event times are positive and properly log-transformed
+  - Mixture components sum to valid probability distributions
+  - Expected event time is in valid time range
+  - Separate methods produce consistent density and interval probabilities
+- id: training_pipeline
+  name: Training Pipeline
+  order: 8
+  responsibility: Orchestrates temporal sequential training with truncated BPTT, early stopping, and checkpointing.
+    RNNs over long temporal sequences require truncated backpropagation to prevent vanishing gradients.
+  interface:
+    inputs:
+    - args (hyperparameters), data_loaders (train/val/test)
+    outputs:
+    - Trained model checkpoint with best validation performance, updated model state
+  required_methods:
+  - name: main
+    description: Main training loop that iterates over epochs, calls forward_graphs for training batches,
+      evaluates on validation set, and implements early stopping
+    evidence: DKG/train.py:29(main)
+  - name: compute_loss
+    description: Computes edge prediction loss and time prediction loss for a batch, following the predict-then-update
+      contract
+    evidence: DKG/train.py:368(compute_loss)
+  - name: forward_graphs
+    description: Forward-only pass for validation that updates embedding state without computing losses,
+      used for pre-populating embeddings before evaluation
+    evidence: DKG/train.py:302(forward_graphs)
+  - name: EarlyStopping.check
+    description: Tracks best checkpoint based on validation metric and implements patience-based early
+      stopping
+    evidence: DKG/utils/train_utils.py:10(EarlyStopping)
+  key_behaviors:
+  - behavior: Predict-then-update execution order
+    description: compute_loss MUST be called BEFORE embedding_updater.forward for each batch. Reversing
+      this order causes data leakage - the model would predict using embeddings that already incorporate
+      batch information.
+    evidence: DKG/train.py:184-221
+  - behavior: Truncated BPTT
+    description: Dynamic embeddings are detached (detach_()) every rnn_truncate_every batches to cut gradient
+      flow between truncations, preventing vanishing gradients over long sequences while keeping memory
+      manageable
+    evidence: DKG/train.py:197-212(emb.detach_() at line 212)
+  - behavior: Dual optimizer architecture
+    description: edge_optimizer and time_optimizer track parameters separately with independent learning
+      rates, allowing independent tuning of link prediction vs time prediction
+    evidence: DKG/train.py:131-132(two AdamW optimizers)
+  - behavior: Equal loss aggregation
+    description: Total loss sums each loss components equally (sum(dict.values())), meaning edge and time
+      losses have equal weight in total optimization objective
+    evidence: DKG/train.py:191(batch_train_loss += sum(batch_train_loss_dict.values()))
+  replaceable_points:
+  - name: optimize_target
+    description: Which loss components to optimize
+    options:
+    - name: both
+      traits:
+      - Edge and time loss
+      - joint optimization
+      fit_for:
+      - Full model training
+      - temporal link and time prediction
+      not_fit_for:
+      - Link prediction only
+      - time prediction only
+    - name: edge
+      traits:
+      - Link prediction only
+      - faster training
+      fit_for:
+      - Link prediction ablation
+      - non-temporal graphs
+      not_fit_for:
+      - Temporal prediction tasks
+      - complete evaluation
+    - name: time
+      traits:
+      - Time prediction only
+      - isolated temporal modeling
+      fit_for:
+      - Temporal prediction ablation
+      - time-only evaluation
+      not_fit_for:
+      - Link prediction tasks
+      - complete evaluation
+    default: both
+  - name: early_stop_criterion
+    description: Metric to track for early stopping decision
+    options:
+    - name: MRR
+      traits:
+      - Mean Reciprocal Rank
+      - comprehensive ranking metric
+      fit_for:
+      - Standard link prediction
+      - full model evaluation
+      not_fit_for:
+      - Time-only models
+      - loss-focused training
+    - name: loss
+      traits:
+      - Training loss
+      - directly optimized
+      fit_for:
+      - Time-only models
+      - quick convergence
+      not_fit_for:
+      - Ranking-based evaluation
+      - link prediction focus
+    - name: MAE
+      traits:
+      - Mean Absolute Error
+      - regression metric
+      fit_for:
+      - Time prediction focus
+      - regression evaluation
+      not_fit_for:
+      - Link prediction evaluation
+      - classification focus
+    default: MRR
+  design_decisions:
+  - Truncated BPTT every 100 batches prevents vanishing gradients while maintaining manageable memory
+    (DKG/train.py:197)
+  - AdamW optimizer with weight_decay=0.00001 provides light regularization to prevent overfitting on
+    small temporal KG datasets (DKG/train.py:131)
+  acceptance_hints:
+  - Loss values decrease over training epochs
+  - Early stopping triggers after patience epochs without improvement
+  - Best checkpoint is saved with highest validation MRR
+  - Truncated BPTT produces stable gradients without exploding values
+- id: evaluation
+  name: Evaluation & Metrics
+  order: 9
+  responsibility: Computes link prediction and time prediction metrics for validation/test. Requires proper
+    temporal handling and memory management for full evaluation against each entities.
+  interface:
+    inputs:
+    - model, data_loader, entire_graph, embeddings, args, phase (train/val/test)
+    outputs:
+    - eval_dict with MRR, REC@k, MAE, RMSE; updated embeddings for next batch
+  required_methods:
+  - name: evaluate
+    description: Main evaluation function that orchestrates loss computation, link prediction evaluation,
+      and time prediction evaluation phases
+    evidence: DKG/eval.py:16(evaluate)
+  - name: eval_link_prediction
+    description: Computes edge rankings by scoring true tail against ALL possible entities, with optional
+      time score combination for joint evaluation
+    evidence: DKG/eval.py:155(eval_link_prediction)
+  - name: EdgeEvaluator.evaluate_edges
+    description: Batched edge evaluation with memory-aware chunking using MAX_EDGES limit to handle CPU/GPU
+      memory constraints
+    evidence: DKG/eval.py:442(EdgeEvaluator)
+  - name: RankingMetric.compute
+    description: Computes MRR (Mean Reciprocal Rank) and Recall@k (percentage of correct entities in top-k
+      predictions)
+    evidence: DKG/utils/eval_utils.py:1(RankingMetric)
+  - name: RegressionMetric.compute
+    description: Computes MAE (Mean Absolute Error) and RMSE (Root Mean Squared Error) for time prediction
+      evaluation
+    evidence: DKG/utils/eval_utils.py:1(RegressionMetric)
+  key_behaviors:
+  - behavior: Full link prediction evaluation
+    description: Ranks true tail against ALL possible entities (entire_G.num_nodes()) rather than sampled
+      negatives. This is the gold standard for knowledge graph completion evaluation.
+    evidence: DKG/eval.py:191(entire_G.num_nodes())
+  - behavior: Weighted score combination
+    description: During joint evaluation, entity and time scores can be combined with learned weights
+      to explore optimal trade-off between link and time prediction signals
+    evidence: DKG/eval.py:254-256(pred)
+  - behavior: Auto-discovered loss weights
+    description: Optimal edge/time weight combination is found via grid search on validation set without
+      manual tuning, adapting to dataset characteristics
+    evidence: DKG/eval.py:131-136(loss_weights)
+  - behavior: Memory-aware batching
+    description: Full matrix computation is split into chunks using MAX_EDGES limit to respect CPU/GPU
+      memory constraints during evaluation
+    evidence: DKG/eval.py:454-458(MAX_EDGES)
+  replaceable_points:
+  - name: evaluation_mode
+    description: What aspects to evaluate
+    options:
+    - name: both
+      traits:
+      - Link and time prediction
+      - full evaluation
+      fit_for:
+      - Complete model evaluation
+      - publication results
+      not_fit_for:
+      - Quick iteration
+      - single-aspect debugging
+    - name: edge
+      traits:
+      - Link prediction only
+      - default mode
+      fit_for:
+      - Link prediction focus
+      - fast evaluation
+      not_fit_for:
+      - Time prediction tasks
+      - complete analysis
+    - name: time
+      traits:
+      - Time prediction only
+      - temporal focus
+      fit_for:
+      - Time prediction ablation
+      - temporal analysis
+      not_fit_for:
+      - Link prediction evaluation
+    default: edge
+  design_decisions:
+  - eval='edge' by default means only link prediction is evaluated; must set eval='both' to enable joint
+    evaluation (DKG/model/model.py:38)
+  acceptance_hints:
+  - MRR and Recall@k are computed against full entity set (not sampled)
+  - Time prediction MAE/RMSE are in expected time unit ranges
+  - Memory usage stays within GPU/CPU limits during batched evaluation
+  - Metrics are consistent across multiple evaluation runs
+data_flow:
+- from_stage: data_loading
+  to_stage: collation
+  data: DGLGraph with edges sorted by time, train/val/test masks, node types, time_interval attribute
+- from_stage: collation
+  to_stage: embedding_updater
+  data: prior_G (historical context), batch_G (batch edges), cumul_G (cumulative state), batch_times,
+    degree normalization
+- from_stage: embedding_updater
+  to_stage: embedding_combination
+  data: MultiAspectEmbedding containing .structural and .temporal tensors for entities and relations
+- from_stage: embedding_combination
+  to_stage: link_prediction
+  data: Combined embeddings, static embeddings, dynamic embeddings, dynamic_relation_emb, graph_emb
+- from_stage: embedding_combination
+  to_stage: temporal_prediction
+  data: Temporally-combined embeddings (temporal_dynamic_emb, temporal_static_emb, relation_emb) for TPP
+    context
+- from_stage: link_prediction
+  to_stage: training_pipeline
+  data: Edge log-likelihood loss (sum of head, rel, tail losses with weights)
+- from_stage: temporal_prediction
+  to_stage: training_pipeline
+  data: Inter-event time log-likelihood loss (log_prob_interval)
+- from_stage: training_pipeline
+  to_stage: evaluation
+  data: Trained model state with optimized parameters and embeddings after training
+- from_stage: evaluation
+  to_stage: training_pipeline
+  data: Validation metrics (MRR, loss, MAE) for early stopping decision and checkpoint selection
+global_contracts:
+- contract: Every DGLGraphs must have num_relations, num_all_nodes, and time_interval attributes set and
+    preserved across subgraph operations
+  evidence: DKG/utils/model_utils.py:14-16(copy_attr)
+- contract: Dynamic embeddings must be on CPU except during batch forward passes - this is a memory optimization
+    invariant for large temporal graphs
+  evidence: DKG/model/embedding.py:120(assert emb.device == torch.device('cpu'))
+- contract: node_latest_event_time tensor shape is [num_nodes, num_nodes+1, 2] where [...,0] tracks events
+    as recipient, [...,1] tracks events as sender, and [...,-1] tracks global latest time
+  evidence: DKG/model/model.py:100-103
+- contract: 'MultiAspectEmbedding namedtuple has required fields: .structural and .temporal (both must
+    be present)'
+  evidence: DKG/model/model.py:22
+- contract: Time values in edge data must be float32; edge masks must be boolean tensors
+  evidence: DKG/data.py:56(G.edata['time']), DKG/data.py:86(mask dtype)
+- contract: 'Temporal ordering: prior_G < batch_G <= cumul_G for each subgraph operations - evaluation
+    relies on this for temporal correctness'
+  evidence: DKG/utils/model_utils.py:7-30(collate_fn), DKG/eval.py:182-184
+- contract: 'Predict-then-update: compute_loss must be called before embedding_updater.forward for each
+    batch - reversing causes data leakage'
+  evidence: DKG/train.py:184-221
+- contract: Log-transformed inter-event times are assumed throughout temporal modeling - changing to linear
+    would break expected_event_time reverse_transform
+  evidence: DKG/model/time_interval_transform.py:28-29, DKG/model/tpp/log_norm_mix_tpp.py:140
+- contract: Edge loss weights tail=1.0, rel=0.2, head=0.1 are hardcoded in EdgeModel.forward - changing
+    requires code modification
+  evidence: DKG/model/model.py:459(log_prob)
+business_decisions:
+- id: BD-001
+  type: B/RC
+  content: Time-based train/val/test split using edge timestamps
+  rationale: Temporal knowledge graphs require chronological splitting to prevent data leakage from future
+    events. Using edge timestamps ensures the model is evaluated on its ability to predict future interactions
+    based solely on historical data, which is essential for realistic performance estimation in production
+    deployment where only past information is available.
+  evidence: DKG/data.py:60-67(G.train_times)
+  stage: data_loading
+  alternative_considered: Random splitting would cause data leakage as future edges would appear in training
+    set
+  _evidence_issues:
+  - 'FN_NOT_FOUND: G.train_times in DKG/data.py'
+- id: BD-002
+  type: B
+  content: Separate node_type handling for FinDKG (12 types) vs others (1 type)
+  rationale: FinDKG is a multi-entity knowledge graph containing companies, events, metrics, and other
+    distinct entity types that require type-aware modeling. The heterogeneous nature of financial knowledge
+    graphs means different entity types carry different semantic roles and structural patterns that must
+    be captured separately for accurate link prediction.
+  evidence: DKG/data.py:45-54(G.num_node_types)
+  stage: data_loading
+  alternative_considered: Treating each nodes uniformly would lose type semantics and reduce prediction
+    accuracy
+  _evidence_issues:
+  - 'FN_NOT_FOUND: G.num_node_types in DKG/data.py'
+- id: BD-003
+  type: BA/M
+  content: Store time_interval as minimum diff between unique timestamps
+  rationale: Time intervals are used as normalization factors for temporal encoding in inter-event time
+    calculations. Computing the minimum difference between unique timestamps provides the fundamental
+    time unit that scales temporal features to a consistent range, preventing numerical instability in
+    neural network training and ensuring temporal features remain comparable across datasets with different
+    time granularities.
+  evidence: DKG/data.py:57-58(G.time_interval)
+  stage: data_loading
+  alternative_considered: Fixed time unit would not adapt to dataset-specific temporal granularity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: G.time_interval in DKG/data.py'
+- id: BD-004
+  type: B
+  content: Separate structural and temporal embeddings with different update mechanisms
+  rationale: Structural patterns representing who connects to whom evolve fundamentally differently than
+    temporal patterns representing when events occur. Structural relationships tend to be more persistent
+    (company ownership, organizational hierarchies) while temporal patterns capture event dynamics (trading
+    activity, news impacts). Separating these allows each embedding space to capture its unique dynamics
+    without interference.
+  evidence: DKG/model/embedding.py:176(GraphStructuralRNNConv), DKG/model/embedding.py:258(GraphTemporalRNNConv)
+  stage: embedding_updater
+  alternative_considered: Joint embeddings would force competing update dynamics and reduce representational
+    capacity
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: GraphStructuralRNNConv), DKG/model/embedding.py:258(GraphTemporalRNNConv in DKG/model/embedding.py'
+- id: BD-005
+  type: BA
+  content: Store node_latest_event_time as [num_nodes, num_nodes+1, 2] tensor for bidirectional tracking
+  rationale: The bidirectional tensor structure tracks entity dynamics separately for events as recipient
+    ([...,0]) versus events as sender ([...,1]). This asymmetry captures the fundamental difference between
+    receiving information versus initiating actions. The extra column handles global latest time for entities
+    without outgoing or incoming edges, ensuring each temporal features remain well-defined regardless
+    of edge direction patterns.
+  evidence: DKG/model/model.py:100-103(node_latest_event_time)
+  stage: embedding_updater
+  alternative_considered: Scalar per-node would lose sender/recipient asymmetry critical for financial
+    event modeling
+  _evidence_issues:
+  - 'FN_NOT_FOUND: node_latest_event_time in DKG/model/model.py'
+- id: BD-006
+  type: B
+  content: Bidirectional temporal encoding (sender/recipient dynamics)
+  rationale: Entity dynamics differ based on whether the entity initiated or received an event. In financial
+    KGs, a company receiving negative news experiences different temporal dynamics than one initiating
+    a merger announcement. Bidirectional encoding captures these asymmetric causal patterns, allowing
+    the model to learn that information flow direction significantly impacts subsequent entity behavior
+    and link formation probability.
+  evidence: DKG/model/embedding.py:357-368(updated_temporal_dynamic)
+  stage: embedding_updater
+  alternative_considered: Unidirectional encoding would conflate sender and recipient dynamics, losing
+    critical causal information
+  _evidence_issues:
+  - 'FN_NOT_FOUND: updated_temporal_dynamic in DKG/model/embedding.py'
+- id: BD-007
+  type: B
+  content: Log transform of time intervals for normalization
+  rationale: Time intervals in event sequences are right-skewed with heavy tails (many short intervals
+    and few very long ones). The log transform makes this distribution more Gaussian, which is crucial
+    for neural network learning since gradients flow better through normalized distributions. Without
+    this transform, the network would struggle with the wide range of interval values and the concentration
+    of small values near zero.
+  evidence: DKG/model/time_interval_transform.py:28-29(log_transform)
+  stage: embedding_updater
+  alternative_considered: Raw intervals would cause gradient issues; min-max scaling would fail on outlier
+    intervals
+  _evidence_issues:
+  - 'FN_NOT_FOUND: log_transform in DKG/model/time_interval_transform.py'
+- id: BD-008
+  type: B
+  content: TypedLinear for node/edge type-specific linear projections in KGTransformer
+  rationale: Different entity types in FinDKG (companies, events, metrics, executives) have fundamentally
+    different semantic roles and feature distributions that require type-specific linear transformations
+    before aggregation. A company embedding and an event embedding operate in different conceptual spaces,
+    so applying uniform transformations would blur type-specific semantics and reduce the model's ability
+    to learn type-appropriate representations.
+  evidence: DKG/model/gnn/kgt.py:171-173(TypedLinear)
+  stage: gnn_convolution
+  alternative_considered: Shared linear projections would conflate type-specific semantics and reduce
+    representation quality
+  _evidence_issues:
+  - 'FN_NOT_FOUND: TypedLinear in DKG/model/gnn/kgt.py'
+  vague_rationale: true
+- id: BD-009
+  type: B
+  content: Relation-aware attention with priority and separate K/Q projections per relation
+  rationale: Relations modulate how much attention to pay to incoming messages during graph convolution.
+    In financial KGs, a 'acquires' relation carries different semantic weight than 'mentions', requiring
+    relation-specific query/key projections to compute appropriate attention weights. This allows the
+    model to learn that certain relation types should dominate message aggregation while others should
+    be discounted.
+  evidence: DKG/model/gnn/kgt.py:24(KGTransformer.__init__)
+  stage: gnn_convolution
+  alternative_considered: Relation-agnostic attention would treat each edges equivalently, losing critical
+    relational semantics
+  vague_rationale: true
+- id: BD-010
+  type: BA
+  content: SiLU (Swish) activation instead of ReLU
+  rationale: SiLU (Sigmoid Linear Unit, also known as Swish) has smooth gradients and self-gating properties
+    that often outperform ReLU on transformer-style architectures. Unlike ReLU which has zero gradients
+    for negative inputs, SiLU maintains gradient flow for each inputs, enabling better optimization dynamics.
+    The non-monotonic nature of SiLU allows more complex input-dependent transformations beneficial for
+    capturing intricate KG patterns.
+  evidence: DKG/model/gnn/kgt.py:47(SiLU)
+  stage: gnn_convolution
+  alternative_considered: ReLU would cause dead neurons for negative inputs; tanh may saturate; GELU is
+    computationally heavier
+  _evidence_issues:
+  - 'FN_NOT_FOUND: SiLU in DKG/model/gnn/kgt.py'
+- id: BD-011
+  type: BA/DK
+  content: Residual connection with learnable skip weight per node type
+  rationale: Learnable skip weights per node type allow the model to learn when to use transformed versus
+    original features for each entity type. Some node types (like metrics) may benefit from heavy transformation
+    while others (like events) may need to preserve more original information. This adaptive skipping
+    prevents gradient degradation in deep networks while maintaining type-specific representational strategies.
+  evidence: DKG/model/gnn/kgt.py:196,272-276(skip)
+  stage: gnn_convolution
+  alternative_considered: Fixed skip connections would not adapt to type-specific needs; no skip would
+    risk gradient issues
+  _evidence_issues:
+  - 'FN_NOT_FOUND: skip in DKG/model/gnn/kgt.py'
+- id: BD-012
+  type: B
+  content: Edge normalization (time decay factor) in temporal convolution
+  rationale: Longer time since last interaction indicates weaker influence in temporal graph convolutions.
+    Financial relationships exhibit temporal decay where recent events are more predictive than distant
+    ones. The edge normalization time decay factor ensures that stale information contributes proportionally
+    less to entity state updates, allowing the model to focus on recent temporal dynamics while still
+    considering historical context.
+  evidence: DKG/model/embedding.py:319(edge_norm)
+  stage: gnn_convolution
+  alternative_considered: Uniform edge weights would treat stale and recent interactions equally, reducing
+    temporal sensitivity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: edge_norm in DKG/model/embedding.py'
+  vague_rationale: true
+- id: BD-013
+  type: M
+  content: 'Configurable combination modes: concat, static_only, dynamic_only'
+  rationale: Different datasets may benefit from different tradeoffs between static and dynamic information
+    based on their temporal characteristics. Some datasets may have stable structural patterns requiring
+    heavy static embedding usage while others may have rapidly evolving dynamics requiring emphasis on
+    dynamic embeddings. The configurable modes enable optimal strategy selection without architectural
+    changes and support ablation studies.
+  evidence: DKG/model/model.py:300-313(mode)
+  stage: embedding_combination
+  alternative_considered: Fixed combination would not adapt to varying dataset characteristics
+  _evidence_issues:
+  - 'FN_NOT_FOUND: mode in DKG/model/model.py'
+- id: BD-014
+  type: BA
+  content: Optional graph convolution on combined embeddings
+  rationale: A second GNN pass after combining static and dynamic embeddings can refine entity representations
+    by leveraging graph structure on the enriched representations. This post-combination convolution captures
+    interactions between static structural patterns and dynamic temporal patterns that may not be fully
+    expressed in either embedding space alone, improving representational quality at the cost of additional
+    computation.
+  evidence: DKG/model/model.py:253-264(graph_conv)
+  stage: embedding_combination
+  alternative_considered: Skipping post-combination convolution would miss structure-pattern interactions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: graph_conv in DKG/model/model.py'
+- id: BD-015
+  type: BA/M
+  content: Weighted sum readout with learnable gating
+  rationale: Learnable gating for weighted sum readout allows soft selection of which nodes contribute
+    most to graph-level embedding generation. Different prediction tasks may require different node importance
+    distributions, and the gating mechanism enables the model to learn task-appropriate aggregation strategies
+    without manual feature engineering.
+  evidence: DKG/model/model.py:346-352(weighted_sum)
+  stage: embedding_combination
+  alternative_considered: Uniform weighting would treat each nodes equally; attention pooling adds complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: weighted_sum in DKG/model/model.py'
+  vague_rationale: true
+- id: BD-016
+  type: BA/M
+  content: Multi-head (8 by default) attention in KGTransformer
+  rationale: Multi-head attention captures different relation patterns in parallel, allowing each head
+    to specialize in distinct aspects of entity interaction. With 8 heads, the model can simultaneously
+    learn different types of relationships (temporal, semantic, structural) without interference, improving
+    representation quality and providing interpretable attention patterns that reveal diverse interaction
+    mechanisms.
+  evidence: DKG/model/model.py:54(num_attn_heads=8)
+  stage: embedding_combination
+  alternative_considered: Single-head would force competing patterns; too many heads increases computation
+    without benefit
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: num_attn_heads=8 in DKG/model/model.py'
+- id: BD-017
+  type: B
+  content: 'Decomposed prediction: separate log_prob_head, log_prob_rel, log_prob_tail'
+  rationale: Treating knowledge graph completion as three separate subtasks (head, relation, tail prediction)
+    enables granular analysis of which aspect fails during prediction. This decomposition is essential
+    for understanding model weaknesses, debugging prediction errors, and providing actionable insights
+    for financial analysts who need to know which component of an interaction is most uncertain.
+  evidence: DKG/model/model.py:408-435(module)
+  stage: link_prediction
+  alternative_considered: Joint prediction would hide which component fails; less actionable for analysts
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in DKG/model/model.py'
+- id: BD-018
+  type: B/RC
+  content: 'Weighted combination of prediction losses: tail=1.0, rel=0.2, head=0.1'
+  rationale: Tail prediction is most important for practical applications as it determines what entities
+    will interact with given context. Head prediction is easiest due to symmetry (predicting who sent
+    a message is similar to predicting recipients), so lower weight reduces noise from this simpler subtask.
+    Relation prediction sits in between as a useful but secondary signal for understanding interaction
+    types.
+  evidence: DKG/model/model.py:459(log_prob)
+  stage: link_prediction
+  alternative_considered: Equal weights would overfit to easier tasks; uniform weighting would lose task
+    priorities
+  _evidence_issues:
+  - 'FN_NOT_FOUND: log_prob in DKG/model/model.py'
+- id: BD-019
+  type: B/DK
+  content: Graph-level context via readout for edge prediction
+  rationale: Global graph context helps disambiguate local patterns that cannot be resolved by considering
+    only the immediate neighborhood. In financial KGs, understanding whether a company is part of a declining
+    sector requires global awareness beyond local edge patterns. The graph-level embedding provides this
+    broader context, enabling predictions that consider macroeconomic trends and market-wide dynamics.
+  evidence: DKG/model/model.py:437-438(graph_emb)
+  stage: link_prediction
+  alternative_considered: Local-only predictions would miss global context crucial for financial analysis
+  vague_rationale: true
+- id: BD-020
+  type: BA/M
+  content: Cross-entropy loss for multi-class entity/relation classification
+  rationale: Link prediction is framed as classification over each possible entities or relations, making
+    cross-entropy loss the natural choice. This formulation naturally handles the large output space of
+    entity/relation prediction and provides well-calibrated probability estimates through the softmax
+    formulation, enabling confidence-based decision-making for downstream applications.
+  evidence: DKG/model/model.py:406(criterion)
+  stage: link_prediction
+  alternative_considered: Margin-based losses would not provide probability estimates; ranking losses
+    are less calibrated
+  _evidence_issues:
+  - 'FN_NOT_FOUND: criterion in DKG/model/model.py'
+- id: BD-021
+  type: B/DK
+  content: LogNormal mixture distribution for inter-event times
+  rationale: Inter-event times in financial sequences are positive and right-skewed, with many short intervals
+    and fewer long ones. The log-normal distribution naturally captures this pattern as it is the distribution
+    of a random variable whose logarithm follows a normal distribution, exactly modeling the multiplicative
+    nature of temporal processes in financial markets where small changes accumulate multiplicatively.
+  evidence: DKG/model/tpp/log_norm_mix_tpp.py:54-72(module)
+  stage: temporal_prediction
+  alternative_considered: Gaussian would produce negative times; exponential lacks flexibility for multi-modal
+    distributions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in DKG/model/tpp/log_norm_mix_tpp.py'
+- id: BD-022
+  type: BA/DK
+  content: 128 mixture components by default
+  rationale: High mixture component capacity allows modeling complex temporal patterns across different
+    relation types and entity categories. Financial events from different contexts (earnings announcements,
+    regulatory filings, market movements) have distinct temporal patterns requiring separate mixture components.
+    With 128 components, the model can capture diverse temporal dynamics without excessive computational
+    overhead.
+  evidence: DKG/model/model.py:51(num_mix_components=128)
+  stage: temporal_prediction
+  alternative_considered: Fewer components would merge distinct temporal patterns; too many increases
+    computation without benefit
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: num_mix_components=128 in DKG/model/model.py'
+- id: BD-023
+  type: B
+  content: Context = [sender_emb, recipient_emb, rel_emb, dyn_rel_emb]
+  rationale: Event timing depends critically on who interacts with whom and the relationship between entities.
+    The sender-recipient pair captures entity-specific temporal tendencies while the relation captures
+    event-type-specific patterns. Including both static and dynamic relation embeddings acknowledges that
+    relationship strength and nature evolve over time, requiring both historical and current relationship
+    information for accurate time prediction.
+  evidence: DKG/model/tpp/log_norm_mix_tpp.py:123-124(context)
+  stage: temporal_prediction
+  alternative_considered: Missing any component would lose critical temporal context signals
+  _evidence_issues:
+  - 'FN_NOT_FOUND: context in DKG/model/tpp/log_norm_mix_tpp.py'
+- id: BD-024
+  type: B/BA
+  content: Interval-based probability for training (CDF difference)
+  rationale: Interval-based probability using CDF differences is more robust than point probability because
+    it accounts for discrete time intervals in the data. Financial event data typically has discretized
+    timestamps, and using interval probabilities correctly handles this granularity rather than treating
+    probability mass as concentrated at exact points. This also prevents numerical issues from evaluating
+    probability density at discrete observation points.
+  evidence: DKG/model/tpp/log_norm_mix_tpp.py:160-166(prob_interval)
+  stage: temporal_prediction
+  alternative_considered: Point probability would misalign with discrete timestamps; PDF evaluation is
+    numerically unstable
+  _evidence_issues:
+  - 'FN_NOT_FOUND: prob_interval in DKG/model/tpp/log_norm_mix_tpp.py'
+- id: BD-025
+  type: BA/M
+  content: Separate log_prob_density (gradient) and log_prob_interval (training) methods
+  rationale: Density-based evaluation provides continuous-time metrics for comparing with other temporal
+    models while interval-based training matches the discrete-time nature of actual data. Separating these
+    methods allows using the most appropriate formulation for each purpose without compromising either
+    evaluation accuracy or training stability, ensuring the model learns from data-realistic intervals
+    while being evaluated on principled continuous-time metrics.
+  evidence: DKG/model/model.py:557-567(module)
+  stage: temporal_prediction
+  alternative_considered: Using only one formulation would compromise either training realism or evaluation
+    quality
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in DKG/model/model.py'
+  vague_rationale: true
+- id: BD-026
+  type: B/BA
+  content: Truncated BPTT every 100 batches (default)
+  rationale: Truncated backpropagation through time prevents vanishing gradients over long sequences while
+    keeping memory usage manageable. Without truncation, training on long financial histories would either
+    exhaust GPU memory or suffer from gradient degradation. The 100-batch window provides a good balance
+    between capturing meaningful temporal dependencies and maintaining computational feasibility for production
+    training runs.
+  evidence: DKG/train.py:197(rnn_truncate_every)
+  stage: training_pipeline
+  alternative_considered: Full BPTT would exhaust memory; no truncation would cause gradient vanishing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: rnn_truncate_every in DKG/train.py'
+- id: BD-027
+  type: M
+  content: Separate edge_optimizer and time_optimizer
+  rationale: Separate optimizers for edge prediction and time prediction allow independent tuning of learning
+    rates for each subtask. Link prediction and temporal point process optimization may require different
+    convergence speeds and learning rate scales, and independent optimizers enable finding optimal configurations
+    for each without compromising the other.
+  evidence: DKG/train.py:131-132(edge_optimizer, time_optimizer)
+  stage: training_pipeline
+  alternative_considered: Shared optimizer would force compromise between task-specific learning rates
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: edge_optimizer, time_optimizer in DKG/train.py'
+- id: BD-028
+  type: B
+  content: Detach dynamic embeddings after truncate to stop gradient propagation
+  rationale: Truncated BPTT requires cutting gradient flow between truncation boundaries to prevent backpropagating
+    through the truncated sequence. Detaching dynamic embeddings at truncation points breaks the computational
+    graph appropriately, ensuring gradients only flow within each truncated segment while maintaining
+    the stateful nature of the dynamic embeddings across batches.
+  evidence: DKG/train.py:211-212(detach_)
+  stage: training_pipeline
+  alternative_considered: Continuous gradients would defeat truncation; full state reset would lose temporal
+    dependencies
+  _evidence_issues:
+  - 'FN_NOT_FOUND: detach_ in DKG/train.py'
+  vague_rationale: true
+- id: BD-029
+  type: M
+  content: 'Optimize mode: edge, time, or both'
+  rationale: Configurable optimization modes support ablation studies and different training strategies
+    for different use cases. Some deployments may only need link prediction while others require temporal
+    prediction, and this flexibility allows training only the relevant components without unnecessary
+    computation. It also enables focused debugging by isolating each prediction task.
+  evidence: DKG/train.py:85(optimize)
+  stage: training_pipeline
+  alternative_considered: Fixed joint optimization would not support single-task scenarios
+  _evidence_issues:
+  - 'FN_NOT_FOUND: optimize in DKG/train.py'
+- id: BD-030
+  type: M/BA
+  content: Early stopping on MRR by default
+  rationale: MRR (Mean Reciprocal Rank) is a comprehensive ranking metric that captures overall prediction
+    quality across each ranks. It is particularly suitable as an early stopping criterion because it is
+    more stable than loss-based stopping (which can plateau at local minima) and more informative than
+    accuracy (which ignores ranking quality). The criterion can be switched to loss for time-only models
+    when link prediction is not relevant.
+  evidence: DKG/train.py:37(early_stop_criterion='MRR')
+  stage: training_pipeline
+  alternative_considered: Loss-based stopping is less robust; accuracy ignores ranking quality
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: early_stop_criterion=''MRR'' in DKG/train.py'
+- id: BD-031
+  type: B/BA
+  content: Full link prediction evaluation (rank against each entities)
+  rationale: Gold standard evaluation ranks the true tail entity against ALL possible entities in the
+    knowledge graph. This strict evaluation ensures fair comparison with baselines and provides realistic
+    performance estimates for production deployment where the true candidate set is always the entire
+    entity set. Filtered metrics further remove corrupted candidates that appear in training, providing
+    the most rigorous evaluation protocol.
+  evidence: DKG/eval.py:191(module)
+  stage: evaluation
+  alternative_considered: Top-k evaluation would inflate metrics; unfiltered evaluation would be overly
+    pessimistic
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in DKG/eval.py'
+- id: BD-032
+  type: M/DK
+  content: Weighted combination of entity and time scores during evaluation
+  rationale: Combining link prediction and time prediction scores allows exploring the optimal trade-off
+    between the two signals for joint prediction tasks. The weighting can be tuned based on which prediction
+    aspect is more important for specific applications, enabling deployment-specific optimization without
+    architectural changes.
+  evidence: DKG/eval.py:254-256(pred)
+  stage: evaluation
+  alternative_considered: Fixed weighting would not adapt to application needs
+  _evidence_issues:
+  - 'FN_NOT_FOUND: pred in DKG/eval.py'
+- id: BD-033
+  type: M/BA
+  content: Auto-discovered loss weights via grid search on validation
+  rationale: Automatic grid search for edge/time loss weights eliminates manual tuning and finds optimal
+    combinations for each dataset. This hyperparameter is highly dataset-dependent, and automatic discovery
+    ensures the best configuration is found without extensive manual experimentation, reducing development
+    time and improving final model quality.
+  evidence: DKG/eval.py:131-136(loss_weights)
+  stage: evaluation
+  alternative_considered: Manual tuning is time-consuming; fixed weights would not adapt to datasets
+  _evidence_issues:
+  - 'FN_NOT_FOUND: loss_weights in DKG/eval.py'
+- id: BD-034
+  type: BA
+  content: Memory-aware batching with MAX_EDGES limit
+  rationale: CPU/GPU memory constraints require splitting full matrix computation into manageable chunks
+    during evaluation. The MAX_EDGES limit prevents out-of-memory errors while maintaining reasonable
+    evaluation speed by processing edges in batches that fit in memory. This is essential for evaluating
+    on large-scale knowledge graphs where full matrix operations would exceed available resources.
+  evidence: DKG/eval.py:454-458(MAX_EDGES)
+  stage: evaluation
+  alternative_considered: No limit would cause OOM on large graphs; too small limit would be inefficient
+  _evidence_issues:
+  - 'FN_NOT_FOUND: MAX_EDGES in DKG/eval.py'
+- id: BD-035
+  type: B
+  content: 'Three subgraph types: prior (for context), batch (for prediction), cumulative (for state)'
+  rationale: Prior graph provides historical context for prediction, batch graph contains target edges
+    to predict, and cumulative graph tracks evolving entity state across the temporal sequence. This separation
+    is fundamental to temporal knowledge graph modeling as it correctly separates historical information
+    (used for prediction) from future information (targets) and maintains persistent state across batches.
+  evidence: DKG/utils/model_utils.py:18-28(edge_subgraph)
+  stage: collation
+  alternative_considered: Single graph would mix context and targets, causing data leakage
+  _evidence_issues:
+  - 'FN_NOT_FOUND: edge_subgraph in DKG/utils/model_utils.py'
+- id: BD-036
+  type: BA
+  content: preserve_nodes=False for batch_G to exclude orphaned nodes
+  rationale: Setting preserve_nodes=False removes orphaned nodes (nodes appearing only in target edges
+    but not in historical context) from the batch graph. This reduces graph size for efficient batch processing
+    while ensuring predictions only depend on historical context. Orphaned nodes without historical edges
+    would have no useful features, making their removal both safe and beneficial for efficiency.
+  evidence: DKG/utils/model_utils.py:22(preserve_nodes=False)
+  stage: collation
+  alternative_considered: Preserving orphans would waste computation on uninformative nodes
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: preserve_nodes=False in DKG/utils/model_utils.py'
+- id: BD-037
+  type: BA/M
+  content: Pre-compute degree normalization for RGCN
+  rationale: Degree normalization is shared across each GNN layers and does not change during training,
+    so precomputing it once avoids redundant computation on every forward pass. This optimization reduces
+    computational overhead while maintaining identical normalization behavior, improving training efficiency
+    without sacrificing model quality.
+  evidence: DKG/utils/model_utils.py:33(comp_deg_norm)
+  stage: collation
+  alternative_considered: Recomputing would waste computation on invariant values
+- id: BD-038
+  type: B
+  content: Use MRR (Mean Reciprocal Rank) as primary early stopping criterion for temporal link prediction
+  rationale: MRR provides a balanced measure of ranking quality that rewards models placing correct predictions
+    near the top. This criterion terminates training when validation MRR plateaus, preventing overfitting
+    while ensuring sufficient model convergence. The boundary is temporal link prediction tasks where
+    ranked results are the primary output format.
+  evidence: DKG/train.py:506(early_stop_criterion default='MRR')
+  stage: training_pipeline
+  alternative_considered: Loss-based or accuracy-based early stopping were considered but MRR better reflects
+    ranking performance needed for link prediction.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: early_stop_criterion default=''MRR'' in DKG/train.py'
+- id: BD-039
+  type: B/BA
+  content: Set patience=30 epochs before early stopping triggers
+  rationale: Patience of 30 epochs provides sufficient tolerance for normal validation fluctuation while
+    preventing excessive wasted computation on non-improving runs. This boundary prevents premature stopping
+    due to noise while capping maximum unnecessary training at 30 epochs beyond optimal performance.
+  evidence: DKG/train.py:29(main)
+  stage: training_pipeline
+  alternative_considered: Lower patience (10-15) would risk premature stopping; higher patience (50+)
+    would waste compute.
+- id: BD-040
+  type: B/BA
+  content: Default learning rate of 0.001 for AdamW optimizer
+  rationale: Learning rate 0.001 is the standard default for AdamW that balances convergence speed with
+    stability across diverse model configurations. This boundary applies to each model components and
+    provides reliable baseline convergence without extensive per-component tuning.
+  evidence: DKG/train.py:501(lr=0.001)
+  stage: training_pipeline
+  alternative_considered: Learning rates 0.0001 and 0.01 were considered; 0.001 provides best general
+    stability.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: lr=0.001 in DKG/train.py'
+- id: BD-041
+  type: B/BA
+  content: Weight decay of 0.00001 to prevent overfitting
+  rationale: Weight decay of 1e-5 provides subtle regularization that constrains large parameter magnitudes
+    without significantly impairing model capacity. This boundary is deliberately conservative, recognizing
+    that other regularization mechanisms (proper early stopping, model capacity limits) handle most overfitting
+    prevention.
+  evidence: DKG/train.py:29(main)
+  stage: training_pipeline
+  alternative_considered: Higher weight decay values (0.001, 0.01) were rejected as too aggressive for
+    this architecture.
+- id: BD-042
+  type: B
+  content: Entity and relation embedding dimension of 200 for FinDKG
+  rationale: Embedding dimension of 200 provides sufficient expressiveness to capture complex entity and
+    relation semantics while remaining computationally tractable. This boundary balances model capacity
+    with training speed, ensuring embeddings can represent fine-grained financial knowledge without excessive
+    memory footprint.
+  evidence: DKG/train.py:541-544(static_entity_embed_dim=200, rel_embed_dim=200)
+  stage: model_architecture
+  alternative_considered: Smaller dimensions (50, 100) were considered but lacked capacity for financial
+    entity complexity.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: static_entity_embed_dim=200, rel_embed_dim=200 in DKG/train.py'
+- id: BD-043
+  type: B/RC
+  content: Use 2 graph convolution layers in embedding updater
+  rationale: Two graph convolution layers enable capturing second-order neighborhood information while
+    avoiding over-smoothing that degrades node representations. This boundary limits receptive field to
+    local graph structure without flattening distinct node identities through excessive message passing.
+  evidence: DKG/train.py:530(num_gconv_layers=2)
+  stage: model_architecture
+  alternative_considered: Single layer would miss neighborhood patterns; 3+ layers cause over-smoothing.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: num_gconv_layers=2 in DKG/train.py'
+- id: BD-044
+  type: B
+  content: Use 1 RNN layer for temporal dynamics modeling
+  rationale: Single RNN layer provides minimal temporal sequence modeling capacity sufficient for event
+    time patterns without adding unnecessary complexity. This boundary limits temporal expressiveness
+    to prevent overfitting on limited historical sequences while ensuring temporal dependencies are captured.
+  evidence: DKG/train.py:531(num_rnn_layers=1)
+  stage: model_architecture
+  alternative_considered: Multiple RNN layers were rejected to avoid overfitting on limited historical
+    context.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: num_rnn_layers=1 in DKG/train.py'
+- id: BD-045
+  type: B
+  content: Use 8 attention heads in KGTransformer
+  rationale: Eight attention heads enable parallel learning of diverse attention patterns for different
+    relationship types and importance aspects. This boundary provides sufficient attention diversity while
+    maintaining computational efficiency, as head outputs are concatenated and projected to the model
+    dimension.
+  evidence: DKG/model/gnn/kgt.py:40(num_heads)
+  stage: model_architecture
+  alternative_considered: Fewer heads (4) would reduce attention diversity; more heads (16) would increase
+    computation without proportional benefit.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: num_heads in DKG/model/gnn/kgt.py'
+- id: BD-046
+  type: B
+  content: Use 128 mixture components in LogNormal mixture TPP
+  rationale: 128 mixture components provide high-fidelity temporal distribution modeling capable of capturing
+    diverse inter-event time patterns. This boundary balances modeling flexibility with computational
+    tractability, allowing complex temporal dynamics in financial event sequences without excessive inference
+    cost.
+  evidence: DKG/train.py:540(num_mix_components=128)
+  stage: model_architecture
+  alternative_considered: Fewer components (32, 64) would limit temporal pattern expressiveness; more
+    (256) would increase memory usage.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: num_mix_components=128 in DKG/train.py'
+- id: BD-047
+  type: B/BA
+  content: Enable log transform on time intervals by default
+  rationale: Log transformation normalizes right-skewed inter-event time distributions commonly observed
+    in financial event sequences. This boundary ensures numerical stability and better gradient flow during
+    temporal prediction by compressing large time intervals while preserving relative ordering information.
+  evidence: DKG/train.py:538(time_interval_log_transform=True)
+  stage: model_architecture
+  alternative_considered: Linear time intervals were rejected due to severe right-skew observed in financial
+    event data.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: time_interval_log_transform=True in DKG/train.py'
+- id: BD-048
+  type: B
+  content: Use 'node2node_inter_event_times' mode for temporal modeling
+  rationale: Node-to-node inter-event time mode captures entity-specific temporal patterns by tracking
+    time intervals between specific entity pairs. This boundary enables learning personalized temporal
+    dynamics for each entity relationship rather than global time patterns, crucial for financial event
+    prediction.
+  evidence: DKG/train.py:536(inter_event_time_mode)
+  stage: model_architecture
+  alternative_considered: Global inter-event times would lose entity-specific temporal signals important
+    for financial forecasting.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: inter_event_time_mode in DKG/train.py'
+- id: BD-049
+  type: B
+  content: RGCN uses 'bdd' regularizer with 100 bases
+  rationale: Block diagonal decomposition (bdd) regularizer with 100 basis functions provides efficient
+    relation-specific transformation matrices without requiring excessive parameters. This boundary balances
+    regularization strength with computational cost, enabling diverse relation representations while preventing
+    overfitting.
+  evidence: DKG/model/embedding.py:189-190(num_bases=100)
+  stage: model_architecture
+  alternative_considered: Basis decomposition with fewer bases would limit relation expressiveness; full
+    rank would cause overfitting.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: num_bases=100 in DKG/model/embedding.py'
+- id: BD-050
+  type: B
+  content: Use SiLU (Swish) activation in KGTransformer
+  rationale: SiLU activation provides smooth, non-monotonic gradients that improve gradient flow compared
+    to ReLU while maintaining computational efficiency. This boundary enhances feature representation
+    quality without introducing dying neuron problems common with ReLU in graph neural networks.
+  evidence: DKG/model/gnn/kgt.py:24(KGTransformer)
+  stage: model_architecture
+  alternative_considered: ReLU was rejected due to dying neuron issues; GELU was considered but SiLU provides
+    similar benefits with simpler computation.
+- id: BD-051
+  type: B
+  content: Edge loss combines tail (1.0), relation (0.2), head (0.1) predictions
+  rationale: Weighted loss combination prioritizes tail entity prediction (main link prediction target)
+    while still supervising relation and head predictions for multi-task consistency. This boundary assigns
+    83% of loss weight to tail prediction, ensuring primary task focus while maintaining auxiliary supervision
+    signals.
+  evidence: DKG/model/model.py:459(log_prob = log_prob_tail + 0.2 * log_prob_rel + 0.1 * log_prob_head)
+  stage: training_pipeline
+  alternative_considered: Equal weighting would dilute tail prediction focus; relation-only would miss
+    entity semantics.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: log_prob = log_prob_tail + 0.2 * log_prob_rel + 0.1 * log_prob_head in DKG/model/model.py'
+- id: BD-052
+  type: B/BA
+  content: Default optimizer mode is 'edge' (not 'both') for training
+  rationale: Edge-only optimization mode focuses computational resources on the primary link prediction
+    task rather than splitting between edge and time prediction. This boundary prioritizes core prediction
+    accuracy while using time prediction primarily as auxiliary supervision for temporal dynamics learning.
+  evidence: DKG/train.py:29(main)
+  stage: training_pipeline
+  alternative_considered: Both mode would split optimization focus; neither mode would lose temporal auxiliary
+    signal.
+- id: BD-053
+  type: B
+  content: Use separate AdamW optimizers for edge and time prediction
+  rationale: Separate optimizers enable independent learning rate tuning and gradient management for edge
+    and time prediction components. This boundary allows the model to learn temporal dynamics at appropriate
+    pace without interfering with edge prediction optimization, improving training stability.
+  evidence: DKG/train.py:131-132(edge_optimizer, time_optimizer)
+  stage: training_pipeline
+  alternative_considered: Single optimizer would cause gradient interference between tasks; completely
+    separate training runs would be inefficient.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: edge_optimizer, time_optimizer in DKG/train.py'
+  vague_rationale: true
+- id: BD-054
+  type: B/BA
+  content: Static embeddings use Xavier uniform initialization
+  rationale: Xavier uniform initialization provides optimal gradient flow for static entity and relation
+    embeddings by scaling weights based on input and output dimensions. This boundary ensures embeddings
+    start with appropriate magnitude distribution, avoiding saturation or vanishing gradients during early
+    training.
+  evidence: DKG/utils/model_utils.py:56(nn.init.xavier_uniform_)
+  stage: model_initialization
+  alternative_considered: Normal initialization would not guarantee optimal gradient scaling; orthogonal
+    init was considered but Xavier better suited for embeddings.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: nn.init.xavier_uniform_ in DKG/utils/model_utils.py'
+  vague_rationale: true
+- id: BD-055
+  type: B/BA
+  content: Dynamic embeddings initialized to zeros
+  rationale: Zero initialization for dynamic embeddings ensures temporal representations start from a
+    neutral baseline before receiving temporal updates. This boundary prevents arbitrary initial temporal
+    states from biasing predictions, allowing the RNN to learn meaningful temporal dynamics from clean
+    initial conditions.
+  evidence: DKG/train.py:98-99(zero_init=True)
+  stage: model_initialization
+  alternative_considered: Random initialization would introduce arbitrary temporal biases; learned initialization
+    would require additional training.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: zero_init=True in DKG/train.py'
+- id: BD-056
+  type: B/DK
+  content: Use concat mode for combining static and dynamic embeddings
+  rationale: Concatenation mode preserves distinct information channels from static (structural) and dynamic
+    (temporal) embeddings without mixing their semantic spaces. This boundary maintains information fidelity
+    while doubling the effective embedding dimension for downstream processing, ensuring both representation
+    types contribute fully.
+  evidence: DKG/train.py:535(static_dynamic_combine_mode='concat')
+  stage: model_architecture
+  alternative_considered: Addition would mix semantic spaces inappropriately; attention-based combination
+    would add complexity without proportional benefit.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: static_dynamic_combine_mode=''concat'' in DKG/train.py'
+- id: BD-057
+  type: B
+  content: RNN truncation every 20 batches during training
+  rationale: Truncating backpropagation-through-time every 20 batches prevents gradient explosion in long
+    temporal sequences while maintaining meaningful temporal context. This boundary limits BPTT depth
+    to prevent numerical instability while preserving sufficient historical information for temporal dynamics
+    learning.
+  evidence: DKG/train.py:532(rnn_truncate_every=20)
+  stage: training_pipeline
+  alternative_considered: Shorter truncation would lose temporal context; longer truncation would risk
+    gradient explosion.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: rnn_truncate_every=20 in DKG/train.py'
+- id: BD-058
+  type: B
+  content: Validation evaluation at specific batch intervals per graph type
+  rationale: 'Variable validation intervals across datasets (ICEWS18: every 6 batches, ICEWS14: every
+    4 batches) adapt evaluation frequency to dataset size and complexity. This boundary balances evaluation
+    overhead with tracking quality, performing more frequent checks on smaller datasets while reducing
+    overhead on larger ones.'
+  evidence: DKG/eval.py:94-99(ICEWS18 i%6==0, ICEWS14 i%4==0)
+  stage: evaluation
+  alternative_considered: Fixed intervals would either waste compute on large datasets or miss optimization
+    opportunities on small ones.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: ICEWS18 i%6==0, ICEWS14 i%4==0 in DKG/eval.py'
+- id: BD-059
+  type: B
+  content: Use max readout operation for graph-level embeddings
+  rationale: Max pooling readout captures the most activated features across node embeddings, providing
+    a robust graph-level representation. This boundary is computationally efficient and captures extreme
+    signal values important for financial event patterns, avoiding averaging effects that could dilute
+    important signals.
+  evidence: DKG/model/model.py:343(readout_op='max')
+  stage: model_architecture
+  alternative_considered: Mean pooling would dilute extreme values; attention-weighted pooling would add
+    complexity.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: readout_op=''max'' in DKG/model/model.py'
+- id: BD-060
+  type: B
+  content: Split temporal dynamics into sender/recipient directions
+  rationale: Directional temporal dynamics modeling captures asymmetric information flow between entity
+    pairs in financial relationships. This boundary enables learning distinct temporal patterns for senders
+    and recipients, crucial for directional event prediction where source and target entities have different
+    temporal characteristics.
+  evidence: DKG/model/embedding.py:358-359(temporal_dynamic_batch_G, temporal_dynamic_rev_batch_G)
+  stage: model_architecture
+  alternative_considered: Unidirectional modeling would lose recipient-specific temporal signals; bidirectional
+    with shared parameters would lack directional specificity.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: temporal_dynamic_batch_G, temporal_dynamic_rev_batch_G in DKG/model/embedding.py'
+- id: BD-061
+  type: B
+  content: Edge norm clamped to max value of 10.0 for temporal encoding
+  rationale: Clamping edge norms to maximum 10.0 prevents extreme time encodings from dominating the temporal
+    representation space. This boundary bounds outlier influence while preserving relative temporal ordering,
+    ensuring numerical stability in sinusoidal time encoding without losing temporal discrimination capability.
+  evidence: DKG/model/embedding.py:319(module)
+  stage: model_architecture
+  alternative_considered: No clamping would risk numerical instability; aggressive clamping would lose
+    temporal granularity.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in DKG/model/embedding.py'
+- id: BD-062
+  type: B/DK
+  content: Set 12 node types for FinDKG entity classification
+  rationale: Twelve node types define the entity taxonomy for financial domain knowledge graph, covering
+    major entity categories in financial markets. This boundary enables entity-type-aware modeling and
+    predictions while maintaining manageable classification granularity for downstream applications.
+  evidence: DKG/data.py:46(num_node_types=12)
+  stage: collation
+  alternative_considered: Finer-grained types would increase classification difficulty; coarser types
+    would lose semantic specificity.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: num_node_types=12 in DKG/data.py'
+- id: BD-063
+  type: B/RC
+  content: Use random seed 101 for reproducibility
+  rationale: Fixed seed 101 ensures deterministic training runs for experimental reproducibility and result
+    verification. This boundary enables consistent model checkpoints and comparison across runs, critical
+    for research validation and production deployment where consistent behavior is required.
+  evidence: DKG/train.py:498(seed=101)
+  stage: training_pipeline
+  alternative_considered: Random seed each run would prevent result verification; specific value chosen
+    arbitrarily as reproducible baseline.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: seed=101 in DKG/train.py'
+- id: BD-064
+  type: B/BA
+  content: GPU evaluation splits edges into chunks of max 400000
+  rationale: Chunking evaluation into batches of 400000 edges balances GPU memory constraints with computational
+    efficiency. This boundary prevents out-of-memory errors during large-scale link prediction evaluation
+    while maintaining reasonable batch processing throughput for practical inference times.
+  evidence: DKG/eval.py:397(eval_edges_iet)
+  stage: evaluation
+  alternative_considered: Larger chunks risk OOM; smaller chunks reduce throughput unnecessarily.
+- id: BD-065
+  type: B
+  content: Time interval epsilon clamp at 1e-10 to prevent log(0)
+  rationale: EPSILON of 1e-10 prevents logarithm of zero during time interval transformation while introducing
+    negligible numerical bias. This boundary ensures numerical stability in log-space temporal computations
+    without materially affecting the learned temporal representations due to the extremely small magnitude.
+  evidence: DKG/model/time_interval_transform.py:6(EPSILON=1e-10)
+  stage: model_architecture
+  alternative_considered: Larger epsilon would introduce bias; smaller epsilon would risk underflow in
+    extreme cases.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: EPSILON=1e-10 in DKG/model/time_interval_transform.py'
+- id: BD-066
+  type: B/BA
+  content: Expected event time = latest_event_time + expected_inter_event_time
+  rationale: Point estimate for next event time combines the most recent event timestamp with expected
+    inter-event duration from the temporal point process. This boundary provides interpretable temporal
+    predictions by explicitly modeling both when events occurred and expected time until next event.
+  evidence: DKG/model/tpp/log_norm_mix_tpp.py:148(return latest_event_time + expected_inter_event_time)
+  stage: temporal_prediction
+  alternative_considered: Mode instead of mean would give different point estimate; full distribution
+    prediction would be more complex.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: return latest_event_time + expected_inter_event_time in DKG/model/tpp/log_norm_mix_tpp.py'
+- id: BD-067
+  type: B/BA
+  content: Use dropout=0 by default (no dropout)
+  rationale: Zero dropout relies on other regularization mechanisms (early stopping, weight decay, limited
+    model capacity) to prevent overfitting. This boundary assumes training data is sufficient and model
+    capacity is already constrained by architecture choices, avoiding the additional hyperparameter complexity
+    of dropout tuning.
+  evidence: DKG/train.py:503(dropout=0)
+  stage: training_pipeline
+  alternative_considered: Dropout values 0.1-0.5 were considered but omitted to avoid hyperparameter complexity
+    when other regularization is sufficient.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: dropout=0 in DKG/train.py'
+- id: BD-068
+  type: B
+  content: Evaluate MRR and Recall at k (1, 3, 10, 100) for link prediction
+  rationale: Multi-granular recall metrics (Recall@1, 3, 10, 100) alongside MRR provide comprehensive
+    evaluation of link prediction quality across different use cases. This boundary captures both top-1
+    accuracy and broader recall coverage, with MRR rewarding models that rank correct predictions highly.
+  evidence: DKG/eval.py:108-112(MRR, REC1, REC3, REC10, REC100)
+  stage: evaluation
+  alternative_considered: Single metric would miss different aspects of ranking quality; additional metrics
+    (Hit@K, NDCG) were considered but omitted for simplicity.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: MRR, REC1, REC3, REC10, REC100 in DKG/eval.py'
+- id: BD-069
+  type: B/BA
+  content: Default 300 training epochs
+  rationale: Three hundred epochs provides sufficient training time for model convergence on temporal
+    knowledge graph tasks while respecting practical runtime constraints. This boundary allows complex
+    temporal patterns to be learned while ensuring training completes within reasonable timeframes on
+    available hardware.
+  evidence: DKG/train.py:500(epochs=300)
+  stage: training_pipeline
+  alternative_considered: Fewer epochs risk underfitting; more epochs would increase runtime without proportional
+    benefit due to early stopping.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: epochs=300 in DKG/train.py'
+- id: BD-070
+  type: B
+  content: Use GraphTransformer architecture with layer norm enabled
+  rationale: Layer normalization in GraphTransformer stabilizes training by normalizing activations across
+    features. This boundary enables deeper architecture training without degradation from internal covariate
+    shift, particularly important for transformer components in graph neural networks where gradient flows
+    through attention mechanisms.
+  evidence: DKG/model/gnn/kgt.py:199(use_norm=True)
+  stage: model_architecture
+  alternative_considered: No layer norm would risk training instability in deeper models; batch norm was
+    rejected as less suitable for transformer architectures.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: use_norm=True in DKG/model/gnn/kgt.py'
+- id: BD-071
+  type: B/BA
+  content: Default GPU device selection with fallback to CPU
+  rationale: Automatic GPU detection with CPU fallback ensures model training utilizes available hardware
+    without manual configuration. This boundary maximizes computational efficiency on GPU-equipped systems
+    while ensuring code runs on CPU-only systems, providing deployment flexibility across different hardware
+    configurations.
+  evidence: DKG/utils/train_utils.py:118(module)
+  stage: training_pipeline
+  alternative_considered: Forced GPU would fail on CPU-only systems; forced CPU would waste GPU capability
+    when available.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in DKG/utils/train_utils.py'
+- id: BD-072
+  type: B
+  content: Node latest event time tensor dimension [num_nodes, num_nodes+1, 2]
+  rationale: Tensor dimension [num_nodes, num_nodes+1, 2] captures directional inter-event times for each
+    node pairs including a sentinel index for no-relationship cases. This boundary enables efficient lookup
+    of entity-pair temporal histories for temporal prediction, with the third dimension storing forward
+    and reverse directional times.
+  evidence: DKG/train.py:45(node_latest_event_time shape)
+  stage: model_architecture
+  alternative_considered: Sparse representation would reduce memory but increase lookup complexity; full
+    dense matrix already used.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: node_latest_event_time shape in DKG/train.py'
+- id: BD-073
+  type: B
+  content: Mean Reciprocal Rank (MRR) for ranking evaluation
+  rationale: Chooses MRR as the primary ranking evaluation metric because it provides a smooth, single-value
+    summary of model performance across each ranks, penalizing models that rank relevant edges lower while
+    being less sensitive to outliers than alternatives like Hits@k. The metric captures overall ranking
+    quality for link prediction tasks in the knowledge graph system.
+  evidence: DKG/eval.py:108,133,139(mean_reciprocal_rank)
+  stage: DKG.eval
+  alternative_considered: Hits@k was considered but provides less granular ranking feedback; MRR captures
+    ranking smoothness across each positions.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: mean_reciprocal_rank in DKG/eval.py'
+- id: BD-074
+  type: B/BA
+  content: Recall@k metric for top-k prediction evaluation
+  rationale: Adopts multi-granularity Recall@k evaluation (k=1,3,10,100) to capture model performance
+    at different retrieval horizons, providing a more nuanced view of prediction quality than single-k
+    metrics. The k=100 setting aligns with typical candidate generation pool sizes in industrial knowledge
+    graph applications.
+  evidence: DKG/eval.py:109-112(recall)
+  stage: DKG.eval
+  alternative_considered: Single k=10 was considered but provides insufficient granularity for production
+    deployment scenarios with varying candidate pool sizes.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: recall in DKG/eval.py'
+- id: BD-075
+  type: B
+  content: Mean Absolute Error (MAE) for time prediction
+  rationale: Selects MAE as a robust time prediction error metric because it provides interpretable errors
+    in original time units, is less sensitive to outliers than squared error metrics, and has intuitive
+    business meaning (average prediction error in time units). Essential for evaluating temporal point
+    process models on knowledge graph event sequences.
+  evidence: DKG/eval.py:72,288(mean_absolute_error)
+  stage: DKG.eval
+  alternative_considered: MSE was considered but is more sensitive to outliers; MAE provides more robust
+    estimates for real-world event timing variability.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: mean_absolute_error in DKG/eval.py'
+- id: BD-076
+  type: B/BA
+  content: Root Mean Squared Error (RMSE) for time prediction
+  rationale: Complements MAE with RMSE to penalize larger prediction errors more heavily, providing a
+    more conservative estimate that highlights models with occasional large temporal mispredictions. The
+    combination of MAE and RMSE reveals both typical and worst-case temporal prediction behavior.
+  evidence: DKG/eval.py:73,289(root_mean_squared_error)
+  stage: DKG.eval
+  alternative_considered: MAE alone was considered insufficient; RMSE provides additional sensitivity
+    to outliers that matters for temporal anomaly detection use cases.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: root_mean_squared_error in DKG/eval.py'
+- id: BD-077
+  type: B/DK
+  content: Softmax for edge probability computation
+  rationale: Applies softmax normalization across candidate entities to convert raw scores into proper
+    probability distributions, enabling valid comparison and ranking of edges. The log-softmax formulation
+    provides numerically stable gradients for training while maintaining probabilistic semantics for downstream
+    ranking evaluation.
+  evidence: DKG/eval.py:206(softmax_edge_prob)
+  stage: DKG.eval
+  alternative_considered: Sigmoid normalization was considered but only suitable for single-label scenarios;
+    softmax properly handles multi-candidate ranking.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: softmax_edge_prob in DKG/eval.py'
+- id: BD-078
+  type: B/BA
+  content: Linear interpolation for edge/time log-prob weight tuning
+  rationale: Systematically explores 11 discrete weight values from 1.0 (edge-only) to 0.0 (time-only)
+    to discover optimal balance between edge and time prediction objectives through empirical grid search.
+    This systematic approach avoids manual tuning and reveals optimal task weighting for joint optimization.
+  evidence: DKG/eval.py:270(eval_time_prediction)
+  stage: DKG.eval
+  alternative_considered: Binary weighting (0/1) was considered but lacks fine-grained exploration; linear
+    interpolation provides smooth coverage of weight space.
+- id: BD-079
+  type: B
+  content: Average rank for ties in MRR computation
+  rationale: Ensures fair MRR scores when multiple candidate edges share identical prediction scores by
+    averaging their ranks, avoiding discontinuous jumps in metric values that would make evaluation unstable.
+    This standard ranking practice prevents gaming of the metric through score quantization.
+  evidence: DKG/eval.py:260(average_rank_ties)
+  stage: DKG.eval
+  alternative_considered: Random tie-breaking was considered but introduces nondeterminism; average rank
+    provides reproducible evaluation.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: average_rank_ties in DKG/eval.py'
+- id: BD-080
+  type: B
+  content: Relational Graph Convolutional Network (RGCN) for structural/temporal graph convolution
+  rationale: Selects RGCN architecture specifically designed for multi-relational knowledge graphs by
+    decomposing relation-specific weight matrices into shared bases, enabling efficient modeling of typed
+    edges while preventing overfitting. The basis decomposition allows sharing parameters across many
+    relation types without requiring individual weight matrices.
+  evidence: DKG/model/embedding.py:176(GraphStructuralRNNConv)
+  stage: DKG.model.embedding
+  alternative_considered: Full relation-specific weight matrices were considered but require O(num_relations)
+    parameters, leading to overfitting on sparse relations.
+- id: BD-081
+  type: B
+  content: Knowledge Graph Transformer (KGT) for graph convolution with typed attention
+  rationale: Introduces relation-type conditioning in attention weights through TypedLinear projections,
+    enabling the model to learn different attention patterns for different edge types rather than applying
+    homogeneous attention across each relationships. This captures the fundamental insight that different
+    relation types imply different neighborhood interaction patterns.
+  evidence: DKG/model/gnn/kgt.py:27-81(KGTransformer)
+  stage: DKG.model.gnn
+  alternative_considered: Standard self-attention without relation typing was considered but fails to
+    capture typed nature of knowledge graph edges.
+- id: BD-082
+  type: B
+  content: GRU vs RNN choice for temporal dynamics
+  rationale: Selects Gated Recurrent Unit architecture over vanilla RNN to mitigate vanishing gradient
+    problems during backpropagation through long temporal sequences, enabling effective learning of long-term
+    temporal dependencies in knowledge graph evolution. The gating mechanism adaptively controls information
+    flow across time steps.
+  evidence: DKG/model/embedding.py:206-211,290-295(temporal_encoder)
+  stage: DKG.model.embedding
+  alternative_considered: LSTM was considered but GRU has fewer parameters (2 gates vs 3) with comparable
+    performance, reducing overfitting risk.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: temporal_encoder in DKG/model/embedding.py'
+- id: BD-083
+  type: B
+  content: scatter_mean for aggregating entity embeddings by relation
+  rationale: Uses mean aggregation within relation types to combine neighbor embeddings, enabling entity
+    representations to incorporate relational neighborhood context while maintaining relation-type specificity.
+    The scatter operation efficiently groups neighbors by relation type without explicit loops.
+  evidence: DKG/model/embedding.py:397-401(aggregate_by_relation)
+  stage: DKG.model.embedding
+  alternative_considered: Sum aggregation was considered but lacks normalization; mean provides scale-invariant
+    aggregation suitable for varying neighborhood sizes.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: aggregate_by_relation in DKG/model/embedding.py'
+- id: BD-084
+  type: B
+  content: Inverse time interval as edge weight decay
+  rationale: Assigns higher influence to temporally proximate edges through inverse decay, implementing
+    the intuition that recent interactions are more predictive of future events than distant ones. The
+    clamping prevents numerical instability from very small time intervals while maintaining the decay
+    semantics.
+  evidence: DKG/model/embedding.py:319(inverse_time_weight)
+  stage: DKG.model.embedding
+  alternative_considered: Exponential decay was considered but inverse decay provides more gradual decay
+    suitable for irregular event timing.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: inverse_time_weight in DKG/model/embedding.py'
+- id: BD-085
+  type: B/BA
+  content: Log transformation of time intervals
+  rationale: Compresses wide-ranging time intervals into log scale to prevent extreme values from dominating
+    gradient updates and stabilize temporal feature learning. Log transformation aligns with the empirical
+    observation that inter-event times in knowledge graphs often follow exponential or log-normal distributions.
+  evidence: DKG/model/time_interval_transform.py:5(TimeIntervalTransform)
+  stage: DKG.model.time_interval_transform
+  alternative_considered: Square root transformation was considered but provides less compression for
+    large values than logarithm.
+- id: BD-086
+  type: B
+  content: Multi-head attention with typed linear projections
+  rationale: Enables parallel learning of diverse relation-specific attention patterns through independent
+    projection subspaces per head, improving expressiveness of typed interactions. The relation_pri scaling
+    allows learning relative importance of different relation types during attention computation.
+  evidence: DKG/model/gnn/kgt.py:171-173,293(TypedLinear_heads)
+  stage: DKG.model.gnn
+  alternative_considered: Single-head attention was considered but limits diversity of learned attention
+    patterns; multi-head enables complementary relation-specific features.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: TypedLinear_heads in DKG/model/gnn/kgt.py'
+- id: BD-087
+  type: B
+  content: Residual/skip connection with learnable gating for graph transformer
+  rationale: Facilitates gradient flow through deep transformer stacks while allowing the model to adaptively
+    control information flow from skip connections through learned gating. This enables the model to choose
+    between identity mapping and learned transformation at each layer, improving optimization in deep
+    architectures.
+  evidence: DKG/model/gnn/kgt.py:196,272-276(gated_skip_connection)
+  stage: DKG.model.gnn
+  alternative_considered: Fixed skip connections without gating were considered but lack adaptability;
+    learned gating allows layer-specific skip strength.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: gated_skip_connection in DKG/model/gnn/kgt.py'
+- id: BD-088
+  type: B
+  content: Block diagonal decomposition (BDD) regularizer for RGCN
+  rationale: Restricts relation embedding matrices to block-diagonal structure, reducing parameters from
+    O(num_relations x dim^2) to O(num_bases x dim^2) while maintaining relational expressiveness. This
+    regularizes the model for datasets with many sparse relation types that cannot support full parameter
+    matrices.
+  evidence: DKG/model/gnn/rgcn.py:14,41(BDD_regularizer)
+  stage: DKG.model.gnn
+  alternative_considered: Full basis decomposition (basis) was considered but BDD provides better regularization
+    for block-structured relation hierarchies.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: BDD_regularizer in DKG/model/gnn/rgcn.py'
+- id: BD-089
+  type: B/DK
+  content: Concatenation for static+dynamic embedding combination
+  rationale: Preserves identity of static structural and dynamic temporal features by concatenating in
+    feature space rather than averaging or adding, ensuring both signal types contribute independently
+    to downstream predictions. This avoids information loss from premature feature fusion.
+  evidence: DKG/model/model.py:301,317(concat_static_dynamic)
+  stage: DKG.model.prediction
+  alternative_considered: Addition or averaging was considered but loses ability to weight static vs dynamic
+    features differently; concatenation preserves full dimensionality.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: concat_static_dynamic in DKG/model/model.py'
+- id: BD-090
+  type: B
+  content: CrossEntropy loss for edge/tail entity prediction
+  rationale: Appropriate for multi-class edge prediction where each entity type represents a class, enabling
+    efficient gradient computation via log-softmax formulation. The loss naturally handles large vocabulary
+    prediction tasks by only computing loss on true class without requiring negative sampling.
+  evidence: DKG/model/model.py:406(CrossEntropyLoss)
+  stage: DKG.model.prediction
+  alternative_considered: BCE with negative sampling was considered but less efficient for large vocabularies;
+    CrossEntropy handles full softmax natively.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: CrossEntropyLoss in DKG/model/model.py'
+  vague_rationale: true
+- id: BD-091
+  type: B/BA
+  content: Weighted combination of edge loss components
+  rationale: Prioritizes tail entity prediction (weight 1.0) over relation (0.2) and head (0.1) prediction
+    to emphasize the most important link prediction direction while still providing auxiliary learning
+    signals. The asymmetric weighting reflects typical knowledge graph query patterns where tail prediction
+    dominates.
+  evidence: DKG/model/model.py:459(weighted_loss_combination)
+  stage: DKG.model.prediction
+  alternative_considered: Equal weighting was considered but tail prediction deserves higher priority
+    for typical KG inference use cases.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: weighted_loss_combination in DKG/model/model.py'
+- id: BD-092
+  type: B
+  content: Graph readout operations for graph-level embedding
+  rationale: 'Aggregates node-level embeddings into graph-level representation using multiple readout
+    strategies (max/min/mean/weighted_sum) to enable subgraph-level predictions and comparisons. Different
+    readout operations capture different aspects: max captures strongest features, mean captures average
+    activation, weighted_sum allows attention-based aggregation.'
+  evidence: DKG/model/model.py:328(graph_readout)
+  stage: DKG.model.prediction
+  alternative_considered: Single readout operation was considered but different operations capture complementary
+    graph-level semantics.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: graph_readout in DKG/model/model.py'
+- id: BD-093
+  type: B
+  content: Log-Normal Mixture distribution for inter-event times
+  rationale: Captures heavy-tailed, skewed inter-event time distributions commonly observed in knowledge
+    graph evolution through mixture of log-normal distributions. Log-normal mixtures are analytically
+    tractable and can represent the multi-modal inter-event time patterns that arise from heterogeneous
+    event sources.
+  evidence: DKG/model/tpp/log_norm_mix_tpp.py:66-72,200-238(LogNormalMixture)
+  stage: DKG.model.tpp
+  alternative_considered: Single log-normal was considered but mixtures capture multi-modal timing patterns
+    from different event types.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: LogNormalMixture in DKG/model/tpp/log_norm_mix_tpp.py'
+- id: BD-094
+  type: B
+  content: Context vector construction from source/destination embeddings
+  rationale: Conditions temporal prediction on sender, recipient, relation, and dynamic relation embeddings
+    through concatenation to capture contextual factors influencing event timing. This approach allows
+    the TPP parameters to adapt based on the specific entities and relationship involved in predicting
+    when the next event will occur.
+  evidence: DKG/model/tpp/log_norm_mix_tpp.py:123-124(context_construction)
+  stage: DKG.model.tpp
+  alternative_considered: Average pooling was considered but concatenation preserves entity identity information
+    needed for entity-specific timing patterns.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: context_construction in DKG/model/tpp/log_norm_mix_tpp.py'
+- id: BD-095
+  type: B/BA
+  content: Expected value formula for log-normal mixture
+  rationale: Provides analytically tractable point estimates for mixture expected value using closed-form
+    transformed distribution formulas, enabling efficient inference without Monte Carlo sampling. This
+    is critical for fast temporal expectation computation during both training and prediction.
+  evidence: DKG/model/tpp/log_norm_mix_tpp.py:229-238(expected_value_formula)
+  stage: DKG.model.tpp
+  alternative_considered: Monte Carlo sampling was considered but adds latency; analytical expected value
+    provides O(1) inference.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: expected_value_formula in DKG/model/tpp/log_norm_mix_tpp.py'
+- id: BD-096
+  type: B/DK
+  content: Early stopping based on validation MRR
+  rationale: Prevents overfitting by halting training when validation MRR plateaus for 10 consecutive
+    epochs, balancing model fit and generalization. The patience window accommodates normal fluctuation
+    in validation metrics while quickly stopping when overfitting begins.
+  evidence: DKG/model/model.py:35-37(early_stopping_MRR)
+  stage: DKG.model.training
+  alternative_considered: Fixed epoch count was considered but leads to overfitting or underfitting depending
+    on dataset; early stopping adapts to convergence patterns.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: early_stopping_MRR in DKG/model/model.py'
+- id: BD-097
+  type: B
+  content: AdamW optimizer with weight decay
+  rationale: Combines adaptive learning rates with explicit L2 regularization through decoupled weight
+    decay, improving generalization in embedding models. AdamW's decoupled weight decay prevents the interaction
+    between regularization and adaptive learning rate scheduling that affects standard Adam with L2.
+  evidence: DKG/train.py:131-132(AdamW_optimizer)
+  stage: DKG.train
+  alternative_considered: Standard Adam with L2 was considered but AdamW provides cleaner regularization
+    behavior; SGD with momentum was considered but slower convergence.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: AdamW_optimizer in DKG/train.py'
+- id: BD-098
+  type: B
+  content: Gradient clipping with gradient preservation
+  rationale: Prevents gradient explosion while maintaining gradient direction for stable RNN training
+    through adaptive clipping of large gradients. The clamp_preserve_gradients function ensures that gradients
+    outside the clipping range still propagate with preserved direction information.
+  evidence: DKG/utils/train_utils.py:125-127(clamp_preserve_gradients)
+  stage: DKG.utils.train_utils
+  alternative_considered: Hard clipping was considered but loses directional information; gradient-preserving
+    clipping maintains useful signal.
+- id: BD-099
+  type: B
+  content: In-degree normalization for RGCN message passing
+  rationale: Normalizes incoming messages by in-degree to prevent high-degree nodes from dominating aggregated
+    representations, ensuring balanced feature propagation across nodes with varying connectivity. The
+    zero-handling ensures numerical stability for nodes with no incoming edges.
+  evidence: DKG/utils/model_utils.py:33-38(comp_deg_norm)
+  stage: DKG.utils.model_utils
+  alternative_considered: No normalization was considered but leads to representation collapse for high-degree
+    hub nodes; out-degree normalization was considered but in-degree better captures node importance.
+- id: BD-100
+  type: B/BA
+  content: Xavier uniform initialization for embeddings
+  rationale: Initializes embedding weights with variance scaling appropriate for ReLU activations, preventing
+    vanishing/exploding gradients at early training stages. The gain calculation specifically accounts
+    for ReLU's zero-half-rectified activation pattern.
+  evidence: DKG/utils/model_utils.py:56(xavier_uniform_init)
+  stage: DKG.utils.model_utils
+  alternative_considered: Normal initialization was considered but uniform provides bounded initialization
+    range; pretrained embeddings were considered but not available.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: xavier_uniform_init in DKG/utils/model_utils.py'
+  vague_rationale: true
+- id: BD-101
+  type: B
+  content: RNN truncation for BPTT in temporal modeling
+  rationale: Truncates backpropagation through time every N steps to enable training on long sequences
+    with bounded memory and computation requirements. This practical technique allows temporal modeling
+    over arbitrarily long histories without O(sequence_length) memory complexity.
+  evidence: DKG/train.py:29(main)
+  stage: DKG.train
+  alternative_considered: Full BPTT was considered but memory grows linearly with sequence length; truncated
+    BPTT enables practical training on long histories.
+- id: BD-102
+  type: B
+  content: Minimum time interval as graph time granularity
+  rationale: Defines smallest resolvable temporal unit in the knowledge graph as the minimum observed
+    time difference, ensuring temporal features match data resolution. This prevents over-resolution (generating
+    meaningless temporal features) and under-resolution (losing timing information).
+  evidence: DKG/data.py:57-58(min_time_interval)
+  stage: DKG.data
+  alternative_considered: Fixed time granularity was considered but cannot adapt to varying event frequencies
+    across datasets.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: min_time_interval in DKG/data.py'
+- id: BD-103
+  type: B
+  content: Inter-event time as difference from latest event
+  rationale: Measures time elapsed since the most recent event for each entity, capturing entity-specific
+    activity patterns and recency effects. This entity-centric temporal feature complements edge-centric
+    features by focusing on individual entity dynamics rather than global timeline position.
+  evidence: DKG/model/embedding.py:426-428(inter_event_time)
+  stage: DKG.model.embedding
+  alternative_considered: Time since first event was considered but recent activity patterns are more
+    predictive of near-term events.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: inter_event_time in DKG/model/embedding.py'
+- id: BD-104
+  type: B
+  content: SiLU (Swish) activation for transformer layers
+  rationale: Uses self-gated SiLU activation which adapts to input magnitude, providing smooth, non-monotonic
+    nonlinearity better suited for transformer architectures than ReLU. The self-gating property allows
+    the activation to learn input-dependent scaling, improving expressiveness in attention feedforward
+    layers.
+  evidence: DKG/model/gnn/kgt.py:24(KGTransformer)
+  stage: DKG.model.gnn
+  alternative_considered: ReLU was considered but SiLU provides smoother gradients and self-gating property;
+    GELU was considered but SiLU has simpler implementation.
+- id: BD-105
+  type: B
+  content: Tanh activation for edge prediction MLP
+  rationale: Constrains output to bounded range [-1,1] with smooth gradients, suitable for scaling edge
+    prediction scores before score combination. The bounded output prevents extreme scores from dominating
+    the weighted combination while maintaining gradient flow.
+  evidence: DKG/model/model.py:387,394,401(tanh_mlp)
+  stage: DKG.model.prediction
+  alternative_considered: ReLU was considered but unbounded outputs can cause score combination instability;
+    sigmoid was considered but symmetric range [-1,1] better suited for signed score combination.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: tanh_mlp in DKG/model/model.py'
+- id: BD-106
+  type: B/BA
+  content: Learning rate 0.0005 for KGTransformer model
+  rationale: Sets conservative learning rate tuned for transformer models with large embedding dimensions
+    to ensure stable convergence without oscillation. The 0.0005 rate balances between fast initial convergence
+    and fine-grained optimization in later training stages.
+  evidence: train_DKG_run.py:95(lr_schedule)
+  stage: DKG.train
+  alternative_considered: Learning rate 0.001 was considered but led to training instability; learning
+    rate 0.0001 was considered but slowed convergence unnecessarily.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: lr_schedule in train_DKG_run.py'
+- id: BD-107
+  type: B/BA
+  content: Embedding dimension 200 for entities and relations
+  rationale: Balances representational capacity with computational efficiency; 200 dimensions provide
+    sufficient expressiveness for entity and relation embeddings without excessive memory overhead or
+    overfitting risk on typical knowledge graph dataset sizes. The dimension choice reflects empirical
+    observation that smaller graphs need less capacity.
+  evidence: DKG/model/model.py:46-50(embedding_dim)
+  stage: DKG.model
+  alternative_considered: Dimension 100 was considered but insufficient for complex relations; dimension
+    400 was considered but excessive for typical dataset sizes.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: embedding_dim in DKG/model/model.py'
+- id: BD-108
+  type: B/RC
+  content: Two graph convolution layers for transformer
+  rationale: Stacks two graph convolution layers to capture second-order neighborhood information while
+    limiting depth to prevent over-smoothing and overfitting. Two layers provide a good balance between
+    receptive field expansion and representation quality, as deeper layers risk learning identical node
+    representations.
+  evidence: DKG/model/model.py:52(num_gconv_layers)
+  stage: DKG.model
+  alternative_considered: Single layer was considered but only captures direct neighbors; three or more
+    layers were considered but risk over-smoothing.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: num_gconv_layers in DKG/model/model.py'
+- id: BD-109
+  type: B/BA
+  content: Eight attention heads in transformer
+  rationale: Enables parallel learning of eight distinct attention patterns, allowing the model to attend
+    to different relationship aspects simultaneously. Eight heads provide sufficient diversity while maintaining
+    computational efficiency, with each head handling approximately dim/8=25 dimensional projections.
+  evidence: DKG/model/model.py:54(num_attn_heads)
+  stage: DKG.model
+  alternative_considered: Four heads was considered but provides less diversity; sixteen heads was considered
+    but adds overhead without proportional benefit.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: num_attn_heads in DKG/model/model.py'
+- id: BD-110
+  type: B/BA
+  content: Dropout rate 0.2 for regularization
+  rationale: Applies moderate dropout (20%) to prevent co-adaptation of neurons during training, providing
+    regularization without excessive information loss. The 0.2 rate reflects empirical observation that
+    knowledge graph models benefit from regularization due to sparse supervision signals.
+  evidence: DKG/model/model.py:59(dropout_rate)
+  stage: DKG.model
+  alternative_considered: Dropout 0.1 was considered but insufficient regularization; dropout 0.3 was
+    considered but excessive information loss.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: dropout_rate in DKG/model/model.py'
+- id: BD-111
+  type: B
+  content: LogSoftmax for mixture weight normalization
+  rationale: Normalizes mixture component weights in log space to ensure valid probability distribution
+    while maintaining numerical stability for gradient computation. Log-softmax is numerically superior
+    to explicit softmax+log for large vocabulary mixture models.
+  evidence: DKG/model/tpp/log_norm_mix_tpp.py:200(LogNormalMixtureDistribution)
+  stage: DKG.model.tpp
+  alternative_considered: Explicit softmax then log was considered but numerically unstable for large
+    weight magnitudes; normalization in log space avoids overflow/underflow.
+- id: BD-112
+  type: B
+  content: Optimize both edge and time predictions (joint training)
+  rationale: Jointly optimizes edge and time prediction tasks to capture shared structural-temporal representations,
+    improving both tasks through multi-task learning synergy. Joint training allows the model to learn
+    unified entity representations that benefit from both link prediction and temporal forecasting signals.
+  evidence: train_DKG_run.py:85(joint_optimization)
+  stage: DKG.train
+  alternative_considered: Separate training was considered but loses potential synergy from shared representations;
+    interleaved training balances task learning.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: joint_optimization in train_DKG_run.py'
+- id: BD-113
+  type: T
+  content: Dynamic embeddings MUST stay on CPU; only batch operations go to GPU—this is a memory optimization
+    invariant
+  rationale: This invariant ensures memory efficiency by keeping the larger dynamic embedding matrices
+    on CPU while only transferring small batch tensors to GPU. Violating this would cause OOM errors on
+    large graphs since GPU memory is limited compared to system RAM. The assertion enforces this boundary—any
+    tensor operation that moves embeddings to GPU is a bug that must be fixed.
+  evidence: DKG/model/embedding.py:22(EmbeddingUpdater)
+  stage: ordering_contract
+- id: BD-114
+  type: T
+  content: Temporal embeddings use [sender, receiver] pair structure (dim=-1) for directional temporal
+    dynamics
+  rationale: The [sender, receiver] pair structure in dimension -1 encodes directional temporal information
+    where [...,0] represents sender temporal state and [...,1] represents receiver temporal state. This
+    boundary is essential for capturing asymmetric temporal dynamics in directed event sequences. Changing
+    this structure would break the temporal reasoning logic that depends on distinguishing past-as-sender
+    from past-as-receiver.
+  evidence: DKG/model/embedding.py:357(temporal_pair_structure)
+  stage: pattern_choice
+  alternative_considered: Could have used separate tensors instead of concatenated pairs but pair structure
+    is more memory-efficient
+  _evidence_issues:
+  - 'FN_NOT_FOUND: temporal_pair_structure in DKG/model/embedding.py'
+- id: BD-115
+  type: T
+  content: Truncated BPTT via detach_() on dynamic embeddings every rnn_truncate_every batches
+  rationale: Truncated backpropagation-through-time breaks gradient flow at the specified interval to
+    control memory usage and prevent vanishing/exploding gradients. The detach_() call at line 212 severs
+    the computational graph, establishing a hard boundary for gradient computation. Without this truncation,
+    training would accumulate gradients across each historical batches, causing memory exhaustion on long
+    sequences.
+  evidence: DKG/train.py:212(detach_dynamic_embeddings)
+  stage: pattern_choice
+  alternative_considered: Full BPTT was rejected due to memory constraints; checkpointing could reduce
+    truncation overhead
+  _evidence_issues:
+  - 'FN_NOT_FOUND: detach_dynamic_embeddings in DKG/train.py'
+- id: BD-116
+  type: T
+  content: 'Graph construction uses strict temporal ordering: prior_G < batch_G <= cumul_G (cumulative)'
+  rationale: The temporal ordering invariant (prior_G < batch_G <= cumul_G) ensures consistent event causality
+    in the dynamic knowledge graph. The boundary requires that edges in prior_G occurred before batch_G,
+    and batch_G is a subset of cumul_G. This prevents temporal paradoxes where future events influence
+    past predictions. Violating this would break the temporal logic and produce invalid event sequences.
+  evidence: DKG/utils/model_utils.py:7(collate_fn)
+  stage: invariant
+  alternative_considered: Non-temporal ordering was rejected to maintain event sequence validity
+- id: BD-117
+  type: T
+  content: FinDKG datasets require special node_type handling with 12 entity types vs 1 for other graphs
+  rationale: FinDKG domain requires 12 distinct entity types (organizations, persons, locations, etc.)
+    whereas other graphs use monolithic type=1. This dataset-specific boundary ensures proper entity typing
+    for financial relation extraction. Removing this special case would break FinDKG entity embeddings
+    and downstream classification. The if/else at line 45-54 enforces this boundary automatically.
+  evidence: DKG/data.py:45(load_dataset_fintdkg_handling)
+  stage: pattern_choice
+  alternative_considered: Could have used unified type schema but FinDKG semantics require fine-grained
+    types
+  _evidence_issues:
+  - 'FN_NOT_FOUND: load_dataset_fintdkg_handling in DKG/data.py'
+- id: BD-118
+  type: T
+  content: TPP module (log_norm_mix_tpp.py) is a standalone temporal point process implementation with
+    internal assertions
+  rationale: The TPP module enforces internal consistency via assertions for tensor shape validation.
+    This establishes a boundary that each TPP operations must maintain valid tensor dimensions. Assertions
+    catching dimension mismatches early prevent silent numerical errors in temporal intensity computations.
+    Removing assertions would allow malformed tensors to propagate through the TPP calculation.
+  evidence: DKG/model/tpp/log_norm_mix_tpp.py:11(LogNormMixTPP)
+  stage: subdirectory
+  alternative_considered: Could use runtime checks instead of assertions but assertions are more efficient
+    for validation
+- id: BD-119
+  type: BA/M
+  content: TimeIntervalTransform defaults to log_transform=True, encoding assumption that each time modeling
+    uses log scale
+  rationale: The default log_transform=True assumes inter-event times follow log-normal distributions,
+    which is standard for event sequences. This business assumption means each time intervals are automatically
+    log-scaled unless explicitly disabled. Changing the default would alter the learned temporal representations.
+    The boundary is at initialization—any non-log-scaled time data must explicitly pass log_transform=False.
+  evidence: DKG/model/time_interval_transform.py:8(TimeIntervalTransform.__init__)
+  stage: default_value
+  alternative_considered: Linear scale was rejected because log scale better models inter-event times
+    in most event sequences
+- id: BD-120
+  type: BA/M
+  content: get_embedding uses zero_init=False for static (Xavier) and zero_init=True for dynamic embeddings
+    (zeros)
+  rationale: 'This parameter controls initialization strategy based on embedding type: Xavier initialization
+    for static embeddings preserves learned representations while zero initialization for dynamic embeddings
+    ensures clean slate. The boundary determines which initialization strategy applies. Static embeddings
+    benefit from Xavier''s variance preservation while dynamic embeddings need zero-initialized state
+    for proper temporal updates.'
+  evidence: DKG/utils/model_utils.py:48(get_embedding)
+  stage: default_value
+  alternative_considered: Uniform or normal initialization were considered but Xavier/zero are optimal
+    for respective use cases
+- id: BD-121
+  type: BA/M
+  content: 'EdgeModel loss combination weights are hardcoded: tail=1.0, rel=0.2, head=0.1'
+  rationale: 'The hardcoded loss weights (tail=1.0, rel=0.2, head=0.1) reflect domain assumptions about
+    prediction importance: tail entity prediction is most important, relation prediction moderate, and
+    head prediction least emphasized. This business assumption encodes that edges (which entity participates)
+    matter more than which direction. Changing these weights would alter the optimization objective without
+    documented justification.'
+  evidence: DKG/model/model.py:459(EdgeModel.forward_loss_combination)
+  stage: default_value
+  alternative_considered: Equal weights were rejected; empirical tuning showed tail-focused loss performs
+    best
+  _evidence_issues:
+  - 'FN_NOT_FOUND: EdgeModel.forward_loss_combination in DKG/model/model.py'
+- id: BD-122
+  type: BA
+  content: Loss computation aggregates via sum(dict.values())—each loss components equally weighted in
+    total
+  rationale: Equal weighting via sum(dict.values()) assumes each loss components (temporal, edge, relation)
+    contribute equally to overall optimization. This business assumption means no loss type is privileged
+    in the final gradient. The boundary determines loss aggregation. If components have different scales,
+    equal weighting may under-optimize some objectives—this is a known limitation of simple summation.
+  evidence: DKG/train.py:368(compute_loss)
+  stage: ordering_contract
+  alternative_considered: Weighted sum was rejected as hyperparameters would require tuning
+- id: BD-123
+  type: BA/DK
+  content: GDELT dataset uses num_bases=50 vs num_bases=100 for other graphs in RGCN regularization
+  rationale: GDELT's smaller num_bases=50 (vs 100) reflects its different graph density and entity count
+    compared to other datasets. This business assumption tunes RGCN regularization strength—fewer bases
+    for sparser graphs. The boundary at line 190-191 applies dataset-specific regularization. Using 100
+    for GDELT would over-regularize, while 50 for denser graphs would under-regularize.
+  evidence: DKG/model/embedding.py:190(RGCN_gnn_num_bases_gdelt)
+  stage: default_value
+  alternative_considered: Auto-tuning num_bases was rejected as it would require validation overhead per
+    dataset
+  _evidence_issues:
+  - 'FN_NOT_FOUND: RGCN_gnn_num_bases_gdelt in DKG/model/embedding.py'
+- id: BD-124
+  type: B
+  content: InterEventTimeModel is a thin wrapper around LogNormMixTPP with no additional logic
+  rationale: InterEventTimeModel delegates each methods to self.tpp_model (LogNormMixTPP), establishing
+    a composition boundary where the wrapper adds no behavior beyond API translation. This architectural
+    decision means InterEventTimeModel exists purely for interface consistency and dataset-specific naming.
+    Every temporal point process logic lives in the TPP layer. Future changes to inter-event time modeling
+    must modify LogNormMixTPP directly.
+  evidence: DKG/model/model.py:540(InterEventTimeModel)
+  stage: inheritance
+  alternative_considered: Direct TPP usage was rejected; wrapper provides cleaner API for model.py interface
+- id: BD-125
+  type: B
+  content: 'Dual optimizer architecture: edge_optimizer and time_optimizer share same parameters but track
+    separately'
+  rationale: The dual optimizer pattern shares model parameters between two AdamW optimizers (lines 131-132)
+    for separate learning rate tracking. This architectural boundary means edge and temporal features
+    can have decoupled update dynamics while operating on the same parameters. The tradeoff is redundant
+    optimizer state and potential convergence differences. Single optimizer with grouped learning rates
+    was rejected to allow per-component rate adjustment.
+  evidence: DKG/train.py:131(setup_optimizers)
+  stage: pattern_choice
+  alternative_considered: Single optimizer with parameter groups was rejected; dual optimizers provide
+    cleaner separation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: setup_optimizers in DKG/train.py'
+- id: BD-126
+  type: T
+  content: node_latest_event_time tensor shape [num_nodes, num_nodes+1, 2] encodes pair-wise latest times
+    plus global column
+  rationale: The tensor dimension [num_nodes, num_nodes+1, 2] encodes pair-wise temporal relationships
+    where [...,-1] accesses the global latest time column. This architectural boundary requires the extra
+    column to store aggregate temporal statistics. Violating the shape would break each indexing operations
+    that depend on the final column for global temporal context. The evidence at line 440 confirms [...,-1]
+    indexing convention for global access.
+  evidence: DKG/model/model.py:100(node_latest_event_time_initialization)
+  stage: invariant
+  alternative_considered: Separate global tensor was rejected; column concatenation is more cache-friendly
+    for pair operations
+  _evidence_issues:
+  - 'FN_NOT_FOUND: node_latest_event_time_initialization in DKG/model/model.py'
+- id: BD-127
+  type: B/BA
+  content: 'INTERACTION: BD-067 (dropout=0 default) × BD-110 (dropout=0.2 model) → Training regularization
+    undefined/contradictory'
+  rationale: These decisions directly contradict each other. BD-067 sets dropout=0 as default in training
+    config, while BD-110 specifies dropout=0.2 in the model constructor. The actual regularization applied
+    depends on which value is used at instantiation time, creating non-deterministic model behavior. This
+    contradiction emerged from parallel development where different files specified conflicting defaults.
+    The issue manifests during model initialization—when train.py creates the model, if dropout argument
+    isn't explicitly passed, BD-110's 0.2 applies, but if train.py explicitly passes dropout=0 per BD-067,
+    the model behaves differently. This ambiguity causes inconsistent regularization across runs and prevents
+    reproducible experiments.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Unified dropout configuration in single location would eliminate contradiction
+- id: BD-128
+  type: B/DK
+  content: 'INTERACTION: BD-004 (separate structural/temporal embeddings) × BD-089 (concat combination
+    mode) → Amplified representational capacity'
+  rationale: 'These decisions multiply each other''s effect on model quality. BD-004 separates structural
+    and temporal embeddings into distinct conceptual spaces, preserving semantic independence. BD-089
+    then concatenates these preserved spaces rather than averaging or adding them, doubling effective
+    embedding dimensionality for downstream use. Without BD-004''s separation, concatenation would mix
+    fundamentally different information types. Without BD-089''s concatenation, the separate embeddings
+    would need to be fused prematurely through addition or averaging, losing type-specific semantics.
+    The interaction amplifies representational capacity: separate embeddings capture heterogeneous patterns
+    (structural: who connects to whom; temporal: when events occur) while concatenation preserves both
+    signal types without interference, enabling downstream layers to learn different weighting strategies
+    for structural versus temporal features.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Addition fusion would conflate signal types; averaging would dilute both
+- id: BD-129
+  type: B
+  content: 'INTERACTION: BD-006 (bidirectional temporal encoding) × BD-060 (split sender/recipient dynamics)
+    → Asymmetric causal pattern capture'
+  rationale: 'These decisions synergistically amplify the model''s ability to capture directional causal
+    patterns in financial events. BD-006 implements bidirectional temporal encoding where entity dynamics
+    differ based on whether the entity initiated or received an event. BD-060 provides the structural
+    mechanism by splitting temporal dynamics into sender and recipient directions, creating the [sender,
+    receiver] pair structure that BD-006 operates on. The interaction is multiplicative: BD-006 defines
+    what to learn (asymmetric causal patterns) while BD-060 defines how to represent it (directional temporal
+    pair encoding). In financial contexts, this captures critical asymmetries—companies receiving negative
+    news experience different temporal dynamics than those initiating merger announcements. Without BD-060,
+    BD-006 would lack the representation structure to distinguish directions. Without BD-006, BD-060''s
+    directional splitting would be inert. The combined effect enables learning that ''A affects B when
+    A initiates'' differs fundamentally from ''B affected by A when B receives''.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Unidirectional encoding would lose receiver-specific temporal signals; shared
+    parameters would lack directional specificity
+- id: BD-130
+  type: BA/M
+  content: 'INTERACTION: BD-107 (embedding dim 200) × BD-109 (8 attention heads) → Multiplicative capacity
+    increase'
+  rationale: These architectural decisions interact multiplicatively to determine model capacity. BD-107
+    sets embedding dimension to 200, providing sufficient expressiveness for entity and relation semantics.
+    BD-109 allocates 8 parallel attention heads, each processing approximately 25 dimensions (200/8).
+    The interaction amplifies representational capacity because each head can specialize in distinct interaction
+    patterns while operating on high-dimensional representations. With 200 dimensions, each head has substantial
+    parameter space to learn complex attention patterns. With 8 heads, the model can simultaneously capture
+    different relationship types (temporal proximity, semantic similarity, structural equivalence) without
+    interference. If dimension were smaller (e.g., 50), heads would compete for limited representational
+    space. If heads were fewer (e.g., 2), the model would lack parallel pattern diversity. The multiplicative
+    effect is essential for financial knowledge graphs where different relation types (acquisitions, mentions,
+    regulatory actions) require different attention patterns operating on rich entity representations.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Lower dimension or fewer heads would force competing patterns; larger dimensions
+    without more heads adds computation without proportional benefit
+- id: BD-131
+  type: BA
+  content: 'INTERACTION: BD-026 (truncated BPTT 100 batches) × BD-057 (truncate every 20 batches) × BD-115
+    (detach_() at truncation) → Hierarchical gradient management'
+  rationale: 'These three decisions form a hierarchical gradient management system that prevents memory
+    exhaustion while maintaining temporal dependencies. BD-026 establishes the primary truncation boundary
+    at 100 batches for full BPTT scope. BD-057 sets a finer-grained truncation at 20 batches for RNN gradient
+    flow. BD-115 provides the mechanism via detach_() calls that sever computational graphs at truncation
+    points. The interaction cascade: BD-115 provides the implementation that enables BD-057 and BD-026
+    to function correctly. Without detach_(), truncating would still allow gradients to flow across truncation
+    boundaries, defeating the purpose. BD-026 and BD-057 operate at different timescales—BD-026 controls
+    overall BPTT scope while BD-057 controls RNN state management. The multiplicative effect is memory
+    efficiency: breaking gradient flow at multiple granularities prevents O(sequence_length) memory growth
+    while allowing temporal patterns spanning many batches to influence predictions. Financial event sequences
+    can span thousands of events; without this hierarchy, training would be infeasible.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Full BPTT would exhaust memory; single-level truncation would not provide sufficient
+    granularity control
+- id: BD-132
+  type: BA/DK
+  content: 'INTERACTION: BD-003 (min timestamp diff as time_interval) × BD-085 (log transform) → Temporal
+    normalization pipeline'
+  rationale: 'These decisions form a hidden dependency chain in the temporal normalization pipeline. BD-003
+    defines time_interval as the minimum difference between unique timestamps, establishing the fundamental
+    time unit for the dataset. BD-085 then applies log transformation to these intervals. The dependency
+    is hidden because BD-085 implicitly assumes the intervals from BD-003 are positive and span multiple
+    orders of magnitude—properties guaranteed by BD-003''s minimum-difference computation. If time_interval
+    were defined differently (e.g., as maximum difference), the log transform would behave differently,
+    potentially causing numerical instability or losing temporal resolution. The interaction amplifies
+    normalization effectiveness: BD-003 adapts the time unit to dataset-specific granularity while BD-085
+    normalizes the resulting right-skewed distribution. Without BD-003, log transform inputs might have
+    inappropriate scale. Without BD-085, BD-003''s adaptive granularity would still produce highly skewed
+    intervals unsuited for neural network training. The pipeline is essential for temporal feature comparability
+    across datasets with different time granularities.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Fixed time unit would not adapt to dataset granularity; linear transform would
+    not handle skew
+  vague_rationale: true
+- id: BD-133
+  type: B/BA
+  content: 'INTERACTION: BD-035 (three subgraph types) × BD-116 (strict temporal ordering invariant) →
+    Temporal causality enforcement'
+  rationale: 'These decisions create a causality enforcement system for temporal knowledge graphs. BD-035
+    establishes three subgraph types (prior, batch, cumulative) with distinct semantic roles—prior provides
+    historical context, batch contains target edges, cumulative tracks evolving state. BD-116 enforces
+    the temporal ordering invariant (prior_G < batch_G <= cumul_G) that prevents temporal paradoxes. The
+    interaction is a hidden dependency: BD-035''s subgraph separation only guarantees correct temporal
+    information flow if BD-116''s ordering invariant is maintained. If ordering were violated, future
+    events could leak into past predictions, corrupting the temporal reasoning logic. The amplified effect
+    prevents causality violations that would make predictions meaningless—a model predicting past events
+    based on future information would be useless for financial forecasting. This interaction is critical
+    because the subgraph architecture (BD-035) assumes temporal ordering as a pre-condition; without the
+    invariant (BD-116), the architecture''s guarantees collapse.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Non-temporal ordering would break event sequence validity; overlapping subgraph
+    definitions would cause data leakage
+- id: BD-134
+  type: BA/M
+  content: 'INTERACTION: BD-012 (edge normalization time decay) × BD-061 (edge norm clamp max 10.0) ×
+    BD-084 (inverse time interval decay) → Temporal proximity weighting'
+  rationale: 'These decisions form a temporal proximity weighting system with potential saturation risks.
+    BD-084 implements inverse time interval as edge weight decay (1/time_interval). BD-012 uses this for
+    temporal convolution edge normalization. BD-061 clamps edge norm to maximum 10.0 to prevent numerical
+    instability. The interaction creates risk cascade: for very recent events (small time intervals),
+    BD-084 produces large decay values. For very old events (large time intervals), BD-084 produces small
+    decay values. The clamping in BD-061 prevents extreme values but creates a saturation effect where
+    moderately old and extremely old edges receive similar (clamped) weights. This risks losing temporal
+    discrimination for distant events—distinguishing between a 1-year-old and 10-year-old edge may not
+    be possible if both clamp to 10.0. The cascade risk: if temporal patterns in financial data have long-range
+    dependencies (e.g., 2008 financial crisis affecting current behavior), the clamping could lose critical
+    long-range temporal signals, degrading predictions for entities with significant historical events.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: No clamping would risk numerical instability; exponential decay would have different
+    saturation characteristics
+- id: BD-135
+  type: B/BA
+  content: 'RISK CASCADE: BD-085 (log transform) → BD-021 (log-normal mixture) → BD-066 (expected time
+    = latest + expected inter-event) → Temporal prediction quality'
+  rationale: 'This cascade connects temporal feature engineering through probabilistic modeling to final
+    predictions. BD-085 applies log transformation to inter-event times, assuming log-normal-like distributions.
+    BD-021 models inter-event times with log-normal mixture distribution, validating BD-085''s assumption
+    and extending it to multi-modal patterns. BD-066 provides the point estimate formula (latest_event_time
+    + expected_inter_event_time) that uses BD-021''s distribution parameters. The cascade risk: if log
+    transformation (BD-085) is miscalibrated for a dataset (e.g., if intervals don''t follow log-normal
+    distributions), errors propagate to mixture parameter learning (BD-021), which then corrupts expected
+    time predictions (BD-066). Financial event sequences may have non-log-normal patterns (e.g., heavy-tailed
+    distributions from market crashes, multi-modal patterns from earnings cycles) that violate BD-085''s
+    implicit assumption. When this occurs, the mixture model learns suboptimal parameters, producing systematically
+    biased time predictions. The cascade manifests in production: entities with non-standard temporal
+    patterns receive inaccurate next-event-time predictions, leading to poor timing for downstream financial
+    decisions.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Distribution-agnostic temporal modeling would avoid assumption risks but may
+    have lower accuracy when assumptions hold
+- id: BD-136
+  type: BA/M
+  content: 'RISK CASCADE: BD-107 (dim 200) + BD-109 (8 heads) → BD-113 (CPU embeddings) + BD-034 (memory
+    batching MAX_EDGES) → Memory pressure during training'
+  rationale: 'This cascade connects model capacity decisions to memory management strategies. BD-107 and
+    BD-109 establish high representational capacity (200-dim embeddings with 8 attention heads), which
+    increases memory requirements quadratically for attention computations (O(batch_size × seq_len² ×
+    dim)). BD-113 enforces that dynamic embeddings stay on CPU to manage memory, establishing an invariant
+    that must be maintained. BD-034 implements memory-aware batching with MAX_EDGES=400000 limit to prevent
+    OOM during evaluation. The cascade risk: as model capacity increases through BD-107/BD-109, memory
+    pressure mounts. BD-113''s CPU/GPU boundary becomes strained—more frequent transfers may be needed.
+    BD-034''s fixed MAX_EDGES may become insufficient for larger datasets or longer sequences, requiring
+    adjustment. If either safeguard fails (embeddings accidentally move to GPU, or MAX_EDGES is exceeded),
+    OOM errors occur. The cascade manifests during scaling: when FinDKG grows or when experimenting with
+    larger models, memory management breaks down, causing training failures. Production deployments must
+    carefully tune MAX_EDGES and enforce BD-113''s invariant to maintain stability.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Lower model capacity would reduce memory pressure but limit representational
+    power; adaptive batching would add complexity
+- id: BD-137
+  type: BA
+  content: 'INTERACTION: BD-122 (equal loss aggregation) × BD-051 (weighted tail=1.0, rel=0.2, head=0.1)
+    → Ambiguous multi-task optimization priority'
+  rationale: 'These decisions create contradictory multi-task optimization signals. BD-122 aggregates
+    losses via sum(dict.values()), which equal-weights each loss components. BD-051 specifies weighted
+    combination (tail=1.0, rel=0.2, head=0.1) within the edge loss computation. The contradiction: BD-122
+    says each losses are equal in aggregation, while BD-051 says tail prediction is 10x more important
+    than head prediction. If multiple loss components exist (temporal, edge, relation), BD-122''s equal
+    aggregation may override BD-051''s weighting hierarchy. The interaction creates ambiguity in optimization
+    priority—when temporal loss and edge loss are summed equally, the relative importance of tail vs head
+    prediction within edge loss becomes unclear if temporal loss magnitude differs. If temporal loss dominates
+    numerically, the weighted edge priorities become negligible. The risk: intended optimization priorities
+    (tail prediction most important) may not materialize if loss scales differ. This is a hidden contradiction
+    where the apparent weighting in BD-051 could be overwhelmed by BD-122''s equal aggregation.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Loss normalization before aggregation would ensure weighted priorities are respected
+    regardless of loss magnitude differences
+- id: BD-GAP-001
+  type: RC
+  content: 'Missing: Timezone explicit annotation'
+  rationale: 'Audit finding: missing: timezone explicit annotation. 4 | float vs Decimal for currency
+    | ❌ not applicable | No currency calculations; this is an entity embedding/ML library. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_loading
+  status: missing
+  known_gap: true
+  severity: high
+  impact: 4 | float vs Decimal for currency | ❌ not applicable | No currency calculations; this is an
+    entity embedding/ML library
+- id: BD-GAP-002
+  type: DK
+  content: 'Missing: Point-in-Time data availability'
+  rationale: 'Audit finding: missing: point-in-time data availability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_loading
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-003
+  type: DK
+  content: 'Missing: Stale data detection and expiry policy'
+  rationale: 'Audit finding: missing: stale data detection and expiry policy. 9 | PnL conservation | ❌
+    not applicable | No PnL calculations in this ML library. This gap affects production reliability and
+    should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_loading
+  status: missing
+  known_gap: true
+  severity: high
+  impact: 9 | PnL conservation | ❌ not applicable | No PnL calculations in this ML library
+- id: BD-GAP-004
+  type: B
+  content: 'Missing: Provider 优先级与凭证隔离'
+  rationale: 'Audit finding: missing: provider 优先级与凭证隔离. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_loading
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-005
+  type: DK
+  content: 'Missing: ** "Add explicit timezone annotation for each time fields in FinDKG dataset (UTC
+    normalization)'
+  rationale: 'Audit finding: missing: ** "add explicit timezone annotation for each time fields in findkg
+    dataset (utc normalization). ** Time comparison across different data sources may produce incorrect
+    results if timezone offsets differ. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_loading
+  status: missing
+  known_gap: true
+  severity: high
+  impact: '** Time comparison across different data sources may produce incorrect results if timezone
+    offsets differ'
+- id: BD-GAP-006
+  content: 'Missing: Timezone explicit annotation'
+  type: RC
+  rationale: 'Audit finding: missing: timezone explicit annotation. 4 | float vs Decimal for currency
+    | ❌ not applicable | No currency calculations; this is an entity embedding/ML library. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_loading
+  status: missing
+  severity: high
+  impact: 4 | float vs Decimal for currency | ❌ not applicable | No currency calculations; this is an
+    entity embedding/ML library
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: KGTransformer Model Training Pipeline
+  source: train_DKG_run.py
+  type: ml_prediction
+  business_problem: Training a knowledge graph-based transformer model for temporal/dynamic knowledge
+    graph embedding tasks to learn entity and relation representations over time.
+  intent_keywords:
+  - training
+  - knowledge graph
+  - KGTransformer
+  - machine learning
+  - model training
+  stage: model_training
+  negative_keywords:
+  - screening
+  - trading strategy
+  - live trading
+  - data pipeline
+  disambiguation: Are you looking to train a knowledge graph embedding model from scratch, or do you need
+    to use an existing model for inference or prediction?
+  data_domain: mixed
+- id: UC-102
+  name: Dynamic Knowledge Graph Model Training
+  source: DKG/train.py
+  type: ml_prediction
+  business_problem: Training dynamic knowledge graph models to learn temporal entity and relation embeddings
+    for link prediction and event time prediction tasks.
+  intent_keywords:
+  - knowledge graph
+  - dynamic graph
+  - temporal modeling
+  - entity embedding
+  - link prediction
+  stage: model_training
+  negative_keywords:
+  - screening
+  - trading strategy
+  - live trading
+  - data pipeline
+  disambiguation: Do you need to train a model on your own temporal knowledge graph data, or are you looking
+    to use existing pre-trained models for inference on new data?
+  data_domain: mixed
+- id: UC-103
+  name: Early Stopping Training Utility
+  source: DKG/utils/train_utils.py
+  type: ml_prediction
+  business_problem: Preventing overfitting during model training by automatically stopping training when
+    validation performance stops improving, with checkpoint management.
+  intent_keywords:
+  - early stopping
+  - overfitting prevention
+  - model training
+  - checkpointing
+  - patience
+  stage: model_training
+  negative_keywords:
+  - screening
+  - trading strategy
+  - live trading
+  - data pipeline
+  - model inference
+  disambiguation: Are you implementing a training loop and need to prevent overfitting, or are you looking
+    for model inference or prediction utilities?
+  data_domain: mixed
+- id: UC-104
+  name: Knowledge Graph Model Evaluation
+  source: DKG/eval.py
+  type: ml_prediction
+  business_problem: Evaluating trained knowledge graph models on link prediction and time prediction tasks
+    to measure model performance using various metrics.
+  intent_keywords:
+  - evaluation
+  - metrics
+  - link prediction
+  - ranking
+  - model assessment
+  stage: model_evaluation
+  negative_keywords:
+  - screening
+  - trading strategy
+  - live trading
+  - data pipeline
+  disambiguation: Are you evaluating a trained model to assess its quality, or do you need help understanding
+    evaluation results and metrics?
+  data_domain: mixed
+- id: UC-105
+  name: Evaluation Metrics Computation Utilities
+  source: DKG/utils/eval_utils.py
+  type: ml_prediction
+  business_problem: Computing standard ranking metrics (MRR, recall) and regression metrics (MAE, MSE,
+    RMSE) for evaluating machine learning model performance.
+  intent_keywords:
+  - metrics
+  - evaluation
+  - ranking
+  - recall
+  - MRR
+  stage: model_evaluation
+  negative_keywords:
+  - screening
+  - trading strategy
+  - live trading
+  - data pipeline
+  - model training
+  disambiguation: Are you looking for utility functions to compute evaluation metrics, or do you need
+    help interpreting existing evaluation results?
+  data_domain: mixed
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 24
+  evidence_invalid: 102
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.19047619047619047
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 2
+    warn: 9
+    fail: 8
+  subdomain_totals:
+    pass: 1
+    warn: 2
+    fail: 7
+  coverage: 29/29 (100%)
+  pass_rate: 3/29 (10%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: graph_learning_backend
+  description: KGTransformer uses DGL's TypedLinear and custom edge-softmax over typed edges; switching
+    would require reimplementing the attention mechanism. PyG is the main alternative but lacks native
+    typed-attention; NetworkX is unsuitable for deep learning.
+  used_in_stages: []
+  options:
+  - name: DGL (Deep Graph Library)
+    traits:
+    - heterogeneous-graphs
+    - message-passing
+    - sparse-ops
+    - GNN-layers
+    fit_for:
+    - General graph neural network workloads, heterogeneous graphs with typed nodes/edges, production
+      deployments
+    not_fit_for:
+    - Very large-scale distributed training beyond single-node multi-GPU
+  - name: PyTorch Geometric
+    traits:
+    - heterogeneous-graphs
+    - message-passing
+    - sparse-ops
+    - GNN-layers
+    fit_for:
+    - Research-focused GNN experiments, easy dataset loading, rich operator library
+    not_fit_for:
+    - Projects already committed to DGL API; custom typed-attention (KGTransformer) requires reimplementation
+  - name: NetworkX (pure Python)
+    traits:
+    - static-graphs
+    - basic-ops
+    fit_for:
+    - Simple static knowledge graph analysis without deep learning
+    not_fit_for:
+    - Dynamic KG modeling, temporal reasoning, GPU-accelerated training
+  default: DGL (Deep Graph Library)
+  _source: worker_resource
+- id: slot-002
+  name: graph_scatter_aggregation
+  description: Only used in RelationRNN for aggregating entity embeddings by relation type. The default
+    torch-scatter is the only GPU-compatible option. A manual index_add implementation is possible for
+    CPU-only scenarios at performance cost.
+  used_in_stages: []
+  options:
+  - name: torch-scatter
+    traits:
+    - GPU-accelerated
+    - scatter-ops
+    - sparse-reductions
+    fit_for:
+    - Efficient per-relation entity embedding aggregation required by RelationRNN
+    not_fit_for:
+    - CPU-only environments without compilation toolchain
+  - name: torch-scatter (alternative build source)
+    traits:
+    - GPU-accelerated
+    - scatter-ops
+    fit_for:
+    - Environments where default PyPI build fails (CUDA/PyTorch version mismatch)
+    not_fit_for:
+    - Users without access to pre-built wheels
+  - name: Manual scatter via torch index_add
+    traits:
+    - no-extra-dep
+    - CPU-only
+    - slower
+    fit_for:
+    - CPU-only deployments avoiding compilation, minimal-dependency environments
+    not_fit_for:
+    - GPU training (performance); production workloads
+  default: torch-scatter
+  _source: worker_resource
+- id: slot-003
+  name: data_loading_format
+  description: Every existing TKG benchmarks use TSV format. Switching to Parquet/HDF5 would require modifying
+    DKG.data.load_data_table() and dataset conversion pipeline. Parquet is the most practical alternative
+    for large-scale deployments.
+  used_in_stages: []
+  options:
+  - name: Tab-separated text files
+    traits:
+    - human-readable
+    - easy-to-edit
+    - standard-TKG-format
+    fit_for:
+    - Every supported datasets; most researchers already use this format
+    not_fit_for:
+    - Very large datasets (hundreds of millions of triplets) where disk I/O is the bottleneck
+  - name: Parquet binary format
+    traits:
+    - columnar
+    - compressed
+    - fast-read
+    fit_for:
+    - Large-scale datasets, cloud storage scenarios, memory-efficient column access
+    not_fit_for:
+    - Small datasets; requires format conversion pipeline
+  - name: HDF5
+    traits:
+    - binary
+    - chunked
+    - random-access
+    fit_for:
+    - Very large graphs with random-access requirements
+    not_fit_for:
+    - Streaming/incremental graph updates
+  default: Tab-separated text files
+  _source: worker_resource
+- id: slot-004
+  name: checkpoint_serialization
+  description: torch.save/load is used for model checkpoints (CPU/GPU-aware serialization). dill is used
+    for graph cache objects where the full object graph (including DGL graph internals) may be more complex.
+    Switching would not break the architecture but dill provides broader serialization coverage for cache.
+  used_in_stages: []
+  options:
+  - name: PyTorch native (.pt)
+    traits:
+    - native
+    - compressed
+    - GPU-tensor-aware
+    fit_for:
+    - Every scenarios; default for PyTorch-based projects
+    not_fit_for:
+    - Interoperability with non-PyTorch frameworks
+  - name: Dill-pickled Python objects
+    traits:
+    - generic-pickle
+    - wider-type-support
+    fit_for:
+    - Complex Python objects (lambdas, local functions) that standard pickle cannot handle
+    not_fit_for:
+    - Performance-critical serialization; large tensor objects
+  default: PyTorch native .pt for model checkpoints; dill for graph cache
+  _source: worker_resource
+- id: slot-005
+  name: temporal_point_process_model
+  description: LogNormal mixture is well-suited for financial event times (positively skewed, heavy-tailed).
+    Exponential is too memoryless for financial dynamics. Neural TPP would be more flexible but requires
+    significantly more engineering effort and data.
+  used_in_stages: []
+  options:
+  - name: LogNormal Mixture TPP
+    traits:
+    - log-normal
+    - mixture-model
+    - temporal-reasoning
+    fit_for:
+    - Modeling inter-event times with heavy-tailed distributions typical in financial events
+    not_fit_for:
+    - High-frequency event streams; non-positive inter-event times
+  - name: Exponential TPP
+    traits:
+    - exponential
+    - poisson-process
+    fit_for:
+    - Simple memoryless temporal processes
+    not_fit_for:
+    - Financial event data (empirically exhibits heavy tails beyond exponential)
+  - name: Neural TPP (RNN-based intensity)
+    traits:
+    - neural
+    - flexible
+    - continuous-time
+    fit_for:
+    - Complex nonparametric temporal patterns
+    not_fit_for:
+    - Small datasets where neural TPP overfits
+  default: LogNormal Mixture TPP (LogNormMixTPP)
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: Bundled local dataset
+  description: 'Temporal Knowledge Graph — financial event triplets (subject, relation, object, time).
+    Coverage: N/A. Auth: None (bundled with repo)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: Bundled local dataset (extended version)
+  description: 'Temporal Knowledge Graph — financial event triplets (same schema as FinDKG, larger). Coverage:
+    N/A. Auth: None (bundled with repo)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: Integrated Crisis Early Warning System
+  description: 'Political event triplets (subject, relation, object, time). Coverage: N/A. Auth: None
+    (public dataset)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: Global Database of Events, Language, and Tone
+  description: 'Worldwide event triplets. Coverage: N/A. Auth: None (public dataset)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: Internet Archive
+  description: 'Historical financial news articles (source corpus for FinDKG construction). Coverage:
+    N/A. Auth: None'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: CUDA GPU Compute
+  description: Training acceleration for KGTransformer model (recommended; CPU fallback available)
+  used_in_stages: []
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: Local filesystem (cache)
+  description: Dill-pickled cached graph objects to avoid repeated loading
+  used_in_stages: []
+  _source: worker_resource
+- id: res-008
+  type: external_service
+  name: Local filesystem (results)
+  description: Checkpoints, logs, and evaluation results
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: external_service
+  name: Local filesystem (data root)
+  description: Temporal knowledge graph data files
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: external_service
+  name: Python standard logging
+  description: Structured training/evaluation logs written to file and stdout
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: python_package
+  name: torch
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: python_package
+  name: dgl
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: python_package
+  name: torch-scatter
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-014
+  type: python_package
+  name: numpy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-015
+  type: python_package
+  name: pandas
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: python_package
+  name: tqdm
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-017
+  type: python_package
+  name: dill
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-018
+  type: python_package
+  name: torch-distributions
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-019
+  type: code_example
+  name: KGTransformer Model Training Pipeline
+  path: train_DKG_run.py
+  description: Training a knowledge graph-based transformer model for temporal/dynamic knowledge graph
+    embedding tasks to learn entity and relation representations over time.
+  used_in_stages:
+  - model_training
+  _source: uc_list
+- id: res-020
+  type: code_example
+  name: Dynamic Knowledge Graph Model Training
+  path: DKG/train.py
+  description: Training dynamic knowledge graph models to learn temporal entity and relation embeddings
+    for link prediction and event time prediction tasks.
+  used_in_stages:
+  - model_training
+  _source: uc_list
+- id: res-021
+  type: code_example
+  name: Early Stopping Training Utility
+  path: DKG/utils/train_utils.py
+  description: Preventing overfitting during model training by automatically stopping training when validation
+    performance stops improving, with checkpoint management.
+  used_in_stages:
+  - model_training
+  _source: uc_list
+- id: res-022
+  type: code_example
+  name: Knowledge Graph Model Evaluation
+  path: DKG/eval.py
+  description: Evaluating trained knowledge graph models on link prediction and time prediction tasks
+    to measure model performance using various metrics.
+  used_in_stages:
+  - model_evaluation
+  _source: uc_list
+- id: res-023
+  type: code_example
+  name: Evaluation Metrics Computation Utilities
+  path: DKG/utils/eval_utils.py
+  description: Computing standard ranking metrics (MRR, recall) and regression metrics (MAE, MSE, RMSE)
+    for evaluating machine learning model performance.
+  used_in_stages:
+  - model_evaluation
+  _source: uc_list

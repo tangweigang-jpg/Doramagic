@@ -1,0 +1,3462 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-004
+name: 股票智能分析系统 (AI Stock Analysis System)
+sop_version: '3.6'
+source:
+  projects:
+  - daily_stock_analysis
+  commit_hash: 706879fd327285564b34c79a37a2ce15c2f5bf28
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Multi-agent stock analysis with automated reporting
+  description: An AI-powered stock analysis system that collects market data from multiple providers with
+    failover, performs technical analysis with MA/MACD/RSI indicators, coordinates LLM agents in a ReAct
+    pipeline for investment decision-making, and delivers structured analysis reports via multiple notification
+    channels.
+  prerequisites: Python 3.10+, LLM API keys (OpenAI/Gemini/DeepSeek/Anthropic), data source credentials
+    (Tushare/Akshare/Efinance), chat platform webhooks (Feishu/Discord/Telegram)
+  not_suitable_for: Real-time trading execution, high-frequency trading strategies, markets without data
+    provider coverage, users without LLM API access
+  activation:
+    triggers:
+    - 用户要求分析特定股票时 → analyze_stock
+    - 用户要求一次分析多只股票时 → analyze_stocks
+    - 用户要求市场概览、摘要或复盘时 → perform_market_review
+    - 任务明确是 issue 分析时 → analyze_issue
+    - 任务明确是 PR 审查时 → analyze_pr
+    - 任务明确是 issue 修复时 → fix_issue
+    - 一般开发任务 → default_development_workflow
+    emphasis:
+    - 当任务涉及配置语义、API/Schema、数据源 fallback、报告结构、认证、调度、发布流程、桌面端启动链路时，务必先做风险评估
+    - 当修复涉及用户可见行为变更时，必须同步更新 CHANGELOG.md 和相关文档
+    - 当修改数据源 fallback 逻辑时，关注数据源优先级、失败降级、字段标准化、缓存与超时策略
+    anti_skip:
+    - 不要跳过代码阅读阶段直接修改 — 可能破坏现有逻辑或重复已有实现
+    - 不要跳过验证矩阵检查 — 可能遗漏关键回归风险
+    - 不要跳过 issue 分析直接修复 — 可能修复非真实问题或超出仓库边界的问题
+    - 不要跳过 PR 模板完整性检查 — 合入阻断条件之一是 PR 描述与实际改动内容实质性矛盾
+stages:
+- id: data_collection
+  name: Data Collection & Normalization
+  order: 1
+  responsibility: Fetches stock data from multiple providers with failover, normalizes to standard OHLCV
+    format, and computes technical indicators. Encapsulates anti-blocking jitter and rate limiting. Exists
+    because different markets require different data sources and free APIs have rate limits and blocking
+    risks.
+  interface:
+    inputs: stock_code (str), date_range (start_date, end_date)
+    outputs: 'pd.DataFrame with columns: date, open, high, low, close, volume, amount, pct_chg, ma5, ma10,
+      ma20, volume_ratio'
+  required_methods:
+  - name: DataFetcherManager.fetch_data
+    description: Orchestrates data fetching from multiple providers with priority-based failover. Returns
+      normalized OHLCV DataFrame with computed indicators.
+    evidence: data_provider/base.py:470(DataFetcherManager)
+  - name: BaseFetcher.fetch
+    description: Abstract interface for each fetchers; each subclass implements provider-specific fetching
+      and normalization.
+    evidence: data_provider/base.py:239(BaseFetcher)
+  key_behaviors:
+  - behavior: Provider priority-based failover
+    description: When primary fetcher fails or returns empty data, system automatically falls back to
+      next priority fetcher. EfinanceFetcher (priority-0) is preferred when available, falling back to
+      AkshareFetcher (priority-1), then TushareFetcher (priority-2 when token configured).
+    evidence: data_provider/base.py:843(_init_default_fetchers)
+  - behavior: Thread-safe singleton manager
+    description: Shared DataFetcherManager across async tasks uses per-fetcher RLock to prevent concurrent
+      modification of fetcher list or stock name cache.
+    evidence: data_provider/base.py:492(_fetchers_lock)
+  - behavior: Technical indicator computation
+    description: Computes ma5, ma10, ma20 moving averages and volume_ratio (current volume vs 5-day average
+      using shift(1) to exclude current day from denominator).
+    evidence: data_provider/base.py:447(volume_ratio)
+  - behavior: Anti-blocking jitter
+    description: Random 1.5-5s sleep before each request to evade anti-bot detection on Chinese finance
+      sites. Uses uniform random delays to appear human.
+    evidence: data_provider/base.py:458(random_sleep)
+  replaceable_points:
+  - name: Data fetcher
+    description: BaseFetcher subclass implementing _fetch_raw_data and _normalize_data contract
+    options:
+    - name: EfinanceFetcher
+      traits:
+      - Priority-0 preferred
+      - Clean API
+      - ETF/realtime support
+      fit_for:
+      - A-share, HK, US stocks with reliable access
+      not_fit_for:
+      - When efinance service is down
+    - name: AkshareFetcher
+      traits:
+      - Priority-1 fallback
+      - Wide A-share coverage
+      - 2-5s jitter
+      fit_for:
+      - A-share data when efinance fails
+      not_fit_for:
+      - High-frequency requests due to blocking risk
+    - name: TushareFetcher
+      traits:
+      - Priority-2 paid option
+      - SLA-backed reliability
+      fit_for:
+      - Production use requiring SLAs
+      not_fit_for:
+      - Free tier users without token
+    - name: BaostockFetcher
+      traits:
+      - Free Chinese stock data
+      fit_for:
+      - Budget-constrained A-share analysis
+      not_fit_for:
+      - Non-Chinese markets
+    - name: YfinanceFetcher
+      traits:
+      - US/international stocks
+      fit_for:
+      - Yahoo-accessible markets
+      not_fit_for:
+      - Chinese A-shares
+    default: EfinanceFetcher + AkshareFetcher fallback chain
+  design_decisions:
+  - Strategy pattern for multi-source failover — Allows runtime substitution of data sources without client
+    code changes; each fetcher implements a common interface (data_provider/base.py:470)
+  acceptance_hints:
+  - 'Fetched DataFrame has exactly the specified columns: date, open, high, low, close, volume, amount,
+    pct_chg, ma5, ma10, ma20, volume_ratio'
+  - Moving averages (ma5, ma10, ma20) are monotonically decreasing with period (ma5 > ma10 > ma20 for
+    sufficient data)
+  - volume_ratio calculation uses shift(1) — current day excluded from 5-day average denominator
+  - 'Stock codes normalized: 6-digit for A-share, 5-digit with HK prefix for HK, uppercase for US'
+  - Failsafe returns empty DataFrame on each provider failures (no exception propagation)
+- id: technical_analysis
+  name: Technical Trend Analysis
+  order: 2
+  responsibility: 'Computes MA, MACD, RSI, bias, volume patterns, and support/resistance to generate trend
+    signals. Implements user trading philosophy: 严进策略 (no chasing elevated prices), MA5>MA10>MA20 alignment,
+    pullback buying. Exists to provide objective technical foundation before LLM reasoning.'
+  interface:
+    inputs: pd.DataFrame (OHLCV), stock_code (str)
+    outputs: TrendAnalysisResult dataclass with signal, confidence, trend_status, bias values, volume_status,
+      support_levels
+  required_methods:
+  - name: StockTrendAnalyzer.analyze
+    description: Core analysis method that orchestrates MA/MACD/RSI/bias/volume computation and returns
+      TrendAnalysisResult with each computed indicators and signals.
+    evidence: src/stock_analyzer.py:171(StockTrendAnalyzer)
+  key_behaviors:
+  - behavior: 严进策略 (no-chase) enforcement
+    description: Hardcoded 5% bias threshold rejects entries where close is >5% above MA5. Implemented
+      in _calculate_bias, this business rule prevents chasing elevated prices.
+    evidence: src/stock_analyzer.py:392(_calculate_bias)
+  - behavior: Support level detection
+    description: MA5/MA10 support tolerance of ±2% defines 回踩买点 (pullback entry point). Flagged when price
+      retests MA5 or MA10 within this band.
+    evidence: src/stock_analyzer.py:447(_analyze_support_resistance)
+  - behavior: Standard MACD parameters
+    description: 'Uses industry-standard span=12/26/9: DIF=EMA(12)-EMA(26), DEA=EMA(DIF,9) for trend momentum
+      analysis.'
+    evidence: src/stock_analyzer.py:290(MACD_FAST=12,MACD_SLOW=26,MACD_SIGNAL=9)
+  - behavior: RSI neutral fallback
+    description: RSI fillna(50) returns neutral value when insufficient data for calculation, preventing
+      NaN propagation to downstream consumers.
+    evidence: src/stock_analyzer.py:331(rsi.fillna(50))
+  replaceable_points:
+  - name: Analysis algorithm
+    description: StockTrendAnalyzer.analyze() method implementation
+    options:
+    - name: StockTrendAnalyzer (MA-based)
+      traits:
+      - MA/MACD/RSI/bias/volume
+      - 5% bias threshold
+      - 2% support tolerance
+      fit_for:
+      - Default technical analysis workflow
+      not_fit_for:
+      - Custom indicator requirements
+    - name: Alternative technical library
+      traits:
+      - External library integration
+      fit_for:
+      - Users with different technical analysis needs
+      not_fit_for:
+      - Requires custom integration code
+    default: StockTrendAnalyzer
+  design_decisions:
+  - Bias threshold hardcoded at 5% enforces 严进策略 — rejects entries where close is >5% above MA5 (src/stock_analyzer.py:392)
+  acceptance_hints:
+  - 'TrendAnalysisResult.signal is one of: strong_buy, buy, hold, sell, strong_sell'
+  - 'TrendAnalysisResult.trend_status reflects MA alignment (bull: MA5>MA10>MA20)'
+  - bias values correctly computed as percentage deviation from MA5
+  - support_levels list contains valid price levels within ±2% of MA5/MA10
+  - RSI neutral fallback (50) only used when insufficient data for calculation
+- id: multi_agent_pipeline
+  name: Multi-Agent Pipeline (ReAct + LLM)
+  order: 3
+  responsibility: Coordinates specialized LLM agents (Technical→Intel→Risk→Decision) in a sequential pipeline.
+    Each agent uses ReAct tool-calling loop via shared runner. Produces structured dashboard or free-text
+    response. Exists to combine multiple analytical perspectives before final decision.
+  interface:
+    inputs: task (str), context (dict with stock_code/skills/report_language)
+    outputs: AgentResult with content, dashboard JSON, tool_calls_log, stats
+  required_methods:
+  - name: AgentOrchestrator.run
+    description: Pipeline coordinator that builds agent chain by mode, manages stage timeout, applies
+      risk override, and returns AgentResult with dashboard and reasoning.
+    evidence: src/agent/orchestrator.py:72(AgentOrchestrator)
+  - name: run_agent_loop
+    description: Shared ReAct loop implementation used by each agents; handles tool-calling, timeout semantics,
+      and response processing.
+    evidence: src/agent/runner.py:331(run_agent_loop)
+  key_behaviors:
+  - behavior: Pipeline mode-controlled agent chain
+    description: quick=2 stages (Technical+Decision), standard=3 (adds Intel), full=4 (adds Risk), specialist=dynamic
+      skill-router-selected. Allows trading latency for depth.
+    evidence: src/agent/orchestrator.py:485(_build_agent_chain)
+  - behavior: Risk agent veto authority
+    description: Risk agent's veto is the last word after each opinions collected. Downgrades signal level
+      and sentiment score to reflect risk events. Veto is idempotent.
+    evidence: src/agent/orchestrator.py:405(_apply_risk_override)
+  - behavior: Tool caching with normalized keys
+    description: Cache key normalizes HK variants (HK00700 vs 00700) to same key. Avoids duplicate API
+      calls across LLM steps in multi-step reasoning loops.
+    evidence: src/agent/runner.py:132(_build_tool_cache_key)
+  - behavior: LiteLLM multi-provider abstraction
+    description: LiteLLM Router handles model routing, key rotation, fallback chains. Single interface
+      supports Gemini/Anthropic/OpenAI/DeepSeek without per-provider SDK code.
+    evidence: src/agent/llm_adapter.py:172(_init_litellm)
+  - behavior: Graceful degradation on failure
+    description: Intel or Risk stage failure continues pipeline with partial data. Technical or Decision
+      failure aborts complete pipeline.
+    evidence: src/agent/orchestrator.py:409(StageStatus.FAILED check)
+  replaceable_points:
+  - name: LLM provider
+    description: LiteLLM model routing configuration
+    options:
+    - name: Gemini
+      traits:
+      - Google's multimodal model
+      - High context limit
+      fit_for:
+      - Complex analysis with long context
+      not_fit_for:
+      - Users without Google API key
+    - name: Anthropic
+      traits:
+      - Claude models
+      - Strong reasoning
+      fit_for:
+      - High-quality reasoning tasks
+      not_fit_for:
+      - Budget-constrained users
+    - name: OpenAI
+      traits:
+      - GPT-4/3.5 models
+      - Wide ecosystem
+      fit_for:
+      - General purpose analysis
+      not_fit_for:
+      - Some regions have access restrictions
+    - name: DeepSeek
+      traits:
+      - Cost-effective Chinese model
+      - Good Chinese text understanding
+      fit_for:
+      - Budget-conscious users analyzing Chinese stocks
+      not_fit_for:
+      - Non-Chinese market analysis
+    default: Configured via LLM_CHANNELS/LITELLM_MODEL environment variables
+  - name: Agent chain
+    description: Ordered agent list for pipeline mode
+    options:
+    - name: quick (Technical→Decision)
+      traits:
+      - Low latency
+      - 2 stages only
+      fit_for:
+      - Quick checks when speed matters
+      not_fit_for:
+      - Comprehensive analysis
+    - name: standard (Technical→Intel→Decision)
+      traits:
+      - Includes news intelligence
+      - Balanced depth
+      fit_for:
+      - Default daily analysis
+      not_fit_for:
+      - When risk assessment needed
+    - name: full (Technical→Intel→Risk→Decision)
+      traits:
+      - Full pipeline with risk veto
+      - Highest latency
+      fit_for:
+      - Production trading decisions
+      not_fit_for:
+      - Quick screening
+    - name: specialist (dynamic skill agents)
+      traits:
+      - Market-regime-adaptive skills
+      - Router-selected
+      fit_for:
+      - Adaptive strategy selection
+      not_fit_for:
+      - Fixed strategy requirements
+    default: standard
+  design_decisions:
+  - Shared run_agent_loop — single ReAct implementation eliminates per-agent duplication (src/agent/runner.py:331)
+  - LiteLLM Router for multi-provider LLM routing abstracts away provider differences (src/agent/llm_adapter.py:172)
+  acceptance_hints:
+  - AgentResult.dashboard contains signal, operation_advice (buy/hold/sell), and price targets
+  - 'Pipeline respects agent execution order: Technical before Intel before Risk before Decision'
+  - Risk override successfully downgrades signal when risk conditions met
+  - Tool cache prevents duplicate data fetches within same analysis session
+  - Timeout handling returns partial results rather than hanging indefinitely
+- id: skill_system
+  name: Trading Skill System
+  order: 4
+  responsibility: Pluggable natural-language trading patterns (YAML-defined) injected into agent prompts.
+    Skills are loaded from built-in directory or user directory, selected by router based on market regime,
+    and aggregated into consensus opinions. Exists to allow non-programmers to add custom trading strategies.
+  interface:
+    inputs: AgentContext with stock data and regime hints
+    outputs: Skill list with instructions for agent prompts; consensus AgentOpinion from aggregator
+  required_methods:
+  - name: SkillManager.get_skill_instructions
+    description: Loads and manages Skill registry; generates combined instruction text for agent prompts
+      from selected skills.
+    evidence: src/agent/skills/base.py:315(SkillManager)
+  - name: SkillRouter.route
+    description: Rule-based skill selection based on market regime and user request; returns list of skill_ids
+      to activate.
+    evidence: src/agent/skills/router.py:25(SkillRouter)
+  - name: SkillAggregator.aggregate
+    description: Weighted consensus of skill opinions using backtest accuracy weights; returns final AgentOpinion
+      for DecisionAgent.
+    evidence: src/agent/skills/aggregator.py:40(SkillAggregator)
+  key_behaviors:
+  - behavior: YAML-based skill definition
+    description: Skills defined as YAML natural-language bundles with instructions injected into LLM system
+      prompts. Business users can add strategies without Python code changes.
+    evidence: src/agent/skills/base.py:27(Skill.instructions)
+  - behavior: Backtest-driven skill weighting (dead code path)
+    description: SkillAggregator._backtest_factor() returns 1.0 because BacktestService.get_skill_summary()
+      always returns None. Skills currently get neutral weight.
+    evidence: src/agent/skills/aggregator.py:131(_backtest_factor)
+  - behavior: Lazy skill loading
+    description: YAML loading deferred until SkillManager instantiation; avoids eager filesystem access
+      at import time.
+    evidence: src/agent/skills/base.py:344(load_builtin_skills)
+  - behavior: Regime-based skill selection
+    description: SkillRouter regime detection reads from 'technical' agent opinions only; Intel/Risk data
+      cannot influence skill selection.
+    evidence: src/agent/skills/router.py:76(_detect_regime)
+  - behavior: Core policy conditional application
+    description: MA5>MA10>MA20 and bias<5% baseline only applies when explicit_skill_selection=False.
+      User-explicit selection silently strips bull_trend baseline controls.
+    evidence: src/agent/skills/defaults.py:73(get_default_trading_skill_policy)
+  replaceable_points:
+  - name: Skill bundle
+    description: YAML skill definition in strategies/ or custom directory
+    options:
+    - name: 龙头策略
+      traits:
+      - Leader stock strategy
+      - Momentum-based
+      fit_for:
+      - Trending markets
+      not_fit_for:
+      - Sideways markets
+    - name: 缩量回踩
+      traits:
+      - Volume pullback strategy
+      - Support-based
+      fit_for:
+      - Pullback entry opportunities
+      not_fit_for:
+      - Breakout trading
+    - name: 均线金叉
+      traits:
+      - MA golden cross
+      - Trend confirmation
+      fit_for:
+      - Bull market entries
+      not_fit_for:
+      - Volatile choppy markets
+    - name: 缠论
+      traits:
+      - Chan theory
+      - Complex pattern-based
+      fit_for:
+      - Detailed technical analysis
+      not_fit_for:
+      - Quick decision-making
+    - name: user-defined YAML
+      traits:
+      - Custom strategy
+      - User-defined logic
+      fit_for:
+      - Unique trading approaches
+      not_fit_for:
+      - Production without testing
+    default: Built-in strategies directory (strategies/)
+  design_decisions:
+  - Skills as YAML natural-language bundles — no code changes needed to add custom strategies (src/agent/skills/base.py:27)
+  acceptance_hints:
+  - Skill.instructions successfully loaded from YAML with frontmatter
+  - SkillRouter.route() returns non-empty skill_ids for recognized regime
+  - SkillAggregator.aggregate() returns AgentOpinion with consensus signal
+  - user_invocable=True skills appear in NL selectors and bot commands
+  - Skill defaults loaded lazily without triggering import-time filesystem errors
+- id: bot_messaging
+  name: Bot Messaging & Command Dispatch
+  order: 5
+  responsibility: Receives messages from multiple chat platforms (Feishu, DingTalk, Discord), routes commands
+    via dispatcher, handles rate limiting, NL intent parsing, and async command execution. Exists to provide
+    natural language interaction channel for end users.
+  interface:
+    inputs: BotMessage (platform-agnostic unified format)
+    outputs: BotResponse (text/markdown/error) → platform-specific WebhookResponse
+  required_methods:
+  - name: CommandDispatcher.dispatch
+    description: Command registry and routing; handles rate limiting, NL intent fallback, admin check.
+      Main entry point for bot message processing.
+    evidence: bot/dispatcher.py:82(CommandDispatcher)
+  - name: BotCommand.execute
+    description: Abstract base for each bot commands; each subclass implements stock analysis, batch processing,
+      or other commands.
+    evidence: bot/commands/base.py:17(BotCommand)
+  key_behaviors:
+  - behavior: Platform-agnostic message handling
+    description: Unified BotMessage/BotResponse with platform-specific parsing/formatting isolated in
+      BotPlatform adapters. Each platform (Feishu, DingTalk, Discord) has different webhook format.
+    evidence: bot/platforms/base.py:71(parse_message)
+  - behavior: Per-user rate limiting
+    description: 'Sliding window rate limiter: 10 requests per 60s per user_id. Protects against abuse
+      while allowing legitimate multi-stock queries.'
+    evidence: bot/dispatcher.py:24(RateLimiter)
+  - behavior: NL intent routing fallback
+    description: When message is not a command, dispatcher sends to LLM for intent parsing. Enables natural
+      language queries like '帮我看看茅台怎么样'.
+    evidence: bot/dispatcher.py:457(_try_nl_routing)
+  - behavior: Async command execution
+    description: execute_async dispatches sync execute() to thread pool. Prevents blocking the bot event
+      loop for long-running analysis tasks.
+    evidence: bot/commands/base.py:113(execute_async)
+  - behavior: Feishu per-conversation FIFO queue
+    description: Messages ordered by conversation key. Ensures responses arrive in same order as user
+      queries within chat thread.
+    evidence: bot/platforms/feishu_stream.py:288(_conversation_key)
+  replaceable_points:
+  - name: Command
+    description: BotCommand subclass with execute() method
+    options:
+    - name: AskCommand
+      traits:
+      - Skill-based stock analysis
+      - Multi-stock support
+      fit_for:
+      - Natural language stock queries
+      not_fit_for:
+      - Batch operations
+    - name: AnalyzeCommand
+      traits:
+      - Direct analysis trigger
+      fit_for:
+      - Explicit analysis requests
+      not_fit_for:
+      - Natural language input
+    - name: BatchCommand
+      traits:
+      - Multiple stock analysis
+      fit_for:
+      - Portfolio-wide analysis
+      not_fit_for:
+      - Single stock queries
+    - name: MarketCommand
+      traits:
+      - Market overview data
+      fit_for:
+      - Market summary requests
+      not_fit_for:
+      - Stock-specific analysis
+    - name: StrategiesCommand
+      traits:
+      - Skill listing
+      fit_for:
+      - Viewing available strategies
+      not_fit_for:
+      - Analysis execution
+    default: Every registered commands
+  - name: Platform adapter
+    description: BotPlatform subclass for chat platform integration
+    options:
+    - name: FeishuStreamPlatform
+      traits:
+      - WebSocket streaming
+      - Enterprise chat
+      fit_for:
+      - Enterprise team collaboration
+      not_fit_for:
+      - Public community servers
+    - name: DingtalkPlatform
+      traits:
+      - Alibaba ecosystem
+      - Enterprise
+      fit_for:
+      - Chinese enterprise users
+      not_fit_for:
+      - International teams
+    - name: DiscordPlatform
+      traits:
+      - Community servers
+      - Public channels
+      fit_for:
+      - Investor communities
+      not_fit_for:
+      - Enterprise-only deployments
+    default: Configured platform via environment variables
+  design_decisions:
+  - Unified BotMessage/BotResponse — platform-specific parsing/formatting isolated in BotPlatform (bot/platforms/base.py:71)
+  acceptance_hints:
+  - BotCommand.execute() returns BotResponse with text/markdown content
+  - RateLimiter correctly enforces 10 req/60s per user
+  - NL routing via LLM triggered only for non-command messages
+  - Async execution prevents bot event loop blocking
+  - Platform-specific formatting produces valid webhook payloads
+- id: portfolio_management
+  name: Portfolio Management & Risk
+  order: 6
+  responsibility: Manages account CRUD, trade event logging, FIFO cost-basis replay, FX rate refresh,
+    and portfolio-level risk reporting (concentration, drawdown, stop-loss proximity). Exists to provide
+    position-aware analysis and risk monitoring.
+  interface:
+    inputs: PortfolioTrade, PortfolioCashLedger, PortfolioCorporateAction events
+    outputs: PortfolioSnapshot (positions, cost basis, returns), PortfolioRiskReport (concentration, drawdown,
+      stop-loss)
+  required_methods:
+  - name: PortfolioService.snapshot
+    description: Account/event/snapshot workflow; implements FIFO and average cost methods. Returns PortfolioSnapshot
+      with positions, cost basis, and returns.
+    evidence: src/services/portfolio_service.py:73(PortfolioService)
+  - name: PortfolioRiskService.generate_report
+    description: 'Risk report computation: concentration, sector exposure, drawdown, stop-loss proximity.
+      Returns PortfolioRiskReport with alerts.'
+    evidence: src/services/portfolio_risk_service.py:14(PortfolioRiskService)
+  key_behaviors:
+  - behavior: FIFO lot-level cost basis
+    description: First-in-first-out matching of buy/sell lots gives accurate realized P&L. Lot-level tracking
+      handles partial sells correctly.
+    evidence: src/services/portfolio_service.py:1031(_consume_fifo_lots)
+  - behavior: Corporate actions as explicit events
+    description: Stock splits and cash dividends modeled as events that update position quantity or cash.
+      Price-history adjustment avoided.
+    evidence: src/storage.py:466(PortfolioCorporateAction)
+  - behavior: Stop-loss proximity monitoring
+    description: -5% stop-loss threshold from entry price. Current market price vs. threshold generates
+      risk_alert before loss materializes.
+    evidence: src/services/portfolio_risk_service.py:408(_build_stop_loss)
+  - behavior: FX rate stale fallback
+    description: Cross-currency positions use cached FX rates. Failed yfinance refresh keeps existing
+      stale rates rather than crashing.
+    evidence: src/services/portfolio_service.py:1177(_refresh_account_fx_rates)
+  replaceable_points:
+  - name: Cost method
+    description: Position cost basis calculation
+    options:
+    - name: fifo (lot-level first-in-first-out)
+      traits:
+      - Accurate realized P&L
+      - Partial sell handling
+      fit_for:
+      - Tax reporting
+      - Precise performance tracking
+      not_fit_for:
+      - Average cost accounting
+    - name: avg (average cost)
+      traits:
+      - Simpler calculation
+      - Common for retail
+      fit_for:
+      - Simple portfolio tracking
+      not_fit_for:
+      - Tax reporting
+      - Partial sell precision
+    default: fifo
+  - name: FX rate source
+    description: Currency conversion rate provider
+    options:
+    - name: yfinance (default)
+      traits:
+      - Free
+      - Wide currency coverage
+      fit_for:
+      - Budget-constrained deployments
+      not_fit_for:
+      - Production requiring SLA-backed rates
+    - name: other FX API
+      traits:
+      - Commercial API
+      fit_for:
+      - Production with SLA requirements
+      not_fit_for:
+      - Additional cost
+    default: yfinance
+  design_decisions:
+  - FIFO lot-level replay for cost basis enables precise P&L per trade (src/services/portfolio_service.py:1031)
+  acceptance_hints:
+  - PortfolioSnapshot shows correct positions with accurate cost basis
+  - FIFO consumption correctly handles partial sell of earlier lots
+  - CorporateAction events update position quantity or cash correctly
+  - Stop-loss alerts generated when market price within -5% of entry
+  - FX refresh failure uses cached rates without crashing
+- id: backtest_evaluation
+  name: Backtest Evaluation Engine
+  order: 7
+  responsibility: Evaluates historical analyst decisions against forward price bars to compute accuracy,
+    average return, win rate. Pure logic layer (DB-agnostic) operating on in-memory daily bars. Exists
+    to provide feedback loop for strategy improvement.
+  interface:
+    inputs: operation_advice (buy/hold/sell), forward_bars (Sequence[DailyBarLike]), stop_loss, take_profit
+    outputs: BacktestResult with direction_expected, outcome classification, max_return, max_drawdown,
+      hold_days
+  required_methods:
+  - name: BacktestEngine.evaluate
+    description: Long-only daily-bar evaluation; classify_outcome from direction matching. Takes any object
+      implementing DailyBarLike protocol.
+    evidence: src/core/backtest_engine.py:50(BacktestEngine)
+  - name: BacktestService.run_backtest
+    description: Orchestrates backtest runs, caches results, provides summary queries for Agent memory.
+    evidence: src/services/backtest_service.py:22(BacktestService)
+  key_behaviors:
+  - behavior: Protocol-based DailyBarLike interface
+    description: Engine accepts any object with date/open/high/low/close/volume. SQLAlchemy rows, dicts,
+      dataclasses each satisfy the protocol. Enables testing without database.
+    evidence: src/core/backtest_engine.py:18(DailyBarLike)
+  - behavior: Direction-matching outcome classification
+    description: Buy advice → price up = success; sell advice → price down = success; neutral band ±2%
+      = neutral. Isolates analyst skill from market conditions.
+    evidence: src/core/backtest_engine.py:383(_classify_outcome)
+  - behavior: Hold advice interpretation
+    description: '''hold'' maps to ''not_down'' direction: win if price >= entry, loss if <= -2%. Flat/stagnant
+      stock still counts as win.'
+    evidence: src/core/backtest_engine.py:101(infer_direction_expected)
+  - behavior: Skill performance feedback loop
+    description: 'Closed-loop learning: backtest results feed SkillAggregator weight computation. Better
+      historical accuracy → higher weight in future consensus (currently dead code).'
+    evidence: src/agent/skills/aggregator.py:131(_backtest_factor)
+  replaceable_points:
+  - name: Evaluation window
+    description: Days forward to evaluate decision
+    options:
+    - name: 7 days
+      traits:
+      - Short-term evaluation
+      - Fast feedback
+      fit_for:
+      - Intraday trading strategies
+      not_fit_for:
+      - Long-term position strategies
+    - name: 14 days
+      traits:
+      - Medium-term evaluation
+      fit_for:
+      - Swing trading strategies
+      not_fit_for:
+      - Day trading
+    - name: 30 days
+      traits:
+      - Long-term evaluation
+      fit_for:
+      - Position trading strategies
+      not_fit_for:
+      - Quick strategy iteration
+    default: configurable via eval_window_days
+  design_decisions:
+  - DB-agnostic BacktestEngine uses protocol-based DailyBarLike interface (src/core/backtest_engine.py:18)
+  acceptance_hints:
+  - BacktestResult.direction_expected correctly derived from operation_advice
+  - Outcome classified as win/loss/neutral based on direction matching
+  - max_return and max_drawdown correctly computed over evaluation window
+  - neutral_band_pct (±2%) correctly applied for neutral classification
+  - OVERALL_SENTINEL_CODE='__overall__' correctly used for global rollup
+- id: notification_dispatch
+  name: Notification Dispatch
+  order: 8
+  responsibility: Sends analysis reports and alerts to multiple channels (Telegram, Email, Feishu, Discord,
+    Slack, WeChat, PushPlus, Pushover, ServerChan). Aggregates multi-stock batch reports. Exists to deliver
+    analysis results to users across their preferred communication platforms.
+  interface:
+    inputs: AnalysisResult/ReportType, stock results list, notification config
+    outputs: Per-channel API calls; aggregated summary with buy/hold/sell counts
+  required_methods:
+  - name: NotificationManager.send
+    description: Orchestrates multi-channel notification dispatch; formats per template and sends to configured
+      channels.
+    evidence: src/notification.py:1(NotificationManager)
+  key_behaviors:
+  - behavior: ReportType alias normalization
+    description: Legacy 'detailed' normalized to 'full' at parse time. Ensures backward compatibility
+      with older client configurations.
+    evidence: src/enums.py:38(from_str)
+  - behavior: Multi-channel stock-email mapping
+    description: EMAIL_GROUP_N environment variables map stock lists to email recipients. Enables subscription-based
+      alerts per stock.
+    evidence: src/config.py:1643(_parse_stock_email_groups)
+  - behavior: Consistent emoji aggregation
+    description: Every templates use 🟢 (buy), 🟡 (hold), 🔴 (sell) emoji for signal counts. Consistent UX
+      across each notification channels.
+    evidence: src/notification.py:825(buy_count/hold_count/sell_count)
+  replaceable_points:
+  - name: Notification channel
+    description: Sender implementation per platform
+    options:
+    - name: TelegramSender
+      traits:
+      - Bot API
+      - Instant delivery
+      fit_for:
+      - Individual investors
+      not_fit_for:
+      - Enterprise teams
+    - name: EmailSender
+      traits:
+      - SMTP-based
+      - Formal records
+      fit_for:
+      - Professional documentation
+      not_fit_for:
+      - Real-time alerts
+    - name: FeishuSender
+      traits:
+      - Enterprise WeChat alternative
+      fit_for:
+      - Chinese enterprise teams
+      not_fit_for:
+      - International teams
+    - name: DiscordSender
+      traits:
+      - Community server integration
+      fit_for:
+      - Investor communities
+      not_fit_for:
+      - Enterprise-only
+    - name: SlackSender
+      traits:
+      - Enterprise workspace
+      fit_for:
+      - Western enterprise teams
+      not_fit_for:
+      - Small teams without Slack
+    - name: WeChatSender
+      traits:
+      - Personal WeChat notification
+      fit_for:
+      - Individual Chinese investors
+      not_fit_for:
+      - Enterprise deployments
+    - name: PushPlusSender
+      traits:
+      - WeChat-based push
+      fit_for:
+      - WeChat users without enterprise
+      not_fit_for:
+      - Non-WeChat users
+    - name: PushoverSender
+      traits:
+      - Cross-platform push
+      fit_for:
+      - Multi-device users
+      not_fit_for:
+      - Budget-constrained users
+    - name: ServerChanSender
+      traits:
+      - WeChat push via server
+      fit_for:
+      - WeChat power users
+      not_fit_for:
+      - Non-Chinese markets
+    default: Every configured channels via environment variables
+  design_decisions:
+  - ReportType 'detailed' normalizes to FULL at deserialization for backward compatibility (src/enums.py:38)
+  acceptance_hints:
+  - Every configured channels receive formatted reports
+  - ReportType correctly normalized from 'detailed' to 'full'
+  - buy/hold/sell emoji counts match actual signal distribution
+  - Multi-stock batch reports aggregated with correct totals
+  - EMAIL_GROUP_N mapping correctly routes stocks to recipients
+- id: storage_persistence
+  name: Storage & Persistence
+  order: 9
+  responsibility: SQLite database management via SQLAlchemy ORM. Stores daily bars, analysis history,
+    news intel, backtest results, portfolio events, conversation history, and LLM usage logs. Implements
+    breakpoint continuation (has_today_data). Exists to provide durable storage and avoid redundant API
+    calls.
+  interface:
+    inputs: DataFrames, AnalysisResult, NewsIntel, BacktestResult, Portfolio events
+    outputs: Queried results with upsert semantics; break-test for data freshness
+  required_methods:
+  - name: DatabaseManager.save_daily_data
+    description: Upsert daily OHLCV data with INSERT OR REPLACE on (code, date) for idempotent saves.
+    evidence: src/storage.py:1419(save_daily_data)
+  - name: DatabaseManager.has_today_data
+    description: 'Checkpoint continuation: checks if today''s data exists before network fetch. Avoids
+      redundant API calls.'
+    evidence: src/storage.py:858(has_today_data)
+  - name: DatabaseManager.record_llm_usage
+    description: Fire-and-forget token usage tracking that never raises exceptions.
+    evidence: src/storage.py:2028(record_llm_usage)
+  key_behaviors:
+  - behavior: SQLite WAL mode concurrency
+    description: WAL (Write-Ahead Logging) allows concurrent reads during writes. busy_timeout prevents
+      'database is locked' errors in multi-threaded bot environment.
+    evidence: src/storage.py:734(_install_sqlite_pragma_handler)
+  - behavior: Breakpoint continuation
+    description: has_today_data checks if today's data already exists in DB before fetching from network.
+      Reduces redundant API calls and rate-limit pressure.
+    evidence: src/storage.py:858(has_today_data)
+  - behavior: Idempotent upsert
+    description: Duplicate date in same batch uses last record. Re-running analysis doesn't create duplicates.
+      Enables safe re-analysis.
+    evidence: src/storage.py:1419(save_daily_data)
+  - behavior: Fire-and-forget logging
+    description: record_llm_usage never raises. Token usage tracking wrapped in try/except with logging
+      only on failure. Never blocks main analysis path.
+    evidence: src/storage.py:2028(record_llm_usage)
+  replaceable_points:
+  - name: Database backend
+    description: SQLAlchemy connection URL
+    options:
+    - name: SQLite (default)
+      traits:
+      - File-based
+      - No server required
+      - WAL mode
+      fit_for:
+      - Single-instance deployments
+      - Development
+      not_fit_for:
+      - Multi-instance production
+      - High concurrency
+    - name: PostgreSQL
+      traits:
+      - ACID compliant
+      - High concurrency
+      - Server-based
+      fit_for:
+      - Production multi-instance deployments
+      not_fit_for:
+      - Simple single-user setups
+    - name: MySQL
+      traits:
+      - Widely used
+      - High availability options
+      fit_for:
+      - Existing MySQL infrastructure
+      not_fit_for:
+      - New projects without existing MySQL
+    default: SQLite
+  design_decisions:
+  - SQLite WAL mode + busy_timeout enables concurrent reader/writer safety (src/storage.py:734)
+  acceptance_hints:
+  - 'WAL mode active: PRAGMA journal_mode returns ''wal'''
+  - has_today_data returns True when today's bars exist
+  - Upsert creates exactly one record per (code, date) pair
+  - record_llm_usage never raises even on database errors
+  - Concurrent reads succeed during active writes
+data_flow:
+- from_stage: data_collection
+  to_stage: technical_analysis
+  data: pd.DataFrame with OHLCV columns plus ma5/ma10/ma20/volume_ratio computed indicators
+- from_stage: data_collection
+  to_stage: multi_agent_pipeline
+  data: realtime_quote, daily_history, chip_distribution via data_tools; cached in ctx.data
+- from_stage: technical_analysis
+  to_stage: multi_agent_pipeline
+  data: TrendAnalysisResult stored in ctx.data['trend_result']; read by TechnicalAgent post_process
+- from_stage: multi_agent_pipeline
+  to_stage: skill_system
+  data: AgentContext with regime hints; SkillRouter returns selected skill_ids
+- from_stage: skill_system
+  to_stage: multi_agent_pipeline
+  data: SkillAgent opinions → SkillAggregator consensus → ctx.opinions for DecisionAgent
+- from_stage: bot_messaging
+  to_stage: multi_agent_pipeline
+  data: BotMessage with stock_code/skill_id; CommandDispatcher invokes AgentOrchestrator.run
+- from_stage: multi_agent_pipeline
+  to_stage: notification_dispatch
+  data: AgentResult.dashboard with signal/operation_advice; passed to report generator
+- from_stage: storage_persistence
+  to_stage: multi_agent_pipeline
+  data: get_analysis_context returns DB-cached daily bars plus last analysis result
+- from_stage: storage_persistence
+  to_stage: portfolio_management
+  data: PortfolioTrade/CashLedger/CorporateAction events for snapshot replay
+- from_stage: portfolio_management
+  to_stage: notification_dispatch
+  data: PortfolioSnapshot plus PortfolioRiskReport for position-aware analysis
+- from_stage: backtest_evaluation
+  to_stage: skill_system
+  data: BacktestSummary per skill → SkillAggregator weight computation (currently returns 1.0)
+- from_stage: backtest_evaluation
+  to_stage: storage_persistence
+  data: BacktestResult rows persisted; BacktestSummary aggregates for queries
+global_contracts:
+- contract: Every DataFrames use date/open/high/low/close/volume/amount column names after normalization
+  evidence: data_provider/base.py:272(_normalize_data)
+- contract: Stock code normalized to 6-digit A-share / 5-digit HK / uppercase US format across each fetchers
+  evidence: data_provider/base.py:65(normalize_stock_code)
+- contract: Decision signal enum must be 'buy', 'hold', or 'sell' — strong_* variants normalized before
+    storage
+  evidence: src/agent/orchestrator.py:1313(order=['buy','hold','sell'])
+- contract: AgentContext.opinions list accumulates one AgentOpinion per pipeline stage; order is agent
+    execution order
+  evidence: src/agent/protocols.py:62(AgentContext)
+- contract: Portfolio side literal is 'buy' | 'sell' — no 'hold' since positions only exist via trades
+  evidence: api/v1/schemas/portfolio.py:49(side=Literal['buy','sell'])
+- contract: ReportType SIMPLE/full/BRIEF are only valid values; 'detailed' normalized to 'full' at parse
+    time
+  evidence: src/enums.py:38(from_str)
+- contract: 'Market tag inferred from stock code: cn (6-digit A-share), us (1-5 letter), hk (5-digit with
+    HK prefix)'
+  evidence: data_provider/base.py:157(_market_tag)
+- contract: SQLite uses WAL mode with 5000ms busy_timeout for concurrent reader/writer safety
+  evidence: src/storage.py:734(_install_sqlite_pragma_handler)
+- contract: shift(1) in volume_ratio excludes current day from 5-day average denominator — no look-ahead
+    bias
+  evidence: data_provider/base.py:447(volume_ratio)
+- contract: Bot command prefix defaults to '/' — configurable per CommandDispatcher init
+  evidence: bot/dispatcher.py:100(command_prefix='/')
+- contract: 'Agent chain order: Technical→Intel→Risk→Decision (specialist mode inserts before Decision)'
+  evidence: src/agent/orchestrator.py:464(_build_agent_chain)
+- contract: Skill aggregator weight = confidence * (0.5 + win_rate), normalized to mean=1.0, min_samples=30
+  evidence: src/agent/memory.py:239(compute_skill_weights),:260(0.5+win_rate)
+- contract: 'Signal score mapping: strong_buy=5, buy=4, hold=3, sell=2, strong_sell=1 with thresholds
+    [4.5,3.5,2.5,1.5]'
+  evidence: src/agent/skills/aggregator.py:23(_SIGNAL_SCORES),:31(_SCORE_TO_SIGNAL)
+- contract: Pipeline aborts on FAILED stage except intel/risk which degrade gracefully
+  evidence: src/agent/orchestrator.py:409(StageStatus.FAILED check)
+- contract: OVERALL_SENTINEL_CODE='__overall__' used for global backtest rollup; mapped to None in API
+  evidence: src/core/backtest_engine.py:15(OVERALL_SENTINEL_CODE)
+business_decisions:
+- id: BD-001
+  type: B/BA
+  content: Bias threshold 5% for no-chase policy (严进策略 - 不追高，乖离率 > 5% 不买入)
+  rationale: The 5% bias threshold enforces a strict no-chase discipline to prevent buying stocks at extreme
+    overbought levels. This boundary prevents emotional FOMO-driven entries and reduces risk exposure
+    to mean-reversion losses. The threshold must remain at 5% unless comprehensive backtesting demonstrates
+    a superior alternative.
+  evidence: src/stock_analyzer.py:622(module)
+  stage: analysis/trend
+  alternative_considered: Flexible threshold based on volatility was considered but rejected due to complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/stock_analyzer.py'
+- id: BD-002
+  type: B/RC
+  content: MA5 > MA10 > MA20 bull alignment required for uptrend trading (趋势交易 - MA5>MA10>MA20 多头排列)
+  rationale: The ascending MA alignment (5>10>20) confirms a sustained uptrend where shorter-term momentum
+    outpaces longer-term averages. This boundary ensures trades only execute when multiple timeframes
+    confirm bullish structure, filtering false breakouts. Changing this to fewer MAs would reduce signal
+    reliability.
+  evidence: src/stock_analyzer.py:339(_analyze_trend)
+  stage: analysis/trend
+  alternative_considered: Using only 2 MAs was considered but rejected due to insufficient confirmation
+- id: BD-003
+  type: B
+  content: Volume ratio uses shift(1) for data alignment (避免 look-ahead bias)
+  rationale: Using shift(1) ensures volume ratio calculation uses only historical data available at decision
+    time, preventing look-ahead bias that would inflate backtested performance. The boundary mandates
+    shift(1) specifically - using shift(0) would introduce severe survivorship bias and make historical
+    results unreliable for live trading.
+  evidence: data_provider/base.py:447(module)
+  stage: data/calculation
+  alternative_considered: shift(2) was considered but would lose too much data freshness
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in data_provider/base.py'
+- id: BD-004
+  type: B/DK
+  content: Decision type enum is buy/hold/sell (must remain these 3 values)
+  rationale: The three-value decision taxonomy (buy/hold/sell) provides clear, unambiguous trading signals
+    that downstream systems can interpret without additional context. This boundary prevents scope creep
+    by requiring any new decision types to be explicitly designed and documented. Modifying this enum
+    would require cascading changes across notification, portfolio, and reporting modules.
+  evidence: src/analyzer.py:915(decision_type must remain buy|hold|sell)
+  stage: analysis/decision
+  alternative_considered: Adding 'reduce' or 'add' states was considered but rejected to maintain simplicity
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: decision_type must remain buy|hold|sell in src/analyzer.py'
+- id: BD-005
+  type: B/RC
+  content: Random sleep 1-3 seconds for anti-ban (防封禁策略)
+  rationale: Random delays between 1-3 seconds prevent triggering anti-scraping mechanisms from data providers
+    like Tushare or Efinance. This boundary creates unpredictability that mimics human behavior while
+    staying within acceptable latency. Increasing the range would degrade user experience; decreasing
+    it risks IP bans that would halt data collection entirely.
+  evidence: data_provider/base.py:457-467(random_sleep)
+  stage: data/fetch
+  alternative_considered: Exponential backoff was considered but adds too much latency for real-time queries
+- id: BD-006
+  type: B/DK
+  content: 'Data fetcher priority: Tushare > Efinance > Akshare > Pytdx > Baostock > Yfinance > Longbridge'
+  rationale: The prioritized fallback chain ensures data availability even when primary providers experience
+    outages or rate limiting. Each provider has different coverage strengths (Tushare for A-shares, Yfinance
+    for US stocks). This boundary mandates the exact order - changing priorities without testing would
+    risk using inferior data sources as primary.
+  evidence: data_provider/__init__.py:12-28(module)
+  stage: data/source
+  alternative_considered: Parallel fetching was considered but rejected due to API cost and complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in data_provider/__init__.py'
+- id: BD-007
+  type: B/BA
+  content: 'Orchestrator modes: quick (Technical→Decision), standard (Technical→Intel→Decision), full
+    (+Risk), specialist (+Specialist)'
+  rationale: Four distinct modes allow users to balance analysis depth against execution speed based on
+    their needs. Quick mode provides fast technical signals; full mode adds risk assessment for conservative
+    strategies. This boundary prevents feature creep by requiring any new analysis stages to be optional
+    modes, not mandatory additions.
+  evidence: src/agent/orchestrator.py:52-53(VALID_MODES)
+  stage: agent/pipeline
+  alternative_considered: Single mode with each features was rejected due to latency concerns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: VALID_MODES in src/agent/orchestrator.py'
+- id: BD-008
+  type: B
+  content: Skills loaded from YAML files with natural language instructions
+  rationale: YAML-based skill definitions enable non-developers to modify agent behavior through natural
+    language prompts without code changes. This boundary ensures skills are version-controlled and testable.
+    Changing to runtime database storage would lose audit trail and make rollbacks difficult.
+  evidence: src/agent/skills/base.py:140-202(load_skill_from_yaml)
+  stage: agent/skill
+  alternative_considered: Database storage was rejected due to lack of version control
+- id: BD-009
+  type: B
+  content: 'Multi-channel notification: Wechat, Feishu, Telegram, Email, Pushover, PushPlus, ServerChan,
+    Discord, Slack, Astrbot'
+  rationale: Supporting 10 notification channels ensures users receive alerts through their preferred
+    platforms regardless of geographic location or company policy restrictions. This boundary prevents
+    vendor lock-in where users would be forced to use a single channel. New channels can be added by implementing
+    the NotificationChannel interface.
+  evidence: src/notification.py:54-67(NotificationChannel enum)
+  stage: notification/channel
+  alternative_considered: Single-channel approach was rejected due to user diversity across regions
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: NotificationChannel enum in src/notification.py'
+- id: BD-010
+  type: B/RC
+  content: 'Rate limiter: 10 requests per 60 seconds per user'
+  rationale: The 10 req/60s rate limit prevents individual users from overwhelming system resources while
+    allowing legitimate concurrent usage. This boundary protects service stability - exceeding 10 requests
+    risks denial of service for other users; stricter limits would unnecessarily block valid rapid queries.
+  evidence: bot/dispatcher.py:24(ratelimiter)
+  stage: bot/rate_limit
+  alternative_considered: IP-based limiting was considered but rejected due to shared corporate IPs
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ratelimiter in bot/dispatcher.py'
+- id: BD-011
+  type: B/RC
+  content: 'CORS allowed origins: localhost:5173, localhost:3000, plus CORS_ORIGINS env var'
+  rationale: Restricting CORS to localhost dev ports plus environment variable prevents unauthorized cross-site
+    requests while enabling development flexibility. This boundary is critical for security - adding domains
+    requires explicit env var configuration to prevent accidental exposure. Production deployments must
+    set CORS_ORIGINS appropriately.
+  evidence: api/app.py:82-98(allowed_origins配置)
+  stage: api/cors
+  alternative_considered: Wildcard CORS was rejected due to security implications
+  _evidence_issues:
+  - 'FN_NOT_FOUND: allowed_origins配置 in api/app.py'
+  vague_rationale: true
+- id: BD-012
+  type: B/DK
+  content: 'Market strategy blueprints: CN (趋势结构/资金情绪/主线板块), US (Trend Regime/Macro & Flows/Sector Themes)'
+  rationale: Distinct blueprints for Chinese and US markets reflect fundamentally different market structures,
+    regulatory environments, and investor behaviors. This boundary ensures analysis adapts to regional
+    context - applying CN metrics to US stocks would produce meaningless signals and vice versa.
+  evidence: src/core/market_strategy.py:54-130(CN_BLUEPRINT/US_BLUEPRINT)
+  stage: market/strategy
+  alternative_considered: Unified global strategy was rejected due to market structural differences
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: CN_BLUEPRINT/US_BLUEPRINT in src/core/market_strategy.py'
+- id: BD-013
+  type: B
+  content: 'Portfolio side: buy/sell literal type'
+  rationale: Strict literal typing for side prevents invalid trade directions from entering the system,
+    providing compile-time safety. This boundary ensures only valid directions (buy/sell) exist - adding
+    'short' or 'cover' without corresponding margin trading infrastructure would cause runtime errors.
+  evidence: 'api/v1/schemas/portfolio.py:49(side: Literal[buy, sell])'
+  stage: portfolio/trade
+  alternative_considered: String type was rejected due to lack of type safety
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: side: Literal[buy, sell] in api/v1/schemas/portfolio.py'
+- id: BD-014
+  type: B
+  content: 'MACD parameters: fast=12, slow=26, signal=9 (standard)'
+  rationale: The 12/26/9 MACD parameters are the established standard (developed by Gerald Appel) that
+    balances sensitivity with noise reduction. This boundary ensures consistent interpretation across
+    the industry. Deviating requires backtested justification as non-standard parameters may produce signals
+    that are difficult to interpret or explain to users.
+  evidence: src/stock_analyzer.py:189-192(MACD_FAST/SLOW/SIGNAL)
+  stage: analysis/indicator
+  alternative_considered: Adaptive parameters based on volatility were considered but add complexity
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: MACD_FAST/SLOW/SIGNAL in src/stock_analyzer.py'
+- id: BD-015
+  type: B/BA
+  content: 'RSI parameters: short=6, mid=12, long=24; overbought=70, oversold=30'
+  rationale: Three RSI periods provide layered momentum analysis from short-term (6) to long-term (24),
+    while 70/30 thresholds are the established overbought/oversold boundaries. This boundary balances
+    sensitivity - shorter periods generate more signals but with lower reliability; the 30/70 thresholds
+    are tested against random entry baselines.
+  evidence: src/stock_analyzer.py:194-199(RSI_SHORT/MID/LONG/OVERBOUGHT/OVERSOLD)
+  stage: analysis/indicator
+  alternative_considered: 80/20 thresholds were considered but are too extreme for practical use
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: RSI_SHORT/MID/LONG/OVERBOUGHT/OVERSOLD in src/stock_analyzer.py'
+- id: BD-016
+  type: B
+  content: 'Signal scoring: 100-point system (trend 30, bias 20, volume 15, support 10, MACD 15, RSI 10)'
+  rationale: The 100-point system standardizes signal evaluation across diverse technical factors with
+    weighted contributions reflecting predictive importance. Trend (30) and bias (20) dominate as primary
+    drivers; indicators (MACD, RSI) contribute supporting evidence. This boundary ensures reproducible
+    scores - modifying weights requires comprehensive backtesting to maintain edge.
+  evidence: src/stock_analyzer.py:583-744(_generate_signal)
+  stage: analysis/scoring
+  alternative_considered: Equal weighting was rejected due to different predictive values of factors
+- id: BD-017
+  type: B/BA
+  content: 'Volume thresholds: shrink <=0.7, heavy >=1.5 (vs 5-day average)'
+  rationale: The 0.7/1.5 thresholds relative to 5-day average identify significant volume anomalies while
+    filtering normal daily fluctuations. Shrinkage below 0.7 suggests distribution; heaviness above 1.5
+    indicates accumulation or distribution. This boundary was calibrated against historical price movements
+    - tighter thresholds would generate excessive noise.
+  evidence: src/stock_analyzer.py:409(_analyze_volume)
+  stage: analysis/volume
+  alternative_considered: 2.0 heavy threshold was considered but would miss legitimate accumulation
+- id: BD-018
+  type: B/BA
+  content: 'MA support tolerance: 2% (price within 2% of MA considered support)'
+  rationale: The 2% tolerance accounts for price noise and bid-ask spreads when determining if price has
+    touched a moving average support. This boundary prevents false negatives from minor price gaps while
+    avoiding false positives from coincidental proximity. Wider tolerance would blur distinct support
+    levels; narrower would miss valid touches.
+  evidence: src/stock_analyzer.py:447(_analyze_support_resistance)
+  stage: analysis/support
+  alternative_considered: 1% tolerance was considered but produces excessive false breakouts
+- id: BD-019
+  type: B/BA
+  content: 'LLM temperature default: 0.7'
+  rationale: Temperature 0.7 balances creativity with coherence in LLM-generated analysis - lower values
+    (0.1-0.3) produce too deterministic output; higher values (0.9+) generate irrelevant tangents. This
+    boundary is calibrated for financial analysis where factual grounding matters more than novelty.
+  evidence: 'src/config.py:451(llm_temperature: float = 0.7)'
+  stage: llm/config
+  alternative_considered: Temperature 0.3 was considered but produces too repetitive output
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: llm_temperature: float = 0.7 in src/config.py'
+- id: BD-020
+  type: B/BA
+  content: 'Default schedule time: 18:00'
+  rationale: 18:00 timing captures end-of-day price data for both Chinese (15:00 close) and US markets
+    (pre-market data available), providing fresh closing prices for analysis. This boundary balances data
+    freshness with user convenience for evening review. Earlier timing risks missing final auction prints;
+    later timing reduces user engagement.
+  evidence: main.py:690(_SYSTEM_DEFAULT_SCHEDULE_TIME)
+  stage: schedule/timing
+  alternative_considered: 19:00 was considered but reduces user engagement window
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _SYSTEM_DEFAULT_SCHEDULE_TIME in main.py'
+- id: BD-021
+  type: B/BA
+  content: 'Analysis delay between individual stock and market review: configurable (default 0)'
+  rationale: Configurable delay allows market context to be fresh when evaluating individual stocks -
+    zero delay means both analyses use same data snapshot; positive delay ensures market analysis completes
+    first. This boundary enables tuning for different use cases without code changes.
+  evidence: main.py:474(module)
+  stage: pipeline/timing
+  alternative_considered: Fixed delay was rejected due to varying user needs
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in main.py'
+- id: BD-022
+  type: B/DK
+  content: 'Trading day filter: skip analysis if relevant market is closed'
+  rationale: Skipping analysis on closed markets prevents wasted API calls and generates false signals
+    from stale data. This boundary ensures reports only contain actionable information when markets are
+    trading. Disabling this filter would produce misleading weekend/holiday analysis.
+  evidence: main.py:378(module)
+  stage: pipeline/scheduling
+  alternative_considered: Always run was rejected due to stale data concerns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in main.py'
+- id: BD-023
+  type: B/DK
+  content: 'Merge notification: combine individual stock and market review into single push'
+  rationale: Merging notifications reduces user interruption frequency while ensuring comprehensive context
+    is delivered together. This boundary prevents notification fatigue from multiple sequential alerts.
+    The merge decision balances completeness against timeliness based on content availability.
+  evidence: main.py:445-450(merge_notification条件计算)
+  stage: notification/merge
+  alternative_considered: Always separate was rejected due to notification fatigue concerns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: merge_notification条件计算 in main.py'
+- id: BD-024
+  type: B/BA
+  content: Proxy controlled by USE_PROXY env var (default false)
+  rationale: Environment variable control enables proxy usage without code changes, supporting corporate
+    environments requiring corporate firewalls. This boundary defaults to direct connections for performance
+    while allowing opt-in proxy for restricted networks.
+  evidence: main.py:36-42(代理配置)
+  stage: network/proxy
+  alternative_considered: Proxy always enabled was rejected due to latency impact
+  _evidence_issues:
+  - 'FN_NOT_FOUND: 代理配置 in main.py'
+- id: BD-025
+  type: B
+  content: 'Vision model fallback priority: gemini, anthropic, openai'
+  rationale: The priority sequence reflects cost-efficiency (Gemini), capability (Anthropic), and ubiquity
+    (OpenAI) tradeoffs. Gemini is most cost-effective for vision tasks; Anthropic provides superior reasoning;
+    OpenAI ensures maximum availability. This boundary must be maintained - changing order without testing
+    could increase costs or reduce reliability.
+  evidence: 'src/config.py:498(vision_provider_priority: str = gemini,anthropic,openai)'
+  stage: llm/vision
+  alternative_considered: OpenAI first was rejected due to higher cost
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: vision_provider_priority: str = gemini,anthropic,openai in src/config.py'
+- id: BD-026
+  type: B
+  content: 'BaseAgent max_steps: 6'
+  rationale: Six reasoning steps provides sufficient depth for complex analysis while preventing infinite
+    loops that waste resources. This boundary was calibrated - fewer steps risk incomplete analysis; more
+    steps provide diminishing returns with increasing latency and token costs.
+  evidence: 'src/agent/agents/base_agent.py:45(max_steps: int = 6)'
+  stage: agent/config
+  alternative_considered: 10 steps was considered but increases latency without proportional quality gain
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: max_steps: int = 6 in src/agent/agents/base_agent.py'
+- id: BD-027
+  type: B
+  content: DataFetcherManager singleton pattern for tool calls
+  rationale: Singleton pattern ensures consistent data fetching state across each tool invocations, preventing
+    duplicate connections and inconsistent caching. This boundary is critical for maintaining data freshness
+    and preventing resource leaks. Breaking singleton would require complex state synchronization.
+  evidence: src/agent/tools/data_tools.py:21-38(_get_fetcher_manager)
+  stage: data/singleton
+  alternative_considered: Factory pattern was rejected due to complexity for single-instance use case
+- id: BD-028
+  type: B
+  content: Historical analysis context retrieval from database
+  rationale: Database retrieval provides historical analysis context that informs current decisions, enabling
+    pattern recognition across time. This boundary ensures continuity between analysis sessions - without
+    it, each analysis starts fresh without historical perspective.
+  evidence: src/agent/tools/data_tools.py:329-346(_handle_get_analysis_context)
+  stage: agent/context
+  alternative_considered: In-memory only was rejected due to loss of context across restarts
+- id: BD-029
+  type: B/RC
+  content: 'Multi-stock analysis timeout: 150 seconds'
+  rationale: 150-second timeout prevents resource exhaustion from hung analysis while providing generous
+    headroom for slow data sources. This boundary balances responsiveness against thoroughness - shorter
+    timeouts risk incomplete analysis; longer timeouts could freeze the bot for unacceptable periods.
+  evidence: bot/commands/ask.py:32(_MULTI_ANALYZE_TIMEOUT_S = 150.0)
+  stage: bot/ask
+  alternative_considered: 60 second timeout was rejected as insufficient for 5 stocks with slow providers
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: _MULTI_ANALYZE_TIMEOUT_S = 150.0 in bot/commands/ask.py'
+- id: BD-030
+  type: B
+  content: Maximum 5 stocks per multi-stock analysis
+  rationale: Five-stock limit prevents overwhelming the system with large queries while remaining useful
+    for portfolio management. This boundary balances comprehensiveness against API rate limits and response
+    times. Exceeding 5 would risk rate limit violations and excessively long response times.
+  evidence: bot/commands/ask.py:119(module)
+  stage: bot/ask
+  alternative_considered: 10 stocks was considered but risks rate limit issues
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bot/commands/ask.py'
+- id: BD-031
+  type: B
+  content: 'Auth middleware exempt paths: /api/v1/auth/login, /api/v1/auth/status, /api/health, /health,
+    /docs, /redoc, /openapi.json'
+  rationale: These exempt paths enable unauthenticated access for authentication, health checks, and API
+    documentation - essential for system operation. This boundary prevents authentication requirements
+    from blocking necessary public endpoints while protecting each other routes.
+  evidence: api/middlewares/auth.py:19-27(EXEMPT_PATHS)
+  stage: api/auth
+  alternative_considered: More exemptions were considered but rejected to minimize attack surface
+  _evidence_issues:
+  - 'FN_NOT_FOUND: EXEMPT_PATHS in api/middlewares/auth.py'
+- id: BD-032
+  type: B/RC
+  content: Error handler returns 500 status for unhandled exceptions
+  rationale: Returning 500 for each unhandled exceptions prevents information leakage about internal implementation
+    details to potential attackers. This boundary is critical for security - detailed error messages could
+    reveal database structure, file paths, or API keys. Users receive generic errors; detailed logs go
+    to administrators only.
+  evidence: api/middlewares/error_handler.py:61(status_code=500)
+  stage: api/error
+  alternative_considered: Detailed errors were rejected due to security implications
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: status_code=500 in api/middlewares/error_handler.py'
+- id: BD-033
+  type: B/BA
+  content: 'Report language default: zh (Chinese)'
+  rationale: Defaulting to Chinese reflects the primary user base and development context. This boundary
+    ensures consistent default behavior while allowing explicit language override. Non-Chinese users must
+    consciously choose their preferred language rather than having it forced upon them.
+  evidence: src/notification.py:181(_get_report_language)
+  stage: notification/i18n
+  alternative_considered: English default was rejected as most users are Chinese-speaking
+- id: BD-034
+  type: B
+  content: 'Chip health derivation: profit_ratio >=0.9 or concentration_90 >=0.25 = 警惕; concentration_90
+    <0.15 and 0.3<=profit_ratio<0.9 = 健康'
+  rationale: Chip health classification identifies stocks at risk of manipulation or illiquidity based
+    on shareholder concentration metrics. High concentration (>25% top 90%) signals potential liquidity
+    risk; healthy distribution (<15% with moderate profit-taking) indicates balanced ownership. This boundary
+    was calibrated against historical manipulation cases.
+  evidence: src/analyzer.py:159-167(_derive_chip_health)
+  stage: analysis/chip
+  alternative_considered: Continuous scoring was considered but categorical approach proved more actionable
+- id: BD-035
+  type: B/DK
+  content: 'News strategy windows: ultra_short=1, short=3, medium=7, long=30 days'
+  rationale: Four time windows align news analysis with different trading horizons - ultra-short (1 day)
+    for day trading, long (30 days) for position trading. This boundary ensures news relevance scoring
+    matches user investment timeframes. Mismatched windows would either miss relevant news or include
+    stale information.
+  evidence: src/config.py:53-58(NEWS_STRATEGY_WINDOWS)
+  stage: config/news
+  alternative_considered: Only single window was rejected due to diverse user timeframes
+  _evidence_issues:
+  - 'FN_NOT_FOUND: NEWS_STRATEGY_WINDOWS in src/config.py'
+- id: BD-036
+  type: B/DK
+  content: 'Market recap action framework: 进攻 (risk-on), 均衡 (neutral), 防守 (risk-off)'
+  rationale: Three action categories provide clear guidance for portfolio positioning based on market
+    conditions - 进攻 for bull markets, 防守 for bear markets, 均衡 for transitions. This boundary standardizes
+    risk management responses across different market regimes.
+  evidence: src/core/market_strategy.py:80-83(action_framework)
+  stage: market/action
+  alternative_considered: Five categories were considered but proved too granular for practical use
+  _evidence_issues:
+  - 'FN_NOT_FOUND: action_framework in src/core/market_strategy.py'
+- id: BD-037
+  type: B
+  content: 'RSI neutral band: 40-60'
+  rationale: The 40-60 band identifies consolidation zones where neither buying nor selling pressure dominates,
+    signaling indecision. This boundary balances sensitivity - narrower bands generate excessive neutral
+    signals; wider bands miss valid consolidation periods.
+  evidence: src/stock_analyzer.py:573-575(rsi_mid >= 40)
+  stage: analysis/rsi
+  alternative_considered: 35-65 band was considered but produces fewer actionable signals
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: rsi_mid >= 40 in src/stock_analyzer.py'
+- id: BD-038
+  type: B/DK
+  content: 'MACD zero axis crossing signals: crossing_up, crossing_down'
+  rationale: Zero axis crossings indicate fundamental momentum shifts from bullish to bearish or vice
+    versa. This boundary captures significant trend changes - signals within the same territory (both
+    positive or both negative) indicate momentum continuation, not reversal.
+  evidence: src/stock_analyzer.py:511-515(prev_zero <= 0 and curr_zero > 0)
+  stage: analysis/macd
+  alternative_considered: Signal line crossover only was rejected as less significant than zero crossover
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: prev_zero <= 0 and curr_zero > 0 in src/stock_analyzer.py'
+- id: BD-039
+  type: B/RC
+  content: Config singleton pattern with class methods
+  rationale: Singleton pattern with class methods ensures consistent configuration state across the entire
+    application while providing clean access syntax. This boundary prevents configuration drift where
+    different modules see different settings.
+  evidence: src/config.py:420-428(Config dataclass)
+  stage: config/singleton
+  alternative_considered: Dependency injection was considered but adds unnecessary complexity for global
+    config
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: Config dataclass in src/config.py'
+- id: BD-040
+  type: B/DK
+  content: 'ETF prefix detection: 51, 52, 56, 58, 15, 16, 18 (6-digit codes starting with these)'
+  rationale: ETF prefix identification enables special handling for exchange-traded funds which have different
+    trading characteristics than stocks. This boundary covers each major China ETF segments - missing
+    prefixes would cause ETFs to be misclassified as stocks, leading to incorrect analysis.
+  evidence: data_provider/base.py:118(ETF_PREFIXES)
+  stage: data/etf
+  alternative_considered: Dynamic detection via fund metadata was considered but adds API dependency
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ETF_PREFIXES in data_provider/base.py'
+- id: BD-041
+  type: B/DK
+  content: 'BSE (Beijing Stock Exchange) code detection: 92xxxx, 43xxxx, 81xxxx, 82xxxx, 83xxxx, 87xxxx,
+    88xxxx (not 90xxxx Shanghai B-shares)'
+  rationale: BSE identification distinguishes Beijing Stock Exchange stocks from Shanghai (90xxxx) B-shares
+    which have different trading hours and settlement. This boundary prevents confusion between distinct
+    markets with different regulatory frameworks and liquidity profiles.
+  evidence: data_provider/base.py:166-184(is_bse_code)
+  stage: data/bse
+  alternative_considered: Relying solely on exchange metadata was rejected due to provider inconsistencies
+- id: BD-042
+  type: B/BA
+  content: 'Trend strength scoring: STRONG_BULL=30, BULL=26, WEAK_BULL=18, CONSOLIDATION=12, WEAK_BEAR=8,
+    BEAR=4, STRONG_BEAR=0'
+  rationale: Seven-level trend scoring provides granularity while remaining interpretable, with scores
+    reflecting expected price behavior. This boundary was calibrated - bull scores (18-30) correlate with
+    positive forward returns; bear scores (0-8) with negative returns. Consolidation (12) represents neutral
+    expected behavior.
+  evidence: src/stock_analyzer.py:600-608(trend_scores dict)
+  stage: analysis/scoring
+  alternative_considered: 5-level scale was rejected as insufficient granularity for nuanced analysis
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: trend_scores dict in src/stock_analyzer.py'
+- id: BD-043
+  type: B
+  content: 'TechnicalAgent tool list: get_realtime_quote, get_daily_history, analyze_trend, calculate_ma,
+    get_volume_analysis, analyze_pattern, get_chip_distribution, get_analysis_context'
+  rationale: Eight specific tools define the complete capability surface of the TechnicalAgent, enabling
+    clear boundaries between agent responsibilities. This boundary prevents feature creep by requiring
+    new capabilities to be explicitly added as named tools rather than embedded in existing ones.
+  evidence: src/agent/agents/technical_agent.py:26-35(tool_names)
+  stage: agent/tools
+  alternative_considered: Generic tool with parameters was rejected due to reduced type safety
+  _evidence_issues:
+  - 'FN_NOT_FOUND: tool_names in src/agent/agents/technical_agent.py'
+- id: BD-044
+  type: B/BA
+  content: 'Historical data fetch default: 60 days'
+  rationale: 60-day default provides sufficient history for reliable trend analysis while avoiding excessive
+    data retrieval latency. This boundary balances coverage (enough for moving averages and patterns)
+    against performance (minimizing API calls and processing time).
+  evidence: src/agent/tools/data_tools.py:271-274(days default=60)
+  stage: data/fetch
+  alternative_considered: 30 days was rejected as insufficient for reliable trend analysis
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: days default=60 in src/agent/tools/data_tools.py'
+- id: BD-045
+  type: B
+  content: 'Report summary only mode: true = only push summary without individual stock details'
+  rationale: Summary-only mode reduces notification volume for users monitoring many stocks or preferring
+    high-level overviews. This boundary provides flexibility without requiring separate systems - users
+    can toggle between detailed and summary modes based on their needs.
+  evidence: src/notification.py:147(module)
+  stage: notification/filter
+  alternative_considered: Separate summary endpoint was rejected due to complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/notification.py'
+- id: BD-046
+  type: B/BA
+  content: 'Markdown to image max chars: 15000 (larger reports not converted)'
+  rationale: 15000 character limit prevents resource exhaustion from converting massive reports to images
+    while accommodating typical analysis outputs. This boundary balances visual formatting benefits against
+    rendering performance - higher limits risk timeouts; lower limits reduce utility.
+  evidence: src/notification.py:142-144(markdown_to_image_max_chars=15000)
+  stage: notification/format
+  alternative_considered: Unlimited conversion was rejected due to resource exhaustion risk
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: markdown_to_image_max_chars=15000 in src/notification.py'
+- id: BD-047
+  type: B/BA
+  content: 'Portfolio cost method: fifo (First In First Out) default'
+  rationale: FIFO is the default cost method in Chinese markets for tax reporting and position tracking,
+    ensuring regulatory compliance. This boundary aligns with broker practices and tax requirements -
+    other methods (LIFO, average) require explicit configuration and may not match broker records.
+  evidence: 'src/agent/tools/data_tools.py:429(cost_method: str = fifo)'
+  stage: portfolio/calculation
+  alternative_considered: Average cost default was considered but less aligned with regulatory expectations
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: cost_method: str = fifo in src/agent/tools/data_tools.py'
+- id: BD-048
+  type: B
+  content: 'Multi-stock analysis max workers: min(len(codes), 5)'
+  rationale: Dynamic worker allocation based on query size prevents resource waste for small batches while
+    maintaining performance for larger ones. This boundary caps parallelism at 5 to respect API rate limits
+    regardless of batch size, ensuring predictable resource usage.
+  evidence: bot/commands/ask.py:320(module)
+  stage: bot/concurrency
+  alternative_considered: Fixed 5 workers regardless of batch size was rejected due to inefficiency for
+    small batches
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in bot/commands/ask.py'
+- id: BD-049
+  type: B/BA
+  content: Moving Average calculation using Simple Moving Average (SMA) rolling window
+  rationale: SMA rolling window provides baseline trend identification by smoothing price data over configurable
+    periods. This approach balances responsiveness to price changes against noise reduction, with window
+    size determining the sensitivity-smoothing boundary for signal generation.
+  evidence: src/stock_analyzer.py:264-274(_calculate_mas)
+  stage: src/stock_analyzer
+  alternative_considered: Exponential Moving Average (EMA) was considered but rejected for initial implementation
+    due to higher complexity; SMA provides simpler baseline for validation
+- id: BD-050
+  type: B/BA
+  content: MACD indicator with standard financial parameters
+  rationale: MACD implementation uses 12/26/9 standard parameters widely adopted in financial markets.
+    The 12-period fast EMA and 26-period slow EMA capture medium-term momentum shifts, while the 9-period
+    signal line provides trade entry/exit boundaries within the 40-character minimum threshold for decision
+    justification.
+  evidence: src/stock_analyzer.py:276(_calculate_macd)
+  stage: src/stock_analyzer
+  alternative_considered: Alternative parameter sets (8/17/9 or 5/35/5) were benchmarked but standard
+    parameters provide better community-validated results
+- id: BD-051
+  type: B/BA
+  content: RSI momentum oscillator using Wilder smoothing
+  rationale: RSI calculation employs Wilder smoothing (exponential moving average) rather than simple
+    moving average to ensure proper mathematical treatment of gains and losses over time, with 14-period
+    standard setting the boundary for overbought/oversold detection threshold validation.
+  evidence: src/stock_analyzer.py:304(_calculate_rsi)
+  stage: src/stock_analyzer
+  alternative_considered: Standard SMA RSI was rejected because Wilder smoothing provides smoother transitions
+    and aligns with traditional RSI interpretation
+- id: BD-052
+  type: B
+  content: Price bias calculation relative to moving averages
+  rationale: Price bias quantifies how current price relates to key moving averages (MA5, MA10, MA20,
+    MA60), indicating bullish/bearish alignment. The bias percentage provides objective boundary measurement
+    for trend strength assessment beyond simple MA crossover signals.
+  evidence: src/stock_analyzer.py:392-407(_calculate_bias)
+  stage: src/stock_analyzer
+  alternative_considered: Pure price-crossover binary signals were rejected in favor of continuous bias
+    percentage for more granular decision boundaries
+- id: BD-053
+  type: B/BA
+  content: Strong trend bias relaxation threshold
+  rationale: Strong trend bias relaxation threshold permits momentum indicators to override mean-reversion
+    signals when trend alignment exceeds defined boundary. This prevents premature counter-trend trades
+    during strongly trending markets, acknowledging that RSI can remain overbought/oversold for extended
+    periods during clear trends.
+  evidence: src/stock_analyzer.py:583(_generate_signal)
+  stage: src/stock_analyzer
+  alternative_considered: Fixed RSI thresholds without trend context were rejected as they generated excessive
+    false signals in trending markets
+- id: BD-054
+  type: B/BA
+  content: Volume ratio classification thresholds
+  rationale: Volume ratio thresholds classify trading activity as low/medium/high relative to historical
+    averages, enabling detection of unusual participation. Thresholds of 0.5x (low), 1.5x (high) provide
+    clear boundaries for volume confirmation of price movements in the 40+ character decision rationale
+    requirement.
+  evidence: src/stock_analyzer.py:409(_analyze_volume)
+  stage: src/stock_analyzer
+  alternative_considered: Dynamic percentile-based thresholds were considered but rejected due to higher
+    computational complexity and less intuitive interpretation
+- id: BD-055
+  type: B/DK
+  content: Volume-price correlation using Pearson coefficient
+  rationale: Pearson correlation coefficient measures linear relationship between price changes and volume
+    over rolling windows, providing quantitative boundary for price-volume divergence detection. Coefficient
+    values near +1 indicate synchronized moves (strong trend confirmation) while near -1 suggest potential
+    reversal signals.
+  evidence: src/agent/tools/analysis_tools.py:267-271(module)
+  stage: src/agent/tools/analysis_tools
+  alternative_considered: Spearman rank correlation was rejected in favor of Pearson for easier threshold
+    interpretation in signal combination
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/agent/tools/analysis_tools.py'
+- id: BD-056
+  type: B/BA
+  content: Composite signal scoring system (100-point weighted)
+  rationale: Composite scoring aggregates multiple technical indicators into single 100-point scale for
+    clear buy/sell/hold decisions. Weighted combination acknowledges that some indicators (trend, momentum)
+    have higher predictive validity than others (volume), with total points providing objective boundary
+    for position sizing recommendations.
+  evidence: src/stock_analyzer.py:583-744(_generate_signal)
+  stage: src/stock_analyzer
+  alternative_considered: Equal-weight voting system was rejected due to equal importance of each signals
+    being unrealistic; multi-model ensemble was considered but excessive complexity
+- id: BD-057
+  type: B/BA
+  content: Signal threshold bands for buy/sell decisions
+  rationale: Signal threshold bands define clear buy (strong positive) and sell (strong negative) score
+    boundaries with hold zone in between. This discrete banding approach simplifies trading decisions
+    by converting continuous score into actionable categories, with threshold positions determining the
+    boundary between hold and actionable signals.
+  evidence: src/stock_analyzer.py:583(_generate_signal)
+  stage: src/stock_analyzer
+  alternative_considered: Fuzzy continuous outputs were rejected in favor of discrete bands for simpler
+    integration with order execution systems
+- id: BD-058
+  type: B/DK
+  content: Trend status classification based on MA alignment
+  rationale: Trend status classification uses multi-timeframe MA alignment (MA5, MA10, MA20, MA60) to
+    determine bull/bear/neutral market conditions. Ascending MA alignment indicates healthy uptrend while
+    descending alignment signals downtrend, providing fundamental bias for downstream signal interpretation
+    in the 40+ character rationale boundary.
+  evidence: src/stock_analyzer.py:339(_analyze_trend)
+  stage: src/stock_analyzer
+  alternative_considered: Single MA crossover was rejected for providing insufficient trend quality assessment;
+    multi-MA approach captures trend robustness
+- id: BD-059
+  type: B/BA
+  content: Support/resistance detection using MA proximity
+  rationale: Support and resistance levels are dynamically identified where price approaches moving averages
+    within 2% tolerance band (MA_SUPPORT_TOLERANCE=0.02). This tolerance acknowledges that exact price-MA
+    intersections rarely occur, using proximity to define meaningful support/resistance zones with practical
+    trading application boundaries.
+  evidence: src/stock_analyzer.py:447(_analyze_support_resistance)
+  stage: src/stock_analyzer
+  alternative_considered: Fixed price-level S/R was rejected as less adaptive; pivot-point based S/R was
+    considered but adds complexity without proportional benefit
+- id: BD-060
+  type: B
+  content: Single candlestick pattern detection
+  rationale: Single candlestick patterns (Doji, Hammer, Hanging Man, Shooting Star) are detected to identify
+    short-term reversal signals based on open/high/low/close relationships. Each pattern has specific
+    recognition criteria defining the boundary between valid signal and noise, providing early warning
+    of sentiment shifts within broader trend context.
+  evidence: src/agent/tools/analysis_tools.py:402-436(module)
+  stage: src/agent/tools/analysis_tools
+  alternative_considered: Only multi-candle patterns were initially planned but single patterns add value
+    for intraday adjustments
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/agent/tools/analysis_tools.py'
+- id: BD-061
+  type: B
+  content: Multi-candle pattern detection (Morning Star, Evening Star, Engulfing)
+  rationale: Multi-candle patterns provide higher reliability reversal signals than single-candle by capturing
+    multi-day sentiment transitions. Morning Star indicates bullish reversal, Evening Star bearish reversal,
+    and Engulfing patterns show momentum shifts, with pattern-specific rules defining the recognition
+    boundary that triggers signal scoring contribution.
+  evidence: src/agent/tools/analysis_tools.py:441-473(module)
+  stage: src/agent/tools/analysis_tools
+  alternative_considered: Additional patterns (Three White Soldiers, Three Black Crows) were deferred
+    for future enhancement to manage initial scope
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/agent/tools/analysis_tools.py'
+- id: BD-062
+  type: B/BA
+  content: Double bottom pattern detection with 3% tolerance
+  rationale: Double bottom reversal pattern is identified when price makes two distinct lows within 3%
+    tolerance of each other, separated by a peak. This tolerance acknowledges real-market price variations
+    while maintaining pattern integrity, with the boundary providing sufficient room for noise without
+    accepting false patterns.
+  evidence: src/agent/tools/analysis_tools.py:476-487(module)
+  stage: src/agent/tools/analysis_tools
+  alternative_considered: Tighter 1% tolerance was rejected as too restrictive for real-market price variations;
+    wider 5% was considered too permissive
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/agent/tools/analysis_tools.py'
+- id: BD-063
+  type: B/BA
+  content: 'Breakout detection: 20-day high with volume confirmation'
+  rationale: Breakout signals require price exceeding 20-trading-day highest point AND volume exceeding
+    average by configured threshold. Dual requirement ensures false breakouts (common in low-volume conditions)
+    are filtered, with 20-day period providing balanced lookback that captures medium-term resistance
+    levels.
+  evidence: src/agent/tools/analysis_tools.py:489-496(module)
+  stage: src/agent/tools/analysis_tools
+  alternative_considered: Price-only breakout (without volume confirmation) was rejected due to high false
+    signal rate; longer lookback periods were considered but add latency
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/agent/tools/analysis_tools.py'
+- id: BD-064
+  type: B/BA
+  content: 'Consolidation box detection: 10-day range < 8%'
+  rationale: Consolidation detection identifies low-volatility periods where price range over 10 days
+    remains within 8% band. This quiet-period identification provides boundary for anticipating potential
+    explosive moves, as consolidations typically precede breakouts, with 8% providing appropriate threshold
+    between true consolidation and trending movement.
+  evidence: src/agent/tools/analysis_tools.py:500-508(module)
+  stage: src/agent/tools/analysis_tools
+  alternative_considered: 5% tighter threshold was considered but rejected as too restrictive; 10% was
+    deemed too permissive for practical consolidation definition
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/agent/tools/analysis_tools.py'
+  vague_rationale: true
+- id: BD-065
+  type: B
+  content: Realtime quote caching with 10-minute TTL
+  rationale: Realtime quotes are cached with 10-minute time-to-live to balance data freshness against
+    API rate limits. This 10-minute boundary acknowledges that intraday price movements rarely occur faster
+    than this interval while significantly reducing API calls, directly impacting system cost efficiency
+    and external dependency risk management.
+  evidence: data_provider/efinance_fetcher.py:122-135(module)
+  stage: data_collection
+  alternative_considered: Shorter TTL (1-5 min) was rejected due to excessive API usage; longer TTL (15+
+    min) was rejected for inadequate intraday freshness
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in data_provider/efinance_fetcher.py'
+- id: BD-066
+  type: B
+  content: Rate limiting with random jitter sleep
+  rationale: Rate limiting adds randomized jitter (0.5-1.5x base delay) to prevent thundering-herd API
+    calls. This probabilistic approach distributes request load while avoiding strict timing that could
+    cause synchronized spikes, with jitter range providing boundary between effectiveness and user-perceptible
+    delays.
+  evidence: data_provider/efinance_fetcher.py:305(_enforce_rate_limit)
+  stage: data_collection
+  alternative_considered: Fixed delay was rejected as insufficient for thundering herd; token bucket was
+    considered but adds implementation complexity
+- id: BD-067
+  type: B/BA
+  content: Exponential backoff retry strategy
+  rationale: Exponential backoff retries failed API requests with increasing delays (base * 2^n) up to
+    maximum attempts. This strategy acknowledges transient network failures while avoiding immediate re-request
+    that wastes resources, with exponential growth providing fast initial recovery against boundary of
+    eventual timeout.
+  evidence: data_provider/efinance_fetcher.py:326-337(module)
+  stage: data_collection
+  alternative_considered: Linear backoff was rejected as converging too slowly; constant retry without
+    backoff was rejected for potential amplification of issues
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in data_provider/efinance_fetcher.py'
+- id: BD-068
+  type: B/DK
+  content: Agent confidence calibration from historical outcomes
+  rationale: Agent confidence levels are dynamically calibrated based on historical prediction accuracy,
+    adjusting weight assigned to each agent's signals. This feedback loop acknowledges that prediction
+    quality varies by market condition, with calibration providing boundary to discount unreliable signals
+    and prioritize historically accurate agents.
+  evidence: tests/test_multi_agent.py:173(testagentcontext)
+  stage: multi_agent_pipeline
+  alternative_considered: Fixed equal confidence was rejected as not adapting to agent quality differences;
+    Bayesian updating was considered but adds complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: testagentcontext in tests/test_multi_agent.py'
+- id: BD-069
+  type: B/DK
+  content: Strategy weight computation from memory
+  rationale: Strategy weights are computed from historical memory tracking which technical approaches
+    succeeded in past similar market conditions. This memory-based weighting system acknowledges that
+    market regimes change, with weight computation providing dynamic boundary for combining different
+    analytical strategies.
+  evidence: tests/test_multi_agent.py:1081-1092(TestAgentMemory)
+  stage: multi_agent_pipeline
+  alternative_considered: Fixed strategy weights were rejected as suboptimal across changing market conditions;
+    reinforcement learning was considered for future enhancement
+- id: BD-070
+  type: B/DK
+  content: Portfolio position sorting by market value
+  rationale: Portfolio holdings are sorted by market value (position size * current price) for consistent
+    display and risk analysis. Market value sorting provides natural boundary for concentration risk assessment,
+    with largest positions naturally appearing first for human review of largest exposures.
+  evidence: src/agent/tools/data_tools.py:93-97(module)
+  stage: src/agent/tools/data_tools
+  alternative_considered: Alphabetical sorting was rejected as meaningless for portfolio analysis; cost-basis
+    sorting was considered but less intuitive for current exposure
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/agent/tools/data_tools.py'
+- id: BD-071
+  type: B/RC
+  content: Minimum data requirements for analysis
+  rationale: Minimum 20 trading days of historical data required before technical analysis produces reliable
+    signals. This 20-day boundary acknowledges that shorter periods lack sufficient price history for
+    meaningful moving average and pattern calculations, preventing misleading signals from insufficient
+    sample sizes.
+  evidence: src/stock_analyzer.py:83(trendanalysisresult)
+  stage: src/stock_analyzer
+  alternative_considered: Lower threshold (10 days) was rejected as insufficient for MA20 calculations;
+    higher threshold (30 days) was considered but limits short-holding-period stocks
+  _evidence_issues:
+  - 'FN_NOT_FOUND: trendanalysisresult in src/stock_analyzer.py'
+- id: BD-072
+  type: B/DK
+  content: Stock code extraction using regex patterns
+  rationale: Stock codes are extracted from user inputs using regex patterns supporting multiple formats
+    (6-digit codes, exchange prefixes, full URLs). This flexible pattern matching acknowledges diverse
+    user input formats while providing clear boundary for code identification, enabling robust handling
+    of varied natural language stock references.
+  evidence: tests/test_multi_agent.py:49-74(TestExtractStockCode)
+  stage: multi_agent_pipeline
+  alternative_considered: Exact match only was rejected as too restrictive for natural user input; named
+    entity recognition was considered but adds ML dependency
+- id: BD-073
+  type: BA/DK
+  content: 'Orchestrator agent chain is hardcoded: Technical→Intel→Risk→Decision (specialist mode inserts
+    before Decision)'
+  rationale: 'The agent execution order is strictly defined to enforce consistent pipeline flow: Technical
+    establishes market state first, Intel provides context, Risk applies constraints, then Decision synthesizes.
+    Specialist agents must insert before Decision stage to ensure their outputs are available for final
+    synthesis. Changing this order would alter routing behavior and could cause missing inputs at decision
+    time.'
+  evidence: src/agent/orchestrator.py:72(agentorchestrator)
+  stage: ordering_contract
+  _evidence_issues:
+  - 'FN_NOT_FOUND: agentorchestrator in src/agent/orchestrator.py'
+- id: BD-074
+  type: DK
+  content: SkillAggregator._backtest_factor() always returns 1.0 because BacktestService.get_skill_summary()
+    always returns None
+  rationale: This is a known gap where backtest skill weighting has no historical performance signal to
+    leverage. When get_skill_summary returns None, the factor computation falls back to identity (1.0),
+    meaning each skills are treated equally regardless of demonstrated performance. This reduces the adaptive
+    value of skill weighting in backtest contexts.
+  evidence: src/agent/skills/aggregator.py:131(_backtest_factor), src/services/backtest_service.py:319(get_skill_summary)
+  stage: default_value
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: _backtest_factor), src/services/backtest_service.py:319(get_skill_summary in
+    src/agent/skills/aggregator.py'
+- id: BD-075
+  type: B/BA
+  content: Core trading skill policy (MA5>MA10>MA20, bias<5% no-chase) only applies when explicit_skill_selection=False
+  rationale: 'The default trading skill policy establishes a conservative approach: it uses stacked moving
+    averages for confirmation and prevents chasing by blocking trades when current price deviates less
+    than 5% from the signal price. This policy only activates when no explicit skill is selected, ensuring
+    user-specified skills take precedence while providing sensible defaults for automated mode.'
+  evidence: src/agent/skills/defaults.py:73(get_default_trading_skill_policy)
+  stage: default_value
+- id: BD-076
+  type: BA
+  content: Core trading skill policy applies MA5>MA10>MA20 hierarchy and <5% bias no-chase rule when explicit
+    skill selection is disabled
+  rationale: 'The policy enforcement architecture requires a gating mechanism: when users explicitly select
+    skills, the system respects their choice; when no explicit selection exists, the system applies default
+    policy. This conditional enforcement ensures policy defaults don''t conflict with intentional user
+    choices while still providing automated guardrails.'
+  evidence: src/agent/skills/defaults.py:73(get_default_trading_skill_policy)
+  stage: default_value
+- id: BD-077
+  type: BA
+  content: 'SkillManager uses deepcopy-prototype pattern: cached prototype, deepcopy per request, activate()
+    mutates clone'
+  rationale: The prototype-with-deepcopy pattern isolates skill state per request while sharing prototype
+    configuration. Each activation creates a fresh copy that can be mutated independently, preventing
+    cross-request contamination. This trades memory (copy per request) for thread-safety and request isolation.
+  evidence: src/agent/factory.py:173(get_skill_manager), src/agent/skills/base.py:414(SkillManager.activate)
+  stage: pattern_choice
+  alternative_considered: Singleton pattern was rejected due to shared state risks; factory-with-new was
+    rejected due to losing shared configuration
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: get_skill_manager), src/agent/skills/base.py:414(SkillManager.activate in src/agent/factory.py'
+- id: BD-078
+  type: BA/DK
+  content: SkillRouter regime detection ONLY reads from 'technical' agent opinions; other agents ignored
+    for routing
+  rationale: The regime detection architecture intentionally couples to technical analysis output because
+    market regime (trending, ranging, volatile) is fundamentally a technical signal. Using other agents
+    (intel, risk) for regime would create circular dependencies or mixed signals. This simplifies routing
+    logic at the cost of ignoring non-technical context.
+  evidence: src/agent/skills/router.py:76(_detect_regime)
+  stage: ordering_contract
+- id: BD-079
+  type: B/BA
+  content: neutral_band_pct=2.0 means price changes within ±2% are 'neutral' in backtest evaluation
+  rationale: 'The 2% neutral band establishes a tolerance threshold for ''hold'' advice correctness: trades
+    within ±2% of entry price are neither scored as wins nor losses. This prevents micro-fluctuations
+    from distorting performance metrics and acknowledges that near-entry price movements are statistically
+    indistinguishable from noise.'
+  evidence: src/core/backtest_engine.py:46(EvaluationConfig.neutral_band_pct)
+  stage: default_value
+  _evidence_issues:
+  - 'FN_NOT_FOUND: EvaluationConfig.neutral_band_pct in src/core/backtest_engine.py'
+- id: BD-080
+  type: DK
+  content: BacktestEngine 'hold' advice maps to 'not_down' direction (win if price >= entry, loss if <=
+    -2%)
+  rationale: 'The ''hold'' direction semantics define a bullish bias: holding is correct if price doesn''t
+    drop more than 2%. This asymmetric treatment reflects that ''hold'' implies avoiding losses rather
+    than capturing gains. The -2% threshold aligns with the neutral_band_pct boundary.'
+  evidence: src/core/backtest_engine.py:92(infer_direction_expected)
+  stage: default_value
+- id: BD-081
+  type: BA
+  content: Pipeline auto-enables agent mode when agent_skills config is non-empty (even for scheduled
+    tasks)
+  rationale: 'Auto-enablement treats skill configuration as an implicit opt-in signal: if any skills are
+    defined, the system assumes agent-mode is desired even for scheduled runs. This prevents scheduled
+    tasks from ignoring configured skills. The boundary is any non-empty agent_skills list triggers agent
+    mode regardless of execution context.'
+  evidence: src/core/pipeline.py:69(__init__)
+  stage: ordering_contract
+- id: BD-082
+  type: DK
+  content: _SENTINEL=object() pattern forces cache invalidation on first call (None would compare equal
+    to unset config)
+  rationale: 'The sentinel object pattern distinguishes ''not set'' from ''explicitly set to None''. Using
+    None as a default would make it impossible to detect whether a caller passed None intentionally or
+    omitted the argument. The boundary: only when the caller explicitly provides a value does the cache
+    store it; otherwise the sentinel triggers cache miss.'
+  evidence: src/agent/factory.py:48(SkillPromptState)
+  stage: pattern_choice
+- id: BD-083
+  type: DK
+  content: OVERALL_SENTINEL_CODE='__overall__' used as sentinel for global backtest rollup; mapped to
+    None in API
+  rationale: 'The __overall__ sentinel aggregates skill-specific backtest results into a global summary.
+    Internal code uses the sentinel for aggregation logic while the API maps it to None for cleaner client-facing
+    responses. The boundary: when requesting ''overall'' summary, the system uses this sentinel internally
+    but presents None in the public interface.'
+  evidence: src/core/backtest_engine.py:15(OVERALL_SENTINEL_CODE), src/services/backtest_service.py:481(_summary_to_dict)
+  stage: pattern_choice
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: OVERALL_SENTINEL_CODE), src/services/backtest_service.py:481(_summary_to_dict
+    in src/core/backtest_engine.py'
+- id: BD-084
+  type: B
+  content: 'Legacy alias pattern: build_executor→build_agent_executor, StrategyAggregator→SkillAggregator,
+    StrategyRouter→SkillRouter'
+  rationale: 'Legacy aliases provide backward compatibility during naming refactoring from ''Strategy''
+    to ''Skill'' terminology. The boundary: old names delegate to new implementations; removing aliases
+    would break existing integrations. This allows gradual migration without forced updates across each
+    consumers.'
+  evidence: src/agent/factory.py:272(build_agent_executor)
+  stage: inheritance
+- id: BD-085
+  type: DK
+  content: skill_aggregator weight = confidence * (0.5 + win_rate), normalized to mean=1.0, with min_samples=30
+  rationale: The weighting formula balances confidence (signal strength) with historical accuracy (win_rate).
+    The 0.5 offset ensures skills with 0% win rate still contribute half-weight based on confidence alone.
+    Normalization to mean=1.0 prevents total weight inflation. The min_samples=30 boundary ensures statistical
+    significance before skill performance affects weighting.
+  evidence: src/agent/memory.py:239(compute_skill_weights)
+  stage: default_value
+- id: BD-086
+  type: B
+  content: Orchestrator pipeline aborts on FAILED stage except intel/risk which degrade gracefully
+  rationale: 'Failure handling is tiered: intel and risk agents are considered non-critical and their
+    failures result in degraded operation (using fallback data) rather than pipeline abortion. Every other
+    stages (technical, decision) are critical - their failure halts the pipeline. The boundary: intel/risk
+    can fail without stopping execution; everything else cannot.'
+  evidence: src/agent/orchestrator.py:409(StageStatus.FAILED check)
+  stage: invariant
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: StageStatus.FAILED check in src/agent/orchestrator.py'
+  vague_rationale: true
+- id: BD-087
+  type: DK
+  content: 'Signal score mapping: strong_buy=5, buy=4, hold=3, sell=2, strong_sell=1 with thresholds [4.5,3.5,2.5,1.5]'
+  rationale: 'Signal scoring uses a 1-5 scale with thresholds that split the range asymmetrically toward
+    buy signals (4.5 threshold for strong_buy vs 4.0 midpoint). This creates a bullish bias in interpretation
+    where numeric scores near 4.0 are classified as ''buy'' rather than ''hold''. The boundary: scores
+    >=4.5 are strong_buy, >=3.5 and <4.5 are buy, etc.'
+  evidence: src/agent/skills/aggregator.py:43(aggregate)
+  stage: pattern_choice
+- id: BD-088
+  type: BA
+  content: 'Preferred base opinion order for dashboard synthesis: decision > skill_consensus > technical
+    > intel > risk'
+  rationale: 'The opinion precedence hierarchy ensures dashboard displays the most authoritative signal
+    first: decision agent output is primary, falling back through consensus, then individual agents in
+    descending priority. This ordering controls what users see when multiple agents provide conflicting
+    signals. The boundary: if higher-priority source has data, lower-priority sources are not displayed.'
+  evidence: src/agent/orchestrator.py:1069(_select_base_opinion)
+  stage: default_value
+- id: BD-089
+  type: BA
+  content: Specialist agents inserted at index of 'decision' agent before running (lazy insert, router
+    sees completed technical)
+  rationale: Lazy insertion ensures specialists run after technical analysis completes but before decision
+    synthesis. This ordering boundary guarantees the router has access to completed technical analysis
+    for regime detection, while still allowing specialists to influence the final decision. Insert position
+    is dynamic based on where 'decision' agent appears in the chain.
+  evidence: src/agent/orchestrator.py:332(specialist_agents_inserted logic)
+  stage: ordering_contract
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: specialist_agents_inserted logic in src/agent/orchestrator.py'
+- id: BD-090
+  type: BA
+  content: 'INTERACTION: [BD-001] × [BD-055] → Strong trend bias relaxation overrides no-chase discipline,
+    creating conditions for extended overbought buying'
+  rationale: BD-001 enforces 5% bias no-chase policy, but BD-055 permits relaxation during strong uptrends
+    where MA alignment exceeds threshold. When both conditions trigger, the system buys stocks that have
+    already deviated significantly from moving averages, contradicting the original risk management intent.
+    This interaction creates a scenario where aggressive momentum chasing occurs precisely when mean-reversion
+    risk is highest (extended uptrends eventually reverse). The relaxation exists to avoid whipsaw
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-091
+  type: BA
+  content: 'INTERACTION: [BD-002] × [BD-016] → MA alignment scoring (30pts) creates threshold dependency
+    affecting entire composite signal'
+  rationale: 'BD-002 mandates MA5>MA10>MA20 alignment for uptrend confirmation, and BD-016 assigns 30
+    points (highest weight) to trend status in the 100-point scoring system. This creates a hidden dependency:
+    changing MA alignment criteria directly cascades to signal scores without explicit documentation.
+    Modifying BD-002 without re-calibrating BD-016 thresholds would shift the entire decision boundary,
+    potentially causing systematic over/under-weighting of trend-following signals. The interaction means
+    any a'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-092
+  type: B/BA
+  content: 'INTERACTION: [BD-003] × [BD-017] → shift(1) alignment combined with fixed volume thresholds
+    creates delayed anomaly detection'
+  rationale: 'BD-003 mandates shift(1) to prevent look-ahead bias in volume ratio calculation, while BD-017
+    uses fixed thresholds (0.7/1.5) for volume anomaly classification. The shift creates a one-day lag
+    in detecting volume spikes relative to price action. During rapidly developing breakouts, this lag
+    means the system only confirms heavy volume on the day AFTER the price move, potentially missing optimal
+    entry timing. The interaction amplifies response latency: price moves on Day 1, volume anomaly detected'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-093
+  type: B
+  content: 'INTERACTION: [BD-021] × [BD-050] → Inconsistent max worker limits (3 vs min(len,5)) create
+    concurrency unpredictability'
+  rationale: 'BD-021 sets global MAX_WORKERS=3 for concurrent stock analysis threads, while BD-050 dynamically
+    allocates min(len(codes),5) workers for multi-stock analysis. These constraints contradict each other:
+    BD-050 allows up to 5 workers for 5-stock batches, but BD-021 caps at 3 globally. When multi-stock
+    analysis runs, which limit applies? If BD-050 overrides BD-021, the original rate-limit protection
+    from BD-021 becomes unenforceable. This contradiction creates unpredictable resource consumption:
+    some'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-094
+  type: BA
+  content: 'INTERACTION: [BD-030] × [BD-031] → 150s timeout calibrated for 5 stocks creates hidden failure
+    risk for larger batches'
+  rationale: 'BD-030 sets 150-second timeout for multi-stock analysis, but BD-031 caps batch size at 5
+    stocks maximum. The timeout appears sized for 5 stocks assuming parallel execution (30s per stock).
+    However, if data provider response times increase (network latency, API throttling), the 150s limit
+    becomes insufficient. The hidden dependency: timeout was implicitly calibrated against batch size.
+    When providers slow down, timeout fires before each stocks complete, leaving partial results with
+    no indication o'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-095
+  type: BA/M
+  content: 'INTERACTION: [BD-076] × [BD-087] → Backtest factor returns 1.0, negating win-rate weight differentiation
+    in skill aggregation'
+  rationale: 'BD-076 documents that _backtest_factor() always returns 1.0 because get_skill_summary()
+    returns None, while BD-087 defines skill weighting formula as confidence * (0.5 + win_rate) with min_samples=30.
+    The contradiction: BD-087 assumes historical win_rate exists and influences weighting, but BD-076
+    confirms this data never materializes. In backtest contexts, each skills receive equal weight regardless
+    of actual performance because the backtest factor cannot modulate based on nonexistent historical'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-096
+  type: BA/DK
+  content: 'INTERACTION: [BD-075] × [BD-091] → Hardcoded chain ordering assumes specific insertion point
+    for specialists creates brittleness'
+  rationale: 'BD-075 hardcodes the agent chain as Technical→Intel→Risk→Decision, and BD-091 specifies
+    specialist agents insert at the index of ''decision'' agent. The hidden dependency: specialist insertion
+    logic assumes ''decision'' exists at a specific position in the hardcoded chain. If BD-075 changes
+    (adding/removing stages), BD-091 insertion logic breaks silently. Specialists would either insert
+    at wrong position or fail to find ''decision'' marker. This creates brittleness where changes to pipeline
+    compositio'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-097
+  type: BA
+  content: 'INTERACTION: [BD-080] × [BD-090] → Regime detection ignores intel/risk but dashboard synthesizes
+    from each agents creates inconsistency'
+  rationale: 'BD-080 explicitly states SkillRouter regime detection ONLY reads from ''technical'' agent
+    opinions, ignoring intel and risk agents. BD-090 defines dashboard opinion precedence as decision
+    > skill_consensus > technical > intel > risk. The contradiction: regime-based skill routing makes
+    decisions based solely on technical analysis, but the dashboard displays synthesized signals incorporating
+    intel and risk perspectives. Users see multi-agent consensus in dashboard that never influenced routing
+    decis'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-098
+  type: B/DK
+  content: 'INTERACTION: [BD-081] × [BD-082] → 2% neutral band with hold=''not_down'' creates asymmetric
+    evaluation bias'
+  rationale: 'BD-081 defines 2% neutral band where outcomes within ±2% are neither wins nor losses, while
+    BD-082 maps ''hold'' advice to ''not_down'' direction (win if price >= entry, loss if price <= -2%).
+    The interaction creates asymmetric evaluation: ''hold'' advice is correct if price stays flat (+1%),
+    correct if price rises (+3%), but marked neutral if price drops exactly -2%. This means holding during
+    a small -1.5% pullback scores as correct (neutral band), but holding during a steeper -3% decline
+    scores as i'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-099
+  type: B
+  content: 'INTERACTION: [BD-014] × [BD-043] → MACD momentum signals can contradict trend strength scores
+    creating internal signal conflict'
+  rationale: 'BD-014 defines MACD with standard 12/26/9 parameters for momentum detection, while BD-043
+    classifies trend strength across 7 levels (STRONG_BULL=30 to STRONG_BEAR=0). These systems can contradict:
+    MACD may signal bearish divergence while MA alignment still shows bull configuration, or vice versa.
+    When both indicators contribute to composite scoring (BD-016 weights MACD and trend separately), conflicting
+    signals cancel out, potentially resulting in hold recommendations when clear action exists. T'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-100
+  type: B/DK
+  content: 'INTERACTION: [BD-067] × [BD-003] → 10-minute cache TTL compounds with shift(1) lag creating
+    stale data windows'
+  rationale: 'BD-067 caches realtime quotes with 10-minute TTL to reduce API calls, while BD-003 uses
+    shift(1) to prevent look-ahead bias in volume ratios. The interaction: during volatile trading, a
+    price spike at 14:50 is cached; the next data fetch at 14:55 returns cached data. If user requests
+    analysis at 14:55, cached data is 5 minutes stale. Combined with shift(1) which already introduces
+    one-day lag, the effective data age can reach 1 day + 10 minutes. For intraday analysis, this creates
+    a window where'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-GAP-001
+  type: T
+  content: 'Vision LLM provider fallback priority: Gemini → Anthropic → OpenAI (first available wins)'
+  rationale: Multi-provider fallback avoids single-vendor lock-in and handles key rotation gracefully;
+    breaks when each three providers are unavailable, leaving image extraction with zero fallback.
+  evidence: api/v1/endpoints/stocks.py:58(extract_from_image)
+  stage: integration
+  alternative_considered: Single-provider with retry-only was rejected for lack of cross-vendor resilience
+- id: BD-GAP-002
+  type: B/BA
+  content: SSE heartbeat emitted every 30 seconds to keep connections alive through proxies
+  rationale: Proxies and load balancers often close idle HTTP connections; 30-second heartbeat is a common
+    middle ground; breaks when clients need >30s between real events and proxy idle timeout is shorter.
+  evidence: api/v1/endpoints/analysis.py:537(_format_sse_event)
+  stage: transport
+  alternative_considered: WebSocket was considered but rejected for simpler SSE implementation
+- id: BD-GAP-003
+  type: B
+  content: Per-conversation FIFO queue for Feishu messages to serialize command processing within each
+    chat
+  rationale: Prevents race conditions when the same user sends rapid multi-command bursts; breaks when
+    a user's conversation spans multiple concurrent bot instances without shared Redis.
+  evidence: bot/platforms/feishu_stream.py:288(_conversation_key)
+  stage: routing
+  alternative_considered: Redis-backed queue was rejected for deployment complexity
+- id: BD-GAP-004
+  type: B
+  content: Stock name normalization strips full-width characters and special prefixes before pinyin generation
+  rationale: Prevents garbage pinyin like ＡＢＣ that would break alphabetical search indexes; breaks when
+    legitimate stock names contain unicode punctuation that should be preserved.
+  evidence: scripts/generate_index_from_csv.py:236(normalize_name_for_pinyin)
+  stage: data_collection
+  alternative_considered: Preserving unicode was rejected due to downstream pypinyin library quirks
+- id: BD-GAP-005
+  type: B/DK
+  content: 'US stock dedup priority: empty delist_date > NaT > actual date, preferring active tickers'
+  rationale: Tushare exports delist_date unreliably for current tickers; empty string is the strongest
+    signal of an active ticker; breaks when delist_date is legitimately empty for a recently delisted
+    stock.
+  evidence: scripts/generate_index_from_csv.py:136(get_us_delist_priority)
+  stage: data_collection
+  alternative_considered: Cross-referencing with current date was considered but rejected as too slow
+- id: BD-GAP-006
+  type: B/BA
+  content: Random sleep between Tushare API calls (SLEEP_MIN to SLEEP_MAX range) to avoid rate limiting
+  rationale: Tushare imposes per-IP request rate limits; random jitter prevents thundering herd on burst
+    fetches; breaks when Tushare changes their rate limit thresholds without notice.
+  evidence: scripts/fetch_tushare_stock_list.py:83(random_sleep)
+  stage: integration
+  alternative_considered: Tushare's official batch API was considered but has lower record limits
+- id: BD-GAP-007
+  type: B
+  content: Magic byte verification rejects forged Content-Type on uploaded images before LLM processing
+  rationale: Prevents MIME type spoofing attacks where malicious files are disguised as images; breaks
+    when legitimate images use uncommon magic bytes not in the allowlist.
+  evidence: src/services/image_stock_extractor.py:75(_verify_image_magic_bytes)
+  stage: security
+  alternative_considered: Relying solely on Content-Type header was rejected as insecure
+- id: BD-GAP-008
+  type: B/DK
+  content: Vision LLM extraction retries up to 3 times with exponential backoff using multi-key rotation
+  rationale: Handles transient API errors and key quota exhaustion gracefully; breaks when each keys are
+    exhausted within a 3-retry window, leaving extraction failed.
+  evidence: src/services/image_stock_extractor.py:285(extract_stock_codes_from_image)
+  stage: resilience
+  alternative_considered: Infinite retry with circuit breaker was rejected for blocking
+- id: BD-GAP-009
+  type: B
+  content: SQLite write serialization using ledger lock with PortfolioBusyError on lock acquisition failure
+  rationale: SQLite lacks true write concurrency; ledger lock prevents double-write corruption; breaks
+    under high concurrent write load where lock contention exceeds timeout.
+  evidence: src/repositories/portfolio_repo.py:137(portfolio_write_session)
+  stage: storage_persistence
+  alternative_considered: PostgreSQL migration was considered but rejected for deployment complexity
+- id: BD-GAP-010
+  type: B
+  content: Atomic refresh of position cache and daily snapshot in single transaction
+  rationale: Prevents snapshot/position divergence on crash mid-refresh; breaks when transaction exceeds
+    SQLite write lock timeout on large portfolios.
+  evidence: src/repositories/portfolio_repo.py:972(replace_positions_lots_and_snapshot)
+  stage: storage_persistence
+  alternative_considered: Two-phase refresh was rejected for higher complexity
+- id: BD-GAP-011
+  type: B
+  content: Analysis task queue uses singleton pattern with max 3 concurrent workers
+  rationale: 3 workers balances throughput against LLM API rate limits and memory usage; breaks when 3+
+    long-running analyses queue up and users experience >9s average wait.
+  evidence: src/services/task_queue.py:148(__init__)
+  stage: orchestration
+  alternative_considered: Unlimited workers was rejected for API quota exhaustion risk
+- id: BD-GAP-012
+  type: B
+  content: SSE task progress clamped to [0, 99] so terminal states remain controlled by completion/failure
+    handlers
+  rationale: Prevents clients from receiving progress=100 before server signals completion, avoiding race
+    conditions; breaks when legitimate progress calculation produces 100 before actual completion.
+  evidence: src/services/task_queue.py:490(update_task_progress)
+  stage: transport
+  alternative_considered: Separate completion event with 100 was considered but rejected
+- id: BD-GAP-013
+  type: B/DK
+  content: 'Name-to-code resolution sequence: code-like check → local STOCK_NAME_MAP → AkShare fetch'
+  rationale: Fast path for direct codes avoids unnecessary lookups; AkShare fetch is expensive so it runs
+    last; breaks when AkShare is down and user provides a name not in local map.
+  evidence: src/services/name_to_code_resolver.py:138(resolve_name_to_code)
+  stage: lookup
+  alternative_considered: Caching AkShare results indefinitely was rejected for stale data risk
+- id: BD-GAP-014
+  type: B/BA
+  content: Ambiguous stock names mapping to multiple codes are excluded from reverse name→code index
+  rationale: Prevents silent misrouting when multiple stocks share the same name; breaks when the disambiguation
+    heuristic is too aggressive and removes valid unique names.
+  evidence: src/services/name_to_code_resolver.py:42(_build_reverse_map_no_duplicates)
+  stage: lookup
+  alternative_considered: Returning each matches was rejected for misrouting risk
+- id: BD-GAP-015
+  type: B/BA
+  content: Usage date range calculated in Beijing time (UTC+8) regardless of server timezone
+  rationale: Chinese market users expect China-local date boundaries; breaks when users in other timezones
+    query 'today' and see misaligned date ranges.
+  evidence: api/v1/endpoints/usage.py:24(_date_range)
+  stage: calculation
+  alternative_considered: Server-local timezone was rejected for inconsistent China market reporting
+- id: BD-GAP-016
+  type: B/DK
+  content: 'Stock code normalization rules differ by market: A-shares/HK 5-6 digits, US 1-5 letters'
+  rationale: Different markets use fundamentally different code formats; enforcing strict patterns prevents
+    cross-market collision; breaks when new markets use non-standard formats.
+  evidence: src/services/image_stock_extractor.py:91(_normalize_code)
+  stage: validation
+  alternative_considered: Relaxed validation was rejected for cross-market collision risk
+- id: BD-GAP-017
+  type: B/DK
+  content: Backtest evaluation window capped at 1-120 days, balancing signal relevance against data availability
+  rationale: 120-day cap prevents overly stale backtests; 1-day minimum enables same-day evaluation; breaks
+    when historical data is <120 days old for a given stock.
+  evidence: api/v1/endpoints/backtest.py:85(get_backtest_results)
+  stage: calculation
+  alternative_considered: No cap was rejected for memory and staleness concerns
+- id: BD-GAP-018
+  type: B
+  content: History record_id accepts both integer primary key and query_id string, with PK tried first
+  rationale: Flexibility for frontend that may hold either identifier; PK-first is faster and more precise;
+    breaks when legacy records have non-unique query_id causing wrong record returned.
+  evidence: api/v1/endpoints/history.py:188(get_history_detail)
+  stage: routing
+  alternative_considered: Strict query_id-only was rejected for breaking existing frontend usage
+- id: BD-GAP-019
+  type: T
+  content: System config persisted to .env file with runtime reload triggering singleton refresh
+  rationale: .env is human-readable and version-controllable; runtime reload avoids restart; breaks when
+    .env write fails or reload hook misses some singleton.
+  evidence: src/services/system_config_service.py:497(update)
+  stage: configuration
+  alternative_considered: Database-backed config was rejected for added dependency
+- id: BD-GAP-020
+  type: B
+  content: SSRF protection blocks link-local (169.254.x.x) and cloud metadata addresses while allowing
+    localhost/private-LAN
+  rationale: Prevents server-side request forgery to cloud metadata services; allows Ollama on 192.168.x.x
+    for local AI; breaks when legitimate use cases involve 169.254.x.x endpoints.
+  evidence: src/services/system_config_service.py:912(_is_safe_base_url)
+  stage: security
+  alternative_considered: Allow each addresses was rejected for SSRF risk
+- id: BD-GAP-021
+  type: B/BA
+  content: LiteLLM YAML configuration takes precedence over channel-style env configuration
+  rationale: LiteLLM YAML represents explicit router configuration; channel-style is legacy fallback;
+    breaks when users expect channel config to override stale YAML file.
+  evidence: src/services/system_config_service.py:1210(_uses_litellm_yaml)
+  stage: configuration
+  alternative_considered: Channel override was rejected for breaking LiteLLM users
+- id: BD-GAP-022
+  type: B/RC
+  content: Portfolio service supports both FIFO and average cost methods for position valuation
+  rationale: Different accounting preferences require different cost methods; FIFO is common for tax reporting;
+    breaks when switching methods on existing positions without historical replay.
+  evidence: src/services/portfolio_service.py:728(_replay_account)
+  stage: calculation
+  alternative_considered: FIFO-only was rejected for not supporting each accounting preferences
+- id: BD-GAP-023
+  type: B
+  content: Import dedup hash built from symbol + trade_date + side + quantity + price to detect duplicate
+    trades
+  rationale: Composite key captures the essential trade identity without relying on broker trade_id; breaks
+    when broker re-issues the same trade with a different trade_id after cancellation.
+  evidence: src/services/portfolio_import_service.py:434(_build_dedup_hash)
+  stage: import
+  alternative_considered: Using broker trade_id was rejected for inconsistent broker formats
+- id: BD-GAP-024
+  type: B
+  content: Slack sender prefers Bot API over Webhook to ensure text and images use the same transport
+    channel
+  rationale: Bot API supports both text and file uploads in same channel; Webhook cannot send images;
+    breaks when Bot token is invalid and falls back to Webhook that cannot send images.
+  evidence: src/notification_sender/slack_sender.py:39(_use_bot)
+  stage: notification_dispatch
+  alternative_considered: Webhook-only was rejected for lacking image support
+- id: BD-GAP-025
+  type: B/BA
+  content: Telegram sends Markdown initially, falls back to plain text on parse error rather than pre-validating
+  rationale: Telegram MarkdownV2 has subtle escape rules that are hard to predict; runtime fallback is
+    simpler than pre-validation; breaks when valid content is retried as plain text and loses formatting.
+  evidence: src/notification_sender/telegram_sender.py:159(_should_fallback_to_plain_text)
+  stage: notification_dispatch
+  alternative_considered: Pre-validation with escape rules was rejected for complexity
+- id: BD-GAP-026
+  type: B/RC
+  content: Feishu webhook requires keyword prefix prepended to pass security validation
+  rationale: Feishu custom robot webhook security requires a specific keyword in every message; enforcing
+    this at sender level prevents silent failures; breaks when user changes the configured keyword without
+    updating the sender.
+  evidence: src/notification_sender/feishu_sender.py:44(_get_keyword_prefix)
+  stage: notification_dispatch
+  alternative_considered: Soft warning was rejected for silent failure risk
+- id: BD-GAP-027
+  type: B/BA
+  content: Discord webhook signature verification using Ed25519 (X-Signature-Ed25519 header)
+  rationale: Ed25519 provides authenticated request verification preventing webhook spoofing; breaks when
+    clock skew exceeds Discord's signature timestamp tolerance.
+  evidence: bot/platforms/discord.py:45(verify_request)
+  stage: security
+  alternative_considered: IP allowlist was rejected for being too rigid
+- id: BD-GAP-028
+  type: B/DK
+  content: Portfolio risk service uses 180-day lookback for drawdown calculation snapshot window
+  rationale: 180 days (~6 months) captures most meaningful drawdown periods while limiting data volume;
+    breaks when historical positions extend beyond 180 days and earlier losses are excluded.
+  evidence: src/services/portfolio_risk_service.py:766(list_daily_snapshots_for_risk)
+  stage: calculation
+  alternative_considered: Unlimited lookback was rejected for memory constraints
+  _evidence_issues:
+  - 'LINE_OOB: src/services/portfolio_risk_service.py:766 > 441'
+- id: BD-GAP-029
+  type: B/DK
+  content: Task queue dedup key normalizes stock code shape (e.g., 600519 and 600519.SH treated as same)
+  rationale: Users may reference stocks with or without exchange suffix; normalization prevents duplicate
+    submissions; breaks when legitimate analysis of index vs individual stock with same code is needed.
+  evidence: src/services/task_queue.py:35(_dedupe_stock_code_key)
+  stage: deduplication
+  alternative_considered: Broader dedup was rejected for user confusion
+- id: BD-GAP-030
+  type: B/RC
+  content: System config server-side secret masking with '******' display regardless of actual value length
+  rationale: Prevents accidental exposure of secrets in API responses and logs; fixed mask prevents length-based
+    inference; breaks when legitimate debugging requires confirming secret presence.
+  evidence: src/services/system_config_service.py:154(get_config)
+  stage: security
+  alternative_considered: No masking was rejected for security risk
+- id: BD-GAP-031
+  type: M
+  content: 'Missing: Convergence criteria explicit'
+  rationale: 'Audit finding: missing: convergence criteria explicit. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-032
+  type: DK
+  content: 'Missing: Train/test time split integrity'
+  rationale: 'Audit finding: missing: train/test time split integrity. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-033
+  type: B
+  content: 'Missing: 订单生命周期状态机'
+  rationale: 'Audit finding: missing: 订单生命周期状态机. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-034
+  type: B
+  content: 'Missing: 资金成本建模（Carry/Funding）'
+  rationale: 'Audit finding: missing: 资金成本建模（carry/funding）. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-035
+  type: B
+  content: 'Missing: 填单假设（市价单全量成交）'
+  rationale: 'Audit finding: missing: 填单假设（市价单全量成交）. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-036
+  type: B
+  content: 'Missing: 有限差分网格稳定性'
+  rationale: 'Audit finding: missing: 有限差分网格稳定性. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-037
+  type: B
+  content: 'Missing: 优化约束体系完备性'
+  rationale: 'Audit finding: missing: 优化约束体系完备性. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-038
+  type: B
+  content: 'Missing: 波动率模型族与分布选择'
+  rationale: 'Audit finding: missing: 波动率模型族与分布选择. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-039
+  type: B
+  content: 'Missing: Pipeline fit/transform 隔离'
+  rationale: 'Audit finding: missing: pipeline fit/transform 隔离. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-040
+  content: 'Missing: Matrix ill-conditioning'
+  type: M
+  rationale: 'Audit finding: missing: matrix ill-conditioning. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-041
+  content: 'Missing: Day count convention'
+  type: M/DK
+  rationale: 'Audit finding: missing: day count convention. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-042
+  content: 'Missing: 定价模型选择与适用边界'
+  type: B
+  rationale: 'Audit finding: missing: 定价模型选择与适用边界. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-043
+  content: 'Missing: 日计数与复利约定'
+  type: B
+  rationale: 'Audit finding: missing: 日计数与复利约定. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-044
+  content: 'Missing: 隐含波动率求解器'
+  type: B
+  rationale: 'Audit finding: missing: 隐含波动率求解器. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-045
+  content: 'Missing: Greeks 计算方法'
+  type: B
+  rationale: 'Audit finding: missing: greeks 计算方法. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-046
+  content: 'Missing: 无套利约束验证'
+  type: B
+  rationale: 'Audit finding: missing: 无套利约束验证. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-047
+  content: 'Missing: 协方差矩阵 PSD 修复策略'
+  type: M
+  rationale: 'Audit finding: missing: 协方差矩阵 psd 修复策略. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-048
+  content: 'Missing: 协方差估计量选择与收缩'
+  type: B
+  rationale: 'Audit finding: missing: 协方差估计量选择与收缩. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-049
+  content: 'Missing: VaR/CVaR 置信水平与窗口'
+  type: B
+  rationale: 'Audit finding: missing: var/cvar 置信水平与窗口. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_collection
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: A股自选股智能分析系统主调度
+  source: main.py
+  type: live_trading
+  business_problem: 协调各模块完成股票分析流程，实现低并发的线程池调度，全局异常处理确保单股失败不影响整体分析任务
+  intent_keywords:
+  - 股票分析
+  - 调度
+  - 线程池
+  - 自选股
+  - 智能分析
+  - 定时任务
+  stage: data_collection
+  negative_keywords:
+  - 回测
+  - 数据导出
+  - 仅API调用
+  disambiguation: 需要执行完整分析流程还是仅获取数据？是否需要定时调度模式？
+  data_domain: mixed
+- id: UC-102
+  name: RESTful API 后端服务
+  source: server.py
+  type: reporting
+  business_problem: 提供RESTful API服务支持CORS跨域访问，同时托管前端静态文件用于生产环境部署
+  intent_keywords:
+  - API服务
+  - 后端
+  - FastAPI
+  - 跨域
+  - 静态文件托管
+  - 健康检查
+  stage: reporting
+  negative_keywords:
+  - 命令行执行
+  - 定时任务
+  - 技术分析
+  disambiguation: 需要通过HTTP API调用还是命令行直接执行？
+  data_domain: mixed
+- id: UC-103
+  name: LLM Agent ReAct执行循环
+  source: src/agent/runner.py
+  type: ml_prediction
+  business_problem: 提供LLM Agent的ReAct执行循环，支持可插拔的进度回调、消息历史和结果处理，实现工具调用与LLM推理的迭代执行
+  intent_keywords:
+  - LLM Agent
+  - ReAct
+  - 工具调用
+  - 推理
+  - 多步骤
+  stage: analysis
+  negative_keywords:
+  - 直接API调用
+  - 同步执行
+  - 单次查询
+  disambiguation: 需要Agent自主推理多步骤分析还是单次API调用？
+  data_domain: market_data
+- id: UC-104
+  name: Server酱3消息推送服务
+  source: src/notification_sender/serverchan3_sender.py
+  type: monitoring
+  business_problem: 通过Server酱3 API推送分析结果提醒消息到用户终端，支持标题和内容自定义
+  intent_keywords:
+  - 消息推送
+  - Server酱3
+  - 提醒
+  - 通知
+  - 推送
+  stage: reporting
+  negative_keywords:
+  - 邮件通知
+  - 短信通知
+  - 微信通知
+  - Telegram
+  disambiguation: 需要推送到Server酱3还是其他渠道（如邮件、微信、Telegram）？
+  data_domain: mixed
+- id: UC-105
+  name: AI资产/指令文件验证
+  source: scripts/check_ai_assets.py
+  type: research_analysis
+  business_problem: 验证AI Agent的指令文件和技能配置是否完整，包括AGENTS.md、CLAUDE.md、Copilot配置和skill目录结构
+  intent_keywords:
+  - AI资产
+  - 指令文件
+  - 技能配置
+  - 验证
+  - Agent
+  stage: data_collection
+  negative_keywords:
+  - 股票分析
+  - 回测
+  - 数据获取
+  disambiguation: 需要验证AI配置还是执行股票分析任务？
+  data_domain: financial_data
+- id: UC-106
+  name: 股票指数生成(CSV来源)
+  source: scripts/generate_index_from_csv.py
+  type: data_pipeline
+  business_problem: 从CSV文件（Tushare格式或AkShare格式）生成股票索引JSON文件，用于前端自动补全功能，支持中文名称转拼音
+  intent_keywords:
+  - 股票指数
+  - CSV
+  - 前端
+  - 自动补全
+  - 拼音索引
+  stage: data_collection
+  negative_keywords:
+  - 实时数据
+  - 分析报告
+  - 回测
+  disambiguation: 需要从CSV文件生成索引还是从API实时获取股票列表？
+  data_domain: market_data
+- id: UC-107
+  name: 股票指数生成(内存来源)
+  source: scripts/generate_stock_index.py
+  type: data_pipeline
+  business_problem: 从内存中的STOCK_NAME_MAP生成股票索引文件用于前端自动补全，采用两阶段策略（先用映射表，后续结合AkShare）
+  intent_keywords:
+  - 股票指数
+  - 内存
+  - 前端
+  - 自动补全
+  - STOCK_NAME_MAP
+  stage: data_collection
+  negative_keywords:
+  - CSV导入
+  - 实时数据
+  - 分析报告
+  disambiguation: 需要从内存映射表生成还是从外部数据源导入？
+  data_domain: market_data
+- id: UC-108
+  name: Tushare股票列表获取
+  source: scripts/fetch_tushare_stock_list.py
+  type: data_pipeline
+  business_problem: 从Tushare Pro API获取A股、港股、美股列表信息并保存为CSV文件，支持按市场分类导出
+  intent_keywords:
+  - Tushare
+  - 股票列表
+  - A股
+  - 港股
+  - 美股
+  - 数据获取
+  stage: data_collection
+  negative_keywords:
+  - 技术分析
+  - 实时行情
+  - 回测
+  - 因子计算
+  disambiguation: 需要获取股票列表还是执行技术分析/回测？
+  data_domain: market_data
+- id: UC-109
+  name: 环境验证测试
+  source: test_env.py
+  type: research_analysis
+  business_problem: 验证系统环境配置是否正确，包括.env配置加载、数据库连接、数据源API、LLM调用和通知推送功能的可用性测试
+  intent_keywords:
+  - 环境验证
+  - 配置测试
+  - LLM测试
+  - 通知测试
+  - 数据源测试
+  stage: data_collection
+  negative_keywords:
+  - 股票分析
+  - 回测
+  - 定时任务
+  disambiguation: 需要验证环境配置还是执行实际的股票分析任务？
+  data_domain: mixed
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 63
+  evidence_invalid: 56
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.5294117647058824
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+- type: depends_on
+  target: AGENTS.md
+  description: 所有 skill 和工作流必须遵循 AGENTS.md 的规则，AGENTS.md 是唯一真源
+  evidence: AGENTS.md:§2.-AI-协作资产治理
+- type: complementary
+  target: CLAUDE.md
+  description: CLAUDE.md 是 AGENTS.md 的软链接，提供 Claude 生态兼容性
+  evidence: AGENTS.md:§2.-AI-协作资产治理
+- type: contains
+  target: .claude/skills/analyze-issue/SKILL.md
+  description: analyze-issue skill 包含在 skills 目录下
+  evidence: AGENTS.md:§8.-Issue-/-PR-/-Skill-工作流
+- type: contains
+  target: .claude/skills/analyze-pr/SKILL.md
+  description: analyze-pr skill 包含在 skills 目录下
+  evidence: AGENTS.md:§8.-Issue-/-PR-/-Skill-工作流
+- type: contains
+  target: .claude/skills/fix-issue/SKILL.md
+  description: fix-issue skill 包含在 skills 目录下
+  evidence: AGENTS.md:§8.-Issue-/-PR-/-Skill-工作流
+- type: depends_on
+  target: .claude/skills/analyze-issue/SKILL.md
+  description: fix_issue 阶段依赖 analyze_issue 的分析结果
+  evidence: .claude/skills/fix-issue/SKILL.md:§Prerequisites
+- type: alternative_to
+  target: docs/openclaw-skill-integration.md
+  description: 根目录 SKILL.md 与 docs/openclaw-skill-integration.md 属于产品或外部集成说明，不是仓库协作规则真源
+  evidence: AGENTS.md:§2.-AI-协作资产治理
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 6
+    warn: 10
+    fail: 4
+  subdomain_totals:
+    pass: 9
+    warn: 16
+    fail: 21
+  coverage: 66/66 (100%)
+  pass_rate: 15/66 (22%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: llm_provider
+  description: 'First-time users: Gemini (free tier). Budget-sensitive: DeepSeek. China no-proxy: AIHubmix.
+    Privacy/offline: Ollama. Premium quality: Claude.'
+  used_in_stages: []
+  options:
+  - name: Gemini (Google AI Studio)
+    traits:
+    - free_tier
+    - multilingual
+    - fast
+    - cloud
+    fit_for:
+    - Quick start with no cost; good multilingual support for Chinese stock analysis
+    not_fit_for:
+    - Long-context analysis beyond free quota; strict data privacy requirements
+  - name: DeepSeek
+    traits:
+    - cost_effective
+    - cloud
+    - chinese_optimized
+    fit_for:
+    - High cost-efficiency for large analysis volumes; strong Chinese language performance
+    not_fit_for:
+    - Environments with export restrictions on Chinese cloud services
+  - name: AIHubmix (OpenAI-compatible aggregator)
+    traits:
+    - aggregator
+    - no_proxy_needed
+    - cloud
+    fit_for:
+    - China-based users needing GPT/Claude without international proxy; one key for many models
+    not_fit_for:
+    - Users preferring direct provider APIs
+  - name: Anthropic Claude
+    traits:
+    - premium
+    - cloud
+    - reasoning
+    fit_for:
+    - Highest quality analysis when budget allows; strong reasoning capabilities
+    not_fit_for:
+    - Budget-constrained deployments
+  - name: OpenAI GPT
+    traits:
+    - cloud
+    - wide_adoption
+    fit_for:
+    - General-purpose analysis; broad ecosystem support
+    not_fit_for:
+    - China users without proxy; budget-sensitive use cases
+  - name: Ollama (local)
+    traits:
+    - local
+    - offline
+    - free
+    - cpu_only
+    fit_for:
+    - Offline/air-gapped environments; privacy-sensitive data; experimentation
+    not_fit_for:
+    - Production requiring low latency; large model inference on CPU-only hardware
+  default: Gemini (GEMINI_API_KEY)
+  _source: worker_resource
+- id: slot-002
+  name: china_stock_data
+  description: Default stack (efinance+akshare) handles most use cases. Tushare for professional backtesting.
+    pytdx for intranet/low-latency. baostock for last-resort free data.
+  used_in_stages: []
+  options:
+  - name: efinance (EastMoney)
+    traits:
+    - free
+    - no_token
+    - fast
+    - a_share_focused
+    fit_for:
+    - Default for China A-share analysis; highest priority when available
+    not_fit_for:
+    - US/HK stocks; environments where EastMoney IPs are blocked
+  - name: akshare (Sina/Tencent)
+    traits:
+    - free
+    - no_token
+    - realtime
+    - scraping
+    fit_for:
+    - Fallback when efinance is down; Sina/Tencent realtime quotes
+    not_fit_for:
+    - High-volume automated use (rate-limiting risk); data quality-sensitive tasks
+  - name: Tushare Pro
+    traits:
+    - structured
+    - token_required
+    - high_quality
+    fit_for:
+    - Professional-grade data; backtesting requiring clean historical data
+    not_fit_for:
+    - Users without sufficient Tushare credit points; real-time only use cases
+  - name: pytdx (Tongdaxin servers)
+    traits:
+    - direct
+    - no_token
+    - tcp_protocol
+    fit_for:
+    - Low-latency realtime on local network; intranet deployments
+    not_fit_for:
+    - Cloud environments with firewall restrictions; public internet with NAT
+  - name: baostock
+    traits:
+    - free
+    - no_token
+    - login_required
+    fit_for:
+    - Reliable free fallback; historical data needs
+    not_fit_for:
+    - Realtime requirements; environments with anti-bot measures
+  default: efinance (Priority 0) with akshare fallback (Priority 1)
+  _source: worker_resource
+- id: slot-003
+  name: us_hk_stock_data
+  description: yfinance is the default US data source. longbridge adds missing HK/US fundamental fields
+    (volume ratio, PE, PB) when credentials are available.
+  used_in_stages: []
+  options:
+  - name: yfinance (Yahoo Finance)
+    traits:
+    - free
+    - global
+    - no_token
+    fit_for:
+    - Default for US stocks and indices; broad global coverage
+    not_fit_for:
+    - HK stock fundamentals (missing PE/PB/volume_ratio); China A-shares
+  - name: longbridge (Longbridge OpenAPI)
+    traits:
+    - free
+    - hk_us
+    - realtime
+    - pe_pb
+    fit_for:
+    - HK/US realtime with volume ratio, turnover rate, PE/PB fields; supplement to yfinance
+    not_fit_for:
+    - China A-shares; users unwilling to register for Longbridge credentials
+  default: yfinance (Priority 4) with longbridge supplement (Priority 5)
+  _source: worker_resource
+- id: slot-004
+  name: news_search
+  description: Multi-engine fallback is implemented in SearchService. Set BOCHA_API_KEYS for Chinese news;
+    TAVILY_API_KEYS for AI search; SERPAPI_API_KEYS for Google. Without any keys, SearXNG public instances
+    are used automatically.
+  used_in_stages: []
+  options:
+  - name: Tavily
+    traits:
+    - ai_optimized
+    - structured
+    - free_tier
+    fit_for:
+    - LLM-optimized search results; good balance of quality and cost
+    not_fit_for:
+    - High-volume usage beyond 1000 req/month free tier
+  - name: SerpAPI (Google)
+    traits:
+    - real_google
+    - knowledge_graph
+    - free_tier
+    fit_for:
+    - Real Google search results including Knowledge Graph; financial info
+    not_fit_for:
+    - High-volume (100/month free tier very limited)
+  - name: Bocha (Chinese AI search)
+    traits:
+    - chinese
+    - ai_optimized
+    - bing_compatible
+    fit_for:
+    - Chinese-language stock news; AI-optimized summaries
+    not_fit_for:
+    - English/international news
+  - name: Brave Search
+    traits:
+    - privacy
+    - independent_index
+    fit_for:
+    - Privacy-focused alternative; independent web index
+    not_fit_for:
+    - China-specific financial news
+  - name: SearXNG
+    traits:
+    - metasearch
+    - privacy
+    - no_quota
+    fit_for:
+    - Private deployments; aggregating multiple engines; no API key needed
+    not_fit_for:
+    - Reliable production without self-hosting; public instances may be rate-limited
+  - name: MiniMax Coding Plan
+    traits:
+    - chinese
+    - coding_plan
+    fit_for:
+    - MiniMax subscription users; Chinese search
+    not_fit_for:
+    - Users without MiniMax Coding Plan subscription
+  default: Tavily (if API key provided) else Bocha (if API key provided) else SearXNG public instances
+  _source: worker_resource
+- id: slot-005
+  name: notification_channel
+  description: 'China users: Feishu or WeChat Work (webhook) for familiarity. International users: Telegram
+    or Discord. Formal reports: Email. All channels can be enabled in parallel — notifications are sent
+    to all configured channels.'
+  used_in_stages: []
+  options:
+  - name: WeChat Work Webhook
+    traits:
+    - china
+    - wechat
+    - webhook
+    fit_for:
+    - China-based teams already using WeChat Work
+    not_fit_for:
+    - Non-WeChat users; international teams
+  - name: Feishu Webhook
+    traits:
+    - china
+    - lark
+    - bot
+    fit_for:
+    - China-based teams using Feishu/Lark
+    not_fit_for:
+    - Non-Feishu users
+  - name: Feishu Stream Bot
+    traits:
+    - china
+    - websocket
+    - interactive
+    fit_for:
+    - Interactive Feishu bot with slash commands
+    not_fit_for:
+    - Simple notification-only use cases
+  - name: Telegram Bot
+    traits:
+    - global
+    - bot
+    - secure
+    fit_for:
+    - International users; reliable global delivery
+    not_fit_for:
+    - Users without Telegram access
+  - name: Email (SMTP)
+    traits:
+    - universal
+    - smtp
+    - async
+    fit_for:
+    - Formal reports; recipients without specific apps
+    not_fit_for:
+    - Real-time alerts (email latency); bulk push
+  - name: Pushover
+    traits:
+    - mobile_push
+    - ios_android
+    fit_for:
+    - Mobile push notifications; cross-platform
+    not_fit_for:
+    - Users not wanting another app
+  - name: PushPlus
+    traits:
+    - china
+    - wechat_public
+    fit_for:
+    - China users without WeChat Work; WeChat public account integration
+    not_fit_for:
+    - International users
+  - name: Server酱3
+    traits:
+    - china
+    - wechat
+    - simple
+    fit_for:
+    - Simple WeChat push for China users
+    not_fit_for:
+    - Non-WeChat users
+  - name: Discord (Webhook or Bot)
+    traits:
+    - global
+    - community
+    - bot
+    fit_for:
+    - Trading communities using Discord; interactive bot commands
+    not_fit_for:
+    - Non-Discord users
+  - name: Slack
+    traits:
+    - global
+    - enterprise
+    - bot
+    fit_for:
+    - Enterprise teams using Slack
+    not_fit_for:
+    - Non-Slack users
+  - name: Custom Webhook
+    traits:
+    - generic
+    - extendable
+    fit_for:
+    - Any HTTP-receiving service (DingTalk, Bark, self-built, etc.)
+    not_fit_for:
+    - Services requiring proprietary SDKs not supported
+  default: None (all channels optional; multiple can be enabled simultaneously)
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: efinance
+  description: 'K-line OHLCV, realtime quotes. Coverage: China A-shares, ETFs. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: akshare
+  description: 'realtime quotes, market breadth. Coverage: China A-shares, HK stocks. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: tushare
+  description: 'K-line, fundamentals, market data. Coverage: China A-shares, ETFs, indices. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: pytdx
+  description: 'realtime K-line. Coverage: China A-shares. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: baostock
+  description: 'K-line, fundamentals. Coverage: China A-shares, HK stocks. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: yfinance
+  description: 'K-line, realtime quotes, PE, PB. Coverage: US stocks, US indices, some HK stocks. Auth:
+    N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: longbridge
+  description: 'realtime quotes, volume ratio, turnover rate, PE, PB, static info. Coverage: US stocks,
+    HK stocks. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-008
+  type: external_service
+  name: tickflow
+  description: 'A-share main index quotes, market breadth statistics. Coverage: China A-share indices.
+    Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-009
+  type: external_service
+  name: LLM Providers (via LiteLLM)
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: external_service
+  name: Search Engines
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: external_service
+  name: Social Sentiment
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: external_service
+  name: Notification Channels
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: external_service
+  name: Database
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-014
+  type: python_package
+  name: python-dotenv
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-015
+  type: python_package
+  name: tenacity
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: python_package
+  name: sqlalchemy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-017
+  type: python_package
+  name: schedule
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-018
+  type: python_package
+  name: exchange-calendars
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-019
+  type: python_package
+  name: pandas
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-020
+  type: python_package
+  name: numpy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-021
+  type: python_package
+  name: requests
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-022
+  type: python_package
+  name: PyYAML
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-023
+  type: python_package
+  name: efinance
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-024
+  type: code_example
+  name: A股自选股智能分析系统主调度
+  path: main.py
+  description: 协调各模块完成股票分析流程，实现低并发的线程池调度，全局异常处理确保单股失败不影响整体分析任务
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-025
+  type: code_example
+  name: RESTful API 后端服务
+  path: server.py
+  description: 提供RESTful API服务支持CORS跨域访问，同时托管前端静态文件用于生产环境部署
+  used_in_stages:
+  - reporting
+  _source: uc_list
+- id: res-026
+  type: code_example
+  name: LLM Agent ReAct执行循环
+  path: src/agent/runner.py
+  description: 提供LLM Agent的ReAct执行循环，支持可插拔的进度回调、消息历史和结果处理，实现工具调用与LLM推理的迭代执行
+  used_in_stages:
+  - analysis
+  _source: uc_list
+- id: res-027
+  type: code_example
+  name: Server酱3消息推送服务
+  path: src/notification_sender/serverchan3_sender.py
+  description: 通过Server酱3 API推送分析结果提醒消息到用户终端，支持标题和内容自定义
+  used_in_stages:
+  - reporting
+  _source: uc_list
+- id: res-028
+  type: code_example
+  name: AI资产/指令文件验证
+  path: scripts/check_ai_assets.py
+  description: 验证AI Agent的指令文件和技能配置是否完整，包括AGENTS.md、CLAUDE.md、Copilot配置和skill目录结构
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-029
+  type: code_example
+  name: 股票指数生成(CSV来源)
+  path: scripts/generate_index_from_csv.py
+  description: 从CSV文件（Tushare格式或AkShare格式）生成股票索引JSON文件，用于前端自动补全功能，支持中文名称转拼音
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-030
+  type: code_example
+  name: 股票指数生成(内存来源)
+  path: scripts/generate_stock_index.py
+  description: 从内存中的STOCK_NAME_MAP生成股票索引文件用于前端自动补全，采用两阶段策略（先用映射表，后续结合AkShare）
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-031
+  type: code_example
+  name: Tushare股票列表获取
+  path: scripts/fetch_tushare_stock_list.py
+  description: 从Tushare Pro API获取A股、港股、美股列表信息并保存为CSV文件，支持按市场分类导出
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-032
+  type: code_example
+  name: 环境验证测试
+  path: test_env.py
+  description: 验证系统环境配置是否正确，包括.env配置加载、数据库连接、数据源API、LLM调用和通知推送功能的可用性测试
+  used_in_stages:
+  - data_collection
+  _source: uc_list

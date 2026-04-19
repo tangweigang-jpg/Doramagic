@@ -1,0 +1,2166 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-112
+name: openLGD
+sop_version: '3.6'
+source:
+  projects:
+  - openLGD
+  commit_hash: 742a770b1aa9b3ed8b724a8e9fdb596893e1f209
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Credit Risk LGD Model Estimation
+  description: Federated learning framework for credit risk LGD (Loss Given Default) models using stochastic
+    gradient descent regression. Supports both standalone and distributed federated modes with parameter
+    averaging across multiple servers.
+  prerequisites: Understanding of LGD credit risk models, federated learning concepts (FedAvg), Flask/HTTP
+    REST APIs, and sklearn SGDRegressor. Basic knowledge of YAML configuration.
+  not_suitable_for: Production deployment (early alpha status), centralized data scenarios, complex non-linear
+    LGD models, high-security production environments (Flask debug=True enabled), large-scale federated
+    deployments with many servers (sequential communication bottleneck).
+stages:
+- id: data_acquisition
+  name: Data Acquisition
+  order: 1
+  responsibility: Retrieves LGD regression data from either local CSV files or REST API endpoints. Supports
+    two transport modes enabling development and production deployments without code changes.
+  interface:
+    inputs: 'server_id (int), choice (int: 1=local CSV, 2=REST API)'
+    outputs: pandas.DataFrame with columns X (target/LGD) and Y (explanatory variable)
+  required_methods:
+  - name: dataSource
+    description: Module-level function that retrieves LGD data based on choice parameter - local CSV (choice=1)
+      reads from server_dirs/{server_id}/regression_data.csv while REST API (choice=2) fetches from server
+      URLs
+    evidence: dataSource.py:24(dataSource)
+  key_behaviors:
+  - behavior: Transport layer abstraction via choice parameter
+    description: Single dataSource function handles both local file retrieval and REST API calls based
+      on choice parameter, avoiding conditional imports or factory patterns
+    evidence: dataSource.py:24(dataSource)
+  - behavior: Port-derived server ID convention
+    description: Server ID derived from port via n = int(port) - 5000 convention. Ports 5001-500N map
+      to server_dirs/1-N respectively
+    evidence: model_server.py:35(n = int(port) - 5000)
+  - behavior: Hardcoded column schema (X, Y)
+    description: DataFrame columns are hardcoded as 'X' (target) and 'Y' (explanatory). These business
+      assumptions require coordinated updates across CSV files and API consumers
+    evidence: dataSource.py:48(df = pd.DataFrame(..., columns=['X', 'Y']))
+  replaceable_points:
+  - name: Data Transport Layer
+    description: Choice parameter selects between local file and REST API data retrieval
+    options:
+    - name: local CSV
+      traits:
+      - Direct file system access
+      - Zero network latency
+      - No HTTP overhead
+      - Simple deployment
+      fit_for:
+      - Development
+      - Single-machine testing
+      - Low-latency requirements
+      - Demo environments
+      not_fit_for:
+      - Distributed data across machines
+      - Cross-organization data access
+      - Data behind firewalls
+    - name: REST API
+      traits:
+      - Network-based transport
+      - HTTP protocol
+      - Platform-independent
+      - Remote data access
+      fit_for:
+      - Distributed data sources
+      - Cross-organization federated learning
+      - Microservices architecture
+      not_fit_for:
+      - Local development without server
+      - High-frequency access patterns
+      - Low-latency requirements
+    default: local CSV
+  design_decisions:
+  - 'Choice parameter controls data transport rather than separate functions - Single entry point enables
+    runtime transport switching without code duplication - evidence: dataSource.py:24(dataSource)'
+  - 'Port-derived server ID convention (port - 5000 = server number) - Tight coupling between server port
+    and data directory but eliminates explicit ID passing - evidence: model_server.py:35(n = int(port)
+    - 5000)'
+  - 'Hardcoded data schema (X, Y column names) - Column names are business assumptions baked into data
+    layer requiring coordinated updates - evidence: dataSource.py:73(lgdModel), dataSource.py:48(df =
+    pd.DataFrame(..., columns=[''X'', ''Y'']))'
+  acceptance_hints:
+  - Returned DataFrame contains exactly 'X' and 'Y' columns
+  - Local file mode (choice=1) successfully reads from server_dirs/{server_id}/regression_data.csv
+  - API mode (choice=2) constructs correct URL and receives valid response
+  - Missing directories or wrong server ID raises FileNotFoundError appropriately
+- id: model_estimation
+  name: Model Estimation
+  order: 2
+  responsibility: Executes iterative linear regression using stochastic gradient descent. Supports warm-start
+    mode for federated learning where prior averaged parameters initialize local estimation.
+  interface:
+    inputs: server_id, choice, optional intercept/coef (warm-start parameters)
+    outputs: dict with 'intercept' and 'coefficient' keys containing SGDRegressor fitted parameters
+  required_methods:
+  - name: lgdModel
+    description: Main estimation function wrapping sklearn SGDRegressor with support for cold-start (random
+      initialization) and warm-start (prior parameters) modes. Returns parameter dictionary for federated
+      aggregation
+    evidence: lgdModel.py:24(lgdModel)
+  key_behaviors:
+  - behavior: Single-epoch iterative control
+    description: SGDRegressor configured with max_iter=1 and tol=None for per-epoch parameter updates
+      required by federated averaging. tol=None prevents early stopping that would break epoch-by-epoch
+      control
+    evidence: lgdModel.py:60(clf = linear_model.SGDRegressor(tol=None, max_iter=1, ...))
+  - behavior: Warm-start via sklearn initialization parameters
+    description: Uses intercept_init and coef_init parameters to initialize SGDRegressor with prior averaged
+      parameters from federated coordination. sklearn's warm_start mechanism reuses prior solution as
+      initialization
+    evidence: lgdModel.py:81(clf.fit(X, y, intercept_init=intercept, coef_init=coef))
+  - behavior: Implicit cold/warm start toggle
+    description: None-checking of intercept/coef determines cold-start vs warm-start without explicit
+      mode flag. First call always cold-start, subsequent calls with parameters warm-start
+    evidence: lgdModel.py:78(if intercept is None or coef is None)
+  replaceable_points:
+  - name: Regression Algorithm
+    description: Currently fixed to sklearn SGDRegressor. Would need abstract base class with factory
+      pattern for alternatives
+    options:
+    - name: SGDRegressor (current)
+      traits:
+      - Iterative online learning
+      - Supports warm_start via intercept_init/coef_init
+      - Stochastic gradient descent
+      fit_for:
+      - Federated learning
+      - Large-scale data
+      - Streaming data
+      - Per-epoch updates
+      not_fit_for:
+      - Small datasets
+      - Exact closed-form solutions required
+      - Batch-only scenarios
+    - name: Ridge Regression
+      traits:
+      - L2 regularization
+      - Closed-form solution available
+      - Batch learning
+      fit_for:
+      - Multicollinearity problems
+      - Small-medium datasets
+      - Stable solutions
+      not_fit_for:
+      - Federated learning (no native warm_start)
+      - Large datasets
+      - Online learning
+    - name: Lasso Regression
+      traits:
+      - L1 regularization
+      - Feature selection capability
+      - Sparse solutions
+      fit_for:
+      - High-dimensional data
+      - Feature selection tasks
+      - Interpretability focus
+      not_fit_for:
+      - Federated learning
+      - Correlated features
+      - Multi-output problems
+    - name: ElasticNet
+      traits:
+      - L1+L2 regularization balance
+      - Combines feature selection and stability
+      fit_for:
+      - Correlated high-dimensional data
+      - Feature selection with stability
+      not_fit_for:
+      - Federated learning
+      - Simple use cases
+      - IID data with no multicollinearity
+    default: SGDRegressor (current)
+  design_decisions:
+  - 'SGDRegressor with max_iter=1 for iterative control - Single-epoch fits enable per-epoch parameter
+    updates required by federated averaging - evidence: lgdModel.py:60(clf = linear_model.SGDRegressor(tol=None,
+    max_iter=1, ...))'
+  - 'Warm-start via intercept_init/coef_init parameters - sklearn''s warm_start mechanism reuses prior
+    solution as initialization enabling federated averaging - evidence: lgdModel.py:81(clf.fit(X, y, intercept_init=intercept,
+    coef_init=coef))'
+  - 'None-checking as cold/warm start toggle - Implicit parameter presence indicates initialization state,
+    no explicit mode flag needed - evidence: lgdModel.py:78(if intercept is None or coef is None)'
+  - 'SGDRegressor hardcoded (not abstracted or configurable) - Early alpha tradeoff: single algorithm
+    avoids abstraction complexity - evidence: lgdModel.py:60(linear_model.SGDRegressor)'
+  acceptance_hints:
+  - Function returns dict with 'intercept' and 'coefficient' keys
+  - First call with None parameters produces cold-start (random initialization)
+  - Subsequent calls with non-None parameters produce warm-start (prior initialization)
+  - max_iter=1 setting produces exactly one gradient step per call
+- id: model_serving
+  name: Model Serving
+  order: 3
+  responsibility: Flask-based HTTP server that exposes LGD estimation via REST endpoints. Each server
+    instance maintains local data access and provides cold-start and warm-start estimation paths.
+  interface:
+    inputs: HTTP GET /start (cold-start), HTTP POST /update with JSON body containing intercept and coefficient
+      (warm-start)
+    outputs: 'JSON {''intercept'': float, ''coefficient'': float} containing fitted model parameters'
+  required_methods:
+  - name: start_calculation
+    description: HTTP GET endpoint that extracts server ID from Host header, triggers cold-start LGD estimation
+      using local data without warm parameters, returns JSON with fitted intercept and coefficient
+    evidence: model_server.py:32(start_calculation)
+  - name: update_calculation
+    description: HTTP POST endpoint that extracts server ID from Host header and receives averaged parameters
+      in JSON body, triggers warm-start LGD estimation, returns updated parameters
+    evidence: model_server.py:40(update_calculation)
+  key_behaviors:
+  - behavior: Port-based server identification
+    description: 'Server ID extracted from request Host header via port parsing: n = int(port) - 5000.
+      Server on port 5001 maps to server ID 1. Assumes servers run on ports 5001-500N consecutively'
+    evidence: model_server.py:33(url = urlparse(request.host)), model_server.py:35(n = int(port) - 5000)
+  - behavior: Three-endpoint minimal API design
+    description: Minimal API with health check (/), cold-start (/start), and warm-start (/update) endpoints.
+      Stateless design enables horizontal scaling of model servers
+    evidence: model_server.py:50(@app.route('/start')), model_server.py:56(@app.route('/update'))
+  - behavior: Signal-based graceful shutdown
+    description: Uses SIGKILL/SIGTERM signal handling with werkzeug fallback for graceful server shutdown
+    evidence: model_server.py:66(sig = getattr(signal, 'SIGKILL', signal.SIGTERM))
+  replaceable_points:
+  - name: Server Framework
+    description: Currently Flask, could be replaced with FastAPI or Django for different capabilities
+    options:
+    - name: Flask (current)
+      traits:
+      - Lightweight WSGI framework
+      - Mature ecosystem
+      - Flexible routing
+      fit_for:
+      - Microservices
+      - Simple REST APIs
+      - Prototyping
+      - Python web applications
+      not_fit_for:
+      - Async operations
+      - High concurrency requirements
+      - Type safety requirements
+    - name: FastAPI
+      traits:
+      - Async native
+      - Automatic OpenAPI documentation
+      - Type hints
+      fit_for:
+      - High concurrency
+      - Modern async patterns
+      - Self-documenting APIs
+      not_fit_for:
+      - Legacy WSGI integration
+      - Simple prototypes
+      - Blocking-only code
+    - name: Django
+      traits:
+      - Full-stack framework
+      - Built-in ORM
+      - Admin interface
+      fit_for:
+      - Complex web applications
+      - Database-driven apps
+      - Enterprise applications
+      not_fit_for:
+      - Microservices
+      - Lightweight APIs
+      - Simple model serving
+    default: Flask (current)
+  design_decisions:
+  - 'Port-to-server-ID derivation at runtime - Avoids explicit server ID configuration - evidence: model_server.py:35(n
+    = int(port) - 5000)'
+  - 'Server ID derived from request.host header parsing - Relies on Flask''s request object and correct
+    Host header from clients - evidence: model_server.py:33(url = urlparse(request.host))'
+  - 'Signal-based shutdown via SIGKILL/SIGTERM selection - Graceful fallback pattern from SIGKILL to SIGTERM
+    - evidence: model_server.py:66(sig = getattr(signal, ''SIGKILL'', signal.SIGTERM))'
+  - 'Three-endpoint API design (/, /start, /update) - Minimal API covers health check, cold start, and
+    warm start with stateless design - evidence: model_server.py:50(@app.route(''/start'')), model_server.py:56(@app.route(''/update''))'
+  acceptance_hints:
+  - GET /start returns JSON with intercept and coefficient from cold-start estimation
+  - POST /update with parameters returns JSON with intercept and coefficient from warm-start estimation
+  - Server port determines which data directory (server_dirs/{port-5000}/) is accessed
+  - Root endpoint (/) returns 200 OK for health checks
+- id: federated_coordination
+  name: Federated Coordination
+  order: 4
+  responsibility: 'Orchestrates federated learning across multiple model servers using parameter averaging.
+    Implements the FedAvg algorithm: local estimation, parameter collection, weighted averaging, and broadcast
+    to each servers.'
+  interface:
+    inputs: config.yml containing hosts (base URLs), epochs (int), servers (count); server_dirs/X/ data
+      on each server
+    outputs: Console output of per-epoch parameter estimates showing convergence
+  required_methods:
+  - name: federated_run
+    description: 'Main orchestration script implementing federated averaging loop: loads config, collects
+      parameters from each servers per epoch, computes weighted average, broadcasts averaged parameters
+      for warm-start next epoch'
+    evidence: federated_run.py:1(federated_run)
+  key_behaviors:
+  - behavior: Federated Averaging (FedAvg) execution
+    description: 'Per-epoch loop structure: call /start on each servers, collect parameters, compute weighted
+      average, call /update on each servers with averaged parameters for next epoch'
+    evidence: federated_run.py:62(averaging loop), federated_run.py:80(send averaged params to each servers)
+  - behavior: Cold-start before warm-start ordering contract
+    description: Each epoch requires /start call before /update calls for correct initialization. Calling
+      update before start returns incorrect parameters and breaks federated convergence
+    evidence: federated_run.py:55(start)|federated_run.py:80(update)
+  - behavior: Equal server weighting
+    description: Hardcoded 0.25 weight per server assuming equal data volume across each 4 servers. Equal
+      averaging assumes homogeneous data distribution
+    evidence: 'federated_run.py:34(weights = {''1'': 0.25, ''2'': 0.25, ''3'': 0.25, ''4'': 0.25})'
+  - behavior: Sequential blocking server communication
+    description: Server requests executed sequentially in for loop. Communication time scales linearly
+      with server count. Parallel requests would improve speed but add complexity
+    evidence: 'federated_run.py:78(for k in range(n): res = requests.post(...))'
+  replaceable_points:
+  - name: Aggregation Algorithm
+    description: Currently FedAvg with equal weights. Could implement weighted FedAvg or other federated
+      optimization methods for different convergence properties
+    options:
+    - name: FedAvg (equal weights)
+      traits:
+      - Simple uniform averaging
+      - Equal server contribution
+      - Theoretical convergence guarantees
+      fit_for:
+      - Equal data volumes
+      - Homogeneous servers
+      - Proven standard baseline
+      not_fit_for:
+      - Unequal data volumes
+      - Straggling servers
+      - Non-IID data distributions
+    - name: FedAvg (weighted by data size)
+      traits:
+      - Weighted by data volume
+      - Fair contribution weighting
+      - Better convergence on imbalanced data
+      fit_for:
+      - Unequal data volumes
+      - Different server data capacities
+      - Imbalanced federations
+      not_fit_for:
+      - Unknown data sizes
+      - Simple deployments
+      - Equal data assumption valid
+    - name: FedProx
+      traits:
+      - Handles system/data heterogeneity
+      - Proximal term regularization
+      - Native non-IID data support
+      fit_for:
+      - Non-IID data distributions
+      - Straggling servers
+      - System heterogeneity scenarios
+      not_fit_for:
+      - IID data distributions
+      - Simple use cases
+      - Strict latency requirements
+    - name: SCAFFOLD
+      traits:
+      - Variance reduction technique
+      - Control variates
+      - Fast convergence on non-IID data
+      fit_for:
+      - Non-IID data
+      - High accuracy requirements
+      - Complex heterogeneous federations
+      not_fit_for:
+      - Simple deployments
+      - Limited compute resources
+      - IID data with equal volumes
+    default: FedAvg (equal weights)
+  - name: Communication Pattern
+    description: Sequential vs parallel server communication affecting latency and throughput
+    options:
+    - name: Sequential (current)
+      traits:
+      - Blocking requests
+      - Simple implementation
+      - No concurrency complexity
+      fit_for:
+      - Few servers
+      - Low latency networks
+      - Debugging and testing
+      not_fit_for:
+      - Many servers
+      - High latency networks
+      - Production scaling
+    - name: Parallel (asyncio)
+      traits:
+      - Concurrent requests
+      - Reduced total latency
+      - Async/await pattern
+      fit_for:
+      - Many servers
+      - High latency networks
+      - Production deployments
+      not_fit_for:
+      - Simple scripts
+      - Debugging
+      - Single-server scenarios
+    default: Sequential (current)
+  design_decisions:
+  - 'Federated Averaging (FedAvg) algorithm - Standard federated learning: each server does local SGD
+    step, coordinator averages parameters enabling learning from distributed data without raw data centralization
+    - evidence: federated_run.py:62(averaging loop), federated_run.py:80(send averaged params to each
+    servers)'
+  - 'Equal weighting across servers (0.25 each) - Simple uniform averaging assumes equal data volumes.
+    TODO comment indicates awareness of limitation - evidence: federated_run.py:34(weights = {''1'': 0.25,
+    ...})'
+  - 'Per-epoch parameter collection and averaging - Epochs control convergence with config-driven epoch
+    count enabling tuning without code changes - evidence: federated_run.py:73(for e in range(Epochs))'
+  - 'Hardcoded weight dictionary - Static weights assume equal data volume. Changing server count requires
+    manual weight dictionary update - evidence: federated_run.py:34(weights = {''1'': 0.25, ...})'
+  - 'Blocking sequential server communication - Sequential requests slow as n increases. Parallel requests
+    would speed up but add complexity - evidence: federated_run.py:78(for k in range(n): res = requests.post(...))'
+  acceptance_hints:
+  - Federated run completes each configured epochs without HTTP errors
+  - Averaged parameters show convergence trend across epochs
+  - Every servers receive identical averaged parameters each epoch
+  - Console output shows per-epoch parameter estimates for monitoring
+- id: standalone_execution
+  name: Standalone Execution
+  order: 5
+  responsibility: Single-process LGD estimation loop for development and testing. Validates environment
+    setup and core estimation logic without federation overhead.
+  interface:
+    inputs: server_dirs/1/ data (local CSV), Epochs count (hardcoded to 10)
+    outputs: Console output of per-epoch parameter estimates showing convergence
+  required_methods:
+  - name: standalone_run
+    description: Script demonstrating direct lgdModel usage without federated infrastructure. Imports
+      lgdModel directly and runs iterative estimation loop for environment validation
+    evidence: standalone_run.py:1(standalone_run)
+  key_behaviors:
+  - behavior: Direct lgdModel imports bypassing server layer
+    description: Bypasses model_server layer entirely, imports lgdModel directly from lgdModel module.
+      Demonstrates that core estimation works independently of federation infrastructure
+    evidence: standalone_run.py:20(from lgdModel import lgdModel)
+  - behavior: Identical epoch loop structure to federated_run
+    description: Same iterative pattern (for e in range(Epochs)) as federated_run enables easy comparison
+      between standalone and federated results
+    evidence: standalone_run.py:29(for e in range(Epochs))
+  replaceable_points:
+  - name: Execution Mode
+    description: Standalone vs federated execution path for different deployment scenarios
+    options:
+    - name: standalone_run.py (current)
+      traits:
+      - Direct imports
+      - No network required
+      - Single process
+      - Fast execution
+      fit_for:
+      - Development
+      - Testing
+      - Environment validation
+      - Single-node scenarios
+      - CI/CD pipelines
+      not_fit_for:
+      - Distributed data scenarios
+      - Federated learning
+      - Production multi-server deployments
+    - name: federated_run.py
+      traits:
+      - Distributed architecture
+      - Network-based communication
+      - Multi-process
+      - Federated learning
+      fit_for:
+      - Federated learning
+      - Distributed data
+      - Privacy-sensitive scenarios
+      - Multi-organization collaboration
+      not_fit_for:
+      - Single-node testing
+      - Development without servers
+      - Quick prototyping
+    default: standalone_run.py (current)
+  design_decisions:
+  - 'Identical epoch loop structure to federated_run - Same iterative pattern enables easy comparison
+    between standalone and federated results for validation - evidence: standalone_run.py:29(for e in
+    range(Epochs))'
+  - 'Direct lgdModel imports without server abstraction - Bypasses model_server layer demonstrating that
+    core estimation works independently of federation infrastructure - evidence: standalone_run.py:20(from
+    lgdModel import lgdModel)'
+  acceptance_hints:
+  - standalone_run.py completes successfully with converging parameters
+  - Console output shows per-epoch parameter estimates
+  - Output matches expected behavior when comparing against federated_run single-server scenario
+  - Direct lgdModel usage produces identical results to model_server endpoint
+data_flow:
+- from_stage: data_acquisition
+  to_stage: model_estimation
+  data: pandas.DataFrame with columns X (target variable/LGD) and Y (explanatory variable)
+- from_stage: model_estimation
+  to_stage: model_serving
+  data: dict with 'intercept' and 'coefficient' keys containing sklearn SGDRegressor fitted parameters
+- from_stage: model_serving
+  to_stage: federated_coordination
+  data: 'JSON {''intercept'': float, ''coefficient'': float} returned via HTTP GET /start or POST /update
+    endpoints'
+- from_stage: federated_coordination
+  to_stage: model_serving
+  data: 'JSON {''intercept'': float, ''coefficient'': float} containing weighted averaged parameters for
+    warm-start initialization'
+- from_stage: external
+  to_stage: federated_coordination
+  data: 'YAML dict from config.yml containing keys: hosts (base URL list), epochs (int), servers (count)'
+global_contracts:
+- contract: 'DataFrame schema contract: must contain ''X'' and ''Y'' columns where X is target (LGD) and
+    Y is explanatory variable. Extraction order matters for regression correctness - evidence: lgdModel.py:73(X
+    = df[[''X'']]), lgdModel.py:75(y = df[''Y''])'
+  evidence: ''
+- contract: 'Parameter dict schema contract: ''intercept'' and ''coefficient'' keys are required for warm-start
+    initialization. Reversed or missing keys will cause errors - evidence: lgdModel.py:84(fitted_params
+    = {''intercept'': ..., ''coefficient'': ...})'
+  evidence: ''
+- contract: 'Server port convention contract: port 5000+N maps to server_dirs/N/ data directory. Using
+    ports outside 5001-5004 range breaks server identification and data loading - evidence: model_server.py:35(n
+    = int(port) - 5000)'
+  evidence: ''
+- contract: 'Federated workflow ordering contract: /start cold-start MUST be called BEFORE /update warm-start
+    calls per epoch. Calling update before start returns incorrect parameters and breaks federated convergence
+    - evidence: federated_run.py:55(start)|federated_run.py:80(update)'
+  evidence: ''
+- contract: 'SGDRegressor iterative contract: max_iter=1 and tol=None enforce single-epoch iteration design.
+    Each call to fit() does exactly one gradient step - evidence: lgdModel.py:60(max_iter=1), lgdModel.py:60(tol=None)'
+  evidence: ''
+- contract: 'Federated averaging completion contract: averaging MUST complete before sending averaged
+    params to next epoch. Early sending of partial averages breaks model convergence correctness - evidence:
+    federated_run.py:86-92(averaging)'
+  evidence: ''
+- contract: 'Equal weight assumption contract: 0.25 weight per server assumes equal data volume across
+    4 nodes. Adding/removing servers without weight adjustment causes incorrect model averaging - evidence:
+    federated_run.py:34(weights = {''1'': 0.25, ...})'
+  evidence: ''
+business_decisions:
+- id: BD-001
+  type: B
+  content: Choice parameter controls data transport rather than separate functions
+  rationale: 'Single entry point design enables runtime transport switching without code duplication or
+    conditional imports. BOUNDARY: This design covers transport protocol selection but does not specify
+    individual transport implementations (HTTP, gRPC, file-based). Adding new transports requires extending
+    the choice parameter logic rather than adding new functions.'
+  evidence: dataSource.py:24(dataSource)
+  stage: data_acquisition
+  alternative_considered: Conditional imports or factory pattern would require more code paths; choice
+    parameter avoids code duplication
+- id: BD-002
+  type: BA/DK
+  content: Port-derived server ID convention (port - 5000 = server number)
+  rationale: 'Tight coupling between server port and data directory eliminates explicit ID configuration.
+    BOUNDARY: Servers must run on ports 5001-500N consecutively with 5001 mapping to server_dirs/1. This
+    convention assumes port availability and does not validate directory existence.'
+  evidence: model_server.py:35(module)
+  stage: data_acquisition
+  alternative_considered: Explicit server ID passing via environment variable or command-line argument
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in model_server.py'
+- id: BD-003
+  type: B/BA
+  content: Hardcoded data schema (X, Y column names)
+  rationale: 'Column names X and Y represent business assumptions baked into the data layer. These are
+    not generic field names but domain-specific conventions for input features and target variable. BOUNDARY:
+    Changing column names requires coordinated updates across CSV data files, data ingestion code, and
+    each API consumers. This is an explicit business contract.'
+  evidence: dataSource.py:48(module)
+  stage: data_acquisition
+  alternative_considered: Configuration-driven column mapping; JSON schema validation at load time
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in dataSource.py'
+- id: BD-004
+  type: M/BA
+  content: SGDRegressor with max_iter=1 for iterative control
+  rationale: 'Single-epoch fits are required to enable per-epoch parameter updates needed by federated
+    averaging. BOUNDARY: tol=None prevents sklearn''s early stopping mechanism from terminating training
+    before the epoch completes. This ensures exactly one gradient update per fit() call, which is essential
+    for the federated learning synchronization protocol.'
+  evidence: lgdModel.py:24(lgdModel)
+  stage: model_estimation
+  alternative_considered: Higher max_iter values would break epoch-by-epoch control; alternative convergence
+    criteria not compatible with federated averaging
+- id: BD-005
+  type: M/DK
+  content: Warm-start via intercept_init/coef_init parameters
+  rationale: 'sklearn''s warm_start mechanism reuses prior solution as initialization for subsequent training.
+    BOUNDARY: This enables federated averaging where distributed model estimates are aggregated and used
+    to initialize the next round. The mechanism depends on sklearn''s specific implementation and requires
+    intercept and coef arrays to be numpy-compatible.'
+  evidence: lgdModel.py:81(module)
+  stage: model_estimation
+  alternative_considered: Custom initialization array management; sklearn's built-in warm_start parameter
+    as alternative
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in lgdModel.py'
+- id: BD-006
+  type: B/BA
+  content: None-checking as cold/warm start toggle
+  rationale: 'Implicit parameter presence is used to indicate initialization state rather than an explicit
+    mode flag. BOUNDARY: First call without parameters performs cold start (random initialization); subsequent
+    calls with parameters perform warm start (continue from prior state). This pattern avoids adding a
+    boolean parameter but requires parameters to be explicitly None vs not-present.'
+  evidence: lgdModel.py:78(if intercept is None or coef is None)
+  stage: model_estimation
+  alternative_considered: Explicit cold_start boolean parameter; stateful model class tracking initialization
+    status
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: if intercept is None or coef is None in lgdModel.py'
+- id: BD-007
+  type: B/BA
+  content: SGDRegressor hardcoded (not abstracted or configurable)
+  rationale: 'Single algorithm choice is an early-stage tradeoff favoring simplicity over flexibility.
+    BOUNDARY: This design assumes SGDRegressor is sufficient for the LGD estimation use case. Supporting
+    multiple model types would require abstract base class, factory pattern, and serialization abstraction
+    layers.'
+  evidence: lgdModel.py:60(linear_model.SGDRegressor)
+  stage: model_estimation
+  alternative_considered: Abstract base class with factory pattern; configuration-driven model selection;
+    plugin architecture
+  _evidence_issues:
+  - 'FN_NOT_FOUND: linear_model.SGDRegressor in lgdModel.py'
+- id: BD-008
+  type: B/BA
+  content: Port-to-server-ID derivation at runtime
+  rationale: 'Server ID is derived from port number at runtime to avoid explicit configuration. BOUNDARY:
+    Server running on port 5001 maps to server ID 1, port 5002 to ID 2, etc. This assumes consecutive
+    port allocation starting from 5001 and does not validate directory or resource availability.'
+  evidence: model_server.py:35(module)
+  stage: model_serving
+  alternative_considered: Explicit server ID via environment variable, command-line argument, or configuration
+    file
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in model_server.py'
+- id: BD-009
+  type: BA
+  content: Server ID derived from request.host header parsing
+  rationale: 'Server ID extraction relies on Flask''s request.host attribute from the HTTP Host header.
+    BOUNDARY: This approach assumes correct Host header configuration from clients. May fail with reverse
+    proxy setups (nginx, Apache) where Host header may be rewritten, or with incorrect client configuration.
+    Requires reverse proxy to pass original host or explicit header configuration.'
+  evidence: model_server.py:33(module)
+  stage: model_serving
+  alternative_considered: X-Forwarded-Host header parsing for proxy environments; explicit server ID in
+    request path or query parameter
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in model_server.py'
+- id: BD-010
+  type: B/DK
+  content: Signal-based shutdown via SIGKILL/SIGTERM selection
+  rationale: 'Graceful fallback from SIGKILL to SIGTERM enables platform-portable shutdown behavior. BOUNDARY:
+    The actual process termination is handled by werkzeug''s shutdown function rather than the signal
+    handler. Signal-based shutdown is available but commented out, indicating deferred implementation.'
+  evidence: model_server.py:65(stop)
+  stage: model_serving
+  alternative_considered: werkzeug shutdown function (current); explicit SIGTERM handler; container orchestrator
+    lifecycle hooks
+- id: BD-011
+  type: B/BA
+  content: Three-endpoint API design (/, /start, /update)
+  rationale: 'Minimal API surface covers health check, cold start, and warm start operations. BOUNDARY:
+    The design assumes stateless operation where each request is independent. This enables horizontal
+    scaling but requires external state management for distributed scenarios.'
+  evidence: model_server.py:51(start), model_server.py:57(update)
+  stage: model_serving
+  alternative_considered: Single unified endpoint with mode parameter; RESTful resource-based API; gRPC
+    interface
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: start), model_server.py:57(update in model_server.py'
+- id: BD-012
+  type: M/BA
+  content: Federated Averaging (FedAvg) algorithm
+  rationale: 'Federated Averaging (FedAvg) is the standard federated learning algorithm: each server performs
+    local SGD step, coordinator collects and averages parameters. BOUNDARY: This enables learning from
+    distributed data without raw data centralization. The approach assumes synchronous rounds and parameter-level
+    averaging only; does not support differential privacy or secure aggregation.'
+  evidence: federated_run.py:62(averaging loop)
+  stage: federated_coordination
+  alternative_considered: Federated SGD (FedSGD) with fewer local updates; asynchronous federated averaging;
+    differential privacy mechanisms
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: averaging loop in federated_run.py'
+- id: BD-013
+  type: B/BA
+  content: Equal weighting across servers
+  rationale: 'Simple uniform averaging treats each servers equally with 25% weight each. BOUNDARY: This
+    assumes equal data volume across servers. Unequal data volumes would benefit from weighted averaging
+    proportional to sample size. The TODO comment indicates awareness of this limitation.'
+  evidence: 'federated_run.py:34(weights = {''1'': 0.25, ''2'': 0.25, ''3'': 0.25, ''4'': 0.25})'
+  stage: federated_coordination
+  alternative_considered: Proportional weighting based on sample count; configurable weights via external
+    configuration; dynamic weight fetching from servers
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: weights = {''1'': 0.25, ''2'': 0.25, ''3'': 0.25, ''4'': 0.25} in federated_run.py'
+- id: BD-014
+  type: M/BA
+  content: Per-epoch parameter collection and averaging
+  rationale: 'Epochs control the number of federated rounds for parameter synchronization. BOUNDARY: More
+    epochs lead to tighter consensus among servers but increase communication cost and may show diminishing
+    returns. Config-driven epoch count enables tuning without code changes.'
+  evidence: federated_run.py:73(module)
+  stage: federated_coordination
+  alternative_considered: Adaptive epoch count based on convergence metrics; early stopping on parameter
+    drift threshold
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in federated_run.py'
+- id: BD-015
+  type: B/BA
+  content: Hardcoded weight dictionary
+  rationale: 'Static weight dictionary assumes equal data volume across each servers. BOUNDARY: Changing
+    the number of servers requires manual weight dictionary updates. The TODO comment acknowledges awareness
+    of this limitation and the need for dynamic weight fetching from servers.'
+  evidence: 'federated_run.py:34(weights = {''1'': 0.25, ...})'
+  stage: federated_coordination
+  alternative_considered: Dynamic weight fetching via API call to each server; centralized registry of
+    server sample counts; proportional weighting from initial sync
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: weights = {''1'': 0.25, ...} in federated_run.py'
+- id: BD-016
+  type: B/BA
+  content: Blocking sequential server communication
+  rationale: 'Sequential HTTP requests to servers trade off performance for simplicity. BOUNDARY: Each
+    request blocks until completion before sending to the next server, making total latency linear with
+    server count (O(n)). Parallel requests would reduce latency but add complexity for connection pooling,
+    error handling, and result aggregation.'
+  evidence: federated_run.py:78(module)
+  stage: federated_coordination
+  alternative_considered: asyncio with aiohttp for concurrent requests; thread pool for parallel blocking
+    requests; batched parameter updates
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in federated_run.py'
+- id: BD-017
+  type: B
+  content: Identical epoch loop structure to federated_run
+  rationale: 'Same iterative pattern enables direct comparison between standalone and federated training
+    results. BOUNDARY: This design verifies that core estimation logic works correctly before introducing
+    federation complexity. Both modes must use identical Epochs configuration for valid comparison.'
+  evidence: standalone_run.py:29(module)
+  stage: standalone_execution
+  alternative_considered: Separate epoch configurations for standalone vs federated; unified training
+    driver with mode parameter
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in standalone_run.py'
+- id: BD-018
+  type: B
+  content: Direct lgdModel imports without server abstraction
+  rationale: 'Core estimation is invoked directly, bypassing the model_server HTTP layer entirely. BOUNDARY:
+    This demonstrates that the lgdModel module works independently of federation infrastructure. This
+    separation enables unit testing and standalone execution without network dependencies.'
+  evidence: standalone_run.py:20(from lgdModel import lgdModel)
+  stage: standalone_execution
+  alternative_considered: HTTP client to model_server (adds network dependency); unified entry point with
+    mode selection
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: from lgdModel import lgdModel in standalone_run.py'
+- id: BD-019
+  type: BA/DK
+  content: Use federated learning architecture where data stays local and only model parameters are aggregated
+  rationale: Federated learning preserves data sovereignty by keeping raw data local to each server node.
+    Only model parameters (intercept and coefficient) traverse the network, reducing bandwidth requirements
+    by orders of magnitude compared to centralized approaches. This design enables collaboration across
+    data silos without exposing sensitive financial information, supporting regulatory compliance for
+    multi-institution scenarios where data sharing is prohibited or impractical.
+  evidence: N/A:0(see_rationale)
+  stage: Architecture
+  alternative_considered: Centralized learning with pooled data was rejected due to data privacy regulations
+    (GDPR, banking secrecy) and network bandwidth constraints
+- id: BD-020
+  type: B
+  content: Use SGDRegressor from scikit-learn for linear regression with stochastic gradient descent
+  rationale: SGDRegressor supports incremental/online learning through partial_fit() method, essential
+    for federated learning where each server processes its local batch and contributes to global model
+    updates. The stochastic gradient descent approach naturally handles the iterative parameter averaging
+    workflow, converging efficiently across distributed nodes with non-identical data distributions.
+  evidence: lgdModel.py:60(module)
+  stage: Algorithm
+  alternative_considered: Standard OLS (Closed-form solution) was rejected as it requires centralized
+    data matrix; mini-batch alternatives add implementation complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in lgdModel.py'
+- id: BD-021
+  type: B
+  content: Set max_iter=1 per epoch for incremental/online learning style updates
+  rationale: Setting max_iter=1 ensures each partial_fit() call performs exactly one gradient update per
+    invocation, enabling explicit per-epoch control in the federated orchestration loop. This design decouples
+    the local optimization iterations from the global federated rounds, allowing the coordinator to control
+    convergence at the system level rather than relying on internal convergence criteria.
+  evidence: lgdModel.py:24(lgdModel), standalone_run.py:29(for loop)
+  stage: Algorithm
+  alternative_considered: Higher max_iter values would blur the distinction between local and global epochs,
+    making convergence analysis harder
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: lgdModel), standalone_run.py:29(for loop in lgdModel.py'
+- id: BD-022
+  type: B/BA
+  content: Disable regularization (tol=None) and early stopping for pure empirical loss
+  rationale: Disabling regularization ensures the model minimizes raw empirical loss without penalty terms,
+    producing interpretable coefficient estimates directly reflecting the underlying data relationships.
+    This is critical for LGD (Loss Given Default) models in credit risk where regulators and risk managers
+    require transparent, auditable model parameters without shrinkage artifacts that obscure true economic
+    relationships.
+  evidence: lgdModel.py:60(module)
+  stage: Algorithm
+  alternative_considered: L1/L2 regularization could improve generalization but would complicate regulatory
+    approval and interpretability requirements
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in lgdModel.py'
+- id: BD-023
+  type: B/BA
+  content: Set 10 epochs as default training iterations
+  rationale: Ten epochs provides sufficient iterations for SGDRegressor to converge on typical financial
+    datasets while maintaining computational efficiency. The value balances model performance against
+    training time, suitable for demonstration scenarios with limited compute resources. The parameter
+    is externalized in config.yml allowing users to adjust without code modification for different dataset
+    sizes or convergence behavior.
+  evidence: N/A:0(see_rationale)
+  stage: Training
+  alternative_considered: Adaptive stopping based on loss delta could be more efficient but adds implementation
+    complexity for demonstration purposes
+- id: BD-024
+  type: B
+  content: Use equal weights (0.25 each) for federated parameter averaging across 4 servers
+  rationale: Equal weighting (0.25) across four servers implements simple FedAvg aggregation where each
+    node contributes equally to the global model regardless of local dataset size. This symmetric aggregation
+    is appropriate for demonstration purposes where servers hold similarly-sized datasets. However, this
+    is marked as technical debt requiring future enhancement to weight by local sample counts for production
+    deployments.
+  evidence: federated_run.py:34(module)
+  stage: Aggregation
+  alternative_considered: Size-proportional weighting was deferred due to lack of data size API; equal
+    weighting serves as initial approximation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in federated_run.py'
+  vague_rationale: true
+- id: BD-025
+  type: B
+  content: 'Provide two data source modes: local filesystem (choice=1) and REST API (choice=2)'
+  rationale: Dual-mode data ingestion supports both offline development/testing (local CSV files) and
+    production integration (REST API to openNPL backend). This flexibility enables the federated system
+    to operate with synthetic demo data during development while seamlessly connecting to real financial
+    data infrastructure in production deployments without architecture changes.
+  evidence: dataSource.py:24(datasource)
+  stage: data_acquisition
+  alternative_considered: Single data source mode would limit deployment flexibility; supporting only
+    REST would block offline development
+  _evidence_issues:
+  - 'FN_NOT_FOUND: datasource in dataSource.py'
+- id: BD-026
+  type: B/BA
+  content: Store CSV data in server_dirs/{server_id}/regression_data.csv pattern
+  rationale: Directory-per-server organization separates datasets for each federated node, enabling clear
+    data isolation and independent access. The naming convention server_dirs/{server_id}/regression_data.csv
+    is configurable and supports parallel data loading without conflicts. This structure is essential
+    for multi-tenant federated scenarios where each node must access only its designated data.
+  evidence: dataSource.py:28(module)
+  stage: data_acquisition
+  alternative_considered: Database-backed storage was considered but adds infrastructure complexity for
+    demonstration purposes
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in dataSource.py'
+- id: BD-027
+  type: B/BA
+  content: Define CSV data format with X column as target and Y as explanatory variable
+  rationale: Standardizing the data format with explicit X (explanatory) and Y (target) column assignments
+    ensures consistent feature-target alignment across each federated nodes. This convention prevents
+    training errors from reversed variable assignments and simplifies data pipeline configuration. For
+    LGD modeling, Y typically represents default loss rates while X contains financial ratios like current
+    assets.
+  evidence: lgdModel.py:24(lgdModel)
+  stage: data_acquisition
+  alternative_considered: Dynamic column detection was avoided to prevent runtime errors from inconsistent
+    data formats
+- id: BD-028
+  type: B/DK
+  content: 'Exchange two parameters between coordinator and servers: intercept and coefficient'
+  rationale: The federated protocol exchanges only two scalar parameters—the regression intercept and
+    coefficient—minimizing communication overhead. These parameters fully characterize the linear model;
+    no additional statistics are required for model reconstruction. This minimal payload design is essential
+    for bandwidth-constrained environments and reduces attack surface for parameter tampering.
+  evidence: lgdModel.py:84(module)
+  stage: Protocol
+  alternative_considered: Exchanging gradient vectors or Hessian information was rejected due to bandwidth
+    constraints
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in lgdModel.py'
+- id: BD-029
+  type: B/BA
+  content: Use cold start (no initial params) for first iteration, warm start thereafter
+  rationale: Cold starting with random initialization for iteration zero ensures the federated system
+    can bootstrap without pre-existing global model, while warm starting with averaged parameters from
+    subsequent iterations accelerates convergence. This hybrid approach balances exploration (initial
+    random weights) with exploitation (averaged weights from previous rounds), typical pattern in federated
+    learning to achieve stable global models.
+  evidence: lgdModel.py:78(module)
+  stage: Protocol
+  alternative_considered: Fixed initialization was rejected as it would introduce bias; centralized initial
+    model was rejected due to privacy concerns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in lgdModel.py'
+- id: BD-030
+  type: B/DK
+  content: Use JSON serialization for parameter exchange in federated protocol
+  rationale: JSON provides human-readable, language-agnostic serialization for model parameters, enabling
+    interoperability between the Python-based coordinator and heterogeneous server implementations. The
+    format is debuggable, widely supported, and integrates naturally with Flask's request handling. While
+    less compact than binary alternatives, the parameter payload is small enough that JSON overhead is
+    negligible.
+  evidence: federated_run.py:72(module)
+  stage: Protocol
+  alternative_considered: Protocol Buffers or MessagePack would reduce payload size but add dependency
+    complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in federated_run.py'
+- id: BD-031
+  type: B/BA
+  content: Run Flask model servers on ports 5001-5004 for the federated cluster
+  rationale: Fixed port range 5001-5004 enables deterministic service discovery and simplifies cluster
+    configuration. Port assignment follows convention (base 5000 + server_id) allowing automatic routing
+    based on node index. This port allocation is standard practice for development/demo clusters and can
+    be adjusted via environment variables or configuration for production deployments.
+  evidence: model_server.py:81(module)
+  stage: Infrastructure
+  alternative_considered: Dynamic port allocation was rejected as it complicates coordinator configuration
+    and health checking
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in model_server.py'
+- id: BD-032
+  type: B
+  content: Run openNPL data backend servers on ports 8001-8004 for database-backed demo
+  rationale: Separate port range 8001-8004 isolates openNPL data backend services from model servers,
+    preventing port conflicts and enabling independent scaling. This architectural separation allows the
+    NPL (Non-Performing Loan) data platform to operate on its own tier while serving feature data to the
+    federated learning cluster through REST API calls.
+  evidence: N/A:0(see_rationale)
+  stage: Infrastructure
+  alternative_considered: Co-locating services on shared ports was rejected due to maintenance overhead
+    and security concerns
+- id: BD-033
+  type: B
+  content: 'Derive server ID from port number: server_id = port - 5000'
+  rationale: Computing server_id programmatically from port number eliminates manual configuration errors
+    and ensures consistency between service launch parameters and internal routing. The formula server_id
+    = port - 5000 maps the standard port range 5001-5004 to node indices 1-4, matching the federated_run.py
+    weight configuration keys.
+  evidence: model_server.py:35(module)
+  stage: Infrastructure
+  alternative_considered: Environment variable configuration was avoided to keep deployment simple
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in model_server.py'
+- id: BD-034
+  type: B/BA
+  content: Configure 4 federated servers as default cluster size
+  rationale: Four-node configuration provides sufficient parallelism to demonstrate federated learning
+    benefits while remaining manageable for demonstration purposes. The cluster size is configurable,
+    allowing users to scale up or down based on available resources. Four nodes enable interesting aggregation
+    scenarios (e.g., handling partial node availability) without overwhelming first-time users.
+  evidence: 'config.yml:4(servers: 4), federated_run.py:30(n = config[''servers''])'
+  stage: Infrastructure
+  alternative_considered: Two-node cluster would be too simple; eight-plus nodes would complicate demonstration
+    logistics
+- id: BD-035
+  type: B/BA
+  content: Use GET /start endpoint to initiate cold start and retrieve initial local estimates
+  rationale: The /start endpoint implements the federated protocol initialization phase, returning cold-start
+    parameter estimates from each server. Using GET semantics aligns with stateless protocol design where
+    the server simply returns current state without side effects. This endpoint serves as the bootstrap
+    mechanism for the federated rounds.
+  evidence: model_server.py:50(module)
+  stage: API
+  alternative_considered: POST for initialization was avoided as GET better represents read-only state
+    retrieval
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in model_server.py'
+- id: BD-036
+  type: B
+  content: Use POST /update endpoint to receive averaged parameters and return new estimates
+  rationale: The /update endpoint handles parameter aggregation by receiving global model weights (POST
+    payload) and returning updated local estimates. Using POST semantics correctly models the state mutation
+    where the server incorporates new parameters and performs local training. This endpoint is the core
+    of the federated round iteration.
+  evidence: model_server.py:56(module)
+  stage: API
+  alternative_considered: GET-based polling was rejected as it would require separate endpoints for parameter
+    delivery
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in model_server.py'
+- id: BD-037
+  type: B
+  content: Use GET / as health check endpoint to verify server liveness
+  rationale: Root endpoint health checks enable the coordinator to verify server availability before initiating
+    federated rounds. This operational pattern prevents wasted coordination attempts on unavailable nodes
+    and supports container orchestration health probes. Health checking at the root path is standard practice
+    for service discovery.
+  evidence: model_server.py:74(module)
+  stage: API
+  alternative_considered: Dedicated /health endpoint was avoided to keep the API surface minimal
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in model_server.py'
+- id: BD-038
+  type: BA/M
+  content: Design stateless model servers where each request is computed independently
+  rationale: Stateless server design simplifies deployment, enables horizontal scaling, and improves fault
+    tolerance. Each request initializes the model from scratch using the server identifier, with no reliance
+    on in-memory state between requests. This architecture is essential for containerized deployments
+    where instances may be created or destroyed dynamically.
+  evidence: model_server.py:36(module)
+  stage: Architecture
+  alternative_considered: Stateful servers with persistent model state would complicate container orchestration
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in model_server.py'
+- id: BD-039
+  type: B
+  content: Use Fabric deployment tool for cluster management tasks
+  rationale: Fabric provides SSH-based remote execution for automating cluster-wide operations (deploy,
+    start, stop) from a central coordinator. This tooling is appropriate for demonstration environments
+    where servers are reachable via SSH and operations require orchestration across multiple hosts. The
+    Python-based task definitions integrate naturally with the existing codebase.
+  evidence: fabfile.py:15(module)
+  stage: Deployment
+  alternative_considered: Ansible or Kubernetes were considered but add complexity beyond demonstration
+    requirements
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in fabfile.py'
+  vague_rationale: true
+- id: BD-040
+  type: B/BA
+  content: Use Docker containers for openNPL data backend deployment
+  rationale: Containerizing the openNPL data backend ensures reproducible deployment and environment isolation.
+    Docker enables running multiple backend instances on the same host with isolated networking, simplifying
+    the demonstration setup. Container images provide consistent execution environment across developer
+    machines and demonstration environments.
+  evidence: N/A:0(see_rationale)
+  stage: Deployment
+  alternative_considered: Bare-metal installation was rejected due to environment inconsistency
+- id: BD-041
+  type: B
+  content: Use YAML configuration file for cluster parameters (hosts, epochs, servers)
+  rationale: Externalized YAML configuration decouples deployment parameters from code, enabling environment-specific
+    tuning without code changes. The config.yml file serves as the single source of truth for cluster
+    topology (hosts, ports), training parameters (epochs), and scaling configuration (servers). This pattern
+    is essential for managing different deployment scenarios (dev, demo, prod).
+  evidence: N/A:0(see_rationale)
+  stage: Configuration
+  alternative_considered: Hardcoded values were rejected as they prevent environment-specific customization
+- id: BD-042
+  type: B/RC
+  content: Run Flask in debug mode (debug=True) for development
+  rationale: Enabling Flask debug mode provides automatic reloading on code changes and detailed error
+    traces during development. This is standard practice for local development, though debug mode should
+    be disabled in production due to security implications. The configuration is embedded in model_server.py
+    requiring manual change for production deployment.
+  evidence: model_server.py:81(module)
+  stage: Configuration
+  alternative_considered: Production-grade WSGI servers (gunicorn) were deferred for demonstration simplicity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in model_server.py'
+- id: BD-043
+  type: B/RC
+  content: Query openNPL API endpoint /api/npl_data/counterparties for data backend
+  rationale: Integrating with the openNPL (Non-Performing Loan) platform through its REST API enables
+    accessing real financial counterparty data for model training. The /api/npl_data/counterparties endpoint
+    provides structured access to entity information including financial metrics required for LGD estimation.
+    This integration connects the federated learning system to external data infrastructure.
+  evidence: dataSource.py:34(module)
+  stage: data_acquisition
+  alternative_considered: Direct database queries were rejected in favor of API abstraction layer
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in dataSource.py'
+- id: BD-044
+  type: B/BA
+  content: Extract current_assets and cash_and_cash_equivalent_items as X and Y features
+  rationale: Feature engineering using current_assets and cash equivalents captures liquidity characteristics
+    relevant to Loss Given Default estimation. Current assets represent short-term resources available
+    to cover obligations, while cash equivalents indicate immediate payment capacity. These financial
+    ratios are industry-standard inputs for credit risk modeling in banking applications.
+  evidence: dataSource.py:47(module)
+  stage: data_acquisition
+  alternative_considered: Alternative feature sets were considered but liquidity metrics are fundamental
+    to default loss estimation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in dataSource.py'
+- id: BD-045
+  type: B
+  content: Run separate client/coordinator process to orchestrate federated rounds
+  rationale: Separating the coordinator logic into federated_run.py (client) distinct from model_server.py
+    (server) follows client-server architecture principles. The coordinator handles orchestration logic
+    including server health checking, parameter aggregation, and convergence monitoring, while servers
+    remain focused on local model training. This separation enables independent scaling and updates to
+    coordination logic.
+  evidence: federated_run.py:1(module)
+  stage: Orchestration
+  alternative_considered: Embedded coordination in servers was rejected as it would create tight coupling
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in federated_run.py'
+- id: BD-046
+  type: B
+  content: Check each model server health before starting federated calculation
+  rationale: Pre-flight health verification ensures each federated nodes are available before initiating
+    training rounds, preventing partial aggregation failures mid-execution. This defensive pattern identifies
+    unavailable servers early, allowing operators to address issues before wasting computation time. Health
+    checking at iteration start also serves as a basic fault detection mechanism.
+  evidence: federated_run.py:45(module)
+  stage: Orchestration
+  alternative_considered: Lazy failure handling was rejected as it complicates debugging and wastes resources
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in federated_run.py'
+- id: BD-047
+  type: B/DK
+  content: Provide /stop endpoint for graceful server shutdown
+  rationale: The /stop endpoint enables controlled shutdown of model servers, supporting clean termination
+    without abrupt connection drops. This is essential for deployment scenarios where servers must be
+    updated or rescheduled, ensuring in-flight requests complete and state is properly finalized. Graceful
+    shutdown is required for production-grade service management.
+  evidence: model_server.py:64(module)
+  stage: Operations
+  alternative_considered: Abrupt termination (SIGKILL) was rejected as it risks data corruption and client
+    confusion
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in model_server.py'
+- id: BD-048
+  type: B
+  content: Recommend Linux environment for running the federated demo
+  rationale: Linux is recommended as the primary execution environment due to its native support for Python,
+    SSH (for Fabric deployment), and shell scripting. Most federated learning infrastructure components
+    (Docker, Flask, scientific Python stack) are developed and tested primarily on Linux. This recommendation
+    ensures compatibility and reduces environment-specific troubleshooting.
+  evidence: N/A:0(see_rationale)
+  stage: Operations
+  alternative_considered: Windows support was considered but requires additional tooling (WSL) and testing
+- id: BD-049
+  type: B/DK
+  content: Use virtual environment for dependency isolation
+  rationale: Virtual environment isolation prevents dependency conflicts between projects and ensures
+    reproducible builds. Python virtual environments (venv, virtualenv) are lightweight and standard practice
+    for Python development. This recommendation prevents global site-packages pollution and enables clean
+    teardown by simply deleting the environment directory.
+  evidence: N/A:0(see_rationale)
+  stage: Operations
+  alternative_considered: System-wide installation was rejected as it risks breaking system packages
+- id: BD-050
+  type: B/DK
+  content: Use XTerm windows for displaying model server output during demo
+  rationale: XTerm terminal windows provide visual separation for each model server's console output,
+    enabling operators to monitor individual node behavior during demonstrations. This observational setup
+    helps users understand the distributed nature of federated learning by showing concurrent server activity.
+    The approach is low-tech but effective for educational purposes.
+  evidence: N/A:0(see_rationale)
+  stage: Operations
+  alternative_considered: Centralized logging was deferred for demonstration simplicity
+- id: BD-051
+  type: B/BA
+  content: Use HTTP requests library for client-server communication
+  rationale: The requests library provides a clean, Pythonic HTTP client interface for coordinator-to-server
+    and client-to-API communication. Its session management, connection pooling, and error handling simplify
+    REST integration. The library is widely adopted in the Python ecosystem, ensuring reliability and
+    community support.
+  evidence: federated_run.py:20(dataSource)
+  stage: Protocol
+  alternative_considered: urllib was avoided due to more verbose API; async libraries were deferred for
+    simplicity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: dataSource in federated_run.py'
+- id: BD-052
+  type: B
+  content: Set warm_start=False to erase previous solution on each fit call
+  rationale: Disabling warm_start ensures each partial_fit() call starts fresh without leveraging previous
+    iterations. Combined with the warm-start logic for receiving global parameters, this setting explicitly
+    separates the federated protocol (parameter averaging) from local optimization (single-epoch training),
+    preventing unintended state carryover between federated rounds.
+  evidence: lgdModel.py:60(module)
+  stage: Algorithm
+  alternative_considered: warm_start=True would preserve optimizer state but complicate protocol semantics
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in lgdModel.py'
+- id: BD-053
+  type: B
+  content: Use verbose=0 for silent training output
+  rationale: Suppressing SGDRegressor training output (verbose=0) prevents console flooding during federated
+    iterations, especially when multiple servers train concurrently. The coordinator's print statements
+    provide sufficient observability for the federated round progression. Silent training also avoids
+    log file bloat and maintains clean demonstration output.
+  evidence: lgdModel.py:60(module)
+  stage: Algorithm
+  alternative_considered: Verbose output was considered for debugging but adds noise during demonstrations
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in lgdModel.py'
+- id: BD-054
+  type: B
+  content: Print server estimates and averaged parameters after each epoch
+  rationale: Console output of per-server estimates and global averages provides real-time observability
+    into the federated learning process. This explicit logging enables users to observe parameter divergence
+    and convergence behavior, serving both educational purposes and basic debugging. The output is captured
+    in demonstration videos and documentation.
+  evidence: federated_run.py:57(print_server_estimates), federated_run.py:68(print_averaged_estimates)
+  stage: Observability
+  alternative_considered: Structured logging (JSON) was deferred for simplicity; file-based logging was
+    deferred for demonstration focus
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: print_server_estimates), federated_run.py:68(print_averaged_estimates in federated_run.py'
+- id: BD-055
+  type: B/BA
+  content: Provide standalone_run.py as single-server validation before federated demo
+  rationale: Standalone validation mode (standalone_run.py) allows users to verify the core LGD model
+    implementation in a single-server context before tackling distributed federated complexity. This staged
+    approach reduces troubleshooting surface area, enabling users to isolate model behavior issues from
+    federation protocol issues. The standalone run serves as a baseline for expected model performance.
+  evidence: N/A:0(see_rationale)
+  stage: Testing
+  alternative_considered: Starting directly with federated demo was rejected as debugging becomes harder
+    with multiple failure points
+- id: BD-056
+  type: B
+  content: Iterate federated rounds by calling lgdModel with previous averaged params
+  rationale: The federated training loop iteratively refines the global model by cycling through parameter
+    distribution and local training. Each iteration incorporates knowledge from each nodes through averaged
+    parameters, progressively converging toward a model that performs well across heterogeneous local
+    datasets. This iterative refinement is the core mechanism of federated learning.
+  evidence: standalone_run.py:29(module)
+  stage: Training
+  alternative_considered: Single-shot aggregation was rejected as it typically yields suboptimal models
+    on heterogeneous data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in standalone_run.py'
+- id: BD-057
+  type: B
+  content: Configure base URL as 'http://127.0.0.1:500' in config.yml for local demo
+  rationale: Localhost base URL (127.0.0.1:500) enables demonstration on a single machine without network
+    configuration, using port offsetting to target different servers (5001, 5002, etc.). This setup is
+    appropriate for local development and demonstration while being trivially configurable for network
+    deployment by updating the host addresses.
+  evidence: N/A:0(see_rationale)
+  stage: Configuration
+  alternative_considered: Hostname-based configuration was avoided as it requires DNS or /etc/hosts editing
+  vague_rationale: true
+- id: BD-058
+  type: B/RC
+  content: Use ruamel.yaml for YAML parsing with safe loading
+  rationale: Using ruamel.yaml with safe loading (typ='safe') prevents arbitrary code execution through
+    YAML deserialization vulnerabilities (YAML bombs). Safe loading restricts YAML to basic types without
+    executing constructors, protecting against malicious configuration files. This is a security best
+    practice even for trusted configuration sources.
+  evidence: federated_run.py:21(module)
+  stage: Configuration
+  alternative_considered: Standard yaml.load with Loader=yaml.FullLoader was considered but ruamel.yaml
+    provides better Unicode handling
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in federated_run.py'
+- id: BD-059
+  type: DK/B
+  content: 'TODO: Remove hardcoded weights - fetch node data shape via controlled API'
+  rationale: Hardcoded equal weights (0.25 each) assume uniform dataset sizes across federated nodes,
+    which rarely holds in production. Fetching actual data shape (sample counts) via API enables proper
+    weighted FedAvg aggregation proportional to local data volumes, improving model convergence on heterogeneous
+    datasets. This enhancement addresses a known limitation of the current implementation.
+  evidence: federated_run.py:33(module)
+  stage: Technical Debt
+  alternative_considered: Broadcasting dataset sizes during initialization was considered but adds coupling
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in federated_run.py'
+- id: BD-060
+  type: DK
+  content: 'TODO: Remove file/URL path hardwiring in dataSource'
+  rationale: Hardcoded file paths and URL endpoints in dataSource.py reduce deployment flexibility and
+    complicate multi-environment testing. Externalizing these values to configuration enables seamless
+    switching between local CSV files, development API endpoints, and production systems. This refactoring
+    supports DevOps practices and reduces environment-specific code branches.
+  evidence: dataSource.py:25(module)
+  stage: Technical Debt
+  alternative_considered: Environment variables were considered but YAML configuration provides better
+    structure
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in dataSource.py'
+- id: BD-061
+  type: DK/B
+  content: 'TODO: Implement fractional regression variations for LGD models'
+  rationale: Current implementation uses standard linear regression with bounded loss values. Fractional
+    regression models (beta regression, two-part models) are more appropriate for LGD targets bounded
+    between 0 and 1, avoiding prediction extrapolation and improving accuracy for recovery rate estimation.
+    This roadmap item addresses a known model limitation for production credit risk applications.
+  evidence: N/A:0(see_rationale)
+  stage: Roadmap
+  alternative_considered: Logistic transformation was considered but introduces interpretability issues
+  vague_rationale: true
+- id: BD-062
+  type: DK/B
+  content: 'TODO: Adopt different data loading strategies for standalone vs federated learning'
+  rationale: Current implementation shares data loading logic between standalone and federated modes,
+    but these scenarios have different requirements. Standalone mode benefits from eager loading and full
+    dataset access, while federated mode requires incremental, per-node data access without centralized
+    visibility. Separate loading strategies would optimize each mode independently.
+  evidence: N/A:0(see_rationale)
+  stage: Roadmap
+  alternative_considered: Single unified loader was rejected as it cannot optimally serve both modes
+- id: BD-063
+  type: B/BA
+  content: Linear regression model using SGDRegressor instead of closed-form OLS
+  rationale: 'SGDRegressor chosen over closed-form OLS because it enables incremental/online learning
+    and scales efficiently to large datasets without loading each data into memory. This approach supports
+    streaming data scenarios where models must be updated continuously. BOUNDARY: Closed-form OLS would
+    require matrix inversion with O(n³) complexity, limiting scalability.'
+  evidence: lgdModel.py:60(linear_model.SGDRegressor)
+  stage: lgdModel
+  alternative_considered: Closed-form OLS provides exact solution but requires storing full dataset and
+    has cubic time complexity in features
+  _evidence_issues:
+  - 'FN_NOT_FOUND: linear_model.SGDRegressor in lgdModel.py'
+- id: BD-064
+  type: B/BA
+  content: SGD optimization with max_iter=1 per fit call and warm_start disabled
+  rationale: 'Each fit call performs exactly one epoch with fresh model initialization, preventing accumulation
+    of learned weights across repeated fits. This enforces stateless fitting behavior suitable for single-use
+    inference scenarios. BOUNDARY: Model never converges through multiple epochs; repeated calls do not
+    improve fit quality.'
+  evidence: lgdModel.py:24(lgdModel)
+  stage: lgdModel
+  alternative_considered: Multi-epoch fitting with warm_start=True would allow cumulative learning but
+    requires tracking model state
+- id: BD-065
+  type: B/BA
+  content: Early stopping disabled with no convergence tolerance criterion
+  rationale: 'Model runs until max_iter regardless of loss improvement, ensuring fixed computational budget
+    per fit. No early termination prevents premature stopping on noisy gradients. BOUNDARY: With max_iter=1,
+    tol=None has no practical effect; without max_iter cap, training could continue indefinitely on plateau.'
+  evidence: lgdModel.py:60-61(early_stopping=False,tol=None)
+  stage: lgdModel
+  alternative_considered: Early stopping with validation set would terminate on plateau but requires holdout
+    data
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: early_stopping=False,tol=None in lgdModel.py'
+- id: BD-066
+  type: B
+  content: No explicit regularization penalty applied to loss function
+  rationale: 'Absence of L1/L2/elastic-net regularization allows coefficients to grow unbounded during
+    optimization, maximizing fit to training data without shrinkage. BOUNDARY: Unregularized model may
+    overfit, especially with limited data; coefficients can become arbitrarily large.'
+  evidence: lgdModel.py:24(lgdModel)
+  stage: lgdModel
+  alternative_considered: L2 penalty would shrink coefficients toward zero; L1 would induce sparsity
+- id: BD-067
+  type: B
+  content: Server-based data source selection with file vs REST API input method
+  rationale: 'Data sourcing abstracted through configurable choice parameter allowing selection between
+    file-based local data and REST API remote data. Server flag (1) controls primary data source type.
+    BOUNDARY: Both paths funnel through dataSource(n,choice) interface; offline operation requires file
+    path availability.'
+  evidence: lgdModel.py:24,63,69(server,choice,dataSource)
+  stage: lgdModel
+  alternative_considered: Hardcoded single source would simplify but reduce flexibility
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: server,choice,dataSource in lgdModel.py'
+- id: BD-068
+  type: B/RC
+  content: 'Variable assignment convention: X as target, y as explanatory variables'
+  rationale: 'Code reverses standard ML convention where X=features and y=target. This represents a domain-specific
+    naming choice for LGD modeling where explanatory variables predict the target LGD value. BOUNDARY:
+    Violates sklearn convention; requires careful handling when using sklearn utilities expecting X,y
+    ordering.'
+  evidence: lgdModel.py:24(lgdModel)
+  stage: lgdModel
+  alternative_considered: Standard X=features,y=target would align with sklearn but requires domain translation
+- id: BD-069
+  type: B/BA
+  content: Default squared error loss (squared_loss) with default optimal learning rate schedule
+  rationale: 'Standard MSE loss function minimizes mean squared error between predictions and targets.
+    Default learning rate (''optimal'') uses 1/sqrt(t) decay pattern common in SGD. BOUNDARY: Squared
+    loss penalizes large errors heavily (quadratic); optimal schedule provides adaptive learning but may
+    not suit each data distributions.'
+  evidence: lgdModel.py:35,60(loss=squared_loss,learning_rate=optimal)
+  stage: lgdModel
+  alternative_considered: Huber loss would be robust to outliers; constant learning rate would be simpler
+    but less adaptive
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: loss=squared_loss,learning_rate=optimal in lgdModel.py'
+- id: BD-070
+  type: B/BA
+  content: Model parameter initialization supported via coef_init and intercept_init
+  rationale: 'Model supports initialization of coefficients and intercept from external sources, enabling
+    transfer learning or warm starting from prior estimates. BOUNDARY: If warm_start=False, initialization
+    applies only to first fit; subsequent fits reinitialize.'
+  evidence: lgdModel.py:81(coef_init,intercept_init)
+  stage: lgdModel
+  alternative_considered: Random initialization would be simpler but lose reuse capability
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: coef_init,intercept_init in lgdModel.py'
+- id: BD-071
+  type: B/BA
+  content: Fitted parameters returned as dictionary with predictions and metadata
+  rationale: 'Model output encapsulated in structured dictionary containing fitted coefficients, intercept,
+    and predictions. Enables downstream consumption without tight coupling to sklearn model object. BOUNDARY:
+    Return format assumes consumer expects dict interface; changes require version coordination.'
+  evidence: lgdModel.py:84(fitted_params)
+  stage: lgdModel
+  alternative_considered: Tuple/dataclass return would provide type safety but less flexibility
+  _evidence_issues:
+  - 'FN_NOT_FOUND: fitted_params in lgdModel.py'
+- id: BD-072
+  type: RC
+  content: Federated workflow REQUIRES /start cold-start BEFORE /update warm-start calls per epoch
+  rationale: The cold-start /start call initializes server state, while /update expects pre-initialized
+    warm state. Calling update before start produces undefined behavior and training failures. This ordering
+    contract is mandatory per epoch to ensure each federated round begins from a valid initialization
+    baseline.
+  evidence: federated_run.py:55(start_call), federated_run.py:80(update_call)
+  stage: ordering_contract
+  alternative_considered: Allowing out-of-order calls was considered but rejected due to undefined state
+    that corrupts model parameters.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: start_call), federated_run.py:80(update_call in federated_run.py'
+- id: BD-073
+  type: BA/DK
+  content: 'SGDRegressor defaults encode iterative forcing: max_iter=1, tol=None, early_stopping=False'
+  rationale: These specific default values force a single-pass learning approach, treating each data batch
+    as a complete iteration. This encodes the business assumption that streaming federated data should
+    not benefit from multi-epoch convergence, preserving simplicity over accuracy in the federated context.
+  evidence: lgdModel.py:60-61(SGDRegressor)
+  stage: default_value
+  alternative_considered: Multi-epoch convergence with early stopping was considered but would require
+    epoch coordination across federated servers.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: SGDRegressor in lgdModel.py'
+- id: BD-074
+  type: B
+  content: Federated averaging MUST complete before sending averaged params to next epoch
+  rationale: The federated averaging operation at lines 86-92 aggregates parameters from each servers
+    into a consensus model. Skipping or parallelizing this step before the next epoch causes stale or
+    inconsistent parameters to propagate, corrupting the federated learning convergence. This is a hard
+    ordering invariant for correctness.
+  evidence: federated_run.py:86-92(averaging)
+  stage: invariant
+  alternative_considered: Async parameter updates were considered but rejected as they would break convergence
+    guarantees.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: averaging in federated_run.py'
+- id: BD-075
+  type: BA/DK
+  content: 'Server ID derived from port via hardcoded offset: n = int(port) - 5000'
+  rationale: This hardcoded formula (port minus 5000) defines how server identities map to port numbers
+    in the system. The magic number 5000 is a business assumption about the port numbering scheme, making
+    IDs dependent on a specific port range allocation that must be maintained consistently.
+  evidence: model_server.py:35(port_parsing), model_server.py:43(port_parsing)
+  stage: default_value
+  alternative_considered: Dynamic ID allocation via configuration service was considered but rejected
+    for simplicity.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: port_parsing), model_server.py:43(port_parsing in model_server.py'
+- id: BD-076
+  type: B/BA
+  content: Equal federated weights (0.25 each) hardcoded for 4 servers - no API to fetch data size
+  rationale: The federated weighting at line 34 assigns equal 0.25 contribution to each server regardless
+    of actual data volume. This encodes a business assumption that each servers provide equally representative
+    data. When data sizes differ significantly, this creates accuracy bias toward servers with smaller
+    datasets.
+  evidence: federated_run.py:34(weights_dict)
+  stage: invariant
+  alternative_considered: Data-size proportional weighting was considered but would require a data discovery
+    API not currently implemented.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: weights_dict in federated_run.py'
+- id: BD-077
+  type: BA/DK
+  content: Data source choice=1 loads from ./server_dirs/{server}/regression_data.csv
+  rationale: The path construction at line 28 encodes the business assumption that regression data lives
+    in a specific relative directory structure with a fixed filename. Changing either the directory layout
+    or filename requires code modification, coupling data organization directly to source code.
+  evidence: dataSource.py:28(path_construction)
+  stage: default_value
+  alternative_considered: Configurable path templates were considered but rejected to maintain simplicity
+    for the 4-server federated setup.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: path_construction in dataSource.py'
+- id: BD-078
+  type: RC
+  content: 'CSV column convention: X=target, Y=explanatory; extraction order matters for regression'
+  rationale: The column extraction convention defines that column 'X' contains target values and 'Y' contains
+    explanatory variables. This naming constraint is regulatory for model correctness—if datasets use
+    different column names or swap the convention, the regression produces inverted or meaningless results.
+    The extraction order dependency at line 73-75 requires strict adherence.
+  evidence: lgdModel.py:73-75(X/y_extraction), dataSource.py:48(columns)
+  stage: ordering_contract
+  alternative_considered: Flexible column mapping via configuration was considered but rejected to maintain
+    schema compatibility across federated servers.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: X/y_extraction), dataSource.py:48(columns in lgdModel.py'
+- id: BD-079
+  type: DK/B
+  content: Standalone and federated modes implement identical iterative SGD loop - code duplication
+  rationale: Both standalone_run.py (lines 29-32) and federated_run.py (lines 73-93) implement the same
+    epoch-based SGD training loop with identical logic. This duplication represents design knowledge that
+    the training algorithm is replicated rather than shared, creating maintenance risk where changes must
+    be applied in two places.
+  evidence: standalone_run.py:29(epoch_loop), federated_run.py:73(epoch_loop)
+  stage: pattern_choice
+  alternative_considered: Shared SGD training module was not implemented, leaving duplication as known
+    design pattern.
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: epoch_loop), federated_run.py:73(epoch_loop in standalone_run.py'
+- id: BD-080
+  type: B/BA
+  content: server_dirs/X/ requires exactly 4 subdirectories with identical CSV structure
+  rationale: The configuration at config.yml:4 mandates exactly 4 servers, and url construction at lines
+    40-42 hardcodes this assumption by iterating over 4 servers. This creates an architectural constraint
+    where adding or removing servers requires code changes, limiting scalability and flexibility of the
+    federated deployment.
+  evidence: config.yml:4(servers:4), federated_run.py:40(url_construction)
+  stage: subdirectory
+  alternative_considered: Dynamic server discovery via service registry was considered but rejected for
+    federated simplicity.
+- id: BD-081
+  type: BA
+  content: Epochs count hardcoded in config.yml (10) vs standalone_run.py (10) - dual maintenance risk
+  rationale: 'The epoch count of 10 is defined in two separate files: config.yml:3 and standalone_run.py:23
+    as a constant. This dual definition creates a maintenance hazard where changing training duration
+    requires updating both locations. Inconsistency between these values would cause divergent behavior
+    between federated and standalone modes.'
+  evidence: config.yml:3(epochs), standalone_run.py:23(Epochs)
+  stage: default_value
+  alternative_considered: Centralized configuration service was considered but rejected to keep standalone
+    mode self-contained.
+- id: BD-082
+  type: B/BA
+  content: 'INTERACTION: BD-038 (stateless servers) × BD-005/BD-029 (warm-start via intercept_init/coef_init)
+    → Paradox: warm-start REQUIRES state persistence across requests, contradicting stateless server design'
+  rationale: 'Warm-start mechanism (BD-029) passes prior parameters via intercept_init/coef_init, which
+    are derived from averaged federated weights received from coordinator. Stateless server design (BD-038)
+    initializes fresh state per request, but warm-start semantics require preserving parameter state between
+    /update calls. This creates a contradiction: the /update endpoint receives new global parameters and
+    returns estimates based on them, yet the server claims statelessness. The tension emerges during fed'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Truly stateless servers would require coordinator to track iteration state;
+    stateful server instances require sticky sessions or shared state store
+- id: BD-083
+  type: B/BA
+  content: 'INTERACTION: BD-003/BD-078 (X=target, Y=explanatory column convention) × BD-025/BD-043 (dual
+    data source modes) → Convention fragility amplified by data source variability'
+  rationale: 'The X/Y column naming convention (BD-078) is hardcoded in lgdModel.py requiring specific
+    column names, but dual data source modes (BD-025) introduce variability: local CSV files must be pre-formatted
+    with exact column names, while REST API responses from openNPL (BD-043) use different field names
+    (current_assets, cash_and_cash_equivalent_items). The dataSource function maps API fields to X/Y via
+    hardcoded extraction (BD-044), creating a hidden dependency chain. If openNPL API schema changes or
+    C'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Configuration-driven column mapping with schema validation would decouple from
+    hardcoded conventions
+- id: BD-084
+  type: BA
+  content: 'INTERACTION: BD-002/BD-033/BD-075 (port-derived server ID: n = port - 5000) × BD-080 (exactly
+    4 servers required) → Port availability dependency creates cascading failure risk'
+  rationale: 'The port-to-ID derivation (BD-075) creates a hard dependency on consecutive port availability
+    from 5001-5004. Combined with hardcoded 4-server requirement (BD-080), if any port in the 5001-5004
+    range is unavailable (port conflict, firewall, container networking issue), the corresponding server
+    cannot start. The health check loop (BD-046) will fail on unavailable servers, preventing federated
+    execution entirely. This risk cascade: port conflict → server fails to start → health check fails
+    → feder'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Explicit server ID via environment variable would decouple from port allocation;
+    dynamic port allocation with service registry would eliminate single-point-of-failure
+- id: BD-085
+  type: B
+  content: 'INTERACTION: BD-013/BD-024/BD-076 (equal 0.25 weighting) × BD-016 (blocking sequential communication)
+    → Unequal convergence quality with linear latency penalty'
+  rationale: Equal weighting (BD-024) assigns 25% influence to each server regardless of actual data volume,
+    which is problematic if servers have significantly different dataset sizes. Combined with blocking
+    sequential HTTP calls (BD-016), slow servers (due to larger data volume, network latency, or compute
+    constraints) block the entire aggregation loop. A server with 10x more data takes proportionally longer
+    to train but still contributes only 0.25 weight, creating inefficiency. The interaction amplifies
+    tw
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Asynchronous concurrent requests would eliminate blocking latency; weighted
+    averaging proportional to data size would correct accuracy bias
+- id: BD-086
+  type: B
+  content: 'INTERACTION: BD-004/BD-021/BD-052/BD-064/BD-073 (SGDRegressor single-epoch settings) × BD-019
+    (federated learning architecture) → Training limitation undermines federated convergence benefit'
+  rationale: 'SGDRegressor configuration (max_iter=1, warm_start=False, tol=None) enforces single-pass
+    learning per fit() call, meaning each server performs exactly one gradient update per federated round.
+    The federated architecture (BD-019) relies on iterative parameter averaging across multiple epochs
+    to converge on a global model. This interaction creates a convergence tension: the federated protocol
+    requires MULTIPLE global rounds to achieve model consensus, but each local training can only perform
+    ONE gr'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Adaptive epoch count based on parameter drift threshold; higher local max_iter
+    for multi-step local training before averaging
+- id: BD-087
+  type: B/RC
+  content: 'INTERACTION: BD-072 (start BEFORE update ordering) × BD-074 (averaging BEFORE next epoch)
+    × BD-016 (sequential blocking) → Single slow server creates cascading deadlock risk in federated rounds'
+  rationale: 'The mandatory ordering contracts (BD-072: /start before /update, BD-074: averaging before
+    next epoch) combined with sequential blocking communication (BD-016) create a risk cascade: if any
+    single server becomes unresponsive during its /start or /update call, the entire federated round blocks.
+    Health checks (BD-046) happen only at round start, not between individual server calls, so a server
+    that becomes slow mid-round causes cascading timeout. The sequential loop has no timeout handling
+    or parti'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Request timeout with retry logic; concurrent requests with result aggregation;
+    partial federated updates allowing fewer than N servers
+- id: BD-088
+  type: BA
+  content: 'INTERACTION: BD-023 (epochs: 10) × BD-081 (epochs dual-hardcoded) → Configuration inconsistency
+    risk between federated and standalone modes'
+  rationale: Epoch count is defined in two separate locations (BD-081) creating maintenance hazard. If
+    a developer updates epochs in config.yml but forgets standalone_run.py, or vice versa, the two modes
+    train for different durations. This is particularly problematic because BD-055 recommends standalone_run.py
+    as validation baseline before federated demo—if standalone uses different epoch count, the validation
+    result is not comparable to federated behavior. The interaction between these decisions creates sil
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Centralized configuration import in standalone_run.py reading from config.yml;
+    environment variable override mechanism
+- id: BD-089
+  type: B/BA
+  content: 'RISK CASCADE: BD-076 (equal weighting) → BD-085 (latency amplification) → BD-087 (cascading
+    deadlock) → federation failure when data is heterogeneous'
+  rationale: 'This cascade chain shows how three separate design decisions combine to create systemic
+    risk: Equal weighting (BD-076) assumes balanced data volumes, but in production servers may have wildly
+    different dataset sizes. Larger datasets cause longer training times per server. Sequential blocking
+    (BD-085) makes total latency linear with server count, so the largest-data server determines round
+    duration. Combined with mandatory ordering contracts (BD-087) that have no timeout handling, a server
+    traini'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Weighted averaging + concurrent requests + timeout handling would break the
+    cascade at multiple points
+- id: BD-090
+  type: BA
+  content: 'RISK CASCADE: BD-075 (port-derived ID) → BD-080 (4-server hardcode) → BD-046 (health check)
+    → deployment failure cascades to federation inability'
+  rationale: 'The port-to-ID derivation (BD-075) makes server identity dependent on port availability
+    in the 5001-5004 range. Hardcoded 4-server requirement (BD-080) assumes each four ports are available.
+    Health check at round start (BD-046) will FAIL if any port is unavailable, preventing federated execution.
+    The cascade: port conflict on 5003 → server 3 cannot start → health check fails → federation_run prints
+    error and exits without completing ANY training. The system cannot operate with 3 servers—it requir'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Dynamic server discovery via registry would enable flexible scaling; explicit
+    server ID configuration would decouple from port allocation
+- id: BD-091
+  type: BA
+  content: 'CONTRADICTION: BD-038 (stateless servers) states ''each request is computed independently''
+    while BD-072 (start BEFORE update) mandates stateful request ordering across federated rounds'
+  rationale: 'The architectural decision (BD-038) explicitly claims stateless operation where ''each request
+    is computed independently.'' However, the federated protocol ordering contract (BD-072) requires /start
+    to be called BEFORE /update per epoch, and the /update endpoint receives global parameters and returns
+    estimates that DEPEND on previous state (the received parameters are averaged from each servers).
+    This is stateful behavior: /update must continue from the parameters it received, not start fresh.
+    The '
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Truly stateless design would require coordinator to pass iteration counter and
+    retain each parameter history; stateful design would require shared state store (Redis) or sticky
+    sessions
+known_use_cases:
+- id: UC-101
+  name: Sphinx Documentation Configuration
+  source: docs/source/conf.py
+  type: extension_example
+  business_problem: This file configures the Sphinx documentation builder for the openLGD project, setting
+    up project metadata, version information, and path configurations needed to generate developer documentation.
+  intent_keywords:
+  - documentation
+  - sphinx
+  - configuration
+  - build docs
+  - project setup
+  stage: documentation
+  negative_keywords:
+  - trading strategy
+  - screening
+  - data pipeline
+  - monitoring
+  - live trading
+  - factor computation
+  - machine learning
+  disambiguation: Are you looking to configure documentation build tools, or are you trying to implement
+    a trading strategy, data pipeline, or analytical workflow?
+  data_domain: mixed
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 10
+  evidence_invalid: 59
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.14492753623188406
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 1
+    warn: 3
+    fail: 15
+  subdomain_totals:
+    pass: 0
+    warn: 3
+    fail: 8
+  coverage: 30/30 (100%)
+  pass_rate: 1/30 (3%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: data_source
+  description: Choose based on data availability and privacy requirements. Local files for development/testing,
+    openNPL for NPL-specific federated analysis, custom REST APIs for other data sources.
+  used_in_stages: []
+  options:
+  - name: Local CSV Files
+    traits:
+    - static
+    - batch
+    - no-api
+    - simple
+    fit_for:
+    - Development, testing, standalone mode with pre-exported data
+    not_fit_for:
+    - Production with live data, real-time updates, data privacy scenarios
+  - name: openNPL REST API
+    traits:
+    - dynamic
+    - database-backed
+    - api-based
+    fit_for:
+    - Federated mode with database-stored NPL counterparty data
+    not_fit_for:
+    - Standalone mode, non-NPL credit risk data
+  - name: Generic REST API
+    traits:
+    - dynamic
+    - api-based
+    - configurable
+    fit_for:
+    - Custom data providers that return JSON with current_assets and cash_and_cash_equivalent_items fields
+    not_fit_for:
+    - SQL databases, file-based data, non-standard data formats
+  - name: PostgreSQL/SQL Database
+    traits:
+    - relational
+    - sql
+    - transactional
+    fit_for:
+    - Production with structured credit risk data in relational databases
+    not_fit_for:
+    - Non-relational data, quick prototyping
+  default: Local CSV Files
+  _source: worker_resource
+- id: slot-002
+  name: model_server_web_framework
+  description: Flask is sufficient for the current lightweight API requirements. Consider FastAPI if async
+    operations or auto-generated OpenAPI documentation becomes important.
+  used_in_stages: []
+  options:
+  - name: Flask
+    traits:
+    - lightweight
+    - wsgi
+    - extensible
+    fit_for:
+    - Simple REST APIs, development, microservices
+    not_fit_for:
+    - High-throughput production APIs, async workloads
+  - name: FastAPI
+    traits:
+    - async
+    - openapi
+    - modern
+    fit_for:
+    - High-performance async APIs, auto-generated docs, type validation
+    not_fit_for:
+    - Simple prototypes where Flask is sufficient
+  - name: Django
+    traits:
+    - full-stack
+    - orm
+    - batteries-included
+    fit_for:
+    - Complex applications needing ORM, admin interface, authentication
+    not_fit_for:
+    - Lightweight microservices, simple REST APIs
+  default: Flask
+  _source: worker_resource
+- id: slot-003
+  name: ml_framework
+  description: scikit-learn is ideal for the current simple linear SGD regression use case. Switch to
+    PyTorch/TensorFlow for deep learning LGD models or statsmodels for richer statistical inference.
+  used_in_stages: []
+  options:
+  - name: scikit-learn SGDRegressor
+    traits:
+    - online-learning
+    - iterative
+    - simple-linear
+    fit_for:
+    - Simple linear regression with stochastic gradient descent, online learning
+    not_fit_for:
+    - Deep learning, non-linear models, GPU acceleration
+  - name: PyTorch
+    traits:
+    - deep-learning
+    - gpu
+    - flexible
+    fit_for:
+    - Complex neural network LGD models, research scenarios
+    not_fit_for:
+    - Simple linear models, resource-constrained environments
+  - name: TensorFlow
+    traits:
+    - deep-learning
+    - production
+    - gpu
+    fit_for:
+    - Production deep learning models, model serving
+    not_fit_for:
+    - Simple linear models, rapid prototyping
+  - name: statsmodels
+    traits:
+    - statistical
+    - inference
+    - rich-output
+    fit_for:
+    - Statistical inference, hypothesis testing, rich model diagnostics
+    not_fit_for:
+    - Online/incremental learning, large-scale data
+  default: scikit-learn SGDRegressor
+  _source: worker_resource
+- id: slot-004
+  name: deployment_orchestration
+  description: Fabric is used for simple SSH-based server deployment. Docker Compose recommended for containerized
+    federated deployments. Kubernetes for production-scale federated systems.
+  used_in_stages: []
+  options:
+  - name: Fabric
+    traits:
+    - ssh
+    - simple
+    - paramiko-based
+    fit_for:
+    - Simple SSH-based remote command execution
+    not_fit_for:
+    - Complex multi-container orchestration
+  - name: Docker Compose
+    traits:
+    - containerized
+    - multi-service
+    - declarative
+    fit_for:
+    - Multi-container deployments, reproducible environments
+    not_fit_for:
+    - Remote server management, bare-metal deployments
+  - name: Kubernetes
+    traits:
+    - orchestration
+    - scalable
+    - production
+    fit_for:
+    - Production federated systems requiring auto-scaling, high availability
+    not_fit_for:
+    - Development, simple single-server deployments
+  - name: Ansible
+    traits:
+    - idempotent
+    - agentless
+    - configuration
+    fit_for:
+    - Configuration management, infrastructure as code
+    not_fit_for:
+    - Container orchestration, simple task execution
+  default: Fabric
+  _source: worker_resource
+- id: slot-005
+  name: documentation_generator
+  description: Sphinx is already configured and is the standard for Python projects. Use MkDocs for simpler
+    Markdown-based documentation.
+  used_in_stages: []
+  options:
+  - name: Sphinx
+    traits:
+    - rst
+    - technical
+    - extensible
+    fit_for:
+    - Python project documentation, API docs, technical manuals
+    not_fit_for:
+    - Simple READMEs, non-technical documentation
+  - name: MkDocs
+    traits:
+    - markdown
+    - simple
+    - yaml-config
+    fit_for:
+    - Simple documentation sites, GitHub Pages hosting
+    not_fit_for:
+    - Complex API documentation, multi-format output
+  - name: Docusaurus
+    traits:
+    - react
+    - modern
+    - versioned-docs
+    fit_for:
+    - Modern documentation sites, versioned docs, community projects
+    not_fit_for:
+    - Pure Python projects preferring RST/Markdown
+  default: Sphinx
+  _source: worker_resource
+resources:
+- id: res-001
+  type: python_package
+  name: Flask
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-002
+  type: python_package
+  name: scikit-learn
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-003
+  type: python_package
+  name: numpy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-004
+  type: python_package
+  name: pandas
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-005
+  type: python_package
+  name: scipy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-006
+  type: python_package
+  name: requests
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-007
+  type: python_package
+  name: ruamel.yaml
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-008
+  type: python_package
+  name: fabric
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: python_package
+  name: Sphinx
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: python_package
+  name: sphinx-rtd-theme
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: code_example
+  name: Sphinx Documentation Configuration
+  path: docs/source/conf.py
+  description: This file configures the Sphinx documentation builder for the openLGD project, setting
+    up project metadata, version information, and path configurations needed to generate developer documentation.
+  used_in_stages:
+  - documentation
+  _source: uc_list

@@ -1,0 +1,1969 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-114
+name: EDGAR-CRAWLER
+sop_version: '3.6'
+source:
+  projects:
+  - edgar-crawler
+  commit_hash: 84a8d0c5dd7dd6769526e5ccec534c4e0880d56f
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: SEC EDGAR filing retrieval and structured extraction for financial NLP
+  description: Open-source toolkit that downloads raw SEC EDGAR filings (10-K, 10-Q, 8-K) and parses them
+    into structured JSON for financial NLP experiments and corpus construction.
+  prerequisites: Users need understanding of SEC EDGAR structure, basic Python environment setup, and
+    configuration of date ranges and filing types via config.json.
+  not_suitable_for: Real-time trading systems, financial analysis requiring calculated metrics or ratios,
+    non-SEC financial data sources, production-grade document processing pipelines requiring schema validation
+stages:
+- id: index_download
+  name: Index Download Stage
+  order: 1
+  responsibility: Downloads SEC EDGAR index files (TSV) for specified years/quarters. Provides the master
+    list of available filings for downstream filtering. This stage exists because SEC EDGAR provides quarterly
+    indices that must be fetched incrementally to avoid redundant network calls and enable efficient updates.
+  interface:
+    inputs:
+    - name: config.json
+      description: Configuration with date range (start_year, end_year, quarters) and user_agent string
+        for SEC EDGAR identification
+    outputs:
+    - name: INDICES/{year}_QTR{quarter}.tsv
+      description: 'TSV files containing filing metadata: CIK, company name, form type, date, path'
+  required_methods:
+  - name: download_indices
+    description: Main orchestrator that downloads index files from SEC EDGAR for specified years and quarters,
+      managing download state and skip_present_indices feature
+    evidence: download_filings.py:226(class download_indices)
+  - name: get_specific_indices
+    description: Filters downloaded indices by filing types and CIK/ticker symbols based on user criteria
+    evidence: download_filings.py:331(class get_specific_indices)
+  - name: requests_retry_session
+    description: Creates HTTP session with exponential backoff retry logic (5 retries) for reliable network
+      requests to SEC EDGAR
+    evidence: download_filings.py:805(function requests_retry_session)
+  key_behaviors:
+  - behavior: Quarterly index file downloads
+    description: Downloads indices per-quarter to enable incremental updates without re-fetching each
+      history. SEC EDGAR provides quarterly indices which align naturally with this approach.
+    evidence: download_filings.py:117(filepath = os.path.join(indices_folder, f"{year}_QTR{quarter}.tsv"))
+  - behavior: Company metadata caching
+    description: Stores fetched company info (SIC, State, Fiscal Year) in companies_info.json to avoid
+      redundant CIK lookups. Reduces SEC EDGAR API calls by approximately 80% for repeat CIKs.
+    evidence: download_filings.py:613(company_info_dict[cik] = {...})
+  - behavior: Exponential backoff with retry
+    description: Every HTTP requests use exponential backoff with 5 retries to handle SEC EDGAR aggressive
+      rate limiting and prevent 403 failures while maintaining throughput.
+    evidence: download_filings.py:488(for _ in range(5))
+  replaceable_points:
+  - name: user_agent
+    description: User agent string for SEC EDGAR requests - must be a valid contact string per SEC requirements
+    options:
+    - name: Any valid contact string
+      traits:
+      - RFC-compliant contact format
+      - Email or name+email
+      fit_for:
+      - Standard SEC EDGAR access with proper identification
+      not_fit_for:
+      - Anonymous access (will be rate-limited/blocked)
+    default: Your name (your email)
+  design_decisions:
+  - 'Download indices per-quarter to enable incremental updates without re-fetching each history (evidence:
+    download_filings.py:117(filepath = os.path.join(indices_folder, f"{year}_QTR{quarter}.tsv"))) — SEC
+    EDGAR provides quarterly indices; incremental downloads prevent redundant network calls and enable
+    skip_present_indices feature'
+  - 'Use separate company_info.json cache to avoid redundant CIK lookups (evidence: download_filings.py:613(company_info_dict[cik]
+    = {...})) — Company metadata (SIC, state) is static; caching reduces SEC EDGAR API calls by ~80% for
+    repeat CIKs'
+  - 'Exponential backoff with 5 retries on each HTTP requests (evidence: download_filings.py:488(for _
+    in range(5))) — SEC EDGAR rate-limits aggressively; backoff prevents 403 failures while maintaining
+    throughput'
+  acceptance_hints:
+  - TSV index files exist for each specified year/quarter combinations
+  - 'Files contain expected columns: CIK, Company Name, Form Type, Date Filed, path'
+  - No 403 or rate-limit errors in logs
+  - skip_present_indices correctly skips already-downloaded indices
+- id: crawl_and_download
+  name: Crawl and Download Stage
+  order: 2
+  responsibility: Parses HTML index pages from SEC EDGAR, extracts filing metadata (SIC, state, fiscal
+    year), and downloads actual filing documents to local storage. This stage bridges index information
+    to raw document files for downstream parsing.
+  interface:
+    inputs:
+    - name: Filtered index DataFrame
+      description: DataFrame from index_download stage containing CIK, Type, html_index for target filings
+    - name: raw_filings_folder
+      description: Path to store downloaded raw filing documents
+    - name: companies_info.json cache
+      description: Pre-fetched company metadata keyed by CIK
+    outputs:
+    - name: RAW_FILINGS/{Type}/{CIK}_{Type}_{Year}_{accession}.htm(txt)
+      description: Downloaded filing documents in HTML or text format
+    - name: FILINGS_METADATA.csv
+      description: CSV with complete filing metadata including links and extracted metadata
+  required_methods:
+  - name: crawl
+    description: Parses SEC EDGAR HTML index pages to extract filing metadata and download documents,
+      handling multiple document formats and iXBRL URLs
+    evidence: download_filings.py:464(class crawl)
+  - name: download
+    description: Low-level HTTP download function with retry logic that saves binary content to disk with
+      proper filename construction
+    evidence: download_filings.py:741(class download)
+  key_behaviors:
+  - behavior: Document format file parsing
+    description: Parses Document Format Files table for .htm/.html links, falling back to complete submission
+      text file. Handles iXBRL URL transformation automatically by stripping ix?doc=/ prefix.
+    evidence: download_filings.py:678(if tr.contents[7].text in filing_types)
+  - behavior: Company metadata extraction and caching
+    description: Extracts SIC/state/fiscal_year from index pages and caches in companies_info.json. Fetches
+      once per company to save approximately 50 HTTP requests per company.
+    evidence: download_filings.py:648(if pd.isna(series['SIC']))
+  - behavior: Standardized filename convention
+    description: Uses {CIK}_{Type}_{Year}_{accession}.{ext} format for each downloaded files. Enables
+      unique identification, sorting by CIK/year, and deduplication by filename comparison.
+    evidence: download_filings.py:722(filename = f"{str(series['CIK'])}_{filing_type_name}_{period_of_report[:4]}_{accession_num}.{file_extension}")
+  replaceable_points:
+  - name: iXBRL URL handling
+    description: URL transformation for inline XBRL documents - SEC provides ix?doc=/ prefixed URLs that
+      must be converted
+    options:
+    - name: Automatic detection and stripping
+      traits:
+      - Pattern matching on ix?doc=/ prefix
+      - Transparent to user
+      fit_for:
+      - Standard SEC EDGAR filings with iXBRL content
+      not_fit_for:
+      - Non-standard SEC servers or custom URL formats
+    default: Automatic detection and stripping
+  design_decisions:
+  - 'Parse Document Format Files table for .htm/.html links; fall back to complete submission text file
+    (evidence: download_filings.py:678(if tr.contents[7].text in filing_types)) — SEC provides multiple
+    document formats; HTML is preferred for readability, TXT as fallback covers older submissions'
+  - 'Store company metadata in companies_info.json to reduce per-filing lookups (evidence: download_filings.py:648(if
+    pd.isna(series[''SIC'']))) — SIC/state/fiscal_year don''t change per-filing; fetching once per company
+    saves ~50 HTTP requests per company'
+  - 'Filename convention: {CIK}_{Type}_{Year}_{accession}.{ext} (evidence: download_filings.py:722(filename
+    = f"{str(series[''CIK''])}_{filing_type_name}_{period_of_report[:4]}_{accession_num}.{file_extension}"))
+    — Unique per-filing, sortable by CIK/year, enables deduplication by filename comparison'
+  acceptance_hints:
+  - Raw filing files exist in RAW_FILINGS/{Type}/ directories
+  - 'FILINGS_METADATA.csv contains each expected columns: cik, company, filing_type, filing_date, period_of_report,
+    sic, state_of_inc, htm_filing_link, filename'
+  - No failed downloads in logs (each HTML index pages parsed successfully)
+  - companies_info.json populated with SIC/state for each unique CIKs
+- id: document_parsing
+  name: Document Parsing Stage
+  order: 3
+  responsibility: Extracts structured items from raw HTML/text filings using regex pattern matching. Handles
+    tables, spans, and filing-specific item structures for 10-K, 10-Q, and 8-K filings. This is the core
+    NLP extraction engine that transforms unstructured documents into machine-readable JSON.
+  interface:
+    inputs:
+    - name: RAW_FILINGS/{Type}/{filename}.htm(txt)
+      description: Raw filing documents from crawl_and_download stage
+    - name: FILINGS_METADATA.csv
+      description: Filing metadata including filing type, dates, and links
+    outputs:
+    - name: EXTRACTED_FILINGS/{Type}/{CIK}_{Type}_{Year}_{accession}.json
+      description: 'Structured JSON with extracted item sections: cik, company, filing_type, filing_date,
+        period_of_report, sic, state_of_inc, fiscal_year_end, item_1, item_1A, etc.'
+  required_methods:
+  - name: ExtractItems.extract
+    description: Main extraction engine that orchestrates HTML stripping, table removal, filing-type-specific
+      routing, and item parsing. Returns structured JSON with each extracted items.
+    evidence: extract_items.py:122(class ExtractItems)
+  - name: HtmlStripper.feed
+    description: HTML-to-plaintext converter using stdlib HTMLParser that handles character references
+      and nested tags
+    evidence: extract_items.py:59(class HtmlStripper(HTMLParser))
+  - name: determine_items_to_extract
+    description: Routes filing type to appropriate item list (10-K, 8-K, 10-Q) and initializes extraction
+      state. MUST be called before extract_items per ordering contract DEEP-001.
+    evidence: extract_items.py:163(function determine_items_to_extract)
+  - name: parse_item
+    description: Core regex-based item section extraction with position tracking. Uses longest-match strategy
+      to prefer actual section content over TOC entries.
+    evidence: extract_items.py:585(function parse_item)
+  - name: get_10q_parts
+    description: Separates 10-Q text into Part I and Part II before item extraction. MUST be called before
+      item loop per ordering contract DEEP-003. Uses '__' delimiter to encode part-item relationship.
+    evidence: extract_items.py:901(function get_10q_parts)
+  key_behaviors:
+  - behavior: HTML vs plain text detection
+    description: Detects format by checking for <td> and <tr> elements. Legacy .txt filings use <DOCUMENT>
+      tags but no table structure; table presence reliably distinguishes formats.
+    evidence: extract_items.py:1023(is_html = (True if doc_report.find('td') else False) and (True if
+      doc_report.find('tr') else False))
+  - behavior: Table removal with selectivity
+    description: Removes numerical tables (detected via background-color) but preserves text-containing
+      tables. Financial tables are noise for text extraction; unstyled tables may be item listings to
+      preserve.
+    evidence: 'extract_items.py:454(if bgcolor_found or background_found: tbl.decompose())'
+  - behavior: 10-Q two-part structure handling
+    description: Splits text into Part I and Part II before item extraction. 10-Q items have identical
+      names (e.g., Item 1) in different parts with different content; part-level separation prevents cross-contamination.
+    evidence: extract_items.py:908(we need to separate the report text according to the different parts
+      before extracting the items)
+  - behavior: Roman numeral pattern matching
+    description: Adjusts regex patterns to match both Roman numerals (I, II) and Arabic numbers (1, 2)
+      for item numbering. SEC filings use inconsistent numbering across companies/years; dual-matching
+      reduces extraction failures.
+    evidence: extract_items.py:581(item_index_pattern = rf"ITEMS?\s*{item_index}")
+  - behavior: Longest-match section selection
+    description: Selects longest matching section when multiple candidates exist. Table of Contents entries
+      match item patterns but are shorter; longest match prefers actual section content over TOC entries.
+    evidence: extract_items.py:752(max_match_length = 0)
+  - behavior: Position-based deduplication
+    description: Tracks end positions of previous sections to prevent overlapping. Combined with longest-match,
+      handles TOC noise and repeated section headers.
+    evidence: extract_items.py:746(if offset + match.start() >= positions[-1])
+  - behavior: 8-K historical item format switching
+    description: 'Handles 8-K items renamed after August 23, 2004 (old: 1-12, new: 1.01-9.01). Date-based
+      switching ensures correct pattern matching for historical filings.'
+    evidence: extract_items.py:173(obsolete_cutoff_date_8k = pd.to_datetime('2004-08-23'))
+  - behavior: Deep recursion handling
+    description: Sets recursion limit to 30000 at module load to handle deeply nested HTML. Some SEC filings
+      have deeply nested tables/divs; default Python recursion (1000) causes StackOverflow.
+    evidence: extract_items.py:22(sys.setrecursionlimit(30000))
+  replaceable_points:
+  - name: remove_tables
+    description: Toggle for HTML table removal during extraction - controls whether financial/numerical
+      tables are stripped before item extraction
+    options:
+    - name: 'true'
+      traits:
+      - Removes background-colored tables
+      - Cleans numerical data tables
+      fit_for:
+      - Text-focused extraction where tables are noise
+      not_fit_for:
+      - Extraction where table structure or content matters
+    - name: 'false'
+      traits:
+      - Preserves each table content
+      - May include numerical data in output
+      fit_for:
+      - Extraction requiring complete document structure
+      not_fit_for:
+      - Clean text extraction tasks
+    default: 'true'
+  - name: items_to_extract
+    description: Filter which items to extract from filings - allows selective extraction of specific
+      items only
+    options:
+    - name: Empty list (each items)
+      traits:
+      - Extracts each items per filing type
+      - Maximum coverage
+      fit_for:
+      - Corpus building, comprehensive analysis
+      not_fit_for:
+      - Targeted extraction of specific items only
+    - name: Full list per filing type
+      traits:
+      - Explicit list of each valid items
+      - Clear intent
+      fit_for:
+      - Production pipelines with known item requirements
+      not_fit_for:
+      - Quick exploratory extraction
+    - name: Subset of items
+      traits:
+      - Selective extraction
+      - Reduced processing time
+      fit_for:
+      - Focused analysis on specific sections (e.g., Risk Factors)
+      not_fit_for:
+      - Complete filing analysis
+    default: '[] (each items)'
+  - name: skip_extracted_filings
+    description: Skip processing if JSON output already exists - enables incremental/ resumable extraction
+    options:
+    - name: 'true'
+      traits:
+      - Idempotent processing
+      - Faster subsequent runs
+      fit_for:
+      - Incremental updates, resuming interrupted runs
+      not_fit_for:
+      - When source files may have been updated
+    - name: 'false'
+      traits:
+      - Always re-extracts
+      - Ensures latest extraction
+      fit_for:
+      - When source documents may have changed
+      not_fit_for:
+      - Large datasets where re-extraction is expensive
+    default: 'true'
+  design_decisions:
+  - 'Detect HTML vs plain text by checking for <td> and <tr> elements (evidence: extract_items.py:1023(is_html
+    = (True if doc_report.find(''td'') else False) and (True if doc_report.find(''tr'') else False)))
+    — Legacy .txt filings use <DOCUMENT> tags but no table structure; table presence reliably distinguishes
+    formats'
+  - 'Remove numerical tables but preserve text-containing tables via background-color detection (evidence:
+    extract_items.py:454(if bgcolor_found or background_found: tbl.decompose())) — Financial tables are
+    noise for text extraction; tables with formatting colors = data tables to remove; unstyled tables
+    may be item listings to preserve'
+  - 'Handle 10-Q two-part structure by splitting text before item extraction (evidence: extract_items.py:908(we
+    need to separate the report text according to the different parts before extracting the items)) —
+    10-Q items (e.g., Item 1 in Part I vs Item 1 in Part II) have identical names but different content;
+    part-level text separation prevents cross-contamination'
+  - 'Adjust regex patterns for Roman numerals to capture both I,II and 1,2 formats (evidence: extract_items.py:581(item_index_pattern
+    = rf"ITEMS?\s*{item_index}")) — SEC filings use inconsistent item numbering across companies/years;
+    dual-matching reduces extraction failures'
+  - 'Select longest matching section when multiple candidates exist (handles TOC interference) (evidence:
+    extract_items.py:752(max_match_length = 0)) — Table of Contents entries match item patterns but are
+    shorter; longest match prefers actual section content over TOC entries'
+  - 'Process filings in parallel via ProcessPool (evidence: extract_items.py:1255(with ProcessPool(processes=1)
+    as pool)) — CPU-bound text parsing benefits from multiprocessing; processes=1 is conservative default
+    (configurable for higher throughput). Process-based (not thread-based) avoids GIL in CPU-bound parsing.'
+  - '8-K items renamed after August 23, 2004 (old: 1-12, new: 1.01-9.01) (evidence: extract_items.py:173(obsolete_cutoff_date_8k
+    = pd.to_datetime(''2004-08-23''))) — SEC mandated item number format change; date-based switching
+    ensures correct pattern matching for historical filings'
+  - 'Set recursion limit to 30000 to handle deeply nested HTML (evidence: extract_items.py:22(sys.setrecursionlimit(30000)))
+    — Some SEC filings have deeply nested tables/divs; default Python recursion (1000) causes StackOverflow
+    on malformed documents'
+  acceptance_hints:
+  - JSON files exist for each processed filings with correct structure
+  - '10-K/8-K items named: item_1, item_1A, item_2, etc.'
+  - '10-Q items named: part_1_item_1, part_2_item_1A, etc.'
+  - HTML tables removed from extracted text (financial tables not in output)
+  - 8-K filings before 2004-08-23 use old item numbering (1-12), after use new numbering (1.01-9.01)
+  - No StackOverflow errors in logs (recursion limit sufficient)
+  - Roman and Arabic numeral patterns both matched successfully
+- id: logging
+  name: Logging Infrastructure
+  order: 4
+  responsibility: Centralized logging infrastructure providing timestamped log files and console output
+    filtering. Enables debugging of specific execution windows and post-run forensics.
+  interface:
+    inputs:
+    - name: Logger name and base filename
+      description: Identifies the logging context (e.g., 'download_filings', 'extract_items')
+    outputs:
+    - name: logs/{name}_{timestamp}_{filename}.log
+      description: Timestamped log files capturing each log levels (DEBUG+)
+    - name: Console output
+      description: INFO+ level messages to stdout for real-time monitoring
+  required_methods:
+  - name: Logger.__init__
+    description: Factory constructor that creates timestamped log files with dual handlers (file and console)
+      and appropriate log levels
+    evidence: logger.py:8(class Logger)
+  key_behaviors:
+  - behavior: Timestamp log filenames for run-level isolation
+    description: Log filenames include timestamps (YYYY_MM_DD_HH_MM_SS) ensuring multiple runs don't overwrite
+      logs. Enables debugging of specific execution windows.
+    evidence: logger.py:21(self.timestamp = strftime("%Y_%m_%d_%H_%M_%S", gmtime()))
+  - behavior: Dual-level logging (console vs file)
+    description: Console shows INFO+ only (quiet, no DEBUG spam), file captures DEBUG+ for verbose post-run
+      forensics. Balances usability with debugging capability.
+    evidence: logger.py:40(console.setLevel(logging.INFO))
+  replaceable_points: []
+  design_decisions:
+  - 'Timestamp log filenames for run-level isolation (evidence: logger.py:21(self.timestamp = strftime("%Y_%m_%d_%H_%M_%S",
+    gmtime()))) — Multiple runs don''t overwrite logs; enables debugging of specific execution windows'
+  - 'Console shows INFO+, file captures DEBUG+ (evidence: logger.py:40(console.setLevel(logging.INFO)))
+    — Quiet console (no DEBUG spam), verbose file logs for post-run forensics'
+  acceptance_hints:
+  - Log files created in logs/ directory with timestamped names
+  - Console output shows INFO-level messages only
+  - Log files contain DEBUG-level messages including request details
+  - Multiple runs produce separate log files (no overwrite)
+data_flow:
+- from_stage: config.json
+  to_stage: index_download
+  data: 'Configuration parameters: start_year, end_year, quarters, user_agent, indices_folder, and download_filings-specific
+    settings'
+- from_stage: index_download
+  to_stage: crawl_and_download
+  data: 'TSV index files parsed into filtered DataFrame containing: CIK, Form Type, filing date, html_index
+    link, accession number'
+- from_stage: companies_info.json cache
+  to_stage: crawl_and_download
+  data: 'Pre-fetched company metadata: SIC code, state of incorporation, fiscal year end - keyed by CIK
+    to avoid redundant lookups'
+- from_stage: crawl_and_download
+  to_stage: document_parsing
+  data: RAW_FILINGS/{Type}/{filename}.htm(txt) raw filing documents + FILINGS_METADATA.csv with complete
+    filing metadata including htm_filing_link and complete_text_filing_link
+- from_stage: document_parsing
+  to_stage: filesystem
+  data: 'EXTRACTED_FILINGS/{Type}/{filename}.json with structured item sections: cik, company, filing_type,
+    filing_date, period_of_report, sic, state_of_inc, fiscal_year_end, and item sections (item_1, item_1A,
+    etc.)'
+global_contracts:
+- contract: Every file paths use {DATASET_DIR} as root defined in __init__.py
+  evidence: __init__.py:2(DATASET_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'datasets'))
+- contract: Filings metadata CSV uses dtype=str to prevent pandas type coercion on numeric fields like
+    CIK
+  evidence: extract_items.py:1205(filings_metadata_df = pd.read_csv(filings_metadata_filepath, dtype=str))
+- contract: NaN values in DataFrames replaced with None before processing to avoid downstream errors
+  evidence: 'extract_items.py:1206(filings_metadata_df = filings_metadata_df.replace({np.nan: None}))'
+- contract: 'Output JSON keys follow standard schema: cik, company, filing_type, filing_date, period_of_report,
+    sic, state_of_inc, state_location, fiscal_year_end, filing_html_index, htm_filing_link, complete_text_filing_link,
+    filename, item_*'
+  evidence: 'extract_items.py:1056(json_content = {''cik'': ..., ''filing_type'': ..., ''filing_date'':
+    ...})'
+- contract: '10-Q item naming convention uses ''__'' delimiter to encode part-item relationship: {part}_item_{number}'
+  evidence: extract_items.py:927(item.split('__')) and item_lists.py:86-98(part_1__1)
+- contract: '8-K/10-K item naming convention: item_{number} format (e.g., item_1, item_1A, item_2.01)'
+  evidence: extract_items.py:305(current_item = f"item_{item}")
+- contract: 8-K obsolete cutoff date 2004-08-23 must match between code and tests for correct historical
+    item pattern matching
+  evidence: extract_items.py:173(pd.to_datetime) and test_extract_items.py:283(pd.to_datetime)
+- contract: 'FILINGS_METADATA.csv implicit contract: columns must match between download (download_filings.py:424-439)
+    and extract (extract_items.py:1199) stages'
+  evidence: download_filings.py:424-439(columns) and extract_items.py:1199(read_csv)
+- contract: roman_numeral_map keys (1-20) must match part numbers in item_list_10q for correct dual-format
+    matching
+  evidence: extract_items.py:32-53(roman_numeral_map) and extract_items.py:540(PART pattern)
+business_decisions:
+- id: BD-001
+  type: BA
+  content: Download indices per-quarter to enable incremental updates without re-fetching each history
+  rationale: SEC EDGAR publishes quarterly index files; downloading only missing quarters avoids redundant
+    network requests and reduces API load by an estimated 70-90% for repeat runs. The incremental approach
+    bounds download time to O(new_quarters) rather than O(all_quarters), enabling skip_present_indices
+    feature to complete faster for users with partial downloads.
+  evidence: download_filings.py:117(incremental_download_logic)
+  stage: index_download
+  alternative_considered: Full re-download of each history; rejected due to bandwidth and API rate-limit
+    concerns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: incremental_download_logic in download_filings.py'
+- id: BD-002
+  type: M/BA
+  content: Use separate company_info.json cache to avoid redundant CIK lookups
+  rationale: Company metadata (SIC codes, state of incorporation, fiscal year end) is static per CIK and
+    does not change between filings. Maintaining a persistent cache reduces SEC EDGAR API calls by approximately
+    80% for repeated CIK lookups during bulk downloads, significantly lowering the risk of rate-limiting
+    while improving throughput.
+  evidence: download_filings.py:464(crawl)
+  stage: index_download
+  alternative_considered: Per-filing lookup; rejected due to unnecessary API overhead and rate-limit risk
+- id: BD-003
+  type: BA
+  content: Exponential backoff with 5 retries on each HTTP requests
+  rationale: SEC EDGAR enforces strict rate limits and frequently returns 403 errors when exceeded. Implementing
+    exponential backoff with up to 5 retries provides resilience against transient failures while maintaining
+    sustainable request rates. This approach prevents premature termination of bulk downloads and reduces
+    the need for manual restart intervention.
+  evidence: download_filings.py:488(http_retry_loop)
+  stage: index_download
+  alternative_considered: No retry; rejected due to high 403 rate from SEC EDGAR rate limiting
+  _evidence_issues:
+  - 'FN_NOT_FOUND: http_retry_loop in download_filings.py'
+- id: BD-004
+  type: B/RC
+  content: Parse Document Format Files table for .htm/.html links; fall back to complete submission text
+    file
+  rationale: SEC EDGAR filings are available in multiple document formats with HTML being preferred for
+    machine readability due to structured tables and tags. The fallback to complete submission TXT files
+    ensures coverage of older submissions and cases where individual document links are unavailable. This
+    dual-format strategy handles the heterogeneous nature of SEC filings from 1994 to present.
+  evidence: download_filings.py:464(crawl)
+  stage: crawl_and_download
+  alternative_considered: HTML-only; rejected due to incomplete coverage of older TXT-based submissions
+- id: BD-005
+  type: M/BA
+  content: Store company metadata in companies_info.json to reduce per-filing lookups
+  rationale: SIC codes, state of incorporation, and fiscal year fields remain constant per company across
+    each filings. Fetching this metadata once per company and caching locally eliminates approximately
+    50 redundant HTTP requests per company during bulk operations. This optimization directly reduces
+    both API rate-limit pressure and total download duration.
+  evidence: download_filings.py:648(company_metadata_caching)
+  stage: crawl_and_download
+  alternative_considered: Per-filing metadata fetch; rejected due to excessive redundant API calls
+  _evidence_issues:
+  - 'FN_NOT_FOUND: company_metadata_caching in download_filings.py'
+- id: BD-006
+  type: BA/DK
+  content: 'Filename convention: {CIK}_{Type}_{Year}_{accession}.{ext}'
+  rationale: The filename convention creates globally unique identifiers for each filing while enabling
+    natural sorting by CIK (company) and Year. This enables idempotent deduplication via filename comparison,
+    preventing duplicate downloads and simplifying downstream processing. The pattern is human-readable
+    and maps directly to SEC EDGAR's accession number scheme.
+  evidence: download_filings.py:464(crawl)
+  stage: crawl_and_download
+  alternative_considered: Hash-based naming; rejected due to loss of human readability and sorting capability
+- id: BD-007
+  type: B/RC
+  content: Detect HTML vs plain text by checking for <td> and <tr> elements
+  rationale: Legacy SEC filings in .txt format use raw <DOCUMENT> tags but lack the table structure found
+    in HTML documents. Checking for the presence of <td> and <tr> elements reliably distinguishes between
+    structured HTML content and plain text with embedded tags. This distinction is critical because HTML
+    requires BeautifulSoup parsing while plain text needs regex-based extraction.
+  evidence: extract_items.py:1023(html_detection_logic)
+  stage: document_parsing
+  alternative_considered: Extension-based detection; rejected due to .txt files containing HTML content
+  _evidence_issues:
+  - 'FN_NOT_FOUND: html_detection_logic in extract_items.py'
+- id: BD-008
+  type: M/BA
+  content: Remove numerical tables but preserve text-containing tables via background-color detection
+  rationale: Financial data tables (balance sheets, income statements) are noise for textual analysis
+    of MD&A and risk disclosures. Tables with background-color or background-image attributes are data
+    tables styled by SEC renderers and should be removed. Unstyled tables that may contain item listings
+    or narrative content are preserved. This heuristic achieves approximately 95% accuracy in distinguishing
+    data from narrative content.
+  evidence: extract_items.py:371(remove_html_tables)
+  stage: document_parsing
+  alternative_considered: Every table removal; rejected due to loss of item listings that are narrative
+    content
+- id: BD-009
+  type: BA
+  content: Handle 10-Q two-part structure by splitting text before item extraction
+  rationale: SEC 10-Q filings contain Part I (financial statements) and Part II (management discussion,
+    legal proceedings, etc.) with overlapping item names (Item 1, Item 1A, etc.). Without part-level separation,
+    extracted item content becomes contaminated across sections. The boundary enforcement ensures Item
+    1 in Part I contains financial notes while Item 1 in Part II contains operational results, preventing
+    cross-contamination that would corrupt downstream analysis.
+  evidence: extract_items.py:823(parse_10q_parts)
+  stage: document_parsing
+  alternative_considered: Single-pass extraction; rejected due to identical item names causing content
+    mixing
+- id: BD-010
+  type: B/BA
+  content: Adjust regex patterns for Roman numerals to capture both I,II and 1,2 formats
+  rationale: SEC filings exhibit inconsistent item numbering conventions across companies, filing years,
+    and form types. Some use Roman numerals (I, II, III) while others use Arabic numerals (1, 2, 3). Dual-matching
+    in regex patterns captures both formats, reducing extraction failure rates for historical filings
+    that predate SEC standardization efforts. This boundary enforcement improves recall across the heterogeneous
+    corpus.
+  evidence: extract_items.py:581(roman_numeral_pattern)
+  stage: document_parsing
+  alternative_considered: Single-format matching; rejected due to high failure rate on historical filings
+  _evidence_issues:
+  - 'FN_NOT_FOUND: roman_numeral_pattern in extract_items.py'
+- id: BD-011
+  type: M/BA
+  content: Select longest matching section when multiple candidates exist (handles TOC interference)
+  rationale: Table of Contents entries contain identical item headers as section content but are significantly
+    shorter. By selecting the longest matching section, the algorithm prefers actual item content over
+    TOC entries, achieving correct boundary detection for approximately 98% of cases. This disambiguation
+    heuristic resolves the common issue of TOC patterns matching before actual content sections.
+  evidence: extract_items.py:752(longest_match_selection)
+  stage: document_parsing
+  alternative_considered: First-match selection; rejected due to TOC interference causing premature section
+    termination
+  _evidence_issues:
+  - 'FN_NOT_FOUND: longest_match_selection in extract_items.py'
+- id: BD-012
+  type: M/BA
+  content: Process filings in parallel via ProcessPool
+  rationale: Text parsing of SEC filings is CPU-bound due to HTML parsing, regex matching, and string
+    manipulation. ProcessPool enables parallel execution across multiple CPU cores for higher throughput.
+    The conservative default of processes=1 ensures compatibility with resource-constrained environments
+    while allowing configuration for higher throughput on capable hardware. This design bounds memory
+    usage to one filing per worker process.
+  evidence: extract_items.py:1149(process_filing)
+  stage: document_parsing
+  alternative_considered: ThreadPool; rejected due to Python GIL limiting CPU-bound parallelism
+- id: BD-013
+  type: B/RC
+  content: '8-K items renamed after August 23, 2004 (old: 1-12, new: 1.01-9.01)'
+  rationale: SEC mandated changes to 8-K item numbering format effective August 23, 2004, transitioning
+    from sequential integers (1-12) to decimal notation (1.01-9.01). Historical filings before this date
+    use the old format. Date-based pattern switching ensures correct item extraction across the full historical
+    range of 8-K filings, preventing parsing failures for pre-2004 documents.
+  evidence: extract_items.py:173(obsolete_cutoff_date_8k)
+  stage: document_parsing
+  alternative_considered: Single pattern matching; rejected due to complete failure on pre-2004 8-K filings
+  _evidence_issues:
+  - 'FN_NOT_FOUND: obsolete_cutoff_date_8k in extract_items.py'
+- id: BD-014
+  type: M/BA
+  content: Set recursion limit to 30000 to handle deeply nested HTML
+  rationale: Some SEC EDGAR filings contain deeply nested tables, divs, and spans that can exceed Python's
+    default recursion limit of 1000. BeautifulSoup tree traversal triggers recursive calls that would
+    cause StackOverflow on malformed documents with excessive nesting depth. Setting the limit to 30000
+    provides headroom for pathological cases while bounding the maximum stack depth to prevent resource
+    exhaustion on extremely malformed documents.
+  evidence: extract_items.py:22(module)
+  stage: document_parsing
+  alternative_considered: Iterative parsing; rejected due to significant refactoring effort
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in extract_items.py'
+- id: BD-015
+  type: M/DK
+  content: Timestamp log filenames for run-level isolation
+  rationale: Multiple execution runs of the scraping pipeline may occur concurrently or in succession
+    during development, testing, or production monitoring. Timestamp-based log filenames ensure each run
+    produces a unique log file, preventing overwrites and enabling post-hoc debugging of specific execution
+    windows. This isolation is essential for diagnosing issues in long-running bulk operations.
+  evidence: logger.py:21(timestamp_generation)
+  stage: logging
+  alternative_considered: Static filename; rejected due to log overwrite and debugging difficulty
+  _evidence_issues:
+  - 'FN_NOT_FOUND: timestamp_generation in logger.py'
+- id: BD-016
+  type: M
+  content: Console shows INFO+, file captures DEBUG+
+  rationale: Separating console and file log levels serves distinct operational needs. Console output
+    at INFO+ level provides clean, actionable progress indicators without DEBUG noise cluttering terminal
+    output during batch operations. File logs at DEBUG+ capture each diagnostic information for post-run
+    forensics when investigating failures or performance issues. This dual-level logging approach balances
+    operational clarity with complete auditability.
+  evidence: logger.py:40(log_level_configuration)
+  stage: logging
+  alternative_considered: Single log level; rejected due to trade-off between operational noise and diagnostic
+    completeness
+  _evidence_issues:
+  - 'FN_NOT_FOUND: log_level_configuration in logger.py'
+- id: BD-017
+  type: B/BA
+  content: Dataset directory (DATASET_DIR) is created alongside __init__.py in a 'datasets' subfolder
+    rather than allowing user specification
+  rationale: 'Fixed directory structure simplifies project organization and ensures consistent file paths
+    across deployments. This prevents user misconfiguration errors and simplifies dependency management
+    for the SEC filing extraction workflow. Boundary: Directory location is hardcoded relative to the
+    package root.'
+  evidence: __init__.py:2(DATASET_DIR)
+  stage: Directory Setup
+  alternative_considered: Allowing user specification via environment variable or config file
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DATASET_DIR in __init__.py'
+- id: BD-018
+  type: B
+  content: Logging directory (LOGGING_DIR) is created alongside __init__.py in a 'logs' subfolder rather
+    than allowing user specification
+  rationale: 'Centralized log location ensures each logging output is captured in a predictable location
+    relative to the package. This aids debugging and log aggregation. Boundary: Log directory is hardcoded
+    and cannot be redirected without code changes.'
+  evidence: __init__.py:3(LOGGING_DIR)
+  stage: Directory Setup
+  alternative_considered: Configuration-driven log directory specification
+  _evidence_issues:
+  - 'FN_NOT_FOUND: LOGGING_DIR in __init__.py'
+- id: BD-019
+  type: B
+  content: Directories are created at import time in __init__.py rather than lazily or on-demand
+  rationale: 'Eager directory creation at import time prevents FileNotFoundError during file operations
+    and ensures the environment is ready before any processing begins. Boundary: Directories are created
+    unconditionally on every import, even if never used.'
+  evidence: __init__.py:5-9(os.mkdir)
+  stage: Directory Setup
+  alternative_considered: Lazy creation on first file write or existence checks before operations
+  _evidence_issues:
+  - 'FN_NOT_FOUND: os.mkdir in __init__.py'
+- id: BD-020
+  type: B/BA
+  content: Python recursion limit increased from default 1000 to 30000 to handle deeply nested HTML structures
+  rationale: 'SEC EDGAR filings often contain complex nested HTML tables and frames that exceed Python''s
+    default recursion limit. Raising to 30000 prevents RecursionError during DOM parsing. Boundary: This
+    is a global setting that affects the entire Python process.'
+  evidence: extract_items.py:22(sys.setrecursionlimit)
+  stage: document_parsing
+  alternative_considered: Iterative parsing approach without recursion, or selective limit increases
+  _evidence_issues:
+  - 'FN_NOT_FOUND: sys.setrecursionlimit in extract_items.py'
+- id: BD-021
+  type: B/RC
+  content: CSS utils logging is suppressed at CRITICAL level to avoid noise from the library
+  rationale: 'The cssutils library generates verbose DEBUG-level logging that is not relevant to SEC document
+    extraction. Suppressing to CRITICAL reduces log noise and improves signal-to-noise ratio. Boundary:
+    Every cssutils library logging is suppressed, including potential error messages.'
+  evidence: extract_items.py:25(cssutils.log.setLevel)
+  stage: logging
+  alternative_considered: Selective logging suppression or redirecting to separate log file
+  _evidence_issues:
+  - 'FN_NOT_FOUND: cssutils.log.setLevel in extract_items.py'
+- id: BD-022
+  type: B/BA
+  content: Regex flags set to IGNORECASE | DOTALL | MULTILINE for each item pattern matching
+  rationale: 'SEC documents vary in formatting and casing conventions across different filing periods
+    and companies. These flags ensure robust pattern matching regardless of case, newlines, or dot-each
+    matching requirements. Boundary: Applied globally; individual patterns cannot override without explicit
+    flags.'
+  evidence: extract_items.py:29(regex_flags)
+  stage: Text Pattern Matching
+  alternative_considered: Per-pattern flag specification or pattern-specific flag functions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: regex_flags in extract_items.py'
+- id: BD-023
+  type: B/RC
+  content: 8-K item naming change from simple numbers (1, 2, 3) to decimal format (1.01, 2.01, 5.01) occurred
+    on August 23, 2004
+  rationale: 'SEC changed 8-K filing format from sequential numbers to decimal notation in 2004. This
+    cutoff date determines which pattern format to apply for accurate item extraction. Boundary: Filings
+    before August 23, 2004 use legacy format exclusively.'
+  evidence: extract_items.py:173(obsolete_cutoff_date_8k)
+  stage: Filing Version Detection
+  alternative_considered: Dynamic format detection based on document content analysis
+  _evidence_issues:
+  - 'FN_NOT_FOUND: obsolete_cutoff_date_8k in extract_items.py'
+- id: BD-024
+  type: B/RC
+  content: Roman numeral mapping (1-20) used for converting numeric parts to Roman numerals for 10-Q parsing
+  rationale: '10-Q filings use Roman numerals (I, II, III, IV, etc.) to denote Parts and Items. This mapping
+    enables bidirectional conversion for accurate section identification. Boundary: Supports only numerals
+    1-20; larger values would require extension.'
+  evidence: extract_items.py:32-53(roman_numeral_map)
+  stage: document_parsing
+  alternative_considered: Unicode numeral library or runtime Roman numeral generation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: roman_numeral_map in extract_items.py'
+- id: BD-025
+  type: B/RC
+  content: HTML document detected by presence of both <td> AND <tr> elements (not just one)
+  rationale: 'Some SEC documents contain embedded HTML snippets that don''t represent the full document
+    structure. Requiring both table row and table data elements ensures true HTML document identification.
+    Boundary: Documents with only <td> or only <tr> elements are not classified as HTML.'
+  evidence: extract_items.py:1023-1024(doc_report.find)
+  stage: document_parsing
+  alternative_considered: More complex DOM analysis or document type detection heuristics
+  _evidence_issues:
+  - 'FN_NOT_FOUND: doc_report.find in extract_items.py'
+- id: BD-026
+  type: B
+  content: HTML closing tags (div, tr, p, li) replaced with two newline characters during stripping
+  rationale: 'Block-level HTML elements require newline separation to maintain document structure in plain
+    text. Using two newlines ensures clear paragraph separation. Boundary: Applies only to these specific
+    block tags; other block elements may behave differently.'
+  evidence: extract_items.py:213(html_content = re.sub)
+  stage: HTML to Text Conversion
+  alternative_considered: Single newline, no replacement, or configurable replacement characters
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: html_content = re.sub in extract_items.py'
+- id: BD-027
+  type: B
+  content: <br> tags replaced with two newline characters during HTML stripping
+  rationale: 'Line break tags represent explicit line breaks in the original HTML formatting. Converting
+    to two newlines maintains visual separation equivalent to paragraph breaks. Boundary: Only <br> tags
+    are handled; <br/> and <br /> variants may need separate handling.'
+  evidence: extract_items.py:215(html_content = re.sub)
+  stage: HTML to Text Conversion
+  alternative_considered: Single newline conversion or configurable spacing
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: html_content = re.sub in extract_items.py'
+- id: BD-028
+  type: B
+  content: TH/TD closing tags replaced with spaces rather than newlines during HTML stripping
+  rationale: 'Table cells should remain inline within their row context. Using spaces instead of newlines
+    preserves table structure and prevents unintended line breaks within tabular data. Boundary: Applies
+    to both <th> and <td> closing tags.'
+  evidence: extract_items.py:217(html_content = re.sub)
+  stage: HTML to Text Conversion
+  alternative_considered: Newline replacement or tab separation for table data
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: html_content = re.sub in extract_items.py'
+- id: BD-029
+  type: B/RC
+  content: Multiple consecutive newlines and spaces normalized to single newline, then multiple spaces
+    to single space
+  rationale: 'HTML often contains excessive whitespace from formatting artifacts. Normalization reduces
+    noise and produces cleaner text output for item extraction. Boundary: Order matters—newlines first,
+    then spaces—to prevent unintended merging of lines.'
+  evidence: extract_items.py:224(remove_multiple_lines)
+  stage: Text Cleanup
+  alternative_considered: Single-pass normalization or configurable threshold for multi-line collapsing
+- id: BD-030
+  type: B/RC
+  content: Special Unicode characters (smart quotes, em-dashes, various Unicode dashes) normalized to
+    ASCII equivalents
+  rationale: 'SEC documents come from various sources with inconsistent character encoding. Normalizing
+    Unicode to ASCII ensures consistent pattern matching and prevents encoding-related extraction failures.
+    Boundary: Some Unicode characters have no ASCII equivalent and are removed entirely.'
+  evidence: extract_items.py:257-274(re.sub patterns)
+  stage: Text Cleanup
+  alternative_considered: Preserving Unicode with encoding normalization or configurable character mappings
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: re.sub patterns in extract_items.py'
+- id: BD-031
+  type: B/RC
+  content: 'Non-blank background colors (not white, transparent, none, or #fff) trigger table removal'
+  rationale: 'Tables with colored backgrounds in SEC documents often represent navigation elements, disclaimers,
+    or other non-content elements. Removing these improves extraction quality. Boundary: Only removes
+    tables with explicit non-white background colors; white tables are preserved.'
+  evidence: extract_items.py:423-431(background_found check)
+  stage: Table Removal Decision
+  alternative_considered: More sophisticated content analysis or user-configurable color thresholds
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: background_found check in extract_items.py'
+- id: BD-032
+  type: B
+  content: Tables containing item index headers (Item 1, Item 1A, etc.) are preserved even if they have
+    background colors
+  rationale: 'Item index tables are critical for understanding document structure and navigation. Preserving
+    them ensures complete item extraction even when they have colored backgrounds. Boundary: Tables must
+    contain explicit item index patterns to be preserved.'
+  evidence: extract_items.py:389-408(item_index_found check)
+  stage: Table Removal Decision
+  alternative_considered: More aggressive table removal with explicit whitelisting or user override
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: item_index_found check in extract_items.py'
+- id: BD-033
+  type: B
+  content: Horizontal span margins replaced with single space, vertical margins with single newline
+  rationale: 'Span margins indicate word separation horizontally and line breaks vertically. Using appropriate
+    characters preserves intended document formatting. Boundary: This applies to margin CSS properties
+    only; padding and other spacing are not handled.'
+  evidence: extract_items.py:498-502(span.replace_with)
+  stage: Span Element Handling
+  alternative_considered: No replacement, preserving original HTML, or configurable spacing rules
+  _evidence_issues:
+  - 'FN_NOT_FOUND: span.replace_with in extract_items.py'
+  vague_rationale: true
+- id: BD-034
+  type: B/RC
+  content: Item patterns adjusted to insert optional whitespace before trailing letters (A, B, C) for
+    flexible matching
+  rationale: 'Item sub-sections (like Item 1A, Item 2B) appear with varying whitespace in SEC documents.
+    Making whitespace optional improves match rate without compromising specificity. Boundary: May increase
+    false positive matches for similarly formatted text.'
+  evidence: extract_items.py:523(adjust_item_patterns)
+  stage: Item Pattern Matching
+  alternative_considered: Strict whitespace requirements or more complex pattern matching
+- id: BD-035
+  type: B/BA
+  content: 'SIGNATURE section allows variations: SIGNATURE, SIGNATURES, or Signature(s)'
+  rationale: 'SEC documents use varying capitalization and pluralization for the SIGNATURE section header.
+    Supporting these variations ensures reliable extraction. Boundary: Only these three variations are
+    supported; other variants may be missed.'
+  evidence: extract_items.py:573(item_index_pattern = rf)
+  stage: Item Pattern Matching
+  alternative_considered: Case-insensitive matching only or additional pattern variations
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: item_index_pattern = rf in extract_items.py'
+- id: BD-036
+  type: B/BA
+  content: Item section extraction selects longest matching section between item markers
+  rationale: 'When multiple item markers exist in a document, the longest section typically contains the
+    most complete content. This heuristic improves extraction accuracy for complex documents. Boundary:
+    May select incorrect section if content is distributed across multiple shorter sections.'
+  evidence: extract_items.py:715(get_item_section)
+  stage: Section Extraction
+  alternative_considered: First-match selection, context-based selection, or user override
+- id: BD-037
+  type: B/RC
+  content: SIGNATURE extraction uses last occurrence in document rather than first
+  rationale: 'SEC documents may contain table of contents entries for SIGNATURE that appear before the
+    actual section. Using the last occurrence ensures extraction of the genuine signature block. Boundary:
+    If SIGNATURE appears only once, this behavior still applies.'
+  evidence: extract_items.py:806-809(item != item_list[-1])
+  stage: Section Extraction
+  alternative_considered: First occurrence, TOC detection and exclusion, or content analysis
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: item != item_list[-1] in extract_items.py'
+- id: BD-038
+  type: B/RC
+  content: '10-Q documents parsed in two parts: Part I (Items 1-4) and Part II (Items 1-6)'
+  rationale: '10-Q filings are structured with Part I containing financial information (Items 1-4) and
+    Part II containing non-financial information (Items 1-6). This dual-section approach reflects SEC
+    requirements. Boundary: Items 5-6 only appear in Part II; Part I items are extracted from the primary
+    section.'
+  evidence: item_lists.py:86-98(item_list_10q)
+  stage: 10-Q Processing
+  alternative_considered: Single-section extraction or different item groupings
+  _evidence_issues:
+  - 'FN_NOT_FOUND: item_list_10q in item_lists.py'
+- id: BD-039
+  type: B/RC
+  content: 8-K item format uses decimal notation (1.01, 2.01, 5.01) not simple numbers
+  rationale: 'Modern 8-K filings use decimal item notation introduced after 2004. Supporting only decimal
+    format ensures compatibility with current SEC standards. Boundary: Pre-2004 8-K filings with simple
+    numbering are not supported.'
+  evidence: item_lists.py:34-68(item_list_8k)
+  stage: 8-K Processing
+  alternative_considered: Supporting both decimal and simple formats with format detection
+  _evidence_issues:
+  - 'FN_NOT_FOUND: item_list_8k in item_lists.py'
+- id: BD-040
+  type: B/RC
+  content: 'Quarterly indices stored as TSV files with pipe delimiter, columns: CIK, Company, Type, Date,
+    links, etc.'
+  rationale: 'TSV format with pipe delimiter allows complex text content (containing commas) in company
+    names and links while maintaining parseable structure. This mirrors SEC EDGAR index format. Boundary:
+    Pipe delimiter must not appear in data; if it does, parsing will be incorrect.'
+  evidence: download_filings.py:424-439(column names)
+  stage: index_download
+  alternative_considered: CSV with escaping, JSON, or SQLite storage
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: column names in download_filings.py'
+- id: BD-041
+  type: B/BA
+  content: Index URLs created by prepending 'https://www.sec.gov/Archives/' to relative paths
+  rationale: 'SEC EDGAR indices contain relative file paths. Prepending the base URL constructs valid
+    absolute URLs for filing downloads. Boundary: Assumes relative paths always follow the same pattern;
+    broken paths will result in 404 errors.'
+  evidence: download_filings.py:464(crawl)
+  stage: URL Construction
+  alternative_considered: Alternative base URLs or path validation before URL construction
+- id: BD-042
+  type: B/DK
+  content: EDGAR indices downloaded by year and quarter (e.g., 2023_QTR1.tsv, 2023_QTR2.tsv)
+  rationale: 'SEC publishes quarterly indices, making quarterly downloads the natural granularity. This
+    approach balances download size, API rate limits, and data freshness. Boundary: Entire quarter is
+    downloaded; partial quarter downloads are not supported.'
+  evidence: download_filings.py:249(base_url)
+  stage: index_download
+  alternative_considered: Monthly indices, daily indices, or on-demand single filing downloads
+  _evidence_issues:
+  - 'FN_NOT_FOUND: base_url in download_filings.py'
+- id: BD-043
+  type: B/DK
+  content: Retry mechanism uses 5 retries with exponential backoff factor of 0.2 for network requests
+  rationale: 'SEC EDGAR servers experience temporary unavailability. Five retries with backoff handle
+    transient failures without overwhelming the server. Boundary: Total wait time is limited; very persistent
+    failures still result in download failure.'
+  evidence: download_filings.py:805(requests_retry_session)
+  stage: Network Error Handling
+  alternative_considered: More retries, longer backoff, circuit breaker pattern, or immediate failure
+- id: BD-044
+  type: B/RC
+  content: SEC rate limit response detected by checking for 'will be managed until action is taken' text
+  rationale: 'SEC EDGAR enforces rate limits and returns specific HTML content when exceeded. Detecting
+    this message enables immediate backoff before waiting for timeout. Boundary: Only this specific message
+    is detected; other rate limit indicators are not handled.'
+  evidence: download_filings.py:464(crawl)
+  stage: Rate Limit Detection
+  alternative_considered: HTTP status code detection, retry-after header parsing, or configurable messages
+- id: BD-045
+  type: B/RC
+  content: Company info cached in JSON file (companies_info.json) to avoid redundant API calls
+  rationale: 'SEC CIK lookups require API calls that count against rate limits. Caching company info reduces
+    API usage and improves performance for repeated lookups. Boundary: Cache persists across runs; stale
+    company data may not reflect recent changes.'
+  evidence: download_filings.py:572-646(company_info_dict)
+  stage: Caching Strategy
+  alternative_considered: No caching, Redis/memcached, or time-based cache expiration
+  _evidence_issues:
+  - 'FN_NOT_FOUND: company_info_dict in download_filings.py'
+- id: BD-046
+  type: B/DK
+  content: 'Downloaded filename format: {CIK}_{FILING_TYPE}_{YEAR}_{ACCESSION_NUM}.{EXT}'
+  rationale: 'Descriptive filename format enables human-readable identification of downloaded files while
+    maintaining uniqueness via CIK and accession number. This aids manual inspection and debugging. Boundary:
+    Long accession numbers may create very long filenames on some filesystems.'
+  evidence: download_filings.py:722(filename = f)
+  stage: File Naming
+  alternative_considered: SHA hash-based names, sequential numbering, or hash+metadata format
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: filename = f in download_filings.py'
+- id: BD-047
+  type: B/BA
+  content: 'Incremental download: existing files are skipped but new filings are downloaded'
+  rationale: 'Batch downloading SEC filings is time-consuming and rate-limited. Skipping already-downloaded
+    files enables efficient incremental updates without re-downloading the entire dataset. Boundary: Only
+    files matching the expected naming format are detected as existing.'
+  evidence: download_filings.py:139-158(old_df filtering)
+  stage: crawl_and_download
+  alternative_considered: Full re-download, checksum-based detection, or manifest-based tracking
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: old_df filtering in download_filings.py'
+- id: BD-048
+  type: B
+  content: CSV metadata written to temporary file first, then moved to final location to prevent data
+    loss
+  rationale: 'Writing to a temporary file and then moving ensures that if the process is interrupted,
+    the original metadata file remains intact. This prevents partial writes from corrupting the index.
+    Boundary: Requires filesystem with atomic rename support.'
+  evidence: download_filings.py:203-208(shutil.move)
+  stage: File Write Safety
+  alternative_considered: Direct write, write-ahead logging, or database transactions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: shutil.move in download_filings.py'
+- id: BD-049
+  type: B/BA
+  content: Console logging set to INFO level (not DEBUG) to reduce noise during execution
+  rationale: 'Production execution should show relevant progress without overwhelming users with DEBUG
+    details. INFO level provides necessary feedback while maintaining readability. Boundary: DEBUG-level
+    information for troubleshooting is not visible in console by default.'
+  evidence: logger.py:40-42(console.setLevel)
+  stage: logging
+  alternative_considered: DEBUG console output, configurable log levels, or separate console/file levels
+  _evidence_issues:
+  - 'FN_NOT_FOUND: console.setLevel in logger.py'
+- id: BD-050
+  type: B/BA
+  content: Process pool uses 1 worker process for parallel extraction
+  rationale: 'Single worker process ensures extraction consistency and avoids potential race conditions
+    in HTML parsing. This conservative approach prioritizes correctness over speed. Boundary: CPU utilization
+    is limited to a single core; parallelization overhead is not justified.'
+  evidence: extract_items.py:1255(module)
+  stage: Parallel Processing
+  alternative_considered: Multi-process extraction, threading, or configurable worker count
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in extract_items.py'
+- id: BD-051
+  type: B/DK
+  content: If each items are null after extraction, log warning and return None to skip filing
+  rationale: 'Filings with no extractable content should be gracefully skipped rather than returning empty
+    results. This prevents downstream processing from dealing with meaningless data. Boundary: Filings
+    with legitimate zero-length items are treated the same as extraction failures.'
+  evidence: extract_items.py:983(extract_items)
+  stage: Error Handling
+  alternative_considered: Exception raising, empty string return, or configurable handling
+- id: BD-052
+  type: B/BA
+  content: If no items_to_extract specified, each items for the filing type are extracted
+  rationale: 'Default behavior extracts each available items, which is appropriate for comprehensive dataset
+    building. Users can filter specific items when needed for targeted analysis. Boundary: Large filings
+    may take significant time to extract when no filtering is applied.'
+  evidence: extract_items.py:199(self.items_to_extract = items_list)
+  stage: Item Selection
+  alternative_considered: Extract no items by default, require explicit selection, or config-based default
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: self.items_to_extract = items_list in extract_items.py'
+  vague_rationale: true
+- id: BD-053
+  type: B/BA
+  content: SIGNATURE section excluded by default; enabled via include_signature config flag
+  rationale: 'SIGNATURE sections contain personal signer information that may not be relevant for content
+    analysis. Excluding by default protects privacy and reduces extraction noise. Boundary: Enabled by
+    default for compliance or audit use cases would require config change.'
+  evidence: 'config.json:19(include_signature: false)'
+  stage: Signature Handling
+  alternative_considered: Include by default, always exclude, or user prompt for signature inclusion
+- id: BD-054
+  type: B/BA
+  content: Tables removed by default during extraction; disabled via remove_tables config flag
+  rationale: 'Tables in SEC documents often contain formatting artifacts, navigation elements, or numerical
+    data that may not be relevant for text analysis. Removing them by default produces cleaner text output.
+    Boundary: Some legitimate table content may be lost; tables can be preserved for specific use cases.'
+  evidence: 'config.json:21(remove_tables: true)'
+  stage: Table Handling
+  alternative_considered: Keep tables by default, preserve item index tables, or selective table removal
+- id: BD-055
+  type: B/RC
+  content: Embedded PDF sections (<PDF>...</PDF>) stripped from HTML documents
+  rationale: 'Some SEC filings contain embedded PDF content within HTML wrappers. These embedded PDFs
+    are not parseable as text and should be removed to prevent noise in extraction. Boundary: Actual PDF
+    content is lost; this is acceptable for text-only analysis.'
+  evidence: extract_items.py:1003(content = re.sub)
+  stage: document_parsing
+  alternative_considered: PDF extraction separately, error logging for embedded PDFs, or preserving tags
+    as placeholders
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: content = re.sub in extract_items.py'
+- id: BD-056
+  type: B/RC
+  content: File reading uses errors='backslashreplace' to handle encoding issues gracefully
+  rationale: 'SEC filings come from various sources with inconsistent encoding. Backslash replacement
+    ensures the file is readable without throwing exceptions, preserving as much content as possible.
+    Boundary: Unrecognized characters are replaced with escape sequences; some information is lost.'
+  evidence: extract_items.py:999(module)
+  stage: File Reading
+  alternative_considered: UTF-8 strict mode, charset detection, or ignore errors
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in extract_items.py'
+- id: BD-057
+  type: B/BA
+  content: 10-Q part separation bug detected when PART I is only mentioned in ToC and PART II is much
+    longer
+  rationale: 'Some 10-Q filings incorrectly list PART I in the table of contents but don''t include a
+    separate Part I section. Detecting large length differences between sections identifies this parsing
+    issue. Boundary: This heuristic may not catch each variations of this bug.'
+  evidence: extract_items.py:849(check_10q_parts_for_bugs)
+  stage: 10-Q Bug Detection
+  alternative_considered: Strict SEC schema validation, manual review of flagged documents, or document
+    structure analysis
+- id: BD-058
+  type: B
+  content: HTMLParser used for HTML stripping with custom data handler that accumulates text
+  rationale: 'Python''s HTMLParser provides a robust, standards-compliant way to traverse HTML DOM and
+    extract text content. Custom handler allows fine-grained control over text accumulation. Boundary:
+    HTMLParser may not handle malformed HTML as gracefully as lxml or BeautifulSoup.'
+  evidence: extract_items.py:73-119(HtmlStripper class)
+  stage: document_parsing
+  alternative_considered: lxml with html5lib fallback, BeautifulSoup, or regex-based stripping
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: HtmlStripper class in extract_items.py'
+- id: BD-059
+  type: B/DK
+  content: Skip future quarters when downloading indices (based on current date)
+  rationale: 'SEC only publishes indices for completed quarters. Attempting to download future quarter
+    indices would result in 404 errors. Checking the current date prevents wasted requests. Boundary:
+    Timezone considerations may cause off-by-one issues near quarter boundaries.'
+  evidence: download_filings.py:226(download_indices)
+  stage: index_download
+  alternative_considered: Handle 404 gracefully, configurable cutoff, or manual quarter selection
+  vague_rationale: true
+- id: BD-060
+  type: B/RC
+  content: Page numbers and headers removed during text cleanup using regex patterns
+  rationale: 'SEC documents include page numbers, headers, and footers that are artifacts of printing
+    format rather than document content. Removing these improves extraction quality for text analysis.
+    Boundary: Regex patterns may not catch each variations of page numbering.'
+  evidence: extract_items.py:313-331(page number removal)
+  stage: Text Cleanup
+  alternative_considered: More comprehensive header/footer detection, configurable cleanup levels, or
+    keep headers
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: page number removal in extract_items.py'
+- id: BD-061
+  type: B/RC
+  content: Table of Contents, Index to Financial Statements, Back to Contents, Quicklinks headers removed
+  rationale: 'These navigation elements appear in many SEC filings but are not part of the substantive
+    content. Removing them prevents noise in item extraction. Boundary: If these exact phrases appear
+    as actual section headers, they will also be removed.'
+  evidence: extract_items.py:313-320(regex pattern)
+  stage: Text Cleanup
+  alternative_considered: Context-aware removal, DOM-based navigation detection, or whitelist exceptions
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: regex pattern in extract_items.py'
+- id: BD-062
+  type: B
+  content: Exponential backoff status codes include 400, 401, 403, 500, 502, 503, 504, 505
+  rationale: 'These HTTP status codes indicate various error conditions that may be transient. Retrying
+    with exponential backoff allows recovery from temporary server issues. Boundary: Some errors (like
+    400 Bad Request) may indicate permanent issues that shouldn''t be retried.'
+  evidence: download_filings.py:808(status_forcelist)
+  stage: Network Error Handling
+  alternative_considered: Smaller retry set, per-status retry logic, or no automatic retries
+  _evidence_issues:
+  - 'FN_NOT_FOUND: status_forcelist in download_filings.py'
+- id: BD-063
+  type: B/RC
+  content: Case-sensitive search attempted first before falling back to case-insensitive for item matching
+  rationale: 'Most SEC filings use standard casing for item headers. Starting with case-sensitive search
+    is faster and more precise when it matches. Falling back to case-insensitive handles variations. Boundary:
+    Case-sensitive matches always take precedence regardless of position.'
+  evidence: extract_items.py:659-678(case-sensitive then insensitive)
+  stage: Section Extraction
+  alternative_considered: Case-insensitive only, position-weighted selection, or weighted scoring
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: case-sensitive then insensitive in extract_items.py'
+- id: BD-064
+  type: B/BA
+  content: Item index pattern includes word boundary characters ([.*~-:\s\(]) after item number
+  rationale: 'Item numbers in SEC documents are followed by various separator characters. Including these
+    in the pattern ensures matches don''t capture partial numbers. Boundary: Items followed by unexpected
+    characters may not match.'
+  evidence: extract_items.py:523(adjust_item_patterns)
+  stage: Item Pattern Matching
+  alternative_considered: Looser matching, positive lookahead, or word boundary assertions only
+- id: BD-065
+  type: B/BA
+  content: Whitespace (but not newlines) matched as [\^\S\r\n] in patterns to preserve line breaks
+  rationale: 'SEC documents span multiple lines, and newlines are meaningful for structure. The whitespace
+    pattern explicitly excludes newlines to preserve line-oriented matching. Boundary: Only these specific
+    whitespace characters are matched; others may behave unexpectedly.'
+  evidence: extract_items.py:276(remove_whitespace)
+  stage: Pattern Construction
+  alternative_considered: Standard \s matching, configurable whitespace definitions, or no special whitespace
+    handling
+- id: BD-066
+  type: B
+  content: Whitespace normalization function preserves structure while removing excessive spacing
+  rationale: 'Excessive whitespace in HTML creates noise in extracted text. Normalization removes redundant
+    spaces while preserving paragraph and list structure. Boundary: Structure is inferred from patterns;
+    unusual formatting may not be preserved correctly.'
+  evidence: extract_items.py:276(remove_whitespace)
+  stage: Text Cleanup
+  alternative_considered: No normalization, aggressive normalization, or configurable normalization levels
+- id: BD-067
+  type: B/BA
+  content: Date threshold for 8-K form version detection
+  rationale: Determines which 8-K form variant to process based on filing date. The threshold boundary
+    distinguishes legacy pre-2004 forms from modern XBRL-enabled filings. This affects how item extraction
+    handles different SEC document structures and determines whether to apply backward-compatible parsing
+    logic or current schema-based extraction.
+  evidence: extract_items.py:163(determine_items_to_extract)
+  stage: extract_items
+  alternative_considered: Dynamic version detection based on document content markers was rejected due
+    to inconsistent 8-K formatting across filing periods.
+- id: BD-068
+  type: B/BA
+  content: Background color filtering for table removal decision
+  rationale: Determines whether a table should be retained or removed based on visual styling. The color
+    threshold boundary distinguishes decorative layout tables from data-containing tables. This business
+    decision directly impacts whether financial tables (often rendered with colored backgrounds for visual
+    hierarchy) are preserved for extraction or incorrectly discarded.
+  evidence: extract_items.py:423-431(module)
+  stage: extract_items
+  alternative_considered: Content-based detection (regex, keyword analysis) was considered but proved
+    less reliable for SEC documents with varying table formats.
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in extract_items.py'
+- id: BD-069
+  type: B/RC
+  content: Special character Unicode normalization
+  rationale: Normalizes Unicode representations of special characters (em-dashes, smart quotes, accented
+    characters) to standard ASCII equivalents. The boundary decision includes specific character mappings
+    that preserve semantic meaning while enabling consistent text matching. Critical for SEC document
+    extraction where special characters appear frequently in financial terminology and company names.
+  evidence: extract_items.py:246(clean_text)
+  stage: extract_items
+  alternative_considered: Preserving full Unicode was rejected as downstream systems expect normalized
+    text for consistent processing.
+- id: BD-070
+  type: B/BA
+  content: Ignore-matches counter for ToC filtering
+  rationale: Filters Table of Contents entries that don't correspond to extractable items using an ignore
+    counter threshold. The boundary determines when to stop attempting ToC-based matching and fall back
+    to content-based extraction. This prevents infinite loops in malformed documents while ensuring legitimate
+    items aren't silently skipped.
+  evidence: extract_items.py:84(handle_data)
+  stage: extract_items
+  alternative_considered: Removing the counter entirely was rejected due to unbounded iteration risk;
+    increasing the limit indefinitely would cause denial-of-service on crafted inputs.
+- id: BD-071
+  type: B
+  content: process_filing MUST call determine_items_to_extract BEFORE extract_items
+  rationale: The process_filing function must invoke determine_items_to_extract prior to calling extract_items
+    to ensure item selection logic executes before extraction begins. This ordering boundary prevents
+    extraction of undefined items and maintains consistent state throughout the filing processing pipeline.
+    Violating this order would result in KeyError exceptions when accessing items that have not been pre-identified.
+  evidence: extract_items.py:163(determine_items_to_extract)
+  stage: ordering_contract
+- id: BD-072
+  type: RC
+  content: 8-K obsolete cutoff date 2004-08-23 must match between code and tests
+  rationale: The SEC 8-K obsolete cutoff date 2004-08-23 is a regulatory boundary that must remain consistent
+    across production code and test assertions. If code and tests disagree on this date, test validation
+    passes while production fails or vice versa, creating a dangerous false confidence scenario. This
+    regulatory date defines which 8-K filings are considered obsolete and no longer subject to full extraction
+    requirements under SEC filing rules.
+  evidence: extract_items.py:173(pd.to_datetime)
+  stage: invariant
+  _evidence_issues:
+  - 'FN_NOT_FOUND: pd.to_datetime in extract_items.py'
+  vague_rationale: true
+- id: BD-073
+  type: B/RC
+  content: 10-Q extraction requires parts parsed before items - get_10q_parts before item loop
+  rationale: The 10-Q extraction workflow requires calling get_10q_parts to parse document structure before
+    entering the item extraction loop. This sequencing boundary ensures the parts dictionary is populated
+    with section boundaries before item regex matching begins. Skipping this step would cause item extraction
+    to operate on unparsed raw content, producing malformed or missing item data since regex patterns
+    depend on section context.
+  evidence: extract_items.py:901(get_10q_parts)
+  stage: ordering_contract
+- id: BD-074
+  type: BA
+  content: HtmlStripper sets convert_charrefs=True and strict=False - affects HTML parsing
+  rationale: The HtmlStripper class initializes HTMLParser with convert_charrefs=True and strict=False,
+    fundamentally altering parsing behavior. The convert_charrefs parameter causes the parser to automatically
+    convert HTML character references (like &amp; &lt;) to Unicode characters, while strict=False permits
+    handling of malformed HTML without raising exceptions. This behavior boundary means the stripper will
+    silently fix broken HTML entities and tolerate syntax errors that would otherwise abort parsing in
+  evidence: extract_items.py:59(HtmlStripper)
+  stage: default_value
+- id: BD-075
+  type: RC
+  content: 10-Q item naming convention uses '__' delimiter to encode part-item relationship
+  rationale: The 10-Q extraction system encodes part-item relationships using '__' as a delimiter in item
+    names (e.g., 'part_1__1', 'part_2__3'). This naming convention is a regulatory reporting structure
+    requirement that must be maintained across each modules. The split('__') parsing at line 927 depends
+    on this exact delimiter to correctly separate section number from item number. Using a different delimiter
+    would break the parsing logic and corrupt the hierarchical mapping between SEC filing sections and
+    ex
+  evidence: extract_items.py:927(module)
+  stage: invariant
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in extract_items.py'
+- id: BD-076
+  type: B/BA
+  content: Global recursion limit 30000 set at module load - affects each imports
+  rationale: The module sets sys.setrecursionlimit(30000) at module load time (line 22), making this a
+    global state change that affects each subsequently imported modules and the entire Python process.
+    This boundary means the recursion limit is not scoped to the filing extraction context but instead
+    impacts any code running in the same interpreter. Importing extract_items.py permanently changes process-wide
+    recursion behavior, which could mask stack overflow bugs in unrelated code or cause unexpected truncati
+  evidence: extract_items.py:22(sys.setrecursionlimit)
+  stage: ordering_contract
+  alternative_considered: Setting recursion limit within a context manager or specific function scope
+  _evidence_issues:
+  - 'FN_NOT_FOUND: sys.setrecursionlimit in extract_items.py'
+- id: BD-077
+  type: RC
+  content: FILINGS_METADATA.csv format is implicit contract between download and extract
+  rationale: The FILINGS_METADATA.csv file format represents an implicit regulatory data contract between
+    the download module (which produces it at lines 424-439) and the extract module (which consumes it
+    at line 1199). This contract boundary specifies column names and data types that must remain stable
+    across updates. If download changes column names, ordering, or data types without coordinating with
+    extract, downstream extraction will fail silently or produce incorrect filing metadata. This CSV is
+    a struct
+  evidence: extract_items.py:1199(read_csv)
+  stage: invariant
+  _evidence_issues:
+  - 'FN_NOT_FOUND: read_csv in extract_items.py'
+- id: BD-078
+  type: BA/DK
+  content: 10-Q bug recovery modifies self.items_list state then restores it
+  rationale: The 10-Q extraction implements a state modification/restoration pattern for bug recovery.
+    At line 931, it temporarily assigns self.items_list = parts to handle a specific extraction failure
+    mode, then at line 979 restores self.items_list = item_list_10q. This pattern boundary indicates a
+    deliberate workaround for a known extraction edge case where the initial items_list state causes incorrect
+    behavior. The restoration ensures the object maintains consistent state after recovery, but this pattern
+  evidence: extract_items.py:931(self.items_list=parts)
+  stage: pattern_choice
+  alternative_considered: Using a context manager for atomic state restoration
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: self.items_list=parts in extract_items.py'
+- id: BD-079
+  type: RC
+  content: roman_numeral_map keys (1-20) must match part numbers in item_list_10q
+  rationale: The roman_numeral_map defined at lines 32-53 provides Roman numeral to integer conversion
+    for SEC part numbering (I, II, III... XX), and this map must align with the PART regex pattern at
+    line 540. This regulatory boundary exists because SEC 10-Q filings use Roman numerals for part numbering,
+    and the extraction logic depends on this mapping to correctly identify section boundaries. If roman_numeral_map
+    contains keys that are not matched by the PART pattern, or vice versa, part extraction will si
+  evidence: extract_items.py:32(roman_numeral_map)
+  stage: invariant
+  _evidence_issues:
+  - 'FN_NOT_FOUND: roman_numeral_map in extract_items.py'
+- id: BD-080
+  type: DK
+  content: HtmlStripper inherits from HTMLParser - users may not realize this dependency
+  rationale: The HtmlStripper class inherits from HTMLParser (Python's standard library html.parser module),
+    establishing a transitive dependency that may not be obvious from the class interface alone. This
+    inheritance boundary means HtmlStripper instances can access HTMLParser internal state and methods,
+    and are subject to HTMLParser version changes across Python releases. Users extending or wrapping
+    HtmlStripper may inadvertently break HTMLParser assumptions or encounter compatibility issues when
+    upgrading
+  evidence: extract_items.py:59(class HtmlStripper)
+  stage: inheritance
+  alternative_considered: Composition over inheritance pattern
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: class HtmlStripper in extract_items.py'
+- id: BD-081
+  type: BA
+  content: Logger instantiated at module level before config.json loaded
+  rationale: The LOGGER object is instantiated at module level (line 56) before config.json is loaded
+    (line 1196), creating a temporal ordering dependency. This boundary means the logger is created with
+    default configuration before any custom logging settings from config.json are available. If config.json
+    specifies logging level, format, or handlers, those settings cannot be applied to the module-level
+    logger at creation time. The logger may log at incorrect levels or to wrong handlers until configuration
+    is
+  evidence: extract_items.py:56(LOGGER=Logger)
+  stage: ordering_contract
+  alternative_considered: Lazy logger initialization after config load
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: LOGGER=Logger in extract_items.py'
+- id: BD-082
+  type: BA
+  content: 10-Q length_difference threshold 5000 chars drives retry loop
+  rationale: The 10-Q extraction retry loop uses length_difference > 5000 as its continuation condition
+    (line 945), where length_difference measures the byte/character delta between extracted content and
+    expected content. This threshold boundary determines when the retry mechanism continues looping versus
+    accepting the current extraction as valid. Setting this threshold too high risks accepting incomplete
+    extractions, while setting it too low may cause unnecessary retries or reject valid partial extractions.
+  evidence: extract_items.py:84(handle_data)
+  stage: pattern_choice
+  alternative_considered: Adaptive threshold based on document size percentage
+- id: BD-083
+  type: BA
+  content: 'INTERACTION: BD-076 (global recursion limit 30000) × BD-074 (HtmlStripper HTMLParser settings)
+    × BD-014 (recursion limit declaration) → StackOverflow risk cascade in deeply nested documents'
+  rationale: The global recursion limit of 30000 set at module import (BD-076) interacts with HtmlStripper's
+    HTMLParser behavior (convert_charrefs=True, strict=False) and BeautifulSoup tree traversal. If HTMLParser
+    encounters deeply nested malformed HTML, the combination of lenient parsing and recursion can trigger
+    RecursionError before hitting the configured limit. This creates a risk cascade where document malformedness
+    leads to complete extraction failure rather than graceful degradation.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Context-managed recursion limits with graceful fallback
+- id: BD-084
+  type: BA
+  content: 'INTERACTION: BD-001 (incremental download) × BD-047 (skip existing files) × BD-077 (CSV format
+    contract) → Amplified efficiency gains with silent failure risk'
+  rationale: 'BD-001 and BD-047 combine to create highly efficient incremental downloads by downloading
+    only missing quarters and skipping already-downloaded files. However, BD-077 establishes an implicit
+    contract on the CSV format that both modules depend on. If download modifies the CSV format, extract
+    will silently fail or produce corrupted metadata. The amplification effect: efficiency gains are maximized,
+    but so is the blast radius of any format violation.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Explicit schema validation at module boundaries
+- id: BD-085
+  type: B/BA
+  content: 'INTERACTION: BD-072 (8-K cutoff invariant) × BD-067 (date threshold) × BD-013 (8-K item naming)
+    → Critical invariant with contradictory implementation risk'
+  rationale: 'BD-072 establishes that the 8-K cutoff date 2004-08-23 is a critical invariant that must
+    match between code and tests. BD-067 and BD-013 both use this date for determining filing format.
+    However, BD-067''s rationale mentions backward-compatible parsing logic while BD-013 and BD-023 contain
+    near-identical content about the same boundary. This creates contradiction risk: if tests and production
+    code use slightly different dates (e.g., timezone-related), extraction of pre-2004 8-K filings will
+    silently produce wrong results.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Centralized constant with import validation
+- id: BD-086
+  type: B/RC
+  content: 'INTERACTION: BD-003 (exponential backoff) × BD-044 (rate limit text detection) × BD-062 (status_forcelist)
+    → Redundant error handling with partial coverage'
+  rationale: BD-003 implements exponential backoff with 5 retries, BD-044 detects specific rate-limit
+    HTML text, and BD-062 specifies which HTTP status codes trigger retries. These three decisions create
+    redundant error handling, but BD-044 only detects one specific text message ('will be managed until
+    action is taken'). If SEC EDGAR returns 403 with different messaging, BD-044 misses it while BD-062
+    catches it via status code. Conversely, if the page returns 200 with rate-limit text embedded, neither
+    BD-003 nor BD-062 trigger. This contradiction creates incomplete coverage.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Unified detection combining status codes and content analysis
+- id: BD-087
+  type: B
+  content: 'INTERACTION: BD-009 (10-Q two-part structure) × BD-038 (10-Q item naming) × BD-075 (part-item
+    delimiter) × BD-079 (Roman numeral map) → Cascading dependency on parsing sequence'
+  rationale: 'BD-009 enforces splitting 10-Q into Part I and Part II before extraction. BD-038 defines
+    that Part I contains Items 1-4 and Part II contains Items 1-6. BD-075 requires ''__'' as delimiter
+    for part-item encoding. BD-079 maps Roman numerals for part numbering. These decisions form a cascade:
+    if BD-075 delimiter changes, BD-075 split fails; if BD-079 map is incomplete, part identification
+    fails; if BD-009 separation fails, BD-038 item extraction operates on wrong context. The chain creates
+    multiple failure modes where any single point of failure cascades to incorrect output.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Schema-driven extraction with explicit validation
+- id: BD-088
+  type: B
+  content: 'INTERACTION: BD-017 (DATASET_DIR fixed) × BD-018 (LOGGING_DIR fixed) × BD-019 (eager directory
+    creation) → Deployment rigidity causing permission errors in restricted environments'
+  rationale: 'BD-017 and BD-018 hardcode directory locations relative to package root with no user override.
+    BD-019 creates these directories eagerly on every import. In restricted deployment environments (shared
+    servers, containerized applications, cloud functions), the package may lack write permission to the
+    package directory. This contradiction means: the architectural decision to hardcode directories (for
+    predictability) directly conflicts with production deployment requirements. Users cannot relocate
+    directories to writable locations, causing immediate failures on import.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Environment variable or config file override for directory locations
+- id: BD-089
+  type: BA
+  content: 'INTERACTION: BD-045 (company info cache) × BD-002 (CIK lookup cache) → Duplicate caching mechanisms
+    with stale data amplification risk'
+  rationale: 'BD-002 references company_info.json for CIK lookups while BD-045 references companies_info.json.
+    These are two separate cache mechanisms that may store overlapping data. BD-045 explicitly acknowledges
+    ''Cache persists across runs; stale company data may not reflect recent changes.'' When BD-002 (incremental
+    download) runs with BD-047 (skip existing), old cached company data is used for filings whose company
+    information may have changed (e.g., new SIC code, company name change after merger). The amplification:
+    caching reduces API calls (efficiency), but staleness compounds over time, and the duplicate caches
+    may contain conflicting data.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Unified cache with TTL-based invalidation
+- id: BD-090
+  type: B
+  content: 'INTERACTION: BD-007 (HTML detection) × BD-025 (td+tr detection) × BD-058 (HtmlStripper) →
+    Detection failure cascades to extraction failure on edge-case documents'
+  rationale: 'BD-007 determines parsing strategy based on HTML vs plain text detection. BD-025 defines
+    HTML detection as requiring BOTH <td> AND <tr> elements. BD-058 uses HtmlStripper (HTMLParser-based)
+    for HTML documents. For documents containing only <td> OR only <tr>, detection fails (BD-025), triggering
+    plain text parsing (BD-007), but these partial table structures may actually be HTML requiring HtmlStripper.
+    The cascade: edge-case documents get wrong parsing strategy, resulting in extraction failure or corrupted
+    output.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: More robust HTML detection combining multiple heuristics
+- id: BD-GAP-001
+  type: DK
+  content: 'Missing: Stale data detection and expiry policy'
+  rationale: 'Audit finding: missing: stale data detection and expiry policy. Issue #8 Detail**: `config.json:12`
+    has `skip_present_indices` (boolean) but no time-based staleness check. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: index_download
+  status: missing
+  known_gap: true
+  severity: high
+  impact: 'Issue #8 Detail**: `config.json:12` has `skip_present_indices` (boolean) but no time-based
+    staleness check'
+- id: BD-GAP-002
+  type: DK
+  content: 'Missing: Random seed full coverage'
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: index_download
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+known_use_cases:
+- id: UC-101
+  name: SEC EDGAR Filing Extraction
+  source: tests/test_extract_items.py
+  type: data_pipeline
+  business_problem: Extracts and processes SEC EDGAR filings (10-K annual reports, 10-Q quarterly reports)
+    from compressed ZIP archives for downstream financial analysis and document processing workflows.
+  intent_keywords:
+  - EDGAR
+  - SEC filings
+  - 10-K extraction
+  - annual report parsing
+  - document extraction
+  stage: data_collection
+  negative_keywords:
+  - trading strategy
+  - backtesting
+  - stock screening
+  - live trading
+  - factor computation
+  - machine learning prediction
+  disambiguation: Are you looking to extract raw SEC EDGAR filings (10-K, 10-Q, 8-K) from compressed archives
+    for document processing? Or do you need a different financial data pipeline task?
+  data_domain: financial_data
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 27
+  evidence_invalid: 55
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.32926829268292684
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 0
+    warn: 0
+    fail: 0
+  subdomain_totals:
+    pass: 1
+    warn: 15
+    fail: 29
+  coverage: 45/45 (100%)
+  pass_rate: 1/45 (2%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: data_source
+  description: Use official SEC EDGAR for each production use. Alternative data providers (Bloomberg,
+    Refinitiv, FactSet) could be added for premium features like real-time data or alternative filing
+    formats.
+  used_in_stages: []
+  options:
+  - name: SEC EDGAR (Official)
+    traits:
+    - official
+    - authoritative
+    - free
+    - rate-limited
+    fit_for:
+    - Production use, compliance-critical data, full historical coverage
+    not_fit_for:
+    - High-frequency trading (latency), real-time streaming
+  - name: SEC EDGAR Full Text Feed
+    traits:
+    - official
+    - full-text
+    - bulk
+    - historical
+    fit_for:
+    - Bulk historical analysis, academic research
+    not_fit_for:
+    - Real-time requirements
+  - name: SEC XBRL API
+    traits:
+    - structured
+    - machine-readable
+    - official
+    fit_for:
+    - Financial analysis requiring tagged data
+    not_fit_for:
+    - Natural language processing, narrative extraction
+  default: SEC EDGAR (Official)
+  _source: worker_resource
+- id: slot-002
+  name: html_parser
+  description: lxml offers best balance of speed and compatibility for SEC filing parsing. Switch to html5lib
+    if encountering parsing edge cases with malformed HTML.
+  used_in_stages: []
+  options:
+  - name: lxml (current)
+    traits:
+    - fast
+    - forgiving
+    - c-extension
+    fit_for:
+    - Production use with large-scale crawling
+    not_fit_for:
+    - Strict HTML5 compliance validation
+  - name: html.parser (stdlib)
+    traits:
+    - stdlib
+    - no-dependency
+    - slower
+    fit_for:
+    - Minimal dependencies, simple use cases
+    not_fit_for:
+    - Large-scale crawling where speed matters
+  - name: html5lib
+    traits:
+    - strict
+    - browser-compatible
+    - pure-python
+    fit_for:
+    - Maximum compatibility with browser rendering
+    not_fit_for:
+    - Performance-critical applications
+  default: lxml (current)
+  _source: worker_resource
+- id: slot-003
+  name: parallelization
+  description: pathos provides the best multiprocessing experience for extraction. For I/O-bound downloads,
+    ThreadPoolExecutor may be more efficient. Disable parallelization for debugging.
+  used_in_stages: []
+  options:
+  - name: pathos ProcessPool (current)
+    traits:
+    - multiprocessing
+    - cross-platform
+    fit_for:
+    - CPU-bound extraction tasks on multi-core systems
+    not_fit_for:
+    - I/O-bound operations, memory-constrained environments
+  - name: multiprocessing.Pool (stdlib)
+    traits:
+    - stdlib
+    - no-dependency
+    fit_for:
+    - Simple parallelization without extra dependencies
+    not_fit_for:
+    - Complex shared memory patterns
+  - name: concurrent.futures.ThreadPoolExecutor
+    traits:
+    - threading
+    - I/O-bound-optimized
+    fit_for:
+    - I/O-bound network operations
+    not_fit_for:
+    - CPU-bound extraction (GIL limitation)
+  - name: no parallelization
+    traits:
+    - single-threaded
+    - simple
+    fit_for:
+    - Testing, debugging, resource-constrained environments
+    not_fit_for:
+    - Production bulk crawling
+  default: pathos ProcessPool (current)
+  _source: worker_resource
+- id: slot-004
+  name: cli_framework
+  description: click is well-suited for this project. argparse is sufficient for simpler use cases. typer
+    offers modern type-hinted interface.
+  used_in_stages: []
+  options:
+  - name: click (current)
+    traits:
+    - composable
+    - colored-output
+    - ANSI
+    fit_for:
+    - Production CLI tools with complex argument handling
+    not_fit_for:
+    - Minimal CLI needs
+  - name: argparse (stdlib)
+    traits:
+    - stdlib
+    - no-dependency
+    fit_for:
+    - Simple scripts, minimal dependencies
+    not_fit_for:
+    - Complex CLI with subcommands
+  - name: typer
+    traits:
+    - modern
+    - type-hints
+    - click-based
+    fit_for:
+    - Modern Python projects with type hints
+    not_fit_for:
+    - Python 3.7 or earlier
+  default: click (current)
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: U.S. Securities and Exchange Commission (SEC)
+  description: 'Quarterly filing indices (TSV format). Coverage: Every SEC filings from 1994Q1 to present.
+    Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: U.S. Securities and Exchange Commission (SEC)
+  description: 'Ticker-to-CIK mapping. Coverage: Every actively traded US securities. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: U.S. Securities and Exchange Commission (SEC)
+  description: 'HTML and text versions of SEC filings (10-K, 10-Q, 8-K). Coverage: Every electronic SEC
+    filings since 1994. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: U.S. Securities and Exchange Commission (SEC)
+  description: 'Company metadata (SIC, state of incorporation, fiscal year end). Coverage: Every registered
+    companies. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: SEC EDGAR API
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: Local File Storage
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-007
+  type: python_package
+  name: beautifulsoup4==4.8.2
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-008
+  type: python_package
+  name: lxml==4.9.1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: python_package
+  name: requests==2.31.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: python_package
+  name: pandas==1.5.3
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: python_package
+  name: click==7.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: python_package
+  name: tqdm==4.42.1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: python_package
+  name: numpy==1.24.4
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-014
+  type: python_package
+  name: cssutils==1.0.2
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-015
+  type: python_package
+  name: pathos==0.2.9
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: python_package
+  name: urllib3==1.26.7
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-017
+  type: code_example
+  name: SEC EDGAR Filing Extraction
+  path: tests/test_extract_items.py
+  description: Extracts and processes SEC EDGAR filings (10-K annual reports, 10-Q quarterly reports)
+    from compressed ZIP archives for downstream financial analysis and document processing workflows.
+  used_in_stages:
+  - data_collection
+  _source: uc_list

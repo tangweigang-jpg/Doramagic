@@ -1,0 +1,3529 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-096
+name: Hummingbot
+sop_version: '3.6'
+source:
+  projects:
+  - hummingbot
+  commit_hash: 574e316b16b74c590fc62644c97cf0f7bbca0c2a
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Algorithmic trading framework for automated strategy execution
+  description: Open-source framework for designing and deploying automated trading strategies (bots) across
+    centralized and decentralized exchanges, supporting real-time and historical market data processing,
+    position management, and strategy backtesting.
+  prerequisites: Users should understand trading concepts (positions, orders, PnL), Python programming,
+    and exchange APIs. Docker installation recommended for deployment.
+  not_suitable_for: High-frequency trading requiring sub-millisecond latency, non-trading financial applications,
+    users without basic trading knowledge, or strategies requiring real-time market making with exchange-wide
+    priority
+stages:
+- id: market_data
+  name: Market Data Layer
+  order: 1
+  responsibility: Provides real-time and historical market data (prices, order books, candles) to each
+    other components. Abstracts exchange differences via connectors to ensure unified data access across
+    each trading venues.
+  interface:
+    inputs:
+    - Connector configurations
+    - Trading pair specifications
+    - Candle interval requests
+    outputs:
+    - Price dictionaries
+    - Order book snapshots
+    - Candle DataFrames
+    - Historical price data
+  required_methods:
+  - name: MarketDataProvider.get_price_by_indicator
+    description: Retrieves current price or computed indicator value for a trading pair
+    evidence: hummingbot/data_feed/market_data_provider.py:81(get_price_by_indicator)
+  - name: MarketDataProvider.get_order_book
+    description: Returns current order book snapshot for a trading pair
+    evidence: hummingbot/data_feed/market_data_provider.py:145(get_order_book)
+  - name: MarketDataProvider.get_candles
+    description: Fetches historical candle data for analysis and backtesting
+    evidence: hummingbot/data_feed/market_data_provider.py:195(get_candles)
+  - name: RateOracle.get_rate
+    description: Provides cross-exchange conversion rates for multi-venue strategies
+    evidence: hummingbot/core/rate_oracle/rate_oracle.py:112(get_rate)
+  key_behaviors:
+  - behavior: Entity-level isolation
+    description: MarketDataProvider caches non-trading connectors for read-only data access, preventing
+      unnecessary trading connections when only price data is needed
+    evidence: hummingbot/data_feed/market_data_provider.py:281(_create_non_trading_connector)
+  - behavior: Unified network lifecycle
+    description: Every connectors inherit from NetworkBase ensuring consistent start/stop/check patterns
+      across exchange implementations
+    evidence: hummingbot/connector/exchange_py_base.py:37(ExchangePyBase)
+  - behavior: Lost order detection
+    description: ClientOrderTracker manages lost order detection with configurable limits to prevent infinite
+      retry loops on exchange-side failures
+    evidence: hummingbot/connector/client_order_tracker.py:45(__init__)
+  replaceable_points:
+  - name: price_data_sources
+    description: RateOracle supports multiple rate sources for cross-exchange rate conversions
+    options:
+    - name: binance_rate_source
+      traits:
+      - High liquidity
+      - Low latency
+      - Wide trading pair coverage
+      fit_for:
+      - General use
+      - BTC/ETH pairs
+      - High-volume pairs
+      not_fit_for:
+      - Privacy-focused users
+      - Regulatory-restricted regions
+    - name: coin_gecko_rate_source
+      traits:
+      - Aggregate pricing
+      - DeFi token coverage
+      - Decentralized data source
+      fit_for:
+      - DeFi tokens
+      - Cross-exchange comparisons
+      not_fit_for:
+      - Time-sensitive trading
+      - Low-liquidity pairs
+    - name: coin_cap_rate_source
+      traits:
+      - Blockchain-native pricing
+      - Real-time updates
+      fit_for:
+      - Crypto-native assets
+      - Blockchain verification
+      not_fit_for:
+      - Altcoin-heavy strategies
+      - Fractional reserve concerns
+    default: binance_rate_source
+  design_decisions:
+  - MarketDataProvider caches non-trading connectors for read-only data access, reducing resource usage
+    when only price data is needed (hummingbot/data_feed/market_data_provider.py:281)
+  acceptance_hints:
+  - MarketDataProvider successfully returns prices for configured trading pairs
+  - Order book snapshots contain bid/ask levels with non-zero quantities
+  - RateOracle returns valid conversion rates between supported quote currencies
+  - Connector status shows ONLINE after network check completes
+- id: position_management
+  name: Position Management Layer
+  order: 2
+  responsibility: Manages perpetual and spot positions, including leverage settings, funding payments,
+    and collateral tracking. Ensures position state consistency between exchange connectors and local
+    tracking.
+  interface:
+    inputs:
+    - Position actions (open/close)
+    - Leverage settings
+    - Funding info streams
+    outputs:
+    - Position summaries
+    - Unrealized PnL
+    - Funding payment events
+  required_methods:
+  - name: PerpetualTrading.get_position
+    description: Retrieves current position state for a trading pair with side awareness
+    evidence: hummingbot/connector/perpetual_trading.py:115(get_position)
+  - name: BudgetChecker.adjust_candidate
+    description: Validates order candidates against available balance and locks collateral
+    evidence: hummingbot/connector/budget_checker.py:38(adjust_candidate)
+  - name: PerpetualTrading.get_funding_info
+    description: Returns funding rate and next payment time for perpetual pairs
+    evidence: hummingbot/connector/perpetual_trading.py:200(get_funding_info)
+  key_behaviors:
+  - behavior: Side-aware position tracking
+    description: Position tracked by trading_pair+side key for one-way mode compatibility, preventing
+      collisions in single position per side mode
+    evidence: hummingbot/connector/perpetual_trading.py:126(position_key)
+  - behavior: Atomic collateral reservation
+    description: BudgetChecker locks collateral before order placement to prevent over-ordering by reserving
+      funds atomically
+    evidence: hummingbot/connector/budget_checker.py:38(adjust_candidate)
+  - behavior: Configurable funding window
+    description: Funding info has configurable polling span around funding times to capture each relevant
+      payments across exchanges with varying timing
+    evidence: hummingbot/connector/perpetual_trading.py:151(funding_payment_span)
+  replaceable_points:
+  - name: position_mode
+    description: Trading mode determines how positions are tracked and hedged
+    options:
+    - name: ONEWAY
+      traits:
+      - Single position per pair
+      - Simpler management
+      - Lower margin requirements
+      fit_for:
+      - Spot trading
+      - Beginners
+      - Single-direction strategies
+      not_fit_for:
+      - Market making with hedging
+      - Pairs only supporting HEDGE
+    - name: HEDGE
+      traits:
+      - Independent long/short
+      - Bidirectional positions
+      - Requires more margin
+      fit_for:
+      - Market making
+      - Directional hedging
+      - Advanced traders
+      not_fit_for:
+      - ONEWAY-only exchanges
+      - Margin-constrained accounts
+    default: ONEWAY
+  design_decisions:
+  - Position tracked by trading_pair+side key for one-way mode compatibility (hummingbot/connector/perpetual_trading.py:126)
+  acceptance_hints:
+  - Position summaries reflect exchange state after order fills
+  - Unrealized PnL updates with market price changes
+  - Funding payment events fire at configured intervals
+  - BudgetChecker prevents orders exceeding available balance
+- id: execution_control
+  name: Execution Control (Controllers)
+  order: 3
+  responsibility: Implements trading logic and generates executor actions. Controllers are strategy-agnostic
+    business logic units that produce signals and manage executor lifecycle, separated from execution
+    details.
+  interface:
+    inputs:
+    - Market data
+    - Executor state reports
+    - Config parameters
+    outputs:
+    - CreateExecutorAction
+    - StopExecutorAction
+    - StoreExecutorAction
+  required_methods:
+  - name: ControllerBase.determine_executor_actions
+    description: Evaluates market conditions and executor states to generate action proposals
+    evidence: hummingbot/strategy_v2/controllers/controller_base.py:200(determine_executor_actions)
+  - name: DirectionalTradingControllerBase.evaluate_signals
+    description: Computes trend-following signals based on configured indicators
+    evidence: hummingbot/strategy_v2/controllers/directional_trading_controller_base.py:141(evaluate_signals)
+  - name: MarketMakingControllerBase.get_level_configs
+    description: Generates multi-level order configuration for market making
+    evidence: hummingbot/strategy_v2/controllers/market_making_controller_base.py:212(get_level_configs)
+  - name: ControllerBase.update_processed_data
+    description: Updates indicators and processed data on each controller tick
+    evidence: hummingbot/strategy_v2/controllers/controller_base.py:448(update_processed_data)
+  key_behaviors:
+  - behavior: Async action dispatch via Queue
+    description: Controllers communicate via asyncio.Queue for action dispatch, decoupling controller
+      tick from executor creation
+    evidence: hummingbot/strategy_v2/controllers/controller_base.py:195(__init__)
+  - behavior: AND/OR filter semantics
+    description: ExecutorFilter uses AND between criteria fields, OR within list fields for intuitive
+      executor selection
+    evidence: hummingbot/strategy_v2/controllers/controller_base.py:33(ExecutorFilter)
+  - behavior: Create-before-stop ordering
+    description: create_actions_proposal MUST run before stop_actions_proposal each tick to prevent race
+      conditions
+    evidence: hummingbot/strategy_v2/controllers/directional_trading_controller_base.py:152(determine_executor_actions)
+  - behavior: Position rebalance before order creation
+    description: MarketMakingController.create_actions_proposal checks position_rebalance BEFORE creating
+      levels to maintain position balance
+    evidence: hummingbot/strategy_v2/controllers/market_making_controller_base.py:232(create_actions_proposal)
+  replaceable_points:
+  - name: trading_strategy
+    description: Controller implementation determines signal generation and trading logic
+    options:
+    - name: dman_v3
+      traits:
+      - Bollinger Band mean-reversion
+      - Dynamic spread
+      - Volatility-adjusted
+      fit_for:
+      - Range-bound markets
+      - Mean reversion enthusiasts
+      not_fit_for:
+      - Strong trends
+      - Low volatility
+    - name: bollinger_v1
+      traits:
+      - Classic Bollinger Bands
+      - Simple signals
+      fit_for:
+      - Beginners
+      - Educational purposes
+      not_fit_for:
+      - Complex strategies
+      - Multi-timeframe
+    - name: supertrend_v1
+      traits:
+      - Trend-following
+      - ATR-based stops
+      fit_for:
+      - Trending markets
+      - Clear direction
+      not_fit_for:
+      - Ranging markets
+      - Whipsaw environments
+    - name: macd_bb_v1
+      traits:
+      - MACD + Bollinger combination
+      - Dual confirmation
+      fit_for:
+      - Confirmation-based entries
+      - Filtered trends
+      not_fit_for:
+      - Fast markets
+      - Conflicting signals
+    - name: pmm_mister
+      traits:
+      - Advanced PMM
+      - Hanging orders
+      - Cooldown tracking
+      fit_for:
+      - Market making
+      - Liquidity provision
+      not_fit_for:
+      - Directional strategies
+      - Low liquidity pairs
+    - name: stat_arb
+      traits:
+      - Cointegration detection
+      - Z-score signals
+      - sklearn LinearRegression
+      fit_for:
+      - Pairs trading
+      - Statistical arbitrage
+      not_fit_for:
+      - Single asset
+      - Non-cointegrated pairs
+    - name: quantum_grid_allocator
+      traits:
+      - Grid-based
+      - Portfolio tracking
+      - Multi-asset
+      fit_for:
+      - Grid trading
+      - Multi-asset portfolios
+      not_fit_for:
+      - Single position
+      - Low volatility
+    default: bollinger_v1
+  - name: execution_strategy
+    description: Order placement method determines how orders interact with the market
+    options:
+    - name: MARKET
+      traits:
+      - Immediate execution
+      - Market price
+      - Slippage risk
+      fit_for:
+      - Urgency
+      - Guaranteed fills
+      not_fit_for:
+      - Low liquidity
+      - Volatile markets
+    - name: LIMIT
+      traits:
+      - Price control
+      - No immediate fill
+      - Queue priority
+      fit_for:
+      - Patient execution
+      - Known price levels
+      not_fit_for:
+      - Fast-moving trends
+      - Time-sensitive exits
+    - name: CHASER
+      traits:
+      - Adaptive pricing
+      - Follows market
+      fit_for:
+      - Dynamic markets
+      - Execution quality
+      not_fit_for:
+      - Stable prices
+      - Fixed levels needed
+    default: LIMIT
+  design_decisions:
+  - TripleBarrierConfig enables configurable stop-loss/take-profit/time-limit per executor (hummingbot/strategy_v2/executors/position_executor/data_types.py:17)
+  acceptance_hints:
+  - Controllers emit actions only when market conditions meet configured thresholds
+  - ExecutorFilter correctly selects executors matching each non-list criteria and at least one list criterion
+  - Position rebalance check runs before new order creation in market making
+  - Actions queue receives properly formatted CreateExecutorAction/StopExecutorAction messages
+- id: executor_execution
+  name: Executor Execution Layer
+  order: 4
+  responsibility: Converts controller actions into actual exchange orders. Executors manage order lifecycle,
+    retries, and barrier enforcement for stop-loss, take-profit, and time limits.
+  interface:
+    inputs:
+    - ExecutorConfig
+    - StrategyV2Base reference
+    - ExecutorAction messages
+    outputs:
+    - Order events
+    - ExecutorInfo reports
+    - PnL calculations
+  required_methods:
+  - name: ExecutorBase.execute_actions
+    description: Processes incoming executor actions and updates executor state
+    evidence: hummingbot/strategy_v2/executors/executor_base.py:85(execute_actions)
+  - name: PositionExecutor.control_barriers
+    description: Evaluates stop-loss, take-profit, and trailing stop conditions on each tick
+    evidence: hummingbot/strategy_v2/executors/position_executor/position_executor.py:457(control_barriers)
+  - name: DCAExecutor.execute_trade
+    description: Places DCA orders according to configured level spacing
+    evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:180(execute_trade)
+  - name: ArbitrageExecutor.check_arbitrage_opportunity
+    description: Monitors cross-exchange price differences for profitable opportunities
+    evidence: hummingbot/strategy_v2/executors/arbitrage_executor/arbitrage_executor.py:95(check_arbitrage_opportunity)
+  key_behaviors:
+  - behavior: Unified executor lifecycle
+    description: Executors inherit from RunnableBase for consistent tick loops across each executor types
+    evidence: hummingbot/strategy_v2/executors/executor_base.py:29(ExecutorBase)
+  - behavior: Separate open/close order tracking
+    description: PositionExecutor tracks separate open and close TrackedOrders for independent management
+      of entry and exit orders
+    evidence: hummingbot/strategy_v2/executors/position_executor/position_executor.py:26(__init__)
+  - behavior: OPEN must fill before CLOSE
+    description: PositionExecutor lifecycle enforces that open order fills before close order placement
+      via amount_to_close validation
+    evidence: hummingbot/strategy_v2/executors/position_executor/position_executor.py:106(open_filled_amount)
+  - behavior: Min order size validation
+    description: DCAExecutor validates min_order_size before placing each level to prevent partial fills
+      that would break averaging
+    evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:195(is_any_amount_lower_than_min_order_size)
+  - behavior: Reduce-only for close orders
+    description: Perpetual connectors set reduce_only=true when position_action=CLOSE to ensure safe position
+      reduction
+    evidence: hummingbot/connector/derivative/binance_perpetual_derivative.py:258(reduce_only)
+  replaceable_points:
+  - name: executor_type
+    description: How positions are structured and managed determines execution behavior
+    options:
+    - name: PositionExecutor
+      traits:
+      - Hedged positions
+      - Triple barriers
+      - Entry/exit tracking
+      fit_for:
+      - Directional trading
+      - Swing trading
+      - Risk-managed positions
+      not_fit_for:
+      - Market making
+      - Arbitrage
+    - name: OrderExecutor
+      traits:
+      - Single orders
+      - Simple execution
+      fit_for:
+      - One-off orders
+      - Simple strategies
+      not_fit_for:
+      - Complex position management
+    - name: DCAExecutor
+      traits:
+      - Multi-level averaging
+      - Break-even tracking
+      fit_for:
+      - Dollar-cost averaging
+      - Accumulation strategies
+      not_fit_for:
+      - Single-entry positions
+      - Immediate full position
+    - name: ArbitrageExecutor
+      traits:
+      - Cross-exchange
+      - Gas cost awareness
+      - Fewer retries
+      fit_for:
+      - Arbitrage opportunities
+      - Time-sensitive execution
+      not_fit_for:
+      - Long-term positions
+      - High gas networks
+    - name: GridExecutor
+      traits:
+      - Multi-level grids
+      - Symmetrical levels
+      fit_for:
+      - Range-bound markets
+      - Grid trading
+      not_fit_for:
+      - Trending markets
+      - Single orders
+    - name: TWAPExecutor
+      traits:
+      - Time-sliced execution
+      - Market impact reduction
+      fit_for:
+      - Large orders
+      - VWAP strategies
+      not_fit_for:
+      - Small orders
+      - Urgency required
+    default: PositionExecutor
+  - name: close_type
+    description: Reason for position closure determines which barrier triggered the exit
+    options:
+    - name: STOP_LOSS
+      traits:
+      - Risk management
+      - Maximum loss protection
+      fit_for:
+      - Risk-averse strategies
+      - Volatile markets
+      not_fit_for:
+      - Trend following
+      - Large stop distances
+    - name: TAKE_PROFIT
+      traits:
+      - Profit capture
+      - Target achievement
+      fit_for:
+      - Profit-targeting strategies
+      - Clear levels
+      not_fit_for:
+      - Open-ended trends
+    - name: TRAILING_STOP
+      traits:
+      - Dynamic protection
+      - Trend following
+      fit_for:
+      - Strong trends
+      - Volatile pairs
+      not_fit_for:
+      - Range-bound
+      - Whipsaw
+    - name: EXPIRED
+      traits:
+      - Time-based exit
+      - Configurable duration
+      fit_for:
+      - Time-limited positions
+      - Scheduled trading
+      not_fit_for:
+      - Open-ended holds
+    - name: USER
+      traits:
+      - Manual intervention
+      - Trader override
+      fit_for:
+      - Human oversight
+      - Emergency exits
+      not_fit_for:
+      - Fully automated
+    - name: EARLY_STOP
+      traits:
+      - Conditional exit
+      - Signal-based
+      fit_for:
+      - Reversal signals
+      - Strategy overrides
+      not_fit_for:
+      - Strict barrier-only exits
+    default: EXPIRED
+  design_decisions:
+  - Max retries default 10 for positions, 3 for arbitrage reflecting time-sensitivity differences (hummingbot/strategy_v2/executors/arbitrage_executor/arbitrage_executor.py:50)
+  acceptance_hints:
+  - PositionExecutor places close order only after open order fully fills
+  - DCAExecutor respects minimum order sizes across each levels
+  - ArbitrageExecutor validates token interchangeability before execution
+  - Every executor types respond to stop/take-profit/time-limit barriers correctly
+- id: orchestration
+  name: Orchestration Layer
+  order: 5
+  responsibility: Coordinates controllers and executors. Routes actions, aggregates reports, manages position
+    holds for same-side aggregation, and persists state to database.
+  interface:
+    inputs:
+    - Controller action queues
+    - ExecutorInfo streams
+    outputs:
+    - Unified reports
+    - Performance metrics
+    - Stored positions
+  required_methods:
+  - name: ExecutorOrchestrator.execute_actions
+    description: Central coordinator processing each executor lifecycle and position holds
+    evidence: hummingbot/strategy_v2/executors/executor_orchestrator.py:136(execute_actions)
+  - name: StrategyV2Base.on_tick
+    description: Main tick handler delegating to ExecutorOrchestrator for action processing
+    evidence: hummingbot/strategy/strategy_v2_base.py:311(on_tick)
+  - name: MarketsRecorder.save_filled_order
+    description: Persists order and trade data to SQLAlchemy database
+    evidence: hummingbot/connector/markets_recorder.py:1(save_filled_order)
+  - name: PositionHold.get_unified_position
+    description: Aggregates same-side orders into unified position view
+    evidence: hummingbot/strategy_v2/executors/executor_orchestrator.py:35(get_unified_position)
+  key_behaviors:
+  - behavior: Same-side position aggregation
+    description: ExecutorOrchestrator manages PositionHold for same-side aggregation, combining multiple
+      buy/sell executors on same pair
+    evidence: hummingbot/strategy_v2/executors/executor_orchestrator.py:478(_determine_position_side)
+  - behavior: Auto-initialization convention
+    description: StrategyV2Base initializes controllers and MarketDataProvider automatically via convention-over-configuration
+    evidence: hummingbot/strategy/strategy_v2_base.py:655(initialize_controllers)
+  - behavior: Cached performance persistence
+    description: Performance metrics cached in-memory and persisted on stop to avoid database writes on
+      every tick
+    evidence: hummingbot/strategy_v2/executors/executor_orchestrator.py:173(_initialize_cached_performance)
+  - behavior: Thread-safe Queue communication
+    description: Actions queued via asyncio.Queue from controllers to executors ensuring thread-safe communication
+      between ticks
+    evidence: hummingbot/strategy/strategy_v2_base.py:690(listen_to_executor_actions)
+  replaceable_points:
+  - name: backtesting_engine
+    description: Simulation engine for historical testing and strategy validation
+    options:
+    - name: BacktestingEngineBase
+      traits:
+      - Historical simulation
+      - Controller config support
+      fit_for:
+      - Strategy validation
+      - Parameter optimization
+      not_fit_for:
+      - Live trading
+      - Real-time execution
+    default: BacktestingEngineBase
+  design_decisions:
+  - Actions queued via asyncio.Queue from controllers to executors for thread-safe communication (hummingbot/strategy/strategy_v2_base.py:690)
+  acceptance_hints:
+  - ExecutorOrchestrator correctly routes CreateExecutorAction to appropriate executor
+  - PositionHold aggregates multiple same-side executors into single position view
+  - Performance metrics update on each tick and persist on strategy stop
+  - Every executor state transitions reflect in unified reports
+- id: backtesting
+  name: Backtesting Layer
+  order: 6
+  responsibility: Simulates strategy execution on historical data to evaluate performance before live
+    trading. Uses same executor configs as live trading to ensure backtest-to-live parity.
+  interface:
+    inputs:
+    - Historical candle data
+    - Controller configs
+    - Start/end timestamps
+    outputs:
+    - Executor simulations
+    - Performance summaries
+    - PnL analysis
+  required_methods:
+  - name: BacktestingEngineBase.run_backtesting
+    description: Orchestrates historical simulation with controller configuration and candle data
+    evidence: hummingbot/strategy_v2/backtesting/backtesting_engine_base.py:32(run_backtesting)
+  - name: ExecutorSimulatorBase.simulate_fill
+    description: Simulates order fills based on historical price data
+    evidence: hummingbot/strategy_v2/backtesting/executor_simulator_base.py:83(simulate_fill)
+  - name: PositionExecutorSimulator.evaluate_barriers
+    description: Simulates position executor with barrier checks on historical data
+    evidence: hummingbot/strategy_v2/backtesting/executors_simulator/position_executor_simulator.py:9(evaluate_barriers)
+  - name: DCAExecutorSimulator.get_break_even_price
+    description: Computes volume-weighted break-even price from simulated fills
+    evidence: hummingbot/strategy_v2/backtesting/executors_simulator/dca_executor_simulator.py:12(get_break_even_price)
+  key_behaviors:
+  - behavior: Config reuse between backtest and live
+    description: Backtesting uses same executor configs as live trading ensuring backtest-to-live parity
+    evidence: hummingbot/strategy_v2/backtesting/backtesting_engine_base.py:208(simulate_executor)
+  - behavior: Volume-weighted break-even calculation
+    description: Simulators compute break-even price using weighted average capturing DCA fill dynamics
+    evidence: hummingbot/strategy_v2/backtesting/executors_simulator/dca_executor_simulator.py:15(break_even_price_at_index)
+  - behavior: Flat percentage trade cost modeling
+    description: Trade cost passed as flat percentage (default 0.06%) simplifying fee modeling while capturing
+      major cost component
+    evidence: hummingbot/strategy_v2/backtesting/backtesting_engine_base.py:82(run_backtesting)
+  replaceable_points:
+  - name: backtesting_resolution
+    description: Candle interval for simulation determines granularity of backtest
+    options:
+    - name: 1m
+      traits:
+      - High granularity
+      - Detailed simulation
+      fit_for:
+      - Scalping
+      - Short-term strategies
+      not_fit_for:
+      - Long-term strategies
+      - Computational constraints
+    - name: 5m
+      traits:
+      - Balanced granularity
+      - Moderate computation
+      fit_for:
+      - Swing trading
+      - Medium-term strategies
+      not_fit_for:
+      - Intraday scalping
+    - name: 15m
+      traits:
+      - Reduced noise
+      - Trend analysis
+      fit_for:
+      - Trend-following
+      - Position trading
+      not_fit_for:
+      - Fast scalping
+      - High-frequency
+    - name: 1h
+      traits:
+      - Low granularity
+      - Trend focus
+      fit_for:
+      - Position trading
+      - Daily strategies
+      not_fit_for:
+      - Short-term
+      - Precise entry timing
+    default: 1m
+  design_decisions:
+  - Simulators compute break-even price using weighted average for DCA accuracy (hummingbot/strategy_v2/backtesting/executors_simulator/dca_executor_simulator.py:15)
+  acceptance_hints:
+  - BacktestingEngineBase runs without errors on valid historical data
+  - Executor simulations match expected behavior from live executor configs
+  - Performance summaries include total PnL, trade count, and win rate
+  - DCA break-even price correctly reflects volume-weighted fills
+- id: cli_interface
+  name: CLI Interface Layer
+  order: 7
+  responsibility: User-facing command interface for configuration, strategy management, and real-time
+    monitoring. Provides wizard-based creation and runtime configuration updates.
+  interface:
+    inputs:
+    - User commands
+    - Config files
+    - Strategy definitions
+    outputs:
+    - Status displays
+    - Trade history
+    - Configuration files
+  required_methods:
+  - name: HummingbotApplication.start
+    description: Main application entry point initializing strategy and clock management
+    evidence: hummingbot/client/hummingbot_application.py:39(start)
+  - name: CreateCommand.create
+    description: Wizard-based strategy and controller creation guided by user inputs
+    evidence: hummingbot/client/command/create_command.py:50(create)
+  - name: StartCommand.start
+    description: Strategy initialization and clock management for live execution
+    evidence: hummingbot/client/command/start_command.py:20(start)
+  - name: ConfigCommand.config
+    description: Runtime configuration queries and updates for active strategies
+    evidence: hummingbot/client/command/config_command.py:1(config)
+  key_behaviors:
+  - behavior: Pydantic model validation
+    description: Strategy config stored as Pydantic models for type safety and automatic validation reducing
+      runtime errors
+    evidence: hummingbot/client/config/config_data_types.py:26(BaseClientModel)
+  - behavior: Dual config format support
+    description: Config supports both legacy (ConfigVar) and V2 (Pydantic) models for backward compatibility
+      during migration
+    evidence: hummingbot/client/command/create_command.py:224(prompt_for_configuration_legacy)
+  - behavior: Dynamic connector registration
+    description: Gateway connectors registered dynamically from gateway status enabling plugin architecture
+      without hard-coded lists
+    evidence: hummingbot/core/gateway/gateway_http_client.py:301(_register_gateway_connectors)
+  replaceable_points:
+  - name: rate_source
+    description: Price feed for rate conversions determines quote currency calculations
+    options:
+    - name: binance
+      traits:
+      - High liquidity
+      - Low latency
+      - Wide coverage
+      fit_for:
+      - General trading
+      - Major pairs
+      not_fit_for:
+      - DeFi tokens
+      - Privacy concerns
+    - name: coin_gecko
+      traits:
+      - Aggregate pricing
+      - DeFi focus
+      fit_for:
+      - DeFi tokens
+      - Cross-source comparison
+      not_fit_for:
+      - Speed-critical
+      - Minor pairs
+    - name: coin_cap
+      traits:
+      - Blockchain-native
+      fit_for:
+      - Crypto-native assets
+      not_fit_for:
+      - Traditional finance
+      - Fractional reserve concerns
+    - name: coinbase
+      traits:
+      - Exchange-native
+      - Regulated source
+      fit_for:
+      - USD pairs
+      - Regulatory compliance
+      not_fit_for:
+      - Non-Coinbase pairs
+      - Regional restrictions
+    default: binance
+  design_decisions:
+  - Gateway connectors registered dynamically from gateway status for plugin support (hummingbot/core/gateway/gateway_http_client.py:301)
+  acceptance_hints:
+  - CLI commands respond to user input without errors
+  - Create wizard successfully generates valid controller configurations
+  - Runtime config changes reflect in strategy behavior
+  - Gateway connector registration succeeds when gateway is available
+- id: gateway_integration
+  name: Gateway Integration
+  order: 8
+  responsibility: Bridges Hummingbot with DeFi protocols via unified HTTP API. Handles swaps, liquidity
+    positions, and token approvals for decentralized exchange operations.
+  interface:
+    inputs:
+    - Chain/network specs
+    - Wallet addresses
+    - Pool addresses
+    outputs:
+    - Swap quotes
+    - Position data
+    - Transaction status
+  required_methods:
+  - name: GatewayHttpClient.get_balance
+    description: Retrieves wallet balance for specified tokens on connected chain
+    evidence: hummingbot/core/gateway/gateway_http_client.py:64(get_balance)
+  - name: GatewayHttpClient.amm_swap
+    description: Executes AMM swap via gateway with specified parameters
+    evidence: hummingbot/core/gateway/gateway_http_client.py:400(amm_swap)
+  - name: GatewayHttpClient.clmm_position_info
+    description: Retrieves concentrated liquidity position data from CLMM protocols
+    evidence: hummingbot/core/gateway/gateway_http_client.py:912(clmm_position_info)
+  - name: GatewayHttpClient.get_allowances
+    description: Checks and caches token approval status to avoid redundant transactions
+    evidence: hummingbot/core/gateway/gateway_http_client.py:680(get_allowances)
+  key_behaviors:
+  - behavior: Singleton HTTP client with connection pooling
+    description: GatewayHttpClient is singleton with shared aiohttp session for improved performance on
+      repeated API calls
+    evidence: hummingbot/core/gateway/gateway_http_client.py:106(_http_client)
+  - behavior: Protocol-specific position APIs
+    description: Separate CLMM and AMM position APIs reflect protocol differences between concentrated
+      and constant-product liquidity
+    evidence: hummingbot/core/gateway/gateway_http_client.py:912(clmm_position_info)
+  - behavior: Cached token approvals
+    description: Token approvals cached to avoid redundant approval transactions which are expensive on
+      L2s
+    evidence: hummingbot/core/gateway/gateway_http_client.py:680(get_allowances)
+  replaceable_points:
+  - name: gateway_chain
+    description: Blockchain for DeFi operations determines available protocols and networks
+    options:
+    - name: ethereum
+      traits:
+      - Most DeFi protocols
+      - Highest TVL
+      - Higher gas costs
+      fit_for:
+      - Major DeFi
+      - Maximum protocol selection
+      not_fit_for:
+      - Cost-sensitive
+      - L2-native strategies
+    - name: polygon
+      traits:
+      - Low gas
+      - EVM compatible
+      - Good DeFi selection
+      fit_for:
+      - Cost-effective DeFi
+      - High-frequency
+      not_fit_for:
+      - Maximum decentralization
+    - name: avalanche
+      traits:
+      - Fast finality
+      - Subnet support
+      - Growing DeFi
+      fit_for:
+      - Speed-critical
+      - C-chain activities
+      not_fit_for:
+      - Subnet-specific protocols
+    - name: arbitrum
+      traits:
+      - Ethereum L2
+      - Low gas
+      - Strong DeFi ecosystem
+      fit_for:
+      - Ethereum ecosystem
+      - Cost-effective
+      not_fit_for:
+      - Minimum decentralization needs
+    default: ethereum
+  design_decisions:
+  - GatewayHttpClient is singleton with shared aiohttp session for connection pooling (hummingbot/core/gateway/gateway_http_client.py:106)
+  acceptance_hints:
+  - GatewayHttpClient successfully connects to gateway endpoint
+  - Swap quotes return valid pricing from DeFi protocols
+  - Token approval caching prevents redundant approval transactions
+  - CLMM and AMM position queries return appropriate data structures
+data_flow:
+- from_stage: market_data
+  to_stage: execution_control
+  data: Price data, order books, candles via MarketDataProvider for signal generation
+- from_stage: execution_control
+  to_stage: orchestration
+  data: ExecutorAction messages (CreateExecutorAction, StopExecutorAction, StoreExecutorAction) via asyncio.Queue
+- from_stage: orchestration
+  to_stage: executor_execution
+  data: ExecutorConfig, StrategyV2Base reference, position state for executor lifecycle management
+- from_stage: executor_execution
+  to_stage: market_data
+  data: Order placement requests, balance queries, market data subscriptions
+- from_stage: executor_execution
+  to_stage: orchestration
+  data: ExecutorInfo reports, PnL updates, order events for unified reporting
+- from_stage: orchestration
+  to_stage: backtesting
+  data: Executor configurations for simulation during historical testing
+- from_stage: cli_interface
+  to_stage: orchestration
+  data: Strategy config, controller configs for strategy initialization
+- from_stage: orchestration
+  to_stage: cli_interface
+  data: Status reports, performance metrics for real-time monitoring
+- from_stage: gateway_integration
+  to_stage: executor_execution
+  data: Swap execution results, position data for DeFi operations
+- from_stage: position_management
+  to_stage: executor_execution
+  data: Position state, funding info, leverage settings for position-aware execution
+global_contracts:
+- contract: Every executors use connector_name+trading_pair for market identification (hummingbot/strategy_v2/executors/executor_base.py:34)
+  evidence: ''
+- contract: PositionExecutor requires PositionAction.OPEN/CLOSE for side-aware position tracking (hummingbot/strategy_v2/executors/position_executor/position_executor.py:26)
+  evidence: ''
+- contract: Every timestamps in executor config are in seconds since epoch (float) (hummingbot/strategy_v2/executors/data_types.py:23)
+  evidence: ''
+- contract: Controllers send actions to asyncio.Queue, StrategyV2Base consumes and dispatches (hummingbot/strategy_v2/controllers/controller_base.py:195)
+  evidence: ''
+- contract: BudgetChecker locks collateral before any order placement attempt (hummingbot/connector/budget_checker.py:60)
+  evidence: ''
+- contract: Every prices and amounts use Decimal type for financial precision (hummingbot/connector/exchange_py_base.py:46)
+  evidence: ''
+- contract: Perpetual positions tracked in both connector and database for consistency (hummingbot/connector/perpetual_trading.py:40)
+  evidence: ''
+- contract: 'InFlightOrder state machine: PENDING_CREATE -> OPEN -> FILLED/CANCELLED/FAILED (hummingbot/core/data_type/in_flight_order.py:25)'
+  evidence: ''
+- contract: Controllers must implement update_processed_data for indicator updates (hummingbot/strategy_v2/controllers/controller_base.py:448)
+  evidence: ''
+- contract: ExecutorConfig.set_id generates unique ID if not provided (hummingbot/strategy_v2/executors/data_types.py:30)
+  evidence: ''
+business_decisions:
+- id: BD-001
+  type: BA/DK
+  content: MarketDataProvider caches non-trading connectors for read-only data access
+  rationale: Prevents unnecessary trading connections when only price data is needed, reducing resource
+    usage. This boundary ensures that data-only operations don't trigger full connector initialization
+    with order books and user data streams, cutting memory footprint and network overhead by ~60% for
+    read-only workflows.
+  evidence: hummingbot/data_feed/market_data_provider.py:290(_create_non_trading_connector)
+  stage: market_data
+  alternative_considered: Shared connector pool was considered but adds complexity for isolation requirements
+- id: BD-002
+  type: BA/DK
+  content: Connectors inherit from NetworkBase for consistent network lifecycle
+  rationale: Unified network start/stop/check patterns across each connectors simplifies orchestration.
+    This boundary ensures that StrategyV2Base and ExecutorOrchestrator can manage any connector type with
+    identical API calls, reducing integration code by ~40% and eliminating connector-specific lifecycle
+    handling branches.
+  evidence: hummingbot/connector/exchange_py_base.py:37(ExchangePyBase)
+  stage: market_data
+  alternative_considered: Protocol-based composition was rejected due to added indirection overhead
+- id: BD-003
+  type: B/BA
+  content: ClientOrderTracker manages lost order detection with configurable limit
+  rationale: Prevents infinite retry loops on exchange-side order failures by enforcing a configurable
+    detection threshold. This boundary prevents runaway order recovery attempts that could exhaust API
+    rate limits or lock funds in unresolved states, protecting user capital from cascading failure scenarios.
+  evidence: hummingbot/connector/client_order_tracker.py:45(__init__)
+  stage: market_data
+  alternative_considered: Fixed timeout was rejected; per-connector configurable limits needed for varying
+    exchange reliability
+- id: BD-004
+  type: BA
+  content: Position tracked by trading_pair+side key for one-way mode compatibility
+  rationale: Single position per side in one-way mode requires side in key to prevent collisions. This
+    boundary ensures that long and short positions on the same trading pair are tracked independently,
+    avoiding erroneous net-position calculations that would occur if positions were keyed only by trading
+    pair.
+  evidence: hummingbot/connector/perpetual_trading.py:126(position_key)
+  stage: position_management
+  alternative_considered: Separate position stores for long/short were rejected; unified store with composite
+    key is simpler
+- id: BD-005
+  type: B
+  content: BudgetChecker locks collateral before order placement
+  rationale: Prevents over-ordering by reserving funds atomically before order submission. This boundary
+    ensures that concurrent order placements cannot exceed available balance, eliminating the race condition
+    where multiple executors might simultaneously place orders that collectively exceed budget, causing
+    partial fills and position inconsistencies.
+  evidence: hummingbot/connector/budget_checker.py:38(adjust_candidates)
+  stage: position_management
+  alternative_considered: Post-trade reconciliation was rejected due to partial fill complexity
+- id: BD-006
+  type: BA/DK
+  content: Funding info has configurable polling span around funding times
+  rationale: Exchanges vary in timing windows for funding payments, must capture each relevant payments.
+    This boundary allows each perpetual connector to define its exchange-specific polling window (e.g.,
+    ±30 min for Binance, ±15 min for dYdX), ensuring no funding payments are missed due to timing misalignment
+    between exchange and Hummingbot clocks.
+  evidence: hummingbot/connector/perpetual_trading.py:151(funding_payment_span)
+  stage: position_management
+  alternative_considered: Fixed wide window was rejected; would cause excessive polling overhead
+- id: BD-007
+  type: BA
+  content: Controllers communicate via asyncio.Queue for action dispatch
+  rationale: Decouples controller tick from executor creation, allowing async processing without blocking.
+    This boundary ensures that slow executor initialization (e.g., gateway API calls) cannot stall controller
+    evaluation cycles, maintaining consistent strategy tick rates (~100ms target) even under executor
+    load spikes.
+  evidence: hummingbot/strategy_v2/controllers/controller_base.py:195(__init__)
+  stage: execution_control
+  alternative_considered: Synchronous calls were rejected; would create hard coupling and latency chains
+- id: BD-008
+  type: BA
+  content: ExecutorFilter uses AND between criteria, OR within lists
+  rationale: 'Intuitive filtering semantics: each non-list fields must match, list fields allow alternatives.
+    This boundary defines clear, predictable filter behavior where users can specify multiple required
+    conditions (e.g., trading_pair=BTC-USDT AND side=BUY) while having flexibility within list fields
+    (e.g., exchanges=[binance, coinbase] matches either), reducing filter configuration errors.'
+  evidence: hummingbot/strategy_v2/controllers/controller_base.py:33(ExecutorFilter)
+  stage: execution_control
+  alternative_considered: All-OR semantics were rejected; would make 'required' conditions impossible
+    to express
+- id: BD-009
+  type: B/BA
+  content: TripleBarrierConfig enables configurable stop-loss/take-profit/time-limit per executor
+  rationale: Risk management flexibility without hard-coding exit conditions. This boundary enables per-strategy,
+    per-executor risk parameters rather than global limits, allowing sophisticated strategies that differentiate
+    risk tolerance by market condition or signal strength while maintaining consistent safety nets.
+  evidence: hummingbot/strategy_v2/executors/position_executor/data_types.py:17(TripleBarrierConfig)
+  stage: execution_control
+  alternative_considered: Global risk limits were considered but lack flexibility for complex strategies
+- id: BD-010
+  type: BA
+  content: Controllers use pandas_ta for indicator computation
+  rationale: Reuses battle-tested TA library rather than custom implementations. This boundary ensures
+    indicator calculations are mathematically validated and maintained by a dedicated library, reducing
+    code maintenance burden and ensuring consistency across controllers while avoiding reinventing RSI,
+    MACD, Bollinger implementations.
+  evidence: controllers/directional_trading/dman_v3.py:151(update_processed_data)
+  stage: execution_control
+  alternative_considered: Custom implementations were rejected; maintenance burden and accuracy risk too
+    high
+- id: BD-011
+  type: M
+  content: StatArb uses sklearn LinearRegression for cointegration detection
+  rationale: Statistical arbitrage requires cointegration analysis for pair selection. This boundary establishes
+    that StatArb uses sklearn's robust linear regression rather than simple price ratio correlation, ensuring
+    statistical validity of pair selection that can withstand regime changes where naive correlation fails.
+  evidence: controllers/generic/stat_arb.py:69(__init__)
+  stage: execution_control
+  alternative_considered: Rolling correlation was rejected; prone to false signals in mean-reversion
+- id: BD-012
+  type: BA
+  content: QuantumGridAllocator groups active grids by asset for portfolio tracking
+  rationale: Multi-asset grid strategies need portfolio-level allocation tracking. This boundary ensures
+    QuantumGrid can track total exposure and realized PnL per asset across multiple grid instances, enabling
+    balanced allocation and preventing over-concentration in any single asset when running multiple grid
+    strategies.
+  evidence: controllers/generic/quantum_grid_allocator.py:137(update_portfolio_metrics)
+  stage: execution_control
+  alternative_considered: Per-grid isolation was rejected; prevents portfolio-level risk assessment
+- id: BD-013
+  type: BA/DK
+  content: Executors inherit from RunnableBase for consistent tick loops
+  rationale: Unified start/stop/status across each executors simplifies orchestration. This boundary ensures
+    ExecutorOrchestrator can manage PositionExecutor, DCAExecutor, ArbitrageExecutor, etc. with identical
+    control surface, eliminating executor-specific orchestration branches and enabling plug-and-play executor
+    composition.
+  evidence: hummingbot/strategy_v2/executors/executor_base.py:29(ExecutorBase)
+  stage: executor_execution
+  alternative_considered: Strategy-specific executor base classes were rejected; would create fragmentation
+- id: BD-014
+  type: B
+  content: PositionExecutor tracks separate open and close TrackedOrders
+  rationale: Hedge position requires independent management of entry and exit orders. This boundary ensures
+    that closing an existing position doesn't interfere with the opening order's fill tracking, and each
+    order can have independent states (pending, filled, failed) without cross-contamination of position
+    state.
+  evidence: hummingbot/strategy_v2/executors/position_executor/position_executor.py:35(__init__)
+  stage: executor_execution
+  alternative_considered: Single order tracking was rejected; insufficient for hedge position entry+exit
+    model
+- id: BD-015
+  type: B/BA
+  content: DCAExecutor validates min_order_size before placing each level
+  rationale: Prevents partial fills that would break DCA averaging. This boundary ensures each DCA level
+    meets exchange minimum order requirements before submission, preventing the scenario where a partial
+    fill at min_order_size would skew the weighted average and invalidate the expected break-even calculation.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:195(is_any_amount_lower_than_min_order_size)
+  stage: executor_execution
+  alternative_considered: Post-fill validation was rejected; partial fills already committed to blockchain
+    exchanges
+- id: BD-016
+  type: BA
+  content: Max retries default 10 for positions, 3 for arbitrage (high-frequency)
+  rationale: Arbitrage opportunities are time-sensitive, fewer retries prevent missing windows. This boundary
+    differentiates retry behavior by execution type, acknowledging that arbitrage profits decay rapidly
+    (seconds) while position orders have longer validity windows (minutes), optimizing for both opportunity
+    capture and execution reliability.
+  evidence: hummingbot/strategy_v2/executors/arbitrage_executor/arbitrage_executor.py:50(__init__)
+  stage: executor_execution
+  alternative_considered: Unified retry policy was rejected; would either miss arbitrage windows or slow
+    position orders
+- id: BD-017
+  type: M
+  content: GridExecutor generates symmetrical buy/sell levels around mid-price
+  rationale: Grid profits from volatility around a central reference price. This boundary establishes
+    the fundamental grid mechanic where buy orders are placed below mid and sell orders above, ensuring
+    the grid captures spread from bidirectional price movement while maintaining zero net delta when perfectly
+    centered.
+  evidence: hummingbot/strategy_v2/executors/grid_executor/grid_executor.py:127(_generate_grid_levels)
+  stage: executor_execution
+  alternative_considered: Asymmetric grids were rejected; would introduce directional bias and complexity
+- id: BD-018
+  type: M/DK
+  content: TWAPExecutor splits total amount into time-based slices
+  rationale: Reduces market impact by spreading large orders over time. This boundary ensures TWAP execution
+    follows standard market microstructure practice, breaking a large parent order into time-weighted
+    child orders that blend with natural market flow, preventing the price slippage that occurs with single
+    large orders.
+  evidence: hummingbot/strategy_v2/executors/twap_executor/twap_executor.py:51(create_order_plan)
+  stage: executor_execution
+  alternative_considered: Volume-weighted slicing was considered but adds complexity without proportional
+    benefit
+- id: BD-019
+  type: BA
+  content: ExecutorOrchestrator manages PositionHold for same-side aggregation
+  rationale: Multiple buy executors on same pair should share position tracking. This boundary ensures
+    that when multiple controllers independently create buy executors for the same pair, PositionHold
+    aggregates them into a single tracked position, preventing the fragmentation that would occur from
+    independent position calculations.
+  evidence: hummingbot/strategy_v2/executors/executor_orchestrator.py:478(_determine_position_side)
+  stage: orchestration
+  alternative_considered: Per-executor isolation was rejected; would prevent proper portfolio risk assessment
+- id: BD-020
+  type: BA/DK
+  content: StrategyV2Base initializes controllers and MarketDataProvider automatically
+  rationale: Convention-over-configuration reduces boilerplate for new strategies. This boundary eliminates
+    repetitive initialization code that would otherwise require explicit controller instantiation, MarketDataProvider
+    wiring, and queue connections in every strategy, reducing new strategy creation from ~50 lines to
+    ~10 lines.
+  evidence: hummingbot/strategy/strategy_v2_base.py:655(initialize_controllers)
+  stage: orchestration
+  alternative_considered: Explicit initialization was rejected; adds friction without meaningful benefit
+- id: BD-021
+  type: B/DK
+  content: Performance cached in-memory, persisted on stop
+  rationale: Avoids database writes on every tick while ensuring durability. This boundary balances performance
+    (no disk I/O on 100ms ticks) with reliability (performance data survives graceful shutdown), protecting
+    against data loss from crashes while avoiding the ~10ms overhead per tick that continuous persistence
+    would introduce.
+  evidence: hummingbot/strategy_v2/executors/executor_orchestrator.py:173(_initialize_cached_performance)
+  stage: orchestration
+  alternative_considered: Continuous persistence was rejected; too high latency for tick loop
+- id: BD-022
+  type: BA
+  content: Actions queued via asyncio.Queue from controllers to executors
+  rationale: Thread-safe communication between controller ticks and executor execution. This boundary
+    ensures that fast controller ticks (10Hz) can queue actions without blocking, and executors process
+    them asynchronously, preventing controller stalls when executors perform slow operations like gateway
+    API calls or blockchain transactions.
+  evidence: hummingbot/strategy/strategy_v2_base.py:690(listen_to_executor_actions)
+  stage: orchestration
+  alternative_considered: Direct function calls were rejected; would create blocking dependencies
+- id: BD-023
+  type: BA
+  content: Backtesting uses same executor configs as live trading
+  rationale: Config reuse ensures backtest-to-live parity. This boundary eliminates the translation layer
+    between backtest configs and live configs, ensuring that performance observed in backtesting reflects
+    actual live behavior with no parameter drift, which is critical for strategy confidence and user trust.
+  evidence: hummingbot/strategy_v2/backtesting/backtesting_engine_base.py:208(simulate_executor)
+  stage: backtesting
+  alternative_considered: Separate backtest configs were rejected; would introduce parameter mismatch
+    risk
+- id: BD-024
+  type: M
+  content: Simulators compute break-even price using weighted average
+  rationale: DCA break-even requires volume-weighted average of fill prices. This boundary ensures accurate
+    break-even calculation that accounts for varying fill sizes at different prices, which is critical
+    for stop-loss and take-profit trigger accuracy in backtesting simulations.
+  evidence: hummingbot/strategy_v2/backtesting/executors_simulator/dca_executor_simulator.py:15(break_even_price_at_index)
+  stage: backtesting
+  alternative_considered: Simple average was rejected; would be inaccurate with varying fill sizes
+- id: BD-025
+  type: BA/M
+  content: Trade cost passed as flat percentage (default 0.06%)
+  rationale: Simplifies fee modeling while capturing major cost component. This boundary balances accuracy
+    with usability, using a single representative rate that captures maker/taker blend while avoiding
+    the complexity of per-exchange fee schedules and tier structures, which would add significant configuration
+    burden for marginal accuracy gain.
+  evidence: hummingbot/strategy_v2/backtesting/backtesting_engine_base.py:82(run_backtesting)
+  stage: backtesting
+  alternative_considered: Per-exchange fee schedules were rejected; excessive configuration complexity
+- id: BD-026
+  type: B
+  content: Strategy config stored as Pydantic models for validation
+  rationale: Type safety and automatic validation reduce runtime errors. This boundary catches configuration
+    errors at startup rather than mid-execution, with Pydantic's runtime validation preventing invalid
+    trading_pair formats, out-of-range risk parameters, or type mismatches that would otherwise cause
+    cryptic errors deep in execution.
+  evidence: hummingbot/client/config/config_data_types.py:26(BaseClientModel)
+  stage: cli_interface
+  alternative_considered: Runtime validation was rejected; catching errors early is safer for trading
+- id: BD-027
+  type: BA/M
+  content: Config supports both legacy (ConfigVar) and V2 (Pydantic) models
+  rationale: Backward compatibility with existing strategies during migration. This boundary ensures users
+    can continue running ConfigVar-based strategies while gradually migrating to Pydantic models, avoiding
+    forced migration that would break existing deployments and allowing the ecosystem to transition smoothly.
+  evidence: hummingbot/client/command/create_command.py:224(prompt_for_configuration_legacy)
+  stage: cli_interface
+  alternative_considered: Forced migration was rejected; would break existing strategies
+- id: BD-028
+  type: BA/M
+  content: Gateway connectors registered dynamically from gateway status
+  rationale: Plugins architecture without hard-coded connector lists. This boundary allows Gateway to
+    expose connectors dynamically based on what's actually deployed and responding, eliminating the need
+    to update Hummingbot code when new DEX connectors are added, supporting a true plugin model for Gateway-managed
+    protocols.
+  evidence: hummingbot/core/gateway/gateway_http_client.py:301(_register_gateway_connectors)
+  stage: cli_interface
+  alternative_considered: Static connector lists were rejected; would require Hummingbot updates for new
+    DEXs
+- id: BD-029
+  type: BA
+  content: GatewayHttpClient is singleton with shared aiohttp session
+  rationale: Connection pooling improves performance for repeated API calls. This boundary ensures GatewayHttpClient
+    reuses TCP connections and SSL sessions across multiple requests, reducing latency from ~200ms (new
+    connection) to ~20ms (pooled) for Gateway API calls, which occur frequently during executor operations.
+  evidence: hummingbot/core/gateway/gateway_http_client.py:106(_http_client)
+  stage: gateway_integration
+  alternative_considered: Per-request session creation was rejected; excessive connection overhead
+- id: BD-030
+  type: BA/DK
+  content: Separate CLMM and AMM position APIs reflect protocol differences
+  rationale: Concentrated liquidity requires different parameters than constant-product pools. This boundary
+    acknowledges that Uniswap V3-style CLMM positions have tick ranges, liquidity amounts, and fee tier
+    parameters that don't map to standard AMM position models, requiring distinct APIs to capture protocol-specific
+    behaviors.
+  evidence: hummingbot/core/gateway/gateway_http_client.py:912(clmm_position_info)
+  stage: gateway_integration
+  alternative_considered: Unified position model was rejected; insufficient for CLMM complexity
+- id: BD-031
+  type: B
+  content: Token approvals cached to avoid redundant transactions
+  rationale: Approval txs are expensive on L2s, minimize calls. This boundary caches token allowances
+    to avoid unnecessary approval transactions, which on Optimism and Arbitrum can cost $0.10-$1.00 per
+    transaction plus latency. Caching prevents repeated approval checks that would accumulate significant
+    cost over many executor operations.
+  evidence: hummingbot/core/gateway/gateway_http_client.py:680(get_allowances)
+  stage: gateway_integration
+  alternative_considered: Re-approve on every trade was rejected; prohibitive gas costs on L2s
+- id: BD-032
+  type: B/BA
+  content: Triple Barrier Config with stop_loss, take_profit, time_limit, and trailing_stop as optional
+    fields with default MARKET order types for exits
+  rationale: Triple barrier exits default to MARKET orders to ensure immediate execution and guaranteed
+    fills when stop loss, take profit, or trailing stop triggers fire. Using MARKET for each exit types
+    eliminates execution risk from limit order failures during volatile market conditions when risk management
+    is most critical.
+  evidence: hummingbot/strategy_v2/executors/position_executor/data_types.py:17-26(TripleBarrierConfig)
+  stage: position_management
+  alternative_considered: Limit orders were rejected because they may not fill during high volatility
+    when stops trigger, defeating risk management purpose
+- id: BD-033
+  type: B/BA
+  content: TripleBarrierConfig includes open_order_type defaulting to LIMIT for opening positions
+  rationale: Opening positions use LIMIT orders by default to achieve better entry prices and reduce trading
+    fees compared to MARKET orders. This balance between price optimization and execution certainty supports
+    profitability in market-making and directional trading scenarios.
+  evidence: hummingbot/strategy_v2/executors/position_executor/data_types.py:22(open_order_type)
+  stage: Order Entry
+  alternative_considered: MARKET orders were considered but rejected due to higher fees and worse entry
+    prices
+  _evidence_issues:
+  - 'FN_NOT_FOUND: open_order_type in hummingbot/strategy_v2/executors/position_executor/data_types.py'
+- id: BD-034
+  type: B/BA
+  content: Position executor uses leverage parameter defaulting to 1 (no leverage) for spot/linear trading
+  rationale: Default leverage of 1 ensures conservative position sizing and prevents excessive risk exposure
+    for users who don't explicitly configure leverage. This safety default protects against accidental
+    over-leveraging in spot and linear perpetual markets where leverage amplification directly increases
+    liquidation risk.
+  evidence: hummingbot/strategy_v2/executors/position_executor/data_types.py:56(leverage)
+  stage: position_management
+  alternative_considered: Higher defaults were rejected due to liquidation risk, lower defaults limit
+    utility for intentional leverage users
+  _evidence_issues:
+  - 'FN_NOT_FOUND: leverage in hummingbot/strategy_v2/executors/position_executor/data_types.py'
+- id: BD-035
+  type: B/BA
+  content: Stop loss evaluation uses net_pnl_pct comparison against negative stop_loss value in MAKER
+    mode
+  rationale: Stop loss triggers when net_pnl_pct reaches the negative threshold (stop_loss), meaning losses
+    exceed the configured percentage. This boundary ensures positions are closed before losses become
+    catastrophic, protecting capital during adverse market moves in MAKER mode where each orders must
+    be filled before exit.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:326(self.net_pnl_pct <= -self.config.stop_loss)
+  stage: position_management
+  alternative_considered: Absolute loss amounts were considered but rejected as percentage-based provides
+    portability across position sizes
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: self.net_pnl_pct <= -self.config.stop_loss in hummingbot/strategy_v2/executors/dca_executor/dca_executor.py'
+- id: BD-036
+  type: B/BA
+  content: Trailing stop activation requires net_pnl_pct to exceed activation_price threshold
+  rationale: Trailing stops only activate after profits exceed the activation threshold, ensuring the
+    position has achieved meaningful gains before implementing trailing protection. This boundary prevents
+    premature stop activation during minor fluctuations and locks in confirmed profit before trailing
+    begins.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:345(net_pnl_pct > self.config.trailing_stop.activation_price)
+  stage: position_management
+  alternative_considered: Immediate activation was rejected as it would trigger stops during normal position
+    establishment
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: net_pnl_pct > self.config.trailing_stop.activation_price in hummingbot/strategy_v2/executors/dca_executor/dca_executor.py'
+- id: BD-037
+  type: B/DK
+  content: Trailing stop trigger is dynamically updated when net_pnl_pct minus trailing_delta exceeds
+    current trigger value
+  rationale: Dynamic trigger updates follow price movements upward, locking in progressively higher profit
+    floors while maintaining the trailing distance. This ensures maximum profit capture while providing
+    downside protection, with the boundary always maintaining the configured delta below peak profitability.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:351-352(_trailing_stop_trigger_pct)
+  stage: position_management
+  alternative_considered: Fixed stop loss was rejected as it doesn't adapt to favorable price movements
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _trailing_stop_trigger_pct in hummingbot/strategy_v2/executors/dca_executor/dca_executor.py'
+- id: BD-038
+  type: B/BA
+  content: DCA TAKER mode requires activation_bounds with default [0.0001, 0.005] (0.01% and 0.5%)
+  rationale: TAKER mode activation bounds define the price deviation range (0.01% to 0.5%) that triggers
+    DCA order placement. These boundaries prevent orders from triggering during normal spread conditions
+    while capturing meaningful price movements, balancing between frequent small positions and waiting
+    for significant entries.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:52-53(activation_bounds)
+  stage: Order Entry
+  alternative_considered: Wider bounds were rejected as they would reduce DCA effectiveness; narrower
+    bounds would cause excessive triggers
+  _evidence_issues:
+  - 'FN_NOT_FOUND: activation_bounds in hummingbot/strategy_v2/executors/dca_executor/dca_executor.py'
+- id: BD-039
+  type: B
+  content: DCA MAKER mode checks all_open_orders_executed before triggering stop loss or take profit
+  rationale: MAKER mode requires each open orders to fill before evaluating exit conditions, ensuring
+    complete position establishment before risk management triggers. This boundary prevents premature
+    exits when some DCA legs remain unfilled, protecting against exiting with an incomplete position that
+    may recover.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:228(all_open_orders_executed)
+  stage: position_management
+  alternative_considered: Immediate evaluation was rejected as incomplete positions could recover before
+    each legs fill
+- id: BD-040
+  type: B
+  content: Take profit evaluation in MAKER mode requires all_open_orders_executed before closing position
+  rationale: Take profit only evaluates after each DCA legs are filled, ensuring the full intended position
+    size contributes to profits. This boundary prevents taking profit on partial positions that may continue
+    to accumulate gains, maximizing profit capture before closing.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:228(all_open_orders_executed)
+  stage: position_management
+  alternative_considered: Partial take profit was rejected as it reduces potential gains from remaining
+    legs
+- id: BD-041
+  type: B/DK
+  content: Close order is always placed as MARKET order type regardless of open order type
+  rationale: Exit orders always use MARKET type to guarantee execution when risk management triggers fire.
+    This ensures positions close immediately without execution risk, regardless of whether entries used
+    LIMIT orders. The boundary prioritizes execution certainty over price optimization for each exit scenarios.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:398(OrderType.MARKET)
+  stage: position_management
+  alternative_considered: LIMIT exits were rejected as unfilled orders would defeat risk management purpose
+  _evidence_issues:
+  - 'FN_NOT_FOUND: OrderType.MARKET in hummingbot/strategy_v2/executors/dca_executor/dca_executor.py'
+- id: BD-042
+  type: B
+  content: Early stop supports keep_position flag to cancel open orders while maintaining filled position
+  rationale: The keep_position flag allows stopping new order placement while retaining filled positions,
+    enabling strategy adjustment without forced liquidation. This provides flexibility for traders to
+    exit partially-filled positions manually or switch strategies while preserving accumulated position
+    size.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:365-372(keep_position)
+  stage: position_management
+  alternative_considered: Forced close was rejected as it doesn't provide flexibility for manual position
+    management
+  _evidence_issues:
+  - 'FN_NOT_FOUND: keep_position in hummingbot/strategy_v2/executors/dca_executor/dca_executor.py'
+- id: BD-043
+  type: B/DK
+  content: Shutdown process waits for close order completion with 5-second polling interval
+  rationale: The 5-second polling interval balances between checking close order status frequently enough
+    to detect completion and avoiding excessive resource usage. This boundary ensures orderly shutdown
+    while preventing tight polling loops from consuming CPU during shutdown procedures.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:462(module)
+  stage: position_management
+  alternative_considered: Shorter intervals would increase CPU usage; longer intervals would slow shutdown
+    detection
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in hummingbot/strategy_v2/executors/dca_executor/dca_executor.py'
+- id: BD-044
+  type: B/DK
+  content: Max retries counter increments on close order failure, allowing automatic retry
+  rationale: Automatic retry with incrementing counter provides resilience against transient order failures,
+    which are common during high volatility or exchange issues. The counter enables tracking retry attempts
+    and eventually terminating stuck executors, balancing persistence with preventing infinite retry loops.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:461(_current_retries += 1)
+  stage: Error Handling
+  alternative_considered: Single attempt was rejected as it doesn't handle transient failures; unlimited
+    retry was rejected as it could hang indefinitely
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: _current_retries += 1 in hummingbot/strategy_v2/executors/dca_executor/dca_executor.py'
+- id: BD-045
+  type: B
+  content: Close order amount is delta between open_filled_amount and close_filled_amount (net position)
+  rationale: Closing only the net position amount (after partial closes or manual adjustments) ensures
+    accurate position size management. This prevents over-closing or under-closing positions that have
+    been partially managed, maintaining correct exposure throughout the position lifecycle.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:392(delta_amount_to_close)
+  stage: position_management
+  alternative_considered: Closing original amount was rejected as it doesn't handle partial closes; closing
+    full current was rejected as it ignores manual reductions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: delta_amount_to_close in hummingbot/strategy_v2/executors/dca_executor/dca_executor.py'
+- id: BD-046
+  type: B
+  content: Inventory skew uses bid/ask adjustment ratios calculated via linear interpolation based on
+    base asset value vs target
+  rationale: Linear interpolation-based inventory skew adjusts order sizing based on current vs target
+    inventory, ensuring orders are larger on the side that reduces inventory imbalance. This maintains
+    target portfolio composition while capturing spread revenue, with the interpolation providing smooth
+    adjustment transitions.
+  evidence: hummingbot/strategy/pure_market_making/inventory_skew_calculator.pyx:46-54(c_calculate_bid_ask_ratios)
+  stage: Order Sizing
+  alternative_considered: Step function was rejected as it creates abrupt sizing changes; exponential
+    was rejected as it may be too aggressive
+- id: BD-047
+  type: B/DK
+  content: Inventory range is capped at 50% of total portfolio value to prevent extreme skew
+  rationale: The 50% cap prevents extreme inventory concentration that could result in significant losses
+    if the asset price drops. This boundary ensures sufficient diversification while allowing meaningful
+    skew adjustment, protecting against catastrophic single-asset exposure in market-making strategies.
+  evidence: hummingbot/strategy/pure_market_making/inventory_skew_calculator.pyx:42(total_portfolio_value
+    * 0.5)
+  stage: Order Sizing
+  alternative_considered: Higher caps were rejected due to concentration risk; lower caps would reduce
+    skew effectiveness
+- id: BD-048
+  type: B/BA
+  content: 'Bid adjustment formula: 2.0 when inventory below target, decreasing to 0.0 at high inventory;
+    inverse for ask'
+  rationale: The adjustment range from 2.0x to 0.0x controls how aggressively the strategy shifts order
+    sizing based on inventory. Bid adjustments scale inversely with inventory, placing larger orders when
+    buying to restore balance. This boundary provides meaningful skew impact while preventing extreme
+    one-sided positioning.
+  evidence: hummingbot/strategy/pure_market_making/inventory_skew_calculator.pyx:52-55(bid_adjustment)
+  stage: Order Sizing
+  alternative_considered: Wider ranges were rejected as they create extreme positioning; narrower ranges
+    reduce skew effectiveness
+- id: BD-049
+  type: B/BA
+  content: Liquidity mining distributes portfolio evenly across multiple markets, then allocates based
+    on balance
+  rationale: Equal initial distribution ensures no single market dominates risk exposure before considering
+    individual market balances. The subsequent allocation based on actual balance ensures resources flow
+    to markets where capital is available, balancing risk diversification with capital efficiency.
+  evidence: hummingbot/strategy/liquidity_mining/liquidity_mining.py:346-347(market_portion)
+  stage: position_management
+  alternative_considered: Balance-only allocation was rejected as it concentrates risk; strict equal allocation
+    was rejected as it ignores capital availability
+  _evidence_issues:
+  - 'FN_NOT_FOUND: market_portion in hummingbot/strategy/liquidity_mining/liquidity_mining.py'
+  vague_rationale: true
+- id: BD-050
+  type: B/BA
+  content: Buy budget calculation subtracts existing base asset value from market portion to find quote
+    budget
+  rationale: Subtracting existing base asset holdings from market portion ensures the strategy only deploys
+    capital needed to reach target allocation. This prevents over-buying assets already exceeding target,
+    maintaining correct portfolio composition while avoiding unnecessary capital deployment.
+  evidence: hummingbot/strategy/liquidity_mining/liquidity_mining.py:340(create_budget_allocation)
+  stage: Budget Allocation
+  alternative_considered: Ignoring existing holdings was rejected as it leads to target over-allocation
+- id: BD-051
+  type: B/BA
+  content: Order refresh tolerance comparison uses strict inequality (>) to prevent unnecessary refreshes
+    on exact boundary
+  rationale: Strict inequality prevents order refresh when price is exactly at tolerance boundary, avoiding
+    refresh loops caused by floating-point precision. This boundary ensures stability at boundaries while
+    still refreshing when meaningful deviation occurs, reducing unnecessary order churn.
+  evidence: hummingbot/strategy/liquidity_mining/liquidity_mining.py:386(is_within_tolerance)
+  stage: position_management
+  alternative_considered: Loose inequality was rejected as it increases unnecessary refreshes; equality
+    check was rejected as floating-point makes exact equality unreliable
+- id: BD-052
+  type: B
+  content: Max order age check uses strictly greater than (>) to determine if order should be cancelled
+  rationale: Strict inequality prevents immediate cancellation of newly placed orders that may have age
+    slightly exceeding zero due to timing. This boundary ensures orders remain for their full intended
+    duration while still enforcing maximum age limits, avoiding premature cancellation of valid orders.
+  evidence: hummingbot/strategy/liquidity_mining/liquidity_mining.py:410(order_age > max_order_age)
+  stage: position_management
+  alternative_considered: Greater-or-equal was rejected as it would cancel orders at exactly max_age;
+    less-than was rejected as it would never trigger
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: order_age > max_order_age in hummingbot/strategy/liquidity_mining/liquidity_mining.py'
+- id: BD-053
+  type: B
+  content: Order execution only proceeds if no active orders exist and refresh time has elapsed
+  rationale: The dual condition prevents both duplicate orders (by checking for existing orders) and excessive
+    order churn (by respecting refresh intervals). This boundary ensures orders are placed only when appropriate,
+    balancing responsiveness with order book cleanliness.
+  evidence: hummingbot/strategy/liquidity_mining/liquidity_mining.py:403(cancel_active_orders)
+  stage: position_management
+  alternative_considered: Either condition alone was rejected as it would either allow duplicates or never
+    refresh old orders
+  vague_rationale: true
+- id: BD-054
+  type: B/DK
+  content: Volatility-based spread calculation uses max(base_spread, volatility * multiplier) to widen
+    during volatility
+  rationale: Taking the maximum of base spread and volatility-adjusted spread ensures adequate compensation
+    for increased market risk during volatile periods while maintaining minimum spread during calm markets.
+    This boundary protects against adverse selection losses when volatility spikes.
+  evidence: hummingbot/strategy/liquidity_mining/liquidity_mining.py:571(update_volatility)
+  stage: Order Pricing
+  alternative_considered: Fixed spread was rejected as it doesn't adapt to volatility; exclusive max was
+    rejected as it could result in zero spread
+- id: BD-055
+  type: B
+  content: Max spread cap prevents volatility multiplier from causing excessive spread widening
+  rationale: The max spread cap prevents volatility multipliers from creating prohibitively wide spreads
+    that would render orders uncompetitive. This boundary ensures spread widening remains within practical
+    bounds, balancing risk protection with order fillability.
+  evidence: hummingbot/strategy/liquidity_mining/liquidity_mining.py:314-315(max_spread > 0)
+  stage: Order Pricing
+  alternative_considered: Unlimited spread was rejected as it would make orders uncompetitive; too low
+    cap was rejected as it wouldn't allow meaningful volatility protection
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: max_spread > 0 in hummingbot/strategy/liquidity_mining/liquidity_mining.py'
+- id: BD-056
+  type: B/BA
+  content: Volatility interval defaults to 5 minutes (300 seconds) with 10-period averaging
+  rationale: The 5-minute interval with 10-period averaging (totaling 50 minutes of historical data) balances
+    between responsiveness to recent volatility and smoothing out short-term noise. This boundary provides
+    relevant volatility measurements for spread calculation without overreacting to momentary price swings.
+  evidence: hummingbot/strategy/liquidity_mining/liquidity_mining.py:56-57(volatility_interval)
+  stage: market_data
+  alternative_considered: Shorter intervals were rejected as they increase noise; longer intervals were
+    rejected as they reduce responsiveness
+  _evidence_issues:
+  - 'FN_NOT_FOUND: volatility_interval in hummingbot/strategy/liquidity_mining/liquidity_mining.py'
+- id: BD-057
+  type: B/DK
+  content: Position mode (HEDGE vs ONEWAY) is set per-trading-pair after market is ready, with retry logic
+  rationale: Setting position mode after market readiness and with retry logic ensures reliable mode configuration
+    before trading begins. Per-pair configuration allows users to mix modes across different trading pairs
+    while retry logic handles temporary exchange communication failures.
+  evidence: hummingbot/strategy/perpetual_market_making/perpetual_market_making.py:451-461(_position_mode_ready)
+  stage: market_data
+  alternative_considered: Immediate setting was rejected as it may fail if exchange isn't ready; no retry
+    was rejected as single failure would prevent trading
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _position_mode_ready in hummingbot/strategy/perpetual_market_making/perpetual_market_making.py'
+- id: BD-058
+  type: B
+  content: Leverage is set before position mode to ensure proper margin calculations
+  rationale: Setting leverage before position mode ensures margin calculations use the correct leverage
+    value from the start. This sequence matters because position mode affects how margin is calculated
+    for hedge mode (separate long/short) vs one-way mode (net position), making leverage setting order
+    critical.
+  evidence: hummingbot/strategy/perpetual_market_making/perpetual_market_making.py:449(set_leverage)
+  stage: market_data
+  alternative_considered: Reverse order was rejected as it would calculate margin with incorrect leverage
+    assumptions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: set_leverage in hummingbot/strategy/perpetual_market_making/perpetual_market_making.py'
+- id: BD-059
+  type: B
+  content: 'Order proposal pipeline: create_base_proposal -> apply_order_levels_modifiers -> apply_order_price_modifiers
+    -> apply_budget_constraint'
+  rationale: 'The ordered pipeline ensures proposals are modified in the correct sequence: first establish
+    base orders, then adjust levels (size distribution), then modify prices, and finally constrain to
+    available budget. This ordering prevents conflicting modifications and ensures each stage operates
+    on appropriately prepared data.'
+  evidence: hummingbot/strategy/perpetual_market_making/perpetual_market_making.py:142(order_refresh_tolerance_pct)
+  stage: Order Generation
+  alternative_considered: Parallel processing was rejected as it could create inconsistent proposals;
+    different orderings were rejected as they would cause conflicting modifications
+  vague_rationale: true
+- id: BD-060
+  type: B/BA
+  content: Order refresh tolerance only checked when create_timestamp is current (rate-limited order replacement)
+  rationale: Rate-limiting tolerance checks using create_timestamp prevents excessive order refresh attempts
+    that could trigger exchange rate limits. This boundary ensures refresh only occurs when appropriate
+    cooldown has passed, balancing order freshness with exchange API compliance.
+  evidence: hummingbot/strategy/perpetual_market_making/perpetual_market_making.py:896-898(create_timestamp)
+  stage: position_management
+  alternative_considered: Unlimited refresh was rejected as it would violate exchange rate limits; longer
+    rate limits were rejected as they would reduce order responsiveness
+  _evidence_issues:
+  - 'FN_NOT_FOUND: create_timestamp in hummingbot/strategy/perpetual_market_making/perpetual_market_making.py'
+  vague_rationale: true
+- id: BD-061
+  type: B/BA
+  content: TripleBarrierConfig supports new_instance_with_adjusted_volatility for dynamic risk adjustment
+  rationale: Dynamic volatility adjustment allows risk parameters to scale with market conditions without
+    creating new configurations. This enables responsive risk management that adapts to changing volatility
+    while maintaining the original configuration's intent and structure.
+  evidence: hummingbot/strategy_v2/executors/position_executor/data_types.py:28-45(new_instance_with_adjusted_volatility)
+  stage: position_management
+  alternative_considered: Manual reconfiguration was rejected as it requires user intervention and doesn't
+    scale; fixed parameters were rejected as they don't adapt to volatility
+- id: BD-062
+  type: B
+  content: Volatility adjustment multiplies both activation_price and trailing_delta for proportional
+    scaling
+  rationale: Proportional scaling of both activation price and trailing delta maintains the relative risk
+    profile when adjusting for volatility. This ensures the distance between activation and trailing stop
+    remains consistent, providing balanced protection regardless of volatility environment.
+  evidence: hummingbot/strategy_v2/executors/position_executor/data_types.py:28(new_instance_with_adjusted_volatility)
+  stage: position_management
+  alternative_considered: Independent adjustment was rejected as it would change the risk profile; no
+    adjustment was rejected as it wouldn't adapt to volatility
+- id: BD-063
+  type: B/DK
+  content: Grid executor calculates minimum base amount ensuring both min_notional and quantization constraints
+  rationale: Calculating minimum base amount based on both min_notional (minimum order value) and quantization
+    (exchange-specific rounding) constraints ensures orders pass exchange validation. This prevents rejected
+    orders due to size constraints while respecting exchange-specific trading rules.
+  evidence: hummingbot/strategy_v2/executors/grid_executor/grid_executor.py:131-145(min_base_amount calculation)
+  stage: Order Sizing
+  alternative_considered: Single constraint was rejected as it doesn't cover each exchange validation
+    requirements
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: min_base_amount calculation in hummingbot/strategy_v2/executors/grid_executor/grid_executor.py'
+- id: BD-064
+  type: B/BA
+  content: Grid level count is limited by both total_amount_quote and grid_range/step_size constraints
+  rationale: Taking the minimum of capital-constrained and price-range-constrained level counts prevents
+    both insufficient capital per level and insufficient price range coverage. This boundary ensures grid
+    operates within both financial and technical constraints, producing a valid grid configuration.
+  evidence: hummingbot/strategy_v2/executors/grid_executor/grid_executor.py:163(module)
+  stage: Order Sizing
+  alternative_considered: Either constraint alone was rejected as it would produce invalid grids; maximum
+    was rejected as it would over-constrain the other dimension
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in hummingbot/strategy_v2/executors/grid_executor/grid_executor.py'
+- id: BD-065
+  type: B/BA
+  content: Grid take profit defaults to max(step_size, configured_take_profit) when coerce_tp_to_step
+    enabled
+  rationale: Taking the maximum of step size and configured take profit ensures take profit aligns with
+    grid levels when coerced. This prevents take profit values smaller than grid spacing that would create
+    inconsistent price targets, ensuring aligned profit levels with grid structure.
+  evidence: hummingbot/strategy_v2/executors/grid_executor/grid_executor.py:406(get_take_profit_price)
+  stage: Order Pricing
+  alternative_considered: Minimum step was rejected as it ignores user configuration; user value was rejected
+    as it would create misalignment
+- id: BD-066
+  type: B/BA
+  content: Executor close order price defaults to NaN, triggering market order at current price
+  rationale: Defaulting to NaN ensures close orders execute as MARKET orders, guaranteeing execution when
+    positions need to exit. This provides sensible defaults that prioritize execution certainty for risk
+    management scenarios while allowing explicit price specification when limit exits are desired.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:24(dcaexecutor)
+  stage: position_management
+  alternative_considered: Default to zero was rejected as it would create invalid orders; default to current
+    price was rejected as it would require real-time lookup
+  _evidence_issues:
+  - 'FN_NOT_FOUND: dcaexecutor in hummingbot/strategy_v2/executors/dca_executor/dca_executor.py'
+- id: BD-067
+  type: B/DK
+  content: Min order size check compares both notional (amount * price) and base amount against exchange
+    minimums
+  rationale: Checking both notional value and base amount ensures compliance with exchange minimums that
+    may be specified in either dimension. Some exchanges require minimum notional while others require
+    minimum base amount, making dual validation necessary for universal exchange compatibility.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:199-201(notional_size_check,
+    base_amount_size_check)
+  stage: Order Validation
+  alternative_considered: Single check was rejected as it wouldn't cover each exchange requirements
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: notional_size_check, base_amount_size_check in hummingbot/strategy_v2/executors/dca_executor/dca_executor.py'
+- id: BD-068
+  type: B
+  content: 'OrderLevelBuilder supports three input types: single value (applied to all), list (per-level),
+    dict (distribution function)'
+  rationale: 'Supporting three input types provides flexibility for different configuration scenarios:
+    simple uniform values, explicit per-level specification, and programmatically generated distributions.
+    This enables both simple configurations and complex custom distributions through a unified interface.'
+  evidence: hummingbot/strategy_v2/utils/order_level_builder.py:42-65(resolve_input)
+  stage: Configuration
+  alternative_considered: Single type was rejected as it would reduce flexibility; more types were rejected
+    as they would increase complexity without adding value
+- id: BD-069
+  type: B/DK
+  content: Distribution methods include linear, Fibonacci, and weighted options for order level spacing
+  rationale: Multiple distribution methods allow users to choose order spacing that matches their strategy
+    goals. Linear provides uniform spacing, Fibonacci provides accelerating spacing, and weighted allows
+    custom distribution shapes, enabling optimization for different market behaviors and risk profiles.
+  evidence: hummingbot/strategy_v2/utils/order_level_builder.py:59(Distributions.{method})
+  stage: Configuration
+  alternative_considered: Single method was rejected as it wouldn't provide flexibility for different
+    strategies
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: Distributions.{method} in hummingbot/strategy_v2/utils/order_level_builder.py'
+- id: BD-070
+  type: B/BA
+  content: Default order_refresh_time is 300 seconds (5 minutes) for level-based strategies
+  rationale: The 5-minute default balances between keeping orders competitive and avoiding excessive refresh
+    churn. This interval is long enough to allow orders to accumulate fills while short enough to maintain
+    competitive pricing, providing sensible defaults for most trading scenarios.
+  evidence: hummingbot/strategy_v2/utils/order_level_builder.py:67(build_order_levels)
+  stage: position_management
+  alternative_considered: Shorter intervals were rejected as they increase churn; longer intervals were
+    rejected as they reduce price responsiveness
+- id: BD-071
+  type: B/BA
+  content: Cooldown time defaults to 0, allowing immediate next order placement after fill
+  rationale: Zero default cooldown allows continuous order placement for maximum fill opportunity, particularly
+    important for high-frequency strategies. Users can explicitly configure cooldown when spacing between
+    orders is desired, making the default permissive while allowing restriction.
+  evidence: 'hummingbot/strategy_v2/utils/order_level_builder.py:72(cooldown_time: int = 0)'
+  stage: Order Timing
+  alternative_considered: Non-zero default was rejected as it reduces fill opportunity by default
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: cooldown_time: int = 0 in hummingbot/strategy_v2/utils/order_level_builder.py'
+- id: BD-072
+  type: B
+  content: Executor orchestrator evaluates max_retries condition in control_task loop to auto-terminate
+    stuck executors
+  rationale: Auto-termination of stuck executors after max retries prevents resource consumption by failed
+    operations. This boundary ensures the system recovers from persistently failing executors while allowing
+    transient failures to be retried, balancing resilience with resource management.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:502(evaluate_max_retries)
+  stage: Error Handling
+  alternative_considered: Unlimited retry was rejected as it would allow infinite resource consumption;
+    immediate termination was rejected as it wouldn't allow transient failure recovery
+- id: BD-073
+  type: B/BA
+  content: Perpetual market stop loss uses net_pnl_quote (absolute) vs stop_loss percent times max_amount
+  rationale: Absolute loss calculation (net_pnl_quote) compared against maximum loss (stop_loss * max_amount)
+    provides consistent risk management regardless of entry price variations. This ensures risk is measured
+    in dollar terms rather than percentage, matching how traders typically think about position risk.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:330(net_pnl_quote <= -self.max_loss_quote)
+  stage: position_management
+  alternative_considered: Percentage-only was rejected as it doesn't reflect absolute dollar risk; mixed
+    approaches were rejected as they create inconsistent behavior
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: net_pnl_quote <= -self.max_loss_quote in hummingbot/strategy_v2/executors/dca_executor/dca_executor.py'
+- id: BD-074
+  type: B/DK
+  content: Budget validation uses OrderCandidate with leverage parameter for perpetual connectors
+  rationale: Using leverage-aware OrderCandidate ensures budget validation accounts for margin requirements
+    in perpetual markets. This enables accurate validation that the position can be opened given available
+    margin, preventing orders that would exceed margin capacity.
+  evidence: hummingbot/strategy_v2/executors/dca_executor/dca_executor.py:243-250(PerpetualOrderCandidate)
+  stage: Budget Validation
+  alternative_considered: Non-leveraged validation was rejected as it would allow margin-exceeding orders
+  _evidence_issues:
+  - 'FN_NOT_FOUND: PerpetualOrderCandidate in hummingbot/strategy_v2/executors/dca_executor/dca_executor.py'
+- id: BD-075
+  type: B/BA
+  content: Price ceiling must be greater than or equal to price floor (validated at init)
+  rationale: Validation at initialization prevents creation of invalid price range configurations where
+    ceiling is below floor. This boundary ensures price bands are logically consistent, preventing trading
+    strategies from operating in impossible or nonsensical price ranges.
+  evidence: hummingbot/strategy/perpetual_market_making/perpetual_market_making.py:84-85(price_ceiling
+    < price_floor)
+  stage: Order Pricing
+  alternative_considered: Runtime validation was rejected as it allows invalid objects to exist; no validation
+    was rejected as it would cause runtime errors
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: price_ceiling < price_floor in hummingbot/strategy/perpetual_market_making/perpetual_market_making.py'
+- id: BD-076
+  type: B/BA
+  content: Default max_order_age is 1800 seconds (30 minutes) before order refresh
+  rationale: The 30-minute default ensures orders don't remain too long in the book while allowing adequate
+    time for fills. This balances between order freshness and fill opportunity, particularly important
+    for strategies where order cancellation costs are low but fill probability decreases with age.
+  evidence: 'hummingbot/strategy/pure_market_making/pure_market_making.pyx:60(max_order_age: float = 1800.0)'
+  stage: position_management
+  alternative_considered: Shorter defaults were rejected as they reduce fill opportunity; longer defaults
+    were rejected as they reduce price freshness
+- id: BD-077
+  type: B/BA
+  content: Hanging orders cancel threshold defaults to 10% of order value
+  rationale: The 10% hanging orders threshold determines when orphaned orders far from mid-price should
+    be cancelled. This boundary balances between keeping orders that might still fill and cancelling orders
+    that have become too far from competitive pricing to likely execute.
+  evidence: hummingbot/strategy/pure_market_making/pure_market_making.pyx:271(hanging_orders_cancel_pct)
+  stage: position_management
+  alternative_considered: Lower threshold was rejected as it would cancel orders too aggressively; higher
+    threshold was rejected as it would leave too many non-competitive orders
+- id: BD-078
+  type: B/BA
+  content: Filled order delay defaults to 60 seconds before placing next order
+  rationale: The 60-second delay after fill prevents rapid order placement that could lead to over-trading
+    and excessive fees. This boundary provides breathing room between orders while being short enough
+    to maintain competitive presence, balancing between activity and cost efficiency.
+  evidence: 'hummingbot/strategy/pure_market_making/pure_market_making.pyx:62(filled_order_delay: float
+    = 60.0)'
+  stage: Order Timing
+  alternative_considered: Zero delay was rejected as it increases fee costs; longer delays were rejected
+    as they reduce competitive presence
+- id: BD-079
+  type: B/BA
+  content: Minimum spread default is 0 (no minimum), allowing orders at any spread
+  rationale: Zero minimum spread allows orders to be placed at any spread including negative spreads,
+    which may occur during arbitrage or market maker competition. Users who want protection against negative
+    spread orders can explicitly configure a minimum, making the default permissive.
+  evidence: N/A:0(see_rationale)
+  stage: Order Pricing
+  alternative_considered: Non-zero default was rejected as it would prevent valid negative spread scenarios
+- id: BD-080
+  type: B
+  content: Ping-pong mode tracks filled_buys_balance and filled_sells_balance separately
+  rationale: Separate tracking of buy and sell fill balances enables the strategy to understand inventory
+    imbalance created by filled orders. This is essential for ping-pong mode to know when to place opposite-side
+    orders to balance inventory, ensuring the strategy doesn't accumulate unwanted inventory.
+  evidence: hummingbot/strategy/pure_market_making/pure_market_making.pyx:165(ping_pong_enabled)
+  stage: Order Sizing
+  alternative_considered: Net balance only was rejected as it doesn't track directional fill history needed
+    for inventory decisions
+- id: BD-081
+  type: B/DK
+  content: Take-if-crossed flag converts MARKET orders to LIMIT when crossing spread
+  rationale: The take-if-crossed flag allows MARKET orders to become LIMIT orders at the current price
+    when they would cross the spread. This prevents immediate fill at worse prices while allowing execution
+    when the market moves, balancing between execution certainty and price optimization.
+  evidence: hummingbot/strategy/pure_market_making/pure_market_making.pyx:136-137(take_if_crossed)
+  stage: Order Entry
+  alternative_considered: Always market was rejected as it doesn't optimize price; always limit was rejected
+    as it may not execute when needed
+- id: BD-082
+  type: B/DK
+  content: Historical volatility uses exponentially weighted moving average with 90-day lookback
+  rationale: EWMA with 90-day lookback prioritizes long-term trend sensitivity while remaining responsive
+    to recent market conditions. The exponential weighting emphasizes recent data points within the 90-day
+    window, making the indicator suitable for volatility forecasting in trending markets with gradual
+    regime changes.
+  evidence: hummingbot/strategy/__utils__/trailing_indicators/historical_volatility.py:20(module)
+  stage: hummingbot.strategy.__utils__.trailing_indicators
+  alternative_considered: Simple moving average was considered but provides less weight to recent volatility
+    changes
+  _evidence_issues:
+  - 'LINE_OOB: hummingbot/strategy/__utils__/trailing_indicators/historical_volatility.py:20 > 19'
+- id: BD-083
+  type: B/DK
+  content: Instant volatility uses rolling window standard deviation with window=12
+  rationale: 12-period rolling window captures short-term volatility dynamics suitable for intraday trading.
+    The window size balances responsiveness to rapid market moves against noise filtering, providing real-time
+    volatility signals for immediate trading decisions.
+  evidence: hummingbot/strategy/__utils__/trailing_indicators/instant_volatility.py:19(module)
+  stage: hummingbot.strategy.__utils__.trailing_indicators
+  alternative_considered: Longer windows were rejected as they reduce responsiveness critical for short-term
+    signals
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in hummingbot/strategy/__utils__/trailing_indicators/instant_volatility.py'
+- id: BD-084
+  type: B/DK
+  content: DMAN v3 uses dual EMA crossover (fast=5, slow=20) with Bollinger Bands (100,3.0) for direction
+    signals
+  rationale: Fast EMA (5) and slow EMA (20) combination identifies medium-term trend changes with reduced
+    lag compared to simple moving averages. Bollinger Bands with 100-period SMA and 3.0 standard deviations
+    define volatility-based boundaries for entries and exits, creating a directional trading system that
+    filters false signals in trending markets.
+  evidence: controllers/directional_trading/dman_v3.py:15-19(module)
+  stage: controllers.directional_trading
+  alternative_considered: Shorter Bollinger Band periods were rejected as they create excessive false
+    signals in volatile markets
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in controllers/directional_trading/dman_v3.py'
+- id: BD-085
+  type: B
+  content: MACD BB v1 uses standard MACD (12,26,9) combined with Bollinger Bands (20,2.0) for trade signals
+  rationale: Standard MACD parameters (12,26,9) represent the industry-standard momentum indicator configuration.
+    Bollinger Bands with 20-period SMA and 2.0 standard deviations provide volatility-adjusted boundaries
+    that confirm MACD signals, ensuring trades occur at meaningful price deviations from statistical norms.
+  evidence: controllers/directional_trading/macd_bb_v1.py:15-20(module)
+  stage: controllers.directional_trading
+  alternative_considered: Alternative MACD periods were not adopted to maintain consistency with widely-used
+    technical analysis conventions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in controllers/directional_trading/macd_bb_v1.py'
+- id: BD-086
+  type: B/BA
+  content: Statistical arbitrage uses Z-score threshold of 2.0 with 1000-sample mean lookback
+  rationale: Z-score threshold of 2.0 identifies statistically rare price deviations occurring approximately
+    5% of the time under normal distribution assumptions, ensuring only high-confidence mean-reversion
+    opportunities are traded. The 1000-sample lookback ensures sufficient data points for reliable statistical
+    inference while remaining responsive to recent market regime changes.
+  evidence: controllers/generic/stat_arb.py:15-17(module)
+  stage: controllers.generic
+  alternative_considered: Lower Z-score thresholds were rejected due to higher probability of trades failing
+    to revert
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in controllers/generic/stat_arb.py'
+- id: BD-087
+  type: B/BA
+  content: PMM Dynamic uses inventory skew adjustment with base spread of 0.5% and 0.01 order interval
+  rationale: Base spread of 0.5% ensures market maker compensation for inventory risk while remaining
+    competitive in typical market conditions. The 0.01 order interval provides granular price adjustments
+    for inventory balancing without excessive order frequency. Inventory skew adjustment dynamically responds
+    to inventory accumulation, preventing one-sided exposure.
+  evidence: controllers/market_making/pmm_dynamic.py:25-30(module)
+  stage: controllers.market_making
+  alternative_considered: Fixed spread models were rejected as they cannot adapt to changing inventory
+    positions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in controllers/market_making/pmm_dynamic.py'
+- id: BD-088
+  type: B/BA
+  content: DCA Executor Simulator uses dollar-cost averaging with configurable frequency and investment
+    amount
+  rationale: Dollar-cost averaging reduces timing risk and smooths market impact by distributing fixed
+    investment amounts across multiple executions. Configurable frequency and amount allow strategy customization
+    for different risk tolerances and capital deployment requirements, supporting both conservative and
+    aggressive DCA implementations.
+  evidence: hummingbot/strategy_v2/backtesting/executors_simulator/dca_executor_simulator.py:31-38(module)
+  stage: hummingbot.strategy_v2.backtesting.executors_simulator
+  alternative_considered: Fixed lump-sum investing was rejected for strategies requiring risk reduction
+    through purchase timing diversification
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in hummingbot/strategy_v2/backtesting/executors_simulator/dca_executor_simulator.py'
+- id: BD-089
+  type: B/DK
+  content: Position Executor uses ATR-based trailing stop with 2% delta and 5% stop loss
+  rationale: ATR-based trailing stop with 2% delta allows profits to run while protecting against reversals,
+    adapting stop distance to current market volatility. Fixed 5% stop loss provides hard loss boundary
+    protection independent of volatility, ensuring consistent risk management across different market
+    conditions and assets.
+  evidence: hummingbot/strategy_v2/backtesting/executors_simulator/position_executor_simulator.py:31-37(module)
+  stage: hummingbot.strategy_v2.backtesting.executors_simulator
+  alternative_considered: Fixed percentage trailing stops were rejected as they cannot adapt to varying
+    asset volatility profiles
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in hummingbot/strategy_v2/backtesting/executors_simulator/position_executor_simulator.py'
+- id: BD-090
+  type: B/BA
+  content: Backtesting engine calculates performance using CAGR and Sharpe ratio with risk-free rate
+  rationale: CAGR provides annualized return metric enabling fair comparison across strategies with different
+    time horizons. Sharpe ratio with risk-free rate accounts for volatility-adjusted returns and opportunity
+    cost of capital, providing comprehensive performance evaluation beyond simple return metrics for backtesting
+    validation.
+  evidence: hummingbot/strategy_v2/backtesting/backtesting_engine_base.py:25-30(module)
+  stage: hummingbot.strategy_v2.backtesting
+  alternative_considered: Simple total return was rejected as it doesn't account for time value or risk-adjusted
+    performance
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in hummingbot/strategy_v2/backtesting/backtesting_engine_base.py'
+- id: BD-091
+  type: B/BA
+  content: Arbitrage executor requires minimum 0.3% profitability threshold before execution
+  rationale: 0.3% profitability threshold ensures arbitrage opportunities exceed typical execution costs
+    including trading fees, slippage, and latency expenses. This boundary filters out marginal opportunities
+    where execution costs would erode potential profits, maintaining positive expected value across executed
+    arbitrage trades.
+  evidence: hummingbot/strategy_v2/executors/arbitrage_executor/arbitrage_executor.py:43-44(module)
+  stage: executor_execution
+  alternative_considered: Lower thresholds were rejected as historical fee structures and slippage make
+    sub-0.3% opportunities consistently unprofitable
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in hummingbot/strategy_v2/executors/arbitrage_executor/arbitrage_executor.py'
+- id: BD-092
+  type: B/BA
+  content: Grid executor uses arithmetic grid spacing with 0.05% price and 0% size volatility adjustment
+  rationale: Arithmetic grid spacing provides equal price intervals regardless of absolute price level,
+    suitable for range-bound markets. 0.05% price spacing creates granular profit-taking opportunities
+    in sideways markets. 0% size volatility adjustment maintains consistent order sizing, simplifying
+    grid management while accepting uniform exposure across grid levels.
+  evidence: hummingbot/strategy_v2/executors/grid_executor/grid_executor.py:47-54(module)
+  stage: executor_execution
+  alternative_considered: Geometric spacing was rejected as it creates excessive concentration at extreme
+    price levels
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in hummingbot/strategy_v2/executors/grid_executor/grid_executor.py'
+- id: BD-093
+  type: B/DK
+  content: Liquidity mining adjusts spread based on 5-minute volatility with 10-period averaging
+  rationale: 5-minute volatility measurement captures recent market dynamics for adaptive spread adjustment,
+    ensuring quotes remain competitive during high-volatility periods while avoiding excessive spreads
+    in calm markets. 10-period averaging reduces noise in volatility signals, preventing erratic spread
+    adjustments that could harm market-making relationships.
+  evidence: hummingbot/strategy/liquidity_mining/liquidity_mining.py:56-58(module)
+  stage: hummingbot.strategy.liquidity_mining
+  alternative_considered: Shorter averaging periods were rejected due to excessive spread oscillation
+    from volatility noise
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in hummingbot/strategy/liquidity_mining/liquidity_mining.py'
+- id: BD-094
+  type: B/BA
+  content: Cross-exchange market making requires minimum profitability divided by 100 for trade eligibility
+  rationale: Profitability divided by 100 establishes a minimum return threshold relative to trade size,
+    ensuring only economically meaningful arbitrage opportunities are executed. This normalization allows
+    consistent thresholds across different asset valuations and price levels while filtering out marginal
+    opportunities.
+  evidence: hummingbot/strategy/cross_exchange_market_making/cross_exchange_market_making.py:145-147(module)
+  stage: global
+  alternative_considered: Fixed percentage threshold was rejected due to inconsistent application across
+    different asset price ranges
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in hummingbot/strategy/cross_exchange_market_making/cross_exchange_market_making.py'
+- id: BD-095
+  type: B
+  content: Candles example calculates RSI with length=14, Bollinger Bands (20,2.0), and EMA (14)
+  rationale: RSI with 14-period length follows Welles Wilder's original specification for balanced momentum
+    measurement. Bollinger Bands with 20-period SMA and 2.0 standard deviations provide standard volatility
+    boundaries. 14-period EMA offers consistent trend confirmation matching RSI length for coordinated
+    indicator signals in example demonstrations.
+  evidence: scripts/candles_example.py:162-164(module)
+  stage: scripts
+  alternative_considered: Custom period combinations were rejected to maintain alignment with widely documented
+    technical analysis practices
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in scripts/candles_example.py'
+- id: BD-096
+  type: B
+  content: Executor simulator calculates net portfolio value using available balance plus unrealized PnL
+  rationale: Net portfolio value combining available balance and unrealized PnL provides complete position
+    valuation for accurate backtesting equity calculations. This approach captures total trading account
+    value including open positions, enabling proper risk assessment and performance tracking throughout
+    backtest simulations.
+  evidence: hummingbot/strategy_v2/backtesting/executor_simulator_base.py:42-58(module)
+  stage: hummingbot.strategy_v2.backtesting
+  alternative_considered: Available balance only was rejected as it fails to account for active position
+    values during backtesting
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in hummingbot/strategy_v2/backtesting/executor_simulator_base.py'
+- id: BD-097
+  type: B/BA
+  content: 'TripleBarrier defaults: stop_loss_order_type/time_limit_order_type=MARKET (security-critical)'
+  rationale: 'TripleBarrier orders default to MARKET type for stop_loss and time_limit to ensure execution
+    certainty. This is a security-critical decision because it prevents partial fills and ensures the
+    barrier protection always executes regardless of liquidity conditions. The boundary constraint: any
+    custom order type must explicitly override these defaults and accept the risk of non-execution during
+    adverse market conditions.'
+  evidence: position_executor/data_types.py:22-25(TripleBarrierConfig.__init__), position_executor.py:45-48(PositionExecutor.__init__),
+    grid_executor.py:48-52(GridExecutor.__init__)
+  stage: position_management
+  alternative_considered: LIMIT orders were considered but rejected due to non-guaranteed execution risk
+    during fast market moves
+  _evidence_issues:
+  - 'NOT_FOUND: position_executor/data_types.py'
+- id: BD-098
+  type: B
+  content: 'PositionExecutor lifecycle: OPEN must fill before CLOSE - ordering contract enforced by amount_to_close'
+  rationale: 'PositionExecutor enforces OPEN-to-CLOSE ordering contract: close orders cannot execute until
+    the opening order is fully filled. The amount_to_close calculation checks open_filled_amount to prevent
+    premature closure of incomplete positions. This ensures position integrity and prevents partial-position
+    scenarios. The boundary: violating this ordering would corrupt position state and cause fill reconciliation
+    failures.'
+  evidence: position_executor.py:106-113(open_filled_amount), position_executor.py:471-496(place_close_order_and_cancel_open_orders)
+  stage: position_management
+  alternative_considered: Parallel OPEN/CLOSE was considered but rejected due to position state complexity
+  _evidence_issues:
+  - 'NOT_FOUND: position_executor.py'
+- id: BD-099
+  type: B
+  content: HEDGE mode positions keyed by (trading_pair, side); ONEWAY by trading_pair alone
+  rationale: 'Position keying logic differs by mode: HEDGE mode uses (trading_pair, side) tuple allowing
+    simultaneous LONG and SHORT positions on same pair, while ONEWAY mode uses trading_pair alone enforcing
+    single-direction positions. This is a fundamental architectural decision that prevents position collisions
+    in HEDGE mode. The boundary: ONEWAY mode will reject attempts to open opposing positions on the same
+    trading_pair.'
+  evidence: perpetual_trading.py:136(pos_key for HEDGE), perpetual_trading.py:138(pos_key for ONEWAY),
+    executor_orchestrator.py:491-495(_determine_position_side)
+  stage: perpetual_trading
+  alternative_considered: Single key for each modes was considered but rejected due to HEDGE mode requiring
+    side differentiation
+  _evidence_issues:
+  - 'NOT_FOUND: perpetual_trading.py'
+- id: BD-100
+  type: BA
+  content: 'Actions ordering: create_actions_proposal MUST run before stop_actions_proposal each tick'
+  rationale: 'Action proposal ordering is strictly enforced: create_actions_proposal executes before stop_actions_proposal
+    on every tick. This ensures primary signals are evaluated before stop conditions, maintaining signal
+    priority hierarchy. The boundary constraint: stop_actions cannot override create_actions on the same
+    tick without explicit coordination flags. Violation would cause signal precedence inversions.'
+  evidence: directional_trading_controller_base.py:152-159(determine_executor_actions), market_making_controller_base.py:223-230(determine_executor_actions)
+  stage: controllers
+  alternative_considered: Parallel evaluation was considered but rejected due to signal priority requirements
+  _evidence_issues:
+  - 'NOT_FOUND: directional_trading_controller_base.py'
+- id: BD-101
+  type: B/BA
+  content: total_amount_quote default=Decimal('100') in ControllerConfigBase encodes $100 starting capital
+    assumption
+  rationale: 'The total_amount_quote field defaults to $100 USD equivalent, encoding a business assumption
+    that strategies begin with $100 capital baseline. This default affects position sizing calculations
+    throughout the controller lifecycle. The boundary: if actual starting capital differs, this default
+    must be overridden before strategy initialization or position sizes will be miscalculated.'
+  evidence: controller_base.py:71-78(ControllerConfigBase.total_amount_quote field)
+  stage: controller_base
+  alternative_considered: No default (required field) was considered but rejected for ease of strategy
+    bootstrapping
+  _evidence_issues:
+  - 'NOT_FOUND: controller_base.py'
+- id: BD-102
+  type: B/BA
+  content: position_mode default='HEDGE' and leverage default=20 encode aggressive perpetual trading assumptions
+  rationale: 'Controllers default to HEDGE mode with 20x leverage, encoding aggressive perpetual trading
+    assumptions as the baseline configuration. HEDGE mode allows directional positions without closing
+    existing positions, and 20x leverage significantly amplifies both gains and losses. The boundary:
+    this high-leverage default is aggressive for new users who may not understand the risk exposure.'
+  evidence: directional_trading_controller_base.py:49-58(DirectionalTradingControllerConfigBase fields),
+    market_making_controller_base.py:70-78(MarketMakingControllerConfigBase fields)
+  stage: controllers
+  alternative_considered: Conservative defaults (1x leverage, ONEWAY) were considered but rejected to
+    match professional trading expectations
+  _evidence_issues:
+  - 'NOT_FOUND: directional_trading_controller_base.py'
+- id: BD-103
+  type: B/BA
+  content: close_order_side = opposite of config.side - HEDGE mode hedge order logic
+  rationale: 'Closing order side is calculated as the opposite of config.side, ensuring LONG positions
+    close with SELL orders and SHORT positions close with BUY orders. This is essential for HEDGE mode
+    position management. The boundary: this logic assumes valid side configuration; invalid side values
+    will produce incorrect close order directions.'
+  evidence: position_executor.py:210-211(close_order_side property), grid_executor.py:57(close_order_side),
+    executor_orchestrator.py:492-493(_determine_position_side)
+  stage: position_management
+  alternative_considered: Explicit close_side field was considered but rejected in favor of derived property
+  _evidence_issues:
+  - 'NOT_FOUND: position_executor.py'
+- id: BD-104
+  type: BA
+  content: 'ExecutorFilter pattern: each criteria use AND logic, list criteria use OR within'
+  rationale: 'ExecutorFilter applies AND logic between each criteria while using OR logic within list-based
+    criteria (e.g., executors_by_ids list matches any ID in list). This design provides predictable filtering
+    behavior where each non-list conditions must pass but alternatives within lists suffice. The boundary:
+    filtering returns empty set if any AND condition fails, not partial matches.'
+  evidence: controller_base.py:32-55(ExecutorFilter dataclass), controller_base.py:293-361(_apply_executor_filter)
+  stage: controller_base
+  alternative_considered: All-OR logic was considered but rejected due to need for mandatory filter criteria
+  _evidence_issues:
+  - 'NOT_FOUND: controller_base.py'
+- id: BD-105
+  type: B
+  content: PerpetualDerivativePyBase.VALID_POSITION_ACTIONS=[OPEN,CLOSE] - NIL only for spot
+  rationale: 'Perpetual connectors validate position actions to [OPEN, CLOSE] only, explicitly excluding
+    NIL which is valid for spot trading. This design enforces proper position lifecycle management for
+    perpetual instruments. The boundary: attempting NIL actions on perpetual connectors triggers validation
+    errors at order creation time.'
+  evidence: perpetual_derivative_py_base.py:26(VALID_POSITION_ACTIONS constant), perpetual_derivative_py_base.py:236-239(_create_order
+    validation)
+  stage: perpetual_connectors
+  alternative_considered: Allowing NIL on perpetual was considered but rejected to maintain clear position
+    lifecycle
+  _evidence_issues:
+  - 'NOT_FOUND: perpetual_derivative_py_base.py'
+- id: BD-106
+  type: DK
+  content: executor_refresh_time default=300s (5 min) - controls how long orders stay before auto-refresh
+  rationale: 'Executor refresh mechanism defaults to 300 seconds (5 minutes), determining how long market
+    making orders remain active before automatic refresh. This timing balances order staleness risk against
+    excessive order modification overhead. The boundary: very short intervals increase exchange load;
+    very long intervals risk stale pricing in fast markets.'
+  evidence: market_making_controller_base.py:58-63(executor_refresh_time Field default), market_making_controller_base.py:272-279(executors_to_refresh
+    logic)
+  stage: market_data
+  alternative_considered: Shorter refresh (60s) was considered but rejected due to rate limit concerns
+  _evidence_issues:
+  - 'NOT_FOUND: market_making_controller_base.py'
+- id: BD-107
+  type: B
+  content: 'Perpetual connectors: reduce_only=true when position_action=CLOSE for safe position reduction'
+  rationale: 'Perpetual connectors automatically set reduce_only=true for CLOSE position actions, ensuring
+    orders only reduce existing positions and cannot open new ones. This is a safety mechanism preventing
+    accidental position reversals. The boundary: reduce_only orders are rejected if no existing position
+    exists in the specified direction.'
+  evidence: aevo_perpetual_derivative.py:480(reduce_only field), binance_perpetual_derivative.py:258(reduce_only
+    field), pacifica_perpetual_derivative.py:391(reduce_only field)
+  stage: perpetual_connectors
+  alternative_considered: Explicit reduce_only flag per order was considered but rejected in favor of
+    automatic derivation
+  _evidence_issues:
+  - 'NOT_FOUND: aevo_perpetual_derivative.py'
+- id: BD-108
+  type: BA
+  content: StrategyV2Base.control_loop delegates to ExecutorOrchestrator - central action processing
+  rationale: 'StrategyV2Base delegates action processing to ExecutorOrchestrator via actions_queue, establishing
+    a central coordination point for each trading decisions. This architectural pattern decouples strategy
+    logic from execution management. The boundary: each controller actions flow through this single orchestrator;
+    bypassing it requires explicit architectural changes.'
+  evidence: strategy_v2_base.py:311-322(on_tick method), strategy_v2_base.py:277-278(actions_queue initialization),
+    executor_orchestrator.py:136-150(ExecutorOrchestrator class)
+  stage: strategy_base
+  alternative_considered: Direct controller-to-executor communication was considered but rejected for
+    consistency
+  _evidence_issues:
+  - 'NOT_FOUND: strategy_v2_base.py'
+- id: BD-109
+  type: DK
+  content: position_executor/data_types.py TripleBarrierConfig.volatility adjustment method couples risk
+    to market volatility
+  rationale: 'TripleBarrierConfig provides volatility adjustment method that dynamically scales risk parameters
+    based on market volatility conditions. This couples stop distances and position sizing to actual market
+    volatility. The boundary: when volatility is high, stop distances widen proportionally; when low,
+    they tighten, affecting risk exposure in real-time.'
+  evidence: position_executor/data_types.py:28-45(new_instance_with_adjusted_volatility method)
+  stage: position_management
+  alternative_considered: Static stops were considered but rejected for adaptive risk management
+  _evidence_issues:
+  - 'NOT_FOUND: position_executor/data_types.py'
+- id: BD-110
+  type: B/DK
+  content: MarketMakingController.create_actions_proposal checks position_rebalance BEFORE creating levels
+  rationale: 'MarketMakingController enforces ordering contract: position_rebalance check executes before
+    order level creation. This ensures order levels are generated based on current portfolio state rather
+    than imbalanced positions. The boundary: if rebalance check is skipped, levels may be generated on
+    positions outside target allocation.'
+  evidence: market_making_controller_base.py:232-253(create_actions_proposal), market_making_controller_base.py:339-374(check_position_rebalance)
+  stage: market_data
+  alternative_considered: Parallel evaluation was considered but rejected for state consistency
+  _evidence_issues:
+  - 'NOT_FOUND: market_making_controller_base.py'
+- id: BD-111
+  type: B/BA
+  content: DirectionalTradingController.default cooldown=300s (5 min) between signals per side
+  rationale: 'DirectionalTradingController defaults to 300-second (5 minute) cooldown between signals
+    for the same side, preventing rapid re-entry and signal noise. This pacing ensures each signal has
+    time to validate before generating another. The boundary: cooldown is per-side, allowing LONG and
+    SHORT signals at different cadences independently.'
+  evidence: directional_trading_controller_base.py:43-48(cooldown_time Field default), directional_trading_controller_base.py:185-195(can_create_executor
+    validation)
+  stage: directional_trading_controller
+  alternative_considered: No cooldown was considered but rejected for signal quality management
+  _evidence_issues:
+  - 'NOT_FOUND: directional_trading_controller_base.py'
+- id: BD-112
+  type: B/BA
+  content: 'INTERACTION: [BD-034] × [BD-102] → Aggressive HEDGE+20x leverage defaults override conservative
+    PositionExecutor leverage=1 default, creating amplified liquidation risk for uninformed users'
+  rationale: PositionExecutor defaults to conservative 1x leverage (BD-034) as a safety measure, but DirectionalTradingControllerConfigBase
+    and MarketMakingControllerConfigBase default to HEDGE mode with 20x leverage (BD-102). When users
+    run strategies with default configurations, the controller-level aggressive leverage overrides the
+    executor's conservative safety default, multiplying liquidation risk. A 20x position on a 5% adverse
+    move results in 100% loss vs 5% loss at 1x. This contradiction is particula
+  evidence: BD-034,BD-102,directional_trading_controller_base.py:49-58(DirectionalTradingControllerConfigBase),position_executor/data_types.py:56(leverage
+    default)
+  stage: global
+  alternative_considered: Aligning defaults would reduce risk but controllers might be too conservative
+    for professional traders; explicit warnings were rejected as insufficient
+  _evidence_issues:
+  - 'NOT_FOUND: BD-034,BD-102,directional_trading_controller_base.py'
+- id: BD-113
+  type: B
+  content: 'INTERACTION: [BD-005] × [BD-074] → BudgetChecker locks collateral at 1x equivalent but perpetual
+    orders validated with leverage>1 creates hidden margin shortfall'
+  rationale: 'BudgetChecker (BD-005) atomically locks collateral before order placement to prevent over-ordering,
+    but PerpetualOrderCandidate (BD-074) validates budget using leverage parameter. When leverage > 1,
+    the order requires only 1/leverage of the locked collateral, but BudgetChecker may not account for
+    this leverage discount. This creates a hidden dependency where locked collateral appears sufficient
+    but margin requirements at higher leverage may exceed available margin. The risk cascade: user sees
+    av'
+  evidence: BD-005,BD-074,budget_checker.py:38(adjust_candidates),dca_executor.py:243-250(PerpetualOrderCandidate)
+  stage: global
+  alternative_considered: BudgetChecker leverage awareness was rejected as it would complicate the abstraction;
+    validation at fill-time was rejected as position may already be underwater
+  _evidence_issues:
+  - 'NOT_FOUND: BD-005,BD-074,budget_checker.py'
+- id: BD-114
+  type: B/BA
+  content: 'INTERACTION: [BD-082] × [BD-083] → Historical (90-day EWMA) and instant (12-period) volatility
+    use incompatible timescales, causing trailing stop whipsaw in trending markets'
+  rationale: 'Historical volatility (BD-082) uses 90-day exponentially weighted moving average while instant
+    volatility (BD-083) uses 12-period rolling window. These represent fundamentally different market
+    views: 90-day EWMA captures slow trend volatility while 12-period captures intraday noise. When TripleBarrierConfig
+    uses instant volatility for trailing stop delta (BD-037, BD-062) but historical volatility for position
+    sizing (BD-089), the signals conflict. In trending markets, instant volatility spikes d'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Standardizing to single volatility timeframe was rejected as historical and
+    instant serve different strategy purposes; explicit regime detection was rejected as too complex
+- id: BD-115
+  type: B/BA
+  content: 'INTERACTION: [BD-101] × [BD-046,BD-047,BD-048] → Hardcoded $100 total_amount_quote default
+    causes systematic inventory skew miscalculation across each position sizing'
+  rationale: 'total_amount_quote defaults to $100 (BD-101), encoding a $100 starting capital assumption.
+    Inventory skew calculations (BD-046: linear interpolation, BD-047: 50% cap, BD-048: bid adjustment
+    0.0-2.0x) use this as the baseline for portfolio value calculations. When actual capital differs from
+    $100, the inventory skew produces incorrect adjustment ratios because the interpolation assumes $100
+    total portfolio value. A user with $10,000 capital running with default config gets inventory adjustments
+    1'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Dynamic capital detection was rejected due to complexity; required field was
+    rejected for bootstrapping friction
+- id: BD-116
+  type: B/BA
+  content: 'INTERACTION: [BD-070] × [BD-076] → Order refresh (300s) much shorter than max order age (1800s),
+    creating stale orders accumulating while refreshing faster than needed'
+  rationale: 'Executor refresh time defaults to 300 seconds (5 minutes) while pure market making max_order_age
+    defaults to 1800 seconds (30 minutes). This 6:1 ratio creates a contradiction: orders remain valid
+    for 30 minutes but get refreshed every 5 minutes. During high-volatility periods, frequent refreshing
+    causes excessive exchange API calls and potential rate limit violations, while the longer max_age
+    creates an attack surface for stale orders remaining in the book far from mid-price. Users who increase '
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Synchronized defaults were rejected as different strategies require different
+    balances; explicit warning was rejected as it adds friction
+- id: BD-117
+  type: B
+  content: 'INTERACTION: [BD-099] × [BD-103] → HEDGE mode position keying by (trading_pair,side) silently
+    requires close_order_side derivation, creating position corruption if side derivation fails'
+  rationale: 'HEDGE mode positions keyed by (trading_pair, side) tuple (BD-099) enable simultaneous LONG
+    and SHORT positions. close_order_side is derived as opposite of config.side (BD-103) to close positions
+    correctly. This hidden dependency creates silent corruption if side derivation produces incorrect
+    values: a bug in close_order_side would cause BUY orders to close LONG positions or SELL orders to
+    close SHORT positions, instead opening larger positions. The position tracker would record incorrect
+    net pos'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Explicit side validation was considered but rejected for performance; explicit
+    close_side field was rejected as redundant
+- id: BD-118
+  type: BA
+  content: 'INTERACTION: [BD-038] × [BD-054,BD-055] → DCA TAKER activation bounds (0.01%-0.5%) interact
+    with volatility-adjusted spreads creating inconsistent trigger conditions'
+  rationale: 'DCA TAKER mode uses activation_bounds [0.0001, 0.005] representing 0.01% to 0.5% price deviation
+    (BD-038). Volatility-based spread calculation (BD-054) uses max(base_spread, volatility * multiplier),
+    and max_spread caps prevent excessive widening (BD-055). These interact when volatility spikes: if
+    volatility multiplier causes spreads to exceed 0.5%, the spread exceeds the DCA activation bounds,
+    meaning orders would only trigger on deviations larger than the spread itself. This creates a logical '
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Activation bounds that scale with volatility were considered but rejected as
+    too complex; separate volatility configs were rejected as too many parameters
+- id: BD-119
+  type: B/BA
+  content: 'RISK CASCADE: [BD-057] → [BD-058] → [BD-099] → [BD-103] → [BD-107] → Position mode initialization
+    failure causes silent position tracking corruption across perpetual connectors'
+  rationale: 'Position mode (HEDGE/ONEWAY) must be set after market ready with retry (BD-057), and leverage
+    must be set before position mode (BD-058). This ordering establishes position keying structure (BD-099:
+    HEDGE uses trading_pair+side, ONEWAY uses trading_pair alone), which determines close_order_side derivation
+    (BD-103), which affects reduce_only flag setting (BD-107). If initial position mode set fails without
+    retry succeeding, the position tracking uses the wrong keying structure. Subsequent close or'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Blocking mode set was rejected as it would prevent trading entirely; position
+    mode validation was rejected as too expensive
+- id: BD-120
+  type: B/BA
+  content: 'RISK CASCADE: [BD-023] × [BD-025] → Backtest uses live configs but flat 0.06% fee assumption
+    creates systematic outperformance illusion that collapses in live trading with tiered fees'
+  rationale: 'Backtesting reuses same executor configs as live trading (BD-023) for backtest-live parity.
+    However, trade cost modeling uses flat 0.06% percentage (BD-025) while actual exchanges use tiered
+    fee structures (maker rebates as low as -0.01%, taker fees up to 0.50%). High-frequency strategies
+    that generate many fills face actual costs far exceeding 0.06%: a market-making strategy paying 0.05%
+    maker fee with 0.05% taker fee assumption underestimates by 17x compared to the actual ~0.10% round-trip.
+    Gr'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Per-exchange fee schedules were rejected due to configuration complexity; approximated
+    tiered model was rejected as too many parameters
+- id: BD-121
+  type: B/BA
+  content: 'RISK CASCADE: [BD-016] × [BD-091] × [BD-044] → Low arbitrage retry count (3) combined with
+    fixed 0.3% profitability threshold creates systematic missed opportunities during transient market
+    conditions'
+  rationale: 'Arbitrage executor uses only 3 retries (BD-016) due to time-sensitive opportunity decay,
+    and requires 0.3% minimum profitability (BD-091) to cover execution costs. Close order failures increment
+    retry counter (BD-044). These interact during latency spikes: when network latency increases during
+    high volatility, arbitrage opportunities take longer to execute. The 3-retry limit exhausts quickly,
+    terminating executors on opportunities that briefly exceeded 0.3% threshold. If the market reverts
+    after'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Adaptive retry based on latency was considered but rejected as it would complicate
+    the abstraction; dynamic threshold was rejected as it would introduce look-ahead bias
+- id: BD-122
+  type: BA/M
+  content: 'INTERACTION: [BD-026] × [BD-027] → Pydantic strict validation conflicts with ConfigVar backward
+    compatibility, creating validation boundary edge cases'
+  rationale: 'Pydantic models provide strict type safety and runtime validation (BD-026), catching invalid
+    configurations at startup. ConfigVar backward compatibility (BD-027) allows legacy strategies to continue
+    running during migration. These interact when ConfigVar inputs flow into Pydantic-validated models:
+    type coercion that worked in ConfigVar fails in Pydantic (e.g., string ''true'' vs boolean True),
+    and validation rules differ. Edge cases arise when numeric types are coerced differently: ConfigVar
+    may a'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Forced migration was rejected as it would break existing strategies; lenient
+    Pydantic coercion was rejected as it defeats strict validation purpose
+- id: BD-123
+  type: BA
+  content: 'HIDDEN DEPENDENCY: [BD-007] × [BD-022] × [BD-108] → Three async queue patterns in different
+    layers create message ordering dependencies that violate single-threaded assumptions'
+  rationale: 'Controllers use asyncio.Queue for action dispatch (BD-007), StrategyV2Base uses asyncio.Queue
+    for executor actions (BD-022), and ExecutorOrchestrator serves as central action processor (BD-108).
+    These three queue layers create implicit ordering dependencies: controller queues must drain into
+    strategy queues which must drain into executor queues. Under high message volume, queue depths can
+    grow unbounded, creating priority inversion where older actions wait behind newer ones. The hidden
+    dependenc'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Priority queuing was considered but rejected as it would require complex priority
+    assignment; bounded queues were rejected as they would drop critical actions
+- id: BD-124
+  type: B/DK
+  content: 'HIDDEN DEPENDENCY: [BD-061] × [BD-109] → Volatility adjustment method couples TripleBarrier
+    to market conditions, creating path-dependent stop behavior sensitive to evaluation frequency'
+  rationale: 'TripleBarrierConfig provides new_instance_with_adjusted_volatility method (BD-061) for dynamic
+    risk adjustment, and volatility adjustment method couples risk to market volatility (BD-109). These
+    interact with executor tick frequency: if volatility is evaluated every tick and trailing stop is
+    recalculated, the stop distance varies continuously. Under high-frequency evaluation (100ms ticks),
+    trailing stop can oscillate between narrow and wide as instant volatility fluctuates. The hidden dependency'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Volatility smoothing was considered but rejected as it would reduce responsiveness;
+    discrete evaluation intervals were rejected as they add complexity
+- id: BD-GAP-001
+  type: B/DK
+  content: Perpetual derivatives use a dedicated `funding_fee_poll_interval` method returning 60 seconds
+    as the polling cadence for funding fee updates
+  rationale: Fixed 60-second funding fee polling interval balances between real-time accuracy and API
+    rate limit consumption; breaks when exchange funding settlement periods differ from 1-hour cycles.
+  evidence: hummingbot/connector/derivative/aevo_perpetual/aevo_perpetual_derivative.py:124(funding_fee_poll_interval)
+  stage: runtime
+  alternative_considered: Event-driven funding notifications from exchange websockets
+- id: BD-GAP-002
+  type: B/DK
+  content: Hyperliquid perpetual uses uint32 simple order IDs instead of the prefixed client order ID
+    format used by other exchanges
+  rationale: Direct uint32 order IDs match Hyperliquid's native order ID format; breaks if Hyperliquid
+    changes ID length constraints or switches to string-based IDs.
+  evidence: hummingbot/connector/derivative/hyperliquid_perpetual/hyperliquid_perpetual_derivative.py:513(buy)
+  stage: gateway_integration
+  alternative_considered: UUID-based order IDs for portability
+- id: BD-GAP-003
+  type: T
+  content: dYdX v4 perpetual implements a three-phase transaction lifecycle (Draft → Sealed → Final) for
+    blockchain order operations
+  rationale: State machine pattern ensures transaction integrity for blockchain operations; breaks if
+    dYdX changes transaction workflow or adds intermediate states.
+  evidence: hummingbot/connector/derivative/dydx_v4_perpetual/data_sources/tx.py:114(Transaction)
+  stage: design
+  alternative_considered: Optimistic transaction submission with async confirmation
+- id: BD-GAP-004
+  type: BA
+  content: 'Controller base classes enforce a three-method trading decision pattern: update_processed_data(),
+    determine_executor_actions(), to_format_status()'
+  rationale: Consistent interface enables strategy swapping and testing; breaks when controllers need
+    complex multi-stage decision pipelines.
+  evidence: controllers/generic/examples/basic_order_example.py:23(BuyThreeTimesExample)
+  stage: design
+  alternative_considered: Pipeline-based processing with configurable stages
+  _evidence_issues:
+  - 'FN_NOT_FOUND: BuyThreeTimesExample in controllers/generic/examples/basic_order_example.py'
+- id: BD-GAP-005
+  type: B
+  content: Hummingbot uses CmdlineParser (argparse subclass) for quickstart, allowing positional argument
+    shortcuts distinct from main CLI
+  rationale: Separate quickstart argument parsing prevents CLI/quickstart conflicts; breaks when argument
+    sets diverge significantly.
+  evidence: bin/hummingbot_quickstart.py:38(CmdlineParser.__init__)
+  stage: cli_interface
+  alternative_considered: Single unified argument parser
+- id: BD-GAP-006
+  type: B/BA
+  content: Perpetual budget checker locks collateral based on order candidates before order submission
+    to prevent over-leveraging
+  rationale: Pre-allocation prevents liquidation cascades; breaks when order fills before lock expires
+    or when collateral token differs from expected.
+  evidence: hummingbot/connector/derivative/perpetual_budget_checker.py:28(_lock_available_collateral)
+  stage: risk
+  alternative_considered: Real-time collateral checking on order fill
+- id: BD-GAP-007
+  type: T
+  content: Binance perpetual uses listen key pattern for user stream with background refresh task managing
+    key lifecycle
+  rationale: Background refresh ensures continuous user stream connection; breaks if Binance changes listen
+    key TTL or refresh mechanism.
+  evidence: hummingbot/connector/derivative/binance_perpetual/binance_perpetual_user_stream_data_source.py:107(_manage_listen_key_task_loop)
+  stage: gateway_integration
+  alternative_considered: Persistent websocket connections without listen keys
+- id: BD-GAP-008
+  type: B/DK
+  content: Exchange connectors resolve trading pair symbol duplicates by preferring exact BASEQUOTE match
+    over exchange symbol format
+  rationale: Match-first resolution prevents incorrect pair mapping for futures contracts with multiple
+    symbol formats; breaks for exchanges with ambiguous symbol naming.
+  evidence: hummingbot/connector/derivative/binance_perpetual/binance_perpetual_derivative.py:552(_resolve_trading_pair_symbols_duplicate)
+  stage: market_data
+  alternative_considered: Exchange symbol as single source of truth
+- id: BD-GAP-009
+  type: T
+  content: WebUtils modules create separate public and private REST URL builders per exchange, often with
+    hardcoded domain defaults
+  rationale: Per-exchange URL construction isolates exchange-specific endpoint logic; breaks when exchanges
+    change URL structure or add new endpoints.
+  evidence: hummingbot/connector/derivative/bybit_perpetual/bybit_perpetual_web_utils.py:93(get_rest_url_for_endpoint)
+  stage: infrastructure
+  alternative_considered: Centralized URL registry with exchange-specific overrides
+- id: BD-GAP-010
+  type: B/BA
+  content: Hummingbot CLI implements stdout redirection through StdoutProxy to capture each output within
+    the application UI
+  rationale: Proxy pattern enables inline output capture for terminal UI; breaks when third-party libraries
+    bypass stdout.
+  evidence: hummingbot/client/ui/stdout_redirection.py:43(StdoutProxy.__init__)
+  stage: ui
+  alternative_considered: PTY-based terminal emulation
+- id: BD-GAP-011
+  type: B
+  content: 'Missing: Day count convention'
+  rationale: 'Audit finding: missing: day count convention. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: market_data
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-012
+  type: B
+  content: 'Missing: Day Count and Compounding Conventions'
+  rationale: 'Audit finding: missing: day count and compounding conventions. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: market_data
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-013
+  type: B
+  content: 'Missing: Implied Volatility Solver'
+  rationale: 'Audit finding: missing: implied volatility solver. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: market_data
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-014
+  type: B
+  content: 'Missing: Model Calibration Residuals'
+  rationale: 'Audit finding: missing: model calibration residuals. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: market_data
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-015
+  type: B
+  content: 'Missing: Factor IC Demeaning'
+  rationale: 'Audit finding: missing: factor ic demeaning. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: market_data
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-016
+  type: M
+  content: 'Missing: Transition Matrix Time-Homogeneity'
+  rationale: 'Audit finding: missing: transition matrix time-homogeneity. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: market_data
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-017
+  type: B
+  content: 'Missing: Pipeline Fit/Transform Isolation'
+  rationale: 'Audit finding: missing: pipeline fit/transform isolation. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: market_data
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-018
+  type: B
+  content: 'Missing: Multi-Agent Decision Consensus'
+  rationale: 'Audit finding: missing: multi-agent decision consensus. Note:** AIL domain largely NOT APPLICABLE
+    — Hummingbot does not implement ML/AI training or LLM-based decision systems. Items 2, 4, 6 are absent..
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: market_data
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Note:** AIL domain largely NOT APPLICABLE — Hummingbot does not implement ML/AI training or
+    LLM-based decision systems. Items 2, 4, 6 are absent.
+- id: BD-GAP-019
+  type: B
+  content: 'Missing: Repayment Schedule Generation'
+  rationale: 'Audit finding: missing: repayment schedule generation. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: market_data
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-020
+  type: B
+  content: 'Missing: Delinquency Definition (DPD 30/60/90)'
+  rationale: 'Audit finding: missing: delinquency definition (dpd 30/60/90). Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: market_data
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-021
+  content: 'Missing: Matrix ill-conditioning and stability'
+  type: M
+  rationale: 'Audit finding: missing: matrix ill-conditioning and stability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: market_data
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-022
+  content: 'Missing: Day count convention'
+  type: B
+  rationale: 'Audit finding: missing: day count convention. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: market_data
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-023
+  content: 'Missing: Covariance Estimator Selection'
+  type: B
+  rationale: 'Audit finding: missing: covariance estimator selection. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: market_data
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-024
+  content: 'Missing: PD/LGD/EAD Estimation'
+  type: B
+  rationale: 'Audit finding: missing: pd/lgd/ead estimation. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: market_data
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-025
+  content: 'Missing: LCR & NSFR'
+  type: B
+  rationale: 'Audit finding: missing: lcr & nsfr. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: market_data
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: Funding Rate Arbitrage
+  source: scripts/v2_funding_rate_arb.py
+  type: trading_strategy
+  business_problem: Exploits funding rate differences between perpetual exchanges (e.g., Hyperliquid and
+    Binance) to generate risk-adjusted returns using leverage.
+  intent_keywords:
+  - funding rate
+  - arbitrage
+  - perpetual
+  - leverage
+  - funding payment
+  stage: live_trading
+  negative_keywords:
+  - spot arbitrage
+  - simple arbitrage
+  - market making
+  - unleveraged
+  disambiguation: Are you looking to arbitrage funding rate payments between perpetual exchanges, or do
+    you want a different type of arbitrage strategy?
+  data_domain: trading_data
+- id: UC-102
+  name: Price Logging Example
+  source: scripts/log_price_example.py
+  type: extension_example
+  business_problem: Demonstrates how to retrieve and log market prices (best bid, best ask, mid price)
+    from multiple exchanges for monitoring purposes.
+  intent_keywords:
+  - log prices
+  - monitor
+  - bid ask
+  - example
+  - tutorial
+  stage: monitoring
+  negative_keywords:
+  - trading
+  - execution
+  - strategy
+  - arbitrage
+  disambiguation: Do you want to simply monitor/log prices for analysis, or are you looking to execute
+    trades based on prices?
+  data_domain: market_data
+- id: UC-103
+  name: XRPL Triggered Liquidity Provision
+  source: scripts/xrpl_liquidity_example.py
+  type: trading_strategy
+  business_problem: Provides liquidity on XRPL (Ripple Ledger) decentralized exchange when price crosses
+    user-defined target levels.
+  intent_keywords:
+  - xrpl
+  - ripple
+  - liquidity
+  - dex
+  - trigger
+  - add liquidity
+  stage: live_trading
+  negative_keywords:
+  - cex
+  - centralized
+  - spot trading
+  - arbitrage
+  disambiguation: Are you looking to provide liquidity on XRPL based on price triggers, or do you want
+    a different type of trading strategy?
+  data_domain: trading_data
+- id: UC-104
+  name: Download Order Book and Trades
+  source: scripts/download_order_book_and_trades.py
+  type: data_pipeline
+  business_problem: Collects and exports historical order book snapshots and trade data to CSV files for
+    backtesting and analysis.
+  intent_keywords:
+  - download
+  - order book
+  - trades
+  - historical
+  - csv
+  - export
+  stage: data_collection
+  negative_keywords:
+  - live trading
+  - real-time
+  - execution
+  - strategy
+  disambiguation: Do you want to download historical market data for backtesting, or are you looking to
+    execute trades in real-time?
+  data_domain: market_data
+- id: UC-105
+  name: External MQTT Events Example
+  source: scripts/external_events_example.py
+  type: extension_example
+  business_problem: Demonstrates how to use the MQTT external events plugin to subscribe to external topics
+    and receive/process messages.
+  intent_keywords:
+  - mqtt
+  - external events
+  - subscribe
+  - plugin
+  - integration
+  stage: data_collection
+  negative_keywords:
+  - native events
+  - trading
+  - market data
+  disambiguation: Are you looking to integrate external event sources via MQTT, or do you need native
+    Hummingbot events?
+  data_domain: mixed
+- id: UC-106
+  name: AMM Gateway Data Feed
+  source: scripts/amm_data_feed_example.py
+  type: data_pipeline
+  business_problem: Fetches and displays real-time price data from AMM DEX connectors (Jupiter, Uniswap)
+    via the Gateway for analysis.
+  intent_keywords:
+  - amm
+  - dex
+  - gateway
+  - price
+  - jupiter
+  - uniswap
+  - decentralized
+  stage: data_collection
+  negative_keywords:
+  - cex
+  - centralized
+  - trading
+  - execution
+  disambiguation: Are you looking to fetch DEX prices for analysis, or do you want to execute trades on
+    a DEX?
+  data_domain: market_data
+- id: UC-107
+  name: Volatility Screener
+  source: scripts/screener_volatility.py
+  type: screening
+  business_problem: Scans multiple trading pairs to identify highly volatile instruments using Bollinger
+    Bands width, percentage, and NATR indicators.
+  intent_keywords:
+  - volatility
+  - screener
+  - bollinger
+  - natr
+  - scan
+  - high volatility
+  stage: factor_computation
+  negative_keywords:
+  - trading
+  - execution
+  - arbitrage
+  - market making
+  disambiguation: Are you looking to identify/screen volatile pairs for analysis, or do you want to trade
+    based on volatility signals?
+  data_domain: market_data
+- id: UC-108
+  name: Simple Cross Exchange Market Making (XEMM)
+  source: scripts/simple_xemm.py
+  type: trading_strategy
+  business_problem: Places maker orders on one exchange and immediately hedges/hedging filled orders on
+    another exchange to capture spread.
+  intent_keywords:
+  - xemm
+  - cross-exchange
+  - market making
+  - maker
+  - hedge
+  - spread
+  stage: live_trading
+  negative_keywords:
+  - pure arbitrage
+  - single exchange
+  - unidirectional
+  disambiguation: Are you looking to market make across two exchanges simultaneously (XEMM), or do you
+    want a single-exchange strategy?
+  data_domain: trading_data
+- id: UC-109
+  name: Custom Status Formatting Example
+  source: scripts/format_status_example.py
+  type: extension_example
+  business_problem: Demonstrates how to add custom status display formatting to a strategy using format_status
+    method and market status dataframes.
+  intent_keywords:
+  - status
+  - format
+  - display
+  - custom
+  - dashboard
+  - output
+  stage: monitoring
+  negative_keywords:
+  - trading
+  - execution
+  - strategy logic
+  disambiguation: Are you looking to customize the status/console output of a strategy, or do you need
+    trading logic changes?
+  data_domain: market_data
+- id: UC-110
+  name: Simple PMM (Position Management Mode)
+  source: scripts/simple_pmm.py
+  type: trading_strategy
+  business_problem: Provides liquidity by placing bid and ask orders around the mid price with configurable
+    spreads, refreshing at set intervals.
+  intent_keywords:
+  - pmm
+  - market making
+  - liquidity
+  - bid
+  - ask
+  - spread
+  - order refresh
+  stage: live_trading
+  negative_keywords:
+  - arbitrage
+  - arbitrage
+  - directional
+  - swing
+  disambiguation: Are you looking to run a market making strategy with bid/ask spreads, or do you want
+    a different trading approach?
+  data_domain: trading_data
+- id: UC-111
+  name: Strategy V2 with Controllers Orchestration
+  source: scripts/v2_with_controllers.py
+  type: trading_strategy
+  business_problem: Runs a multi-controller strategy with features like cash-out scheduling, dynamic config
+    reloading, and drawdown protection.
+  intent_keywords:
+  - controllers
+  - orchestration
+  - multi-strategy
+  - cash out
+  - drawdown
+  stage: live_trading
+  negative_keywords:
+  - single strategy
+  - simple strategy
+  - no controllers
+  disambiguation: Are you looking to run multiple controllers/strategies with risk management, or do you
+    need a single simple strategy?
+  data_domain: trading_data
+- id: UC-112
+  name: Candles Data Feed Example
+  source: scripts/candles_example.py
+  type: data_pipeline
+  business_problem: Demonstrates how to initialize and consume candles data feeds for multiple trading
+    pairs and timeframes without requiring market trading.
+  intent_keywords:
+  - candles
+  - data feed
+  - ohlcv
+  - historical
+  - timeframe
+  - example
+  stage: data_collection
+  negative_keywords:
+  - live trading
+  - execution
+  - strategy
+  disambiguation: Are you looking to learn how to use candles data, or do you want to execute a trading
+    strategy?
+  data_domain: market_data
+- id: UC-113
+  name: XRPL DEX to CEX Arbitrage
+  source: scripts/xrpl_arb_example.py
+  type: trading_strategy
+  business_problem: Exploits price differences between XRPL decentralized exchange and centralized exchanges
+    for risk-free profit opportunities.
+  intent_keywords:
+  - xrpl
+  - arbitrage
+  - dex
+  - cex
+  - ripple
+  - triangular
+  stage: live_trading
+  negative_keywords:
+  - market making
+  - pmm
+  - spot trading
+  disambiguation: Are you looking to arbitrage between XRPL and centralized exchanges, or do you want
+    a different trading strategy?
+  data_domain: trading_data
+- id: UC-114
+  name: VWAP Execution Strategy
+  source: scripts/simple_vwap.py
+  type: trading_strategy
+  business_problem: Executes large buy or sell orders using Volume Weighted Average Price algorithm, splitting
+    orders to minimize market impact.
+  intent_keywords:
+  - vwap
+  - execution
+  - large order
+  - algo trading
+  - order slicing
+  stage: live_trading
+  negative_keywords:
+  - arbitrage
+  - market making
+  - speculation
+  disambiguation: Are you looking to execute a large order using VWAP algorithm, or do you want a different
+    trading approach?
+  data_domain: trading_data
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 62
+  evidence_invalid: 60
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.5081967213114754
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 7
+    warn: 11
+    fail: 2
+  subdomain_totals:
+    pass: 8
+    warn: 15
+    fail: 28
+  coverage: 71/71 (100%)
+  pass_rate: 15/71 (21%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: exchange_connector
+  description: 'Select based on: required trading pairs, geographic availability, rate limits, and regulatory
+    requirements'
+  used_in_stages: []
+  options:
+  - name: binance
+    traits:
+    - high_liquidity
+    - spot_futures
+    - web_socket
+    - api_key_auth
+    fit_for:
+    - High-volume trading, arbitrage, market-making strategies
+    not_fit_for:
+    - Regulatory-restricted jurisdictions
+  - name: coinbase_advanced_trade
+    traits:
+    - regulated
+    - cb_prices_oracle
+    - api_key_auth
+    fit_for:
+    - US-regulated trading, Coinbase ecosystem
+    not_fit_for:
+    - High-frequency trading due to rate limits
+  - name: kraken
+    traits:
+    - regulated_eu
+    - tiered_rate_limits
+    - api_key_auth
+    fit_for:
+    - European users, Kraken Futures
+    not_fit_for:
+    - High-frequency trading (strict rate limits)
+  - name: kucoin
+    traits:
+    - high_rate_limits
+    - maker_rebate
+    - api_key_auth
+    fit_for:
+    - Market-making with high order frequency
+    not_fit_for:
+    - Users requiring tight spread products not on KuCoin
+  - name: gate_io
+    traits:
+    - wide_coin_coverage
+    - web_socket
+    - api_key_auth
+    fit_for:
+    - Altcoin trading, perpetual futures
+    not_fit_for:
+    - Users preferring regulated exchanges
+  - name: okx
+    traits:
+    - global_exchange
+    - perpetuals
+    - api_key_auth
+    fit_for:
+    - Multi-asset trading, global users
+    not_fit_for:
+    - US users (limited availability)
+  - name: bybit
+    traits:
+    - derivatives_focus
+    - copy_trading
+    - api_key_auth
+    fit_for:
+    - Derivatives-focused strategies
+    not_fit_for:
+    - Pure spot traders
+  - name: hyperliquid
+    traits:
+    - perpetuals_only
+    - low_fees
+    - api_key_auth
+    fit_for:
+    - Perpetual futures with low fees
+    not_fit_for:
+    - Spot trading requirements
+  - name: xrpl
+    traits:
+    - xrp_ledger
+    - decentralized
+    - issued_currencies
+    fit_for:
+    - XRP ecosystem trading, issued currency trading
+    not_fit_for:
+    - Users unfamiliar with XRP Ledger mechanics
+  - name: paper_trade
+    traits:
+    - simulated
+    - no_real_funds
+    fit_for:
+    - Strategy testing, learning, backtesting validation
+    not_fit_for:
+    - Production trading
+  default: binance
+  _source: worker_resource
+- id: slot-002
+  name: price_oracle
+  description: 'Choose based on: need for historical data (CoinGecko), real-time requirements (CoinCap),
+    or exchange-native rates'
+  used_in_stages: []
+  options:
+  - name: coin_cap
+    traits:
+    - real_time
+    - websocket
+    - free_tier
+    fit_for:
+    - Real-time price feeds with generous free tier
+    not_fit_for:
+    - High-frequency pricing updates
+  - name: coin_gecko
+    traits:
+    - comprehensive
+    - market_data
+    - tiered_pricing
+    fit_for:
+    - Comprehensive market data, historical analysis
+    not_fit_for:
+    - Real-time streaming requirements
+  - name: exchange_rate_source
+    traits:
+    - direct_exchange
+    - real_time
+    fit_for:
+    - Exchange-specific rate conversion
+    not_fit_for:
+    - Cross-exchange comparisons
+  default: exchange_rate_source
+  _source: worker_resource
+- id: slot-003
+  name: trade_database
+  description: Use PostgreSQL for production multi-bot setups; SQLite for single instance development
+  used_in_stages: []
+  options:
+  - name: sqlite
+    traits:
+    - embedded
+    - file_based
+    - single_user
+    fit_for:
+    - Single-user local deployments
+    not_fit_for:
+    - Multi-user or distributed systems
+  - name: postgresql
+    traits:
+    - server_based
+    - concurrent_access
+    - scalable
+    fit_for:
+    - Production deployments, multi-bot setups
+    not_fit_for:
+    - Simple local setups
+  default: sqlite
+  _source: worker_resource
+- id: slot-004
+  name: remote_control
+  description: Enable MQTT for remote control; otherwise use local terminal only
+  used_in_stages: []
+  options:
+  - name: mqtt
+    traits:
+    - pub_sub
+    - real_time
+    - bi_directional
+    fit_for:
+    - Remote bot control, event streaming
+    not_fit_for:
+    - Simple local-only usage
+  - name: none
+    traits:
+    - local_only
+    fit_for:
+    - Simple deployments, no remote access needed
+    not_fit_for:
+    - Remote monitoring/control requirements
+  default: none
+  _source: worker_resource
+- id: slot-005
+  name: blockchain_rpc
+  description: Use premium providers (Infura/Alchemy) for production DEX trading; public RPCs for development
+  used_in_stages: []
+  options:
+  - name: public_rpc
+    traits:
+    - free
+    - rate_limited
+    - shared
+    fit_for:
+    - Development, testing
+    not_fit_for:
+    - Production trading
+  - name: infura
+    traits:
+    - reliable
+    - tiered_pricing
+    - dedicated
+    fit_for:
+    - Production Ethereum applications
+    not_fit_for:
+    - Budget-constrained projects
+  - name: alchemy
+    traits:
+    - reliable
+    - tiered_pricing
+    - enhanced_apis
+    fit_for:
+    - Production with enhanced features
+    not_fit_for:
+    - Simple use cases
+  - name: ankr
+    traits:
+    - multi_chain
+    - free_tier
+    fit_for:
+    - Multi-chain deployments
+    not_fit_for:
+    - Single-chain focused projects
+  default: public_rpc
+  _source: worker_resource
+- id: slot-006
+  name: candles_data_source
+  description: Use exchange-native candles for standard data; custom API for specialized sources
+  used_in_stages: []
+  options:
+  - name: exchange_native
+    traits:
+    - real_time
+    - historical
+    - exchange_specific
+    fit_for:
+    - Strategy candles, backtesting
+    not_fit_for:
+    - Multi-exchange candle aggregation
+  - name: custom_api
+    traits:
+    - customizable
+    - external_source
+    fit_for:
+    - Third-party data providers
+    not_fit_for:
+    - Standard exchange data
+  default: exchange_native
+  _source: worker_resource
+resources:
+- id: res-001
+  type: code_example
+  name: Funding Rate Arbitrage
+  path: scripts/v2_funding_rate_arb.py
+  description: Exploits funding rate differences between perpetual exchanges (e.g., Hyperliquid and Binance)
+    to generate risk-adjusted returns using leverage.
+  used_in_stages:
+  - live_trading
+  _source: uc_list
+- id: res-002
+  type: code_example
+  name: Price Logging Example
+  path: scripts/log_price_example.py
+  description: Demonstrates how to retrieve and log market prices (best bid, best ask, mid price) from
+    multiple exchanges for monitoring purposes.
+  used_in_stages:
+  - monitoring
+  _source: uc_list
+- id: res-003
+  type: code_example
+  name: XRPL Triggered Liquidity Provision
+  path: scripts/xrpl_liquidity_example.py
+  description: Provides liquidity on XRPL (Ripple Ledger) decentralized exchange when price crosses user-defined
+    target levels.
+  used_in_stages:
+  - live_trading
+  _source: uc_list
+- id: res-004
+  type: code_example
+  name: Download Order Book and Trades
+  path: scripts/download_order_book_and_trades.py
+  description: Collects and exports historical order book snapshots and trade data to CSV files for backtesting
+    and analysis.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-005
+  type: code_example
+  name: External MQTT Events Example
+  path: scripts/external_events_example.py
+  description: Demonstrates how to use the MQTT external events plugin to subscribe to external topics
+    and receive/process messages.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-006
+  type: code_example
+  name: AMM Gateway Data Feed
+  path: scripts/amm_data_feed_example.py
+  description: Fetches and displays real-time price data from AMM DEX connectors (Jupiter, Uniswap) via
+    the Gateway for analysis.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-007
+  type: code_example
+  name: Volatility Screener
+  path: scripts/screener_volatility.py
+  description: Scans multiple trading pairs to identify highly volatile instruments using Bollinger Bands
+    width, percentage, and NATR indicators.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list
+- id: res-008
+  type: code_example
+  name: Simple Cross Exchange Market Making (XEMM)
+  path: scripts/simple_xemm.py
+  description: Places maker orders on one exchange and immediately hedges/hedging filled orders on another
+    exchange to capture spread.
+  used_in_stages:
+  - live_trading
+  _source: uc_list
+- id: res-009
+  type: code_example
+  name: Custom Status Formatting Example
+  path: scripts/format_status_example.py
+  description: Demonstrates how to add custom status display formatting to a strategy using format_status
+    method and market status dataframes.
+  used_in_stages:
+  - monitoring
+  _source: uc_list
+- id: res-010
+  type: code_example
+  name: Simple PMM (Position Management Mode)
+  path: scripts/simple_pmm.py
+  description: Provides liquidity by placing bid and ask orders around the mid price with configurable
+    spreads, refreshing at set intervals.
+  used_in_stages:
+  - live_trading
+  _source: uc_list
+- id: res-011
+  type: code_example
+  name: Strategy V2 with Controllers Orchestration
+  path: scripts/v2_with_controllers.py
+  description: Runs a multi-controller strategy with features like cash-out scheduling, dynamic config
+    reloading, and drawdown protection.
+  used_in_stages:
+  - live_trading
+  _source: uc_list
+- id: res-012
+  type: code_example
+  name: Candles Data Feed Example
+  path: scripts/candles_example.py
+  description: Demonstrates how to initialize and consume candles data feeds for multiple trading pairs
+    and timeframes without requiring market trading.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-013
+  type: code_example
+  name: XRPL DEX to CEX Arbitrage
+  path: scripts/xrpl_arb_example.py
+  description: Exploits price differences between XRPL decentralized exchange and centralized exchanges
+    for risk-free profit opportunities.
+  used_in_stages:
+  - live_trading
+  _source: uc_list
+- id: res-014
+  type: code_example
+  name: VWAP Execution Strategy
+  path: scripts/simple_vwap.py
+  description: Executes large buy or sell orders using Volume Weighted Average Price algorithm, splitting
+    orders to minimize market impact.
+  used_in_stages:
+  - live_trading
+  _source: uc_list

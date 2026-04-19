@@ -1,0 +1,2466 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-063
+name: chainladder
+sop_version: '3.6'
+source:
+  projects:
+  - chainladder-python
+  commit_hash: bef74e5d69955aaeafe462e9680f4d5667321605
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Property and Casualty Insurance Loss Reserving
+  description: A Python library for property and casualty loss reserving using chain ladder methods, supporting
+    both deterministic and stochastic models for insurance loss triangles with sklearn-compatible API.
+  prerequisites: Familiarity with pandas DataFrames, scikit-learn estimators, insurance loss reserving
+    concepts (LDFs, CDFs, IBNR, ultimate losses)
+  not_suitable_for: Life insurance actuarial work, health insurance, non-insurance financial forecasting,
+    real-time streaming data processing, non-triangular time series analysis
+stages:
+- id: triangle_data_structure
+  name: Triangle Data Structure
+  order: 1
+  responsibility: 'Core 4D data structure for insurance loss triangles with origin/development dimensions,
+    supporting sparse arrays and multiple backends (numpy/cupy/dask). WHY: Insurance loss data is inherently
+    4D (index x columns x origin x development) requiring a specialized structure over pandas DataFrames.'
+  interface:
+    inputs:
+    - pandas DataFrame with origin, development, columns, index fields
+    outputs:
+    - Triangle with values (kdims, vdims, odims, ddims), valuation dates, grain metadata
+  required_methods:
+  - name: Triangle.__init__
+    description: Initializes 4D triangle container from pandas DataFrame or array-like data with origin/development
+      dimensions
+    evidence: chainladder/core/triangle.py:32(Triangle.__init__)
+  - name: Triangle.to_frame
+    description: Converts triangle back to pandas DataFrame for interoperability with data science stack
+    evidence: chainladder/core/triangle.py:1(to_frame)
+  - name: TriangleSlicer.loc
+    description: Pandas-style location indexing for 4D triangle by origin/development labels
+    evidence: chainladder/core/slice.py:193(TriangleSlicer.loc)
+  - name: TriangleSlicer.iloc
+    description: Integer-location based indexing for 4D triangle
+    evidence: chainladder/core/slice.py:193(TriangleSlicer.iloc)
+  key_behaviors:
+  - behavior: Sparse COO array default storage
+    description: Triangle uses sparse COO format by default since insurance triangles are approximately
+      60% sparse, avoiding memory overhead of storing NaN values
+    evidence: chainladder/core/triangle.py:305(sp(...))
+  - behavior: Automatic grain detection
+    description: System infers date granularity (Y/S/Q/M) from data automatically, eliminating need for
+      manual specification
+    evidence: chainladder/core/base.py:394(_get_grain)
+  - behavior: 4D shape enforcement
+    description: Every triangles maintain 4D shape (index, columns, origin, development) with datetime
+      indices for origin and development dimensions
+    evidence: chainladder/core/triangle.py:312(shape=...)
+  - behavior: Origin <= Development invariant
+    description: Every triangle cells enforce that origin date must be <= development date, maintaining
+      actuarial validity
+    evidence: chainladder/core/base.py:157(origin<=development)
+  replaceable_points:
+  - name: array_backend
+    description: Swap sparse array implementation with alternative backends for different performance
+      characteristics
+    options:
+    - name: sparse
+      traits:
+      - Memory efficient
+      - Default for large triangles
+      - COO format
+      fit_for:
+      - Large triangles with many NaN cells
+      - Memory-constrained environments
+      - Standard development patterns
+      not_fit_for:
+      - Dense triangles
+      - GPU computation
+      - Distributed computing
+    - name: numpy
+      traits:
+      - Dense array
+      - CPU-only
+      - No sparse overhead
+      fit_for:
+      - Small triangles
+      - Dense data patterns
+      - Maximum compatibility
+      not_fit_for:
+      - Large sparse triangles
+      - Memory efficiency requirements
+    - name: cupy
+      traits:
+      - GPU-accelerated
+      - CUDA-based
+      - Parallel computation
+      fit_for:
+      - Very large triangles
+      - GPU cluster environments
+      - High-performance computation
+      not_fit_for:
+      - CPU-only environments
+      - Small datasets
+      - No NVIDIA GPU
+    - name: dask
+      traits:
+      - Out-of-core computation
+      - Chunked arrays
+      - Distributed ready
+      fit_for:
+      - Larger-than-memory triangles
+      - Distributed computing clusters
+      - Lazy evaluation
+      not_fit_for:
+      - Single-machine workflows
+      - Small datasets
+      - Real-time processing
+    default: sparse
+  - name: array_backend_priority
+    description: Backend selection order when AUTO_SPARSE configuration is enabled
+    options:
+    - name: dask,sparse,cupy,numpy
+      traits:
+      - Dask-first
+      - Distributed computing priority
+      fit_for:
+      - HPC environments
+      - Distributed workflows
+      not_fit_for:
+      - Single-machine workflows
+    - name: sparse,cupy,numpy,dask
+      traits:
+      - Sparse-first
+      - Balanced performance
+      fit_for:
+      - General use
+      - Mixed workloads
+      not_fit_for:
+      - Dense triangles
+      - GPU-only workflows
+    default: sparse
+  design_decisions:
+  - 'Sparse COO array as default storage - Insurance triangles are ~60% sparse; sparse avoids storing
+    NaNs. Evidence: chainladder/core/triangle.py:305(sp(...))'
+  - 'ULT_VAL defaults to 2261-12-31 - Far-future date ensures LDF/CDF calculations don''t overflow. Evidence:
+    chainladder/__init__.py:7(ULT_VAL)'
+  - 'Grain auto-detection (Y/S/Q/M) - Infer date granularity from data to avoid manual specification.
+    Evidence: chainladder/core/base.py:394(_get_grain)'
+  - 'Development lag = (valuation-origin)/(365.25/12) - Monthly development periods regardless of origin
+    grain. Evidence: chainladder/core/base.py:391(_development_lag)'
+  - 'TriangleBase inherits from TriangleIO, TriangleDisplay, TriangleSlicer, TriangleDunders, TrianglePandas,
+    Common - Massive mixin composition for interface segregation. Evidence: chainladder/core/base.py:class
+    TriangleBase'
+  acceptance_hints:
+  - Triangle created from DataFrame maintains 4D shape with datetime origin/development indices
+  - Sparse memory footprint is < 50% of dense equivalent for typical insurance triangles
+  - Backend switching via set_backend completes without data loss
+  - loc/iloc indexing returns valid triangles respecting origin <= development constraint
+- id: development_pattern_estimation
+  name: Development Pattern Estimation
+  order: 2
+  responsibility: 'Computes loss development factors (LDFs) and cumulative development factors (CDFs)
+    from historical triangle data. WHY: LDFs are the foundation of each chain ladder reserving methods.'
+  interface:
+    inputs:
+    - Cumulative Triangle with is_cumulative=True
+    outputs:
+    - ldf_, cdf_, sigma_, std_err_ triangles representing development patterns
+  required_methods:
+  - name: Development.fit_transform
+    description: Fits LDF estimator to triangle and transforms to attach ldf_, cdf_, sigma_, std_err_
+      attributes
+    evidence: chainladder/development/development.py:11(Development.fit_transform)
+  - name: WeightedRegression.fit
+    description: Closed-form regression solver producing LDFs with Mack stochastic properties
+    evidence: chainladder/utils/weighted_regression.py:10(WeightedRegression.fit)
+  - name: TweedieGLM.fit
+    description: GLM-based LDF estimation using Patsy formulas for overdispersed Poisson model
+    evidence: chainladder/development/glm.py:13(TweedieGLM.fit)
+  key_behaviors:
+  - behavior: Thru-origin regression (intercept=0)
+    description: LDF regression forces zero-intercept because LDF at age 0 is 1.0 by actuarial theory
+    evidence: chainladder/utils/weighted_regression.py:75(_fit_OLS_thru_orig)
+  - behavior: Volume-weighted averaging default
+    description: Default average='volume' uses volume-weighted LDFs (exponent=1) following Mack (1993)
+      methodology
+    evidence: chainladder/development/base.py:18-22(fit - exponent mapping)
+  - behavior: Drop mechanisms with order-dependent execution
+    description: 'Drop adjustments apply in order: n_periods → drop_high/low → drop_above/below → drop_valuation
+      → drop. Order matters for which observations remain'
+    evidence: chainladder/development/base.py:87(_drop_adjustment)
+  - behavior: preserve=1 minimum guarantee
+    description: Default preserve=1 ensures at least 1 link ratio kept when dropping outliers, preventing
+      empty LDF calculations
+    evidence: chainladder/development/base.py:194-202(_drop_n)
+  replaceable_points:
+  - name: average
+    description: LDF averaging method controlling weighting scheme for link ratio aggregation
+    options:
+    - name: volume
+      traits:
+      - Volume-weighted
+      - Mack standard
+      - exponent=1
+      fit_for:
+      - Standard reserving
+      - Mack chain ladder
+      - Industry practice
+      not_fit_for:
+      - Unstable low-volume cells
+      - Expert smoothing
+    - name: simple
+      traits:
+      - Simple average
+      - Equal weighting
+      - exponent=2
+      fit_for:
+      - Homogeneous data
+      - Equal importance across cells
+      not_fit_for:
+      - Heterogeneous volume data
+      - Large-cell dominance scenarios
+    - name: regression
+      traits:
+      - Regression-weighted
+      - Statistical fit
+      - exponent=0
+      fit_for:
+      - Advanced smoothing
+      - Statistical analysis
+      not_fit_for:
+      - Non-regression scenarios
+      - Simple audits
+    - name: 0.0-2.0
+      traits:
+      - Continuous exponent
+      - Custom blending
+      fit_for:
+      - Custom weighting schemes
+      - Research applications
+      not_fit_for:
+      - Standard reserving
+      - Regulatory filings
+    default: volume
+  - name: sigma_interpolation
+    description: Missing sigma estimation method for Mack stochastic variance calculations
+    options:
+    - name: log-linear
+      traits:
+      - Log-linear extrapolation
+      - Regression-based
+      - Smooth decay
+      fit_for:
+      - Standard Mack calculations
+      - Tail extrapolation
+      - Regular development patterns
+      not_fit_for:
+      - Irregular sigma patterns
+      - Non-monotonic development
+    - name: mack
+      traits:
+      - Mack ratio approximation
+      - Mack (1993) original
+      fit_for:
+      - Exact Mack replication
+      - Historical consistency
+      not_fit_for:
+      - Irregular patterns
+      - Modern smoothing preferences
+    default: log-linear
+  - name: groupby
+    description: Group triangles for pooled LDF estimation across multiple dimensions
+    options:
+    - name: 'null'
+      traits:
+      - No grouping
+      - Individual estimation
+      fit_for:
+      - Single triangle
+      - Distinct business segments
+      not_fit_for:
+      - Pooled estimation
+      - Credibility weighting
+    - name: callable
+      traits:
+      - Custom grouping function
+      fit_for:
+      - Complex grouping logic
+      - Custom hierarchies
+      not_fit_for:
+      - Simple categorical grouping
+    - name: list
+      traits:
+      - Column-based grouping
+      fit_for:
+      - Multi-column grouping
+      - LOB-based pooling
+      not_fit_for:
+      - Single dimension
+      - Complex hierarchies
+    - name: str
+      traits:
+      - Single column grouping
+      fit_for:
+      - Simple LOB grouping
+      - Line-of-business pooling
+      not_fit_for:
+      - Multi-dimensional grouping
+    default: 'null'
+  design_decisions:
+  - 'Thru-origin regression (intercept=0) - LDF regression forces zero-intercept because LDF at age 0
+    is 1.0. Evidence: chainladder/utils/weighted_regression.py:75(_fit_OLS_thru_orig)'
+  - 'Average options: volume/regression/simple - Exponent controls weighting: volume(1), simple(2), regression(0).
+    Evidence: chainladder/development/development.py:19(average)'
+  - 'Sigma interpolation: log-linear vs Mack - Log-linear extrapolates missing sigma; Mack uses ratio
+    approximation. Evidence: chainladder/utils/weighted_regression.py:98(sigma_fill)'
+  - 'Drop mechanisms: drop_high/low/valuation/x - Multiple exclusion strategies for outliers. Evidence:
+    chainladder/development/base.py:87(_drop_adjustment)'
+  - 'n_periods=-1 means ''use each periods'' - Counter-intuitive default; -1 is sentinel for ''all'' vs
+    positive values for ''last N periods''. Evidence: chainladder/development/development.py:76(n_periods=-1)'
+  acceptance_hints:
+  - LDFs attached to triangle via ldf_ attribute match expected 1.x range for typical development ages
+  - cdf_ = ldf_.cumprod() produces monotonically increasing factors approaching infinity
+  - sigma_ values decrease with development age following log-linear decay
+  - Drop adjustments reduce link ratio count without producing empty LDFs
+  - sample_weight passed through pipeline to each fitting steps
+- id: reserving_methods
+  name: Reserving Methods
+  order: 3
+  responsibility: 'Computes ultimate losses and IBNR from development patterns and (optionally) exposure.
+    WHY: Different actuarial methods suit different data maturity levels.'
+  interface:
+    inputs:
+    - Triangle (optionally with sample_weight/exposure), fitted ldf_/cdf_
+    outputs:
+    - ultimate_, ibnr_, full_triangle_, full_expectation_ triangles
+  required_methods:
+  - name: Chainladder.fit_predict
+    description: Deterministic chain ladder computing ultimates as latest_diagonal × CDF
+    evidence: chainladder/methods/chainladder.py:7(Chainladder.fit_predict)
+  - name: MackChainladder.fit_predict
+    description: Stochastic chain ladder with parameter and process risk estimation per Mack (1993)
+    evidence: chainladder/methods/mack.py:9(MackChainladder.fit_predict)
+  - name: BornhuetterFerguson.fit_predict
+    description: Exposure-based reserving with single Bornhuetter-Ferguson iteration
+    evidence: chainladder/methods/bornferg.py:7(BornhuetterFerguson.fit_predict)
+  - name: CapeCod.fit_predict
+    description: Self-funding BF using trended exposures derived from triangle data
+    evidence: chainladder/methods/capecod.py:10(CapeCod.fit_predict)
+  - name: Benktander.fit_predict
+    description: Iterated Bornhuetter-Ferguson with configurable iterations for credibility blending
+    evidence: chainladder/methods/benktander.py:8(Benktander.fit_predict)
+  key_behaviors:
+  - behavior: CDF alignment to latest diagonal
+    description: Scales CDF so current reserves match reported losses, preventing discontinuity between
+      actual and projected losses
+    evidence: chainladder/methods/base.py:26(_align_cdf)
+  - behavior: Auto-validation with Development.fit_transform
+    description: MethodBase.validate_X auto-applies Development().fit_transform() if ldf_ missing, silently
+      modifying input triangles
+    evidence: chainladder/methods/base.py:18-24(validate_X)
+  - behavior: Mack requires sigma_ attribute
+    description: MackChainladder.fit raises ValueError if sigma_ attribute missing, requiring volume-weighted
+      Development
+    evidence: chainladder/methods/mack.py:60-61(fit)
+  - behavior: Benktander inheritance pattern
+    description: BornhuetterFerguson, CapeCod, and ExpectedLoss each inherit from Benktander sharing _get_ultimate
+      logic
+    evidence: chainladder/methods/bornferg.py:7(class BornhuetterFerguson(Benktander))
+  replaceable_points:
+  - name: n_iters
+    description: BF iterations determining method type (1=BF, >1=Benktander)
+    options:
+    - name: '1'
+      traits:
+      - Single iteration
+      - Deterministic BF
+      fit_for:
+      - Standard BF
+      - Mature triangles
+      - Simple reserving
+      not_fit_for:
+      - Immature triangles
+      - Credibility blending
+    - name: 2-5
+      traits:
+      - Multiple iterations
+      - Benktander credibility
+      fit_for:
+      - Immature triangles
+      - Credibility weighting
+      - Industry practice
+      not_fit_for:
+      - Mature triangles
+      - Simple deterministic reserving
+    default: '1'
+  - name: apriori
+    description: Exposure multiplier for BF/Benktander controlling a priori weight
+    options:
+    - name: '1.0'
+      traits:
+      - Equal weight
+      - Standard BF
+      fit_for:
+      - Balanced reserving
+      - Standard practice
+      not_fit_for:
+      - Heavy-tailed business
+      - Expert judgment weighting
+    - name: 0.0-1.0
+      traits:
+      - Reduced a priori
+      - Data-driven
+      fit_for:
+      - Mature data
+      - Low uncertainty
+      not_fit_for:
+      - Immature triangles
+      - High a priori confidence
+    - name: '>1.0'
+      traits:
+      - Elevated a priori
+      - Conservative
+      fit_for:
+      - Immature triangles
+      - Expert judgment
+      - Regulatory conservatism
+      not_fit_for:
+      - Mature triangles
+      - Low uncertainty data
+    default: '1.0'
+  - name: trend
+    description: Annual trend rate for CapeCod exposure trending
+    options:
+    - name: '0.0'
+      traits:
+      - No trend
+      - Level premiums
+      fit_for:
+      - Stable environment
+      - Current dollars
+      not_fit_for:
+      - Inflation-adjusted reserving
+      - Trend-aware analysis
+    - name: positive
+      traits:
+      - Positive inflation
+      fit_for:
+      - Medical inflation
+      - Social inflation
+      - Rising costs
+      not_fit_for:
+      - Deflationary environments
+      - Stable costs
+    - name: negative
+      traits:
+      - Negative trend
+      fit_for:
+      - Deflationary periods
+      - Cost reductions
+      not_fit_for:
+      - Normal inflation environments
+    default: '0.0'
+  design_decisions:
+  - 'CDF alignment to latest diagonal - Scales CDF so current reserves match reported losses. Evidence:
+    chainladder/methods/base.py:26(_align_cdf)'
+  - 'sample_weight as exposure for BF/CapeCod - Apriori exposure required for exposure-based methods.
+    Evidence: chainladder/methods/benktander.py:62(if sample_weight is None)'
+  - 'Mack recursion for parameter/process risk - Recursive formula propagates variance through development.
+    Evidence: chainladder/methods/mack.py:121(_mack_recursion)'
+  - 'CapeCod self-funding: derive apriori from data - No external exposure needed; uses weighted average
+    of ultimates. Evidence: chainladder/methods/capecod.py:98(_get_capecod_aprioris)'
+  - 'ultimate_ attribute required for ibnr_, full_expectation_, full_triangle_ - Methods must set ultimate_
+    or Common properties raise AttributeError. Evidence: chainladder/core/common.py:94-130(ibnr_, full_expectation_,
+    full_triangle_)'
+  acceptance_hints:
+  - ultimate_ = latest_diagonal × cdf produces monotonically increasing ultimates
+  - ibnr_ = ultimate_ - latest_diagonal gives positive reserves for future development
+  - full_triangle_ contains each projected values including zeros for future origin periods
+  - Mack prediction error satisfies sqrt(variance) contract
+  - Methods auto-fit Development if ldf_ missing from input triangle
+- id: tail_estimation
+  name: Tail Factor Estimation
+  order: 4
+  responsibility: 'Extrapolates development patterns beyond observed maturity to ultimate. WHY: Claims
+    can take decades to fully develop; tail bridges to 100% CDF.'
+  interface:
+    inputs:
+    - Triangle with ldf_ (may lack final period)
+    outputs:
+    - ldf_ with tail, tail_ (point estimate), sigma_/std_err_ extended
+  required_methods:
+  - name: TailCurve.fit_transform
+    description: Extrapolates LDFs using exponential/inverse-power/weibull curve fitting
+    evidence: chainladder/tails/curve.py:11(TailCurve.fit_transform)
+  - name: TailBondy.fit_transform
+    description: Generalized Bondy exponent curve fitting via least_squares optimization
+    evidence: chainladder/tails/bondy.py:11(TailBondy.fit_transform)
+  - name: TailConstant.fit_transform
+    description: No tail extension (ldf=1.0 for future periods)
+    evidence: chainladder/tails/constant.py:9(TailConstant.fit_transform)
+  key_behaviors:
+  - behavior: TailBase extends DevelopmentBase
+    description: Every tail estimators inherit DevelopmentBase fit/transform logic, including drop/n_periods
+      handling
+    evidence: chainladder/tails/base.py:9(class TailBase)
+  - behavior: Auto-apply Development if ldf_ missing
+    description: TailBase.fit auto-applies Development().fit_transform() if ldf_ missing before calculating
+      tail
+    evidence: chainladder/tails/base.py:15-16(fit)
+  - behavior: Decay-based initial LDF seed
+    description: Quadratic series expansion solves for initial tail LDF providing smooth decay into tail
+    evidence: chainladder/tails/base.py:77(_get_initial_ldf)
+  - behavior: Tail sigma via log-linear extrapolation
+    description: Extrapolate sigma to tail period using regression on log(sigma) maintaining Mack stochastic
+      properties
+    evidence: chainladder/tails/base.py:108(_get_tail_stats)
+  replaceable_points:
+  - name: curve
+    description: Tail shape function determining extrapolation functional form
+    options:
+    - name: exponential
+      traits:
+      - Exponential decay
+      - Most common
+      - Stable tail
+      fit_for:
+      - Standard reserving
+      - Regular development
+      - Industry practice
+      not_fit_for:
+      - Heavy-tailed business
+      - Long-tail liability
+    - name: inverse_power
+      traits:
+      - Power law decay
+      - Heavy-tailed
+      - Slow decay
+      fit_for:
+      - Long-tail lines
+      - Workers compensation
+      - Malpractice
+      not_fit_for:
+      - Short-tail lines
+      - Fast convergence
+    - name: weibull
+      traits:
+      - Weibull decay
+      - Flexible shape
+      - Generalized
+      fit_for:
+      - Variable tail behavior
+      - Research applications
+      not_fit_for:
+      - Standard reserving
+      - Regulatory filings
+    - name: bondy
+      traits:
+      - Bondy exponent
+      - Data-driven
+      - Optimized
+      fit_for:
+      - Tail-sensitive analysis
+      - Expert calibration
+      not_fit_for:
+      - Standard practice
+      - Quick estimates
+    default: exponential
+  - name: attachment_age
+    description: Where tail attaches to observed LDFs (latest age or specified age)
+    options:
+    - name: latest age
+      traits:
+      - Auto-detect
+      - Data-driven
+      fit_for:
+      - Standard use
+      - Most triangles
+      not_fit_for:
+      - Early termination
+      - Known maturity
+    - name: int
+      traits:
+      - Fixed age
+      - Explicit control
+      fit_for:
+      - Known maturity points
+      - Expert judgment
+      not_fit_for:
+      - Variable maturity
+      - Automated pipelines
+    default: latest age
+  - name: decay
+    description: Decay rate parameter for exponential tail function
+    options:
+    - name: '1.0'
+      traits:
+      - Standard decay
+      fit_for:
+      - Most triangles
+      - Balanced tail
+      not_fit_for:
+      - Fast convergence
+      - Slow convergence
+    - name: 0.5-2.0
+      traits:
+      - Adjusted decay
+      fit_for:
+      - Calibrated tails
+      - Expert judgment
+      not_fit_for:
+      - Standard reserving
+    default: '1.0'
+  design_decisions:
+  - 'Decay-based initial LDF seed - Quadratic series expansion solves for initial tail LDF. Evidence:
+    chainladder/tails/base.py:77(_get_initial_ldf)'
+  - 'Tail sigma via log-linear extrapolation - Extrapolate sigma to tail period using regression on log(sigma).
+    Evidence: chainladder/tails/base.py:108(_get_tail_stats)'
+  - 'Bondy exponent fitting via least_squares - Optimize power-law exponent to match observed LDFs. Evidence:
+    chainladder/tails/bondy.py:97(least_squares)'
+  - 'projection_period default=12 months - Extend 12 months beyond last observed development. Evidence:
+    chainladder/tails/base.py:18(projection_period)'
+  - 'projection_period=12 default determines tail length - Changing projection_period changes tail length
+    for each tail estimators. Evidence: chainladder/tails/base.py:18-21(fit - self.projection_period)'
+  acceptance_hints:
+  - Tail factors multiply to produce CDF approaching 1.0 at ULT_VAL
+  - Tail sigma values continue log-linear decay pattern from observed development
+  - Tail attachment point connects smoothly without discontinuity
+  - ldf_ attribute extended with additional development periods beyond observed data
+- id: adjustments
+  name: Triangle Adjustments
+  order: 5
+  responsibility: 'Pre-processing transformers for trend, bootstrap sampling, and parallelogram adjustments.
+    WHY: Raw triangles may need normalization before analysis.'
+  interface:
+    inputs:
+    - Triangle
+    outputs:
+    - Transformed Triangle with trend_, resampled_triangles_, or OLF applied
+  required_methods:
+  - name: Trend.fit_transform
+    description: Apply compound trend factors to triangles along origin or valuation axis
+    evidence: chainladder/adjustments/trend.py:10(Trend.fit_transform)
+  - name: BootstrapODPSample.fit_transform
+    description: ODP bootstrap resampling for stochastic analysis generating simulated triangles
+    evidence: chainladder/adjustments/bootstrap.py:13(BootstrapODPSample.fit_transform)
+  - name: ParallelogramOLF.fit_transform
+    description: Convert parallelogram format to triangle format applying on-level factors
+    evidence: chainladder/adjustments/parallelogram.py:11(ParallelogramOLF.fit_transform)
+  - name: BerquistSherman.fit_transform
+    description: Adjust for case reserve changes normalizing historical development
+    evidence: chainladder/adjustments/berqsherm.py:11(BerquistSherman.fit_transform)
+  key_behaviors:
+  - behavior: ODP bootstrap uses Pearson residuals
+    description: Residuals scaled by sqrt(expected)^k for overdispersed Poisson following Mack (1993)
+      ODP bootstrap
+    evidence: chainladder/adjustments/bootstrap.py:130(unscaled_residuals)
+  - behavior: BootstrapODPSample extends DevelopmentBase
+    description: Bootstrap inherits each DevelopmentBase fit/transform logic, being a development transformer
+      producing simulated triangles
+    evidence: chainladder/adjustments/bootstrap.py:class BootstrapODPSample(DevelopmentBase)
+  - behavior: Hat matrix adjustment option
+    description: DF adjustment vs hat matrix for residual standardization; hat is more conservative
+    evidence: chainladder/adjustments/bootstrap.py:108(hat_adj)
+  - behavior: Trend axis flexibility
+    description: Origin trend adjusts a priori exposure; valuation trend adjusts displayed results
+    evidence: chainladder/adjustments/trend.py:25(axis)
+  replaceable_points:
+  - name: hat_adj
+    description: Residual standardization method for ODP bootstrap
+    options:
+    - name: 'true'
+      traits:
+      - Hat matrix adjustment
+      - Conservative
+      - Lower variance
+      fit_for:
+      - Regulatory reserving
+      - Conservative estimates
+      - Lower capital
+      not_fit_for:
+      - Research applications
+      - Optimistic scenarios
+    - name: 'false'
+      traits:
+      - DF adjustment
+      - Standard bootstrap
+      fit_for:
+      - Standard practice
+      - Academic research
+      not_fit_for:
+      - Regulatory conservatism
+      - Low variance requirements
+    default: 'true'
+  - name: axis
+    description: Trend application axis for Trend adjustment
+    options:
+    - name: origin
+      traits:
+      - A priori adjustment
+      - Exposure trending
+      fit_for:
+      - Exposure-based methods
+      - BF/CapeCod
+      - Premium trending
+      not_fit_for:
+      - Display adjustments
+      - Historical analysis
+    - name: valuation
+      traits:
+      - Display adjustment
+      - Historical trending
+      fit_for:
+      - Historical analysis
+      - Inflation adjustment
+      - Reporting
+      not_fit_for:
+      - Exposure-based methods
+      - Forward projections
+    default: origin
+  design_decisions:
+  - 'ODP bootstrap uses Pearson residuals - Residuals scaled by sqrt(expected)^k for overdispersed Poisson.
+    Evidence: chainladder/adjustments/bootstrap.py:130(unscaled_residuals)'
+  - 'Hat matrix adjustment option - DF adjustment vs hat matrix for residual standardization. Evidence:
+    chainladder/adjustments/bootstrap.py:108(hat_adj)'
+  - 'Trend axis: origin vs valuation - Origin trend adjusts a priori; valuation adjusts displayed results.
+    Evidence: chainladder/adjustments/trend.py:25(axis)'
+  acceptance_hints:
+  - Bootstrap generates n_simulation resampled triangles preserving development patterns
+  - Trend factors multiply consistently across each development periods
+  - Parallelogram conversion produces valid triangle respecting origin <= development constraint
+  - Berquist-Sherman adjustment produces normalized triangle with consistent case reserve changes
+- id: workflow_ensemble
+  name: Workflow and Ensemble
+  order: 6
+  responsibility: 'Pipeline orchestration, hyperparameter tuning, and model voting. WHY: Production reserving
+    requires combining multiple transformers and methods.'
+  interface:
+    inputs:
+    - Raw Triangle, estimator configurations
+    outputs:
+    - Fitted pipeline, grid search results, or ensemble ultimate
+  required_methods:
+  - name: Pipeline.fit_transform
+    description: sklearn-style sequential transformer/estimator chain executing steps in order
+    evidence: chainladder/workflow/gridsearch.py:106(Pipeline.fit_transform)
+  - name: GridSearch.fit
+    description: Exhaustive parameter search with scoring across parameter combinations
+    evidence: chainladder/workflow/gridsearch.py:14(GridSearch.fit)
+  - name: VotingChainladder.fit_predict
+    description: Weighted average of multiple reserving methods producing ensemble ultimate
+    evidence: chainladder/workflow/voting.py:157(VotingChainladder.fit_predict)
+  key_behaviors:
+  - behavior: Pipeline passes sample_weight to each steps
+    description: Exposure needed by BF/CapeCod flows through transformer chain to estimator
+    evidence: chainladder/workflow/gridsearch.py:144(fit)
+  - behavior: VotingChainladder inherits from both _BaseChainladderVoting and MethodBase
+    description: Ensemble methods are full estimators with fit/predict from MethodBase plus ensemble logic
+    evidence: chainladder/workflow/voting.py:173(class VotingChainladder(_BaseChainladderVoting, MethodBase))
+  - behavior: fit_predict contract for Pipeline chaining
+    description: fit_predict must return predicted triangle; breaking it breaks Pipeline and GridSearch
+    evidence: chainladder/workflow/gridsearch.py:139(fit_predict)
+  - behavior: Parallel joblib execution
+    description: n_jobs for CPU parallelization in GridSearch and Voting; grid search is embarrassingly
+      parallel
+    evidence: chainladder/workflow/gridsearch.py:97(Parallel)
+  replaceable_points:
+  - name: scoring
+    description: GridSearch evaluation metric for parameter selection
+    options:
+    - name: 'null'
+      traits:
+      - No scoring
+      - Best_params only
+      fit_for:
+      - Manual evaluation
+      - Custom criteria
+      not_fit_for:
+      - Automated selection
+      - Best model identification
+    - name: callable
+      traits:
+      - Custom scoring function
+      fit_for:
+      - Domain-specific metrics
+      - Expert criteria
+      not_fit_for:
+      - Standard metrics
+      - Quick evaluation
+    - name: dict
+      traits:
+      - Multiple scoring metrics
+      fit_for:
+      - Comprehensive evaluation
+      - Multi-objective optimization
+      not_fit_for:
+      - Simple single-metric selection
+    default: 'null'
+  - name: weights
+    description: VotingChainladder combination weights controlling method contribution
+    options:
+    - name: 'null'
+      traits:
+      - Equal weights
+      fit_for:
+      - Neutral blending
+      - Equal confidence
+      not_fit_for:
+      - Method differentiation
+      - Expert weighting
+    - name: array
+      traits:
+      - Global weights
+      - Equal across origins
+      fit_for:
+      - Simple blending
+      - Equal importance
+      not_fit_for:
+      - Origin-specific weighting
+    - name: list
+      traits:
+      - Ordered weights
+      fit_for:
+      - Simple specification
+      - List of floats
+      not_fit_for:
+      - Named methods
+      - Complex hierarchies
+    - name: dict
+      traits:
+      - Named method weights
+      fit_for:
+      - Explicit mapping
+      - Method identification
+      not_fit_for:
+      - Ordered-only
+      - Simple arrays
+    - name: callable
+      traits:
+      - Dynamic weighting
+      - Origin-dependent
+      fit_for:
+      - Maturity-based weights
+      - Expert judgment
+      - Complex logic
+      not_fit_for:
+      - Static weights
+      - Simple equal blending
+    default: 'null'
+  design_decisions:
+  - 'Pipeline passes sample_weight to each steps - Exposure needed by BF/CapeCod in pipeline. Evidence:
+    chainladder/workflow/gridsearch.py:144(fit)'
+  - 'Weights support array/list/dict/callable - Flexible weighting by origin period or globally. Evidence:
+    chainladder/workflow/voting.py:78(_coerce_assum_vector_to_array)'
+  - 'Parallel joblib execution in GridSearch/Voting - n_jobs for CPU parallelization. Evidence: chainladder/workflow/gridsearch.py:97(Parallel)'
+  - 'sklearn inheritance pattern: BaseEstimator + TransformerMixin for transformers, BaseEstimator for
+    estimators - Enables Pipeline/GridSearch integration. Evidence: chainladder/development/base.py:14(DevelopmentBase)'
+  acceptance_hints:
+  - Pipeline.fit_transform produces same result as manual sequential calls to each step
+  - GridSearch identifies optimal parameter combination from parameter grid
+  - VotingChainladder weights sum to 1.0 or are normalized automatically
+  - Parallel execution with n_jobs=-1 uses each available CPU cores
+data_flow:
+- from_stage: triangle_data_structure
+  to_stage: development_pattern_estimation
+  data: Cumulative Triangle (4D sparse array with origin/development dims, is_cumulative=True)
+- from_stage: development_pattern_estimation
+  to_stage: reserving_methods
+  data: ldf_, cdf_, sigma_, std_err_ triangles attached to input triangle via ldf_ attribute
+- from_stage: reserving_methods
+  to_stage: reserving_methods
+  data: sample_weight (exposure triangle matching X's shape) for BF/Benktander/CapeCod methods
+- from_stage: development_pattern_estimation
+  to_stage: tail_estimation
+  data: Triangle with ldf_ lacking final development period (incomplete CDF)
+- from_stage: tail_estimation
+  to_stage: reserving_methods
+  data: Extended ldf_/cdf_ with tail periods, sigma_/std_err_ extrapolated to ULT_VAL
+- from_stage: adjustments
+  to_stage: development_pattern_estimation
+  data: Trend-adjusted or resampled triangles ready for LDF calculation
+- from_stage: triangle_data_structure
+  to_stage: workflow_ensemble
+  data: Raw Triangle input to Pipeline or VotingChainladder
+- from_stage: workflow_ensemble
+  to_stage: reserving_methods
+  data: Fitted Pipeline or VotingChainladder ultimate triangles via fit_predict
+global_contracts:
+- contract: Every Triangles use 4D shape (index, columns, origin, development) with datetime indices
+  evidence: chainladder/core/triangle.py:312(shape=...)
+- contract: Origin must be <= Development for each cells
+  evidence: chainladder/core/base.py:157(origin<=development)
+- contract: is_cumulative flag distinguishes cumulative from incremental triangles
+  evidence: chainladder/core/triangle.py:252(is_cumulative)
+- contract: valuation_date = max development date as Timestamp
+  evidence: chainladder/core/triangle.py:239(val_date)
+- contract: 'LDFs multiplied give CDFs: cdf = ldf.cumprod()'
+  evidence: chainladder/core/common.py:80(cdf_)
+- contract: ultimate = latest_diagonal × cdf (for chain ladder)
+  evidence: chainladder/methods/chainladder.py:75(ultimate=ld*cdf)
+- contract: ibnr = ultimate - latest_diagonal
+  evidence: chainladder/core/common.py:94(ibnr_)
+- contract: ULL_VAL='2261-12-31' marks ultimate development period
+  evidence: chainladder/__init__.py:7(ULT_VAL)
+- contract: ldf_ attribute is cross-module contract required by Development, Tail, and Methods
+  evidence: chainladder/methods/base.py:20(if 'ldf_' not in obj), chainladder/tails/base.py:15(if 'ldf_'
+    not in obj)
+- contract: Common mixin provides has_ldf, cdf_, ibnr_, full_expectation_, full_triangle_ to both DevelopmentBase
+    and MethodBase
+  evidence: chainladder/core/common.py:62-130(class Common)
+- contract: options.ULT_VAL constant used across modules for ultimate valuation date
+  evidence: chainladder/methods/base.py:49(options.ULT_VAL), chainladder/core/common.py:42(options.ULT_VAL)
+- contract: Common.set_backend provides numpy/sparse/cupy/dask abstraction used by each Triangle and estimator
+    objects
+  evidence: chainladder/core/common.py:135-202(set_backend)
+business_decisions:
+- id: BD-001
+  type: B/BA
+  content: Default LDF averaging method is 'volume' weighted, using exponents {volume:1, simple:2, regression:0}
+    to control regression weighting
+  rationale: 'Volume-weighted averaging gives more influence to larger, more credible accident years where
+    losses are more stable. The exponent mapping allows fine control over how regression-based LDFs are
+    blended with volume-weighted averages, providing flexibility while defaulting to a statistically sound
+    approach. Boundary: Only affects LDF calculations when multiple link ratios are averaged; simple/exponential
+    weighting used for non-regression cases.'
+  evidence: chainladder/development/development.py:19(average),:139(exponent mapping)
+  stage: development_pattern_estimation
+  alternative_considered: Simple average (equal weights) would overweight small, volatile accident periods
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: average),:139(exponent mapping in chainladder/development/development.py'
+- id: BD-002
+  type: B
+  content: n_periods=-1 uses each available origin periods for LDF calculation
+  rationale: 'Using each available origin periods maximizes data utilization and statistical credibility
+    of LDF estimates. This ensures no usable historical data is discarded. Boundary: Only applies when
+    n_periods=-1; positive values limit to most recent n periods only.'
+  evidence: chainladder/development/development.py:16(n_periods)
+  stage: development_pattern_estimation
+  alternative_considered: Limiting to recent periods could exclude relevant historical patterns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: n_periods in chainladder/development/development.py'
+- id: BD-003
+  type: B
+  content: preserve=1 ensures minimum 1 link ratio is retained even after exclusions, preventing degenerate
+    calculations
+  rationale: 'Setting preserve=1 prevents each link ratios from being excluded by drop_high/drop_low/drop_valuation,
+    which would cause division-by-zero or undefined LDFs. This guards against accidentally removing 100%
+    of data. Boundary: Applied after each exclusion methods; actual link ratio count = total - exclusions,
+    floored at preserve value.'
+  evidence: chainladder/development/development.py:42(preserve)
+  stage: development_pattern_estimation
+  alternative_considered: No preserve floor could result in NaN LDFs for each periods
+  _evidence_issues:
+  - 'FN_NOT_FOUND: preserve in chainladder/development/development.py'
+- id: BD-004
+  type: B/BA
+  content: drop_above=inf and drop_below=0.0 means no automatic threshold exclusion of link ratios
+  rationale: 'By default, no link ratios are excluded based on magnitude thresholds, allowing the full
+    data range to contribute to LDF estimates. Users must explicitly set finite drop_above/drop_below
+    values to trigger threshold-based exclusions. Boundary: Only affects threshold exclusion; rank-based
+    exclusions (drop_high/low) operate independently.'
+  evidence: chainladder/development/development.py:74(__init__)
+  stage: development_pattern_estimation
+  alternative_considered: Finite default thresholds could exclude valid data for unusual triangles
+- id: BD-005
+  type: B/BA
+  content: drop_high/drop_low exclude outliers by rank position (highest/lowest n values) before averaging
+  rationale: 'Rank-based outlier removal is simpler and more robust than threshold-based methods that
+    depend on data distribution assumptions. It systematically removes extreme values regardless of how
+    extreme they are. Boundary: Applied before averaging; count-based (n values) not percentage-based;
+    separate from drop_above/drop_below threshold exclusions.'
+  evidence: chainladder/development/base.py:122(_drop_n)
+  stage: development_pattern_estimation
+  alternative_considered: Threshold-based exclusion could miss outliers or exclude too many in skewed
+    distributions
+- id: BD-006
+  type: B/BA
+  content: Default tail=1.0 (no tail factor) with decay=0.5 (50% decay per period) for TailConstant
+  rationale: 'Tail=1.0 represents the conservative no-tail assumption, while decay=0.5 provides a standard
+    parametric decay rate if tail extension is enabled. The 50% decay per period is a common actuarial
+    default that produces reasonable tail factors for typical development patterns. Boundary: Only active
+    when tail extension is requested; decay controls how rapidly LDFs approach 1.0.'
+  evidence: chainladder/tails/constant.py:8(TailConstant)
+  stage: tail_estimation
+  alternative_considered: More aggressive decay (lower value) would produce higher tail factors
+- id: BD-007
+  type: B/BA
+  content: TailCurve default curve is 'exponential' with extrap_periods=100 and errors='ignore'
+  rationale: 'Exponential curve is the standard parametric form for tail extrapolation in actuarial practice,
+    based on the empirical observation that LDFs often follow exponential decay. extrap_periods=100 extends
+    far beyond typical development periods (12-24 months) to reach maturity. Boundary: Curve fitting excludes
+    LDFs below reg_threshold; errors=''ignore'' suppresses fitting warnings for sparse data.'
+  evidence: chainladder/tails/curve.py:11(TailCurve)
+  stage: tail_estimation
+  alternative_considered: Alternative curves (inverse power, loglogistic) may better fit specific development
+    patterns
+- id: BD-008
+  type: B/BA
+  content: TailBondy uses scipy least_squares optimization with initial b=0.5 for generalized Bondy tail
+  rationale: 'The Bondy method fits a parametric curve to each LDFs simultaneously using nonlinear least
+    squares. Initial b=0.5 provides a reasonable starting point for the iterative optimizer, which then
+    refines to minimize fitting error. Boundary: b0=0.5 is for generalized Bondy; standard Bondy uses
+    fixed b; poor initial values may cause convergence issues.'
+  evidence: chainladder/tails/bondy.py:93(least_squares)
+  stage: tail_estimation
+  alternative_considered: Fixed b parameter (standard Bondy) eliminates optimization but reduces flexibility
+  _evidence_issues:
+  - 'FN_NOT_FOUND: least_squares in chainladder/tails/bondy.py'
+- id: BD-009
+  type: B/BA
+  content: sigma_interpolation defaults to 'log-linear' for filling missing sigma values
+  rationale: 'Log-linear interpolation is appropriate for sigma (standard deviation of LDFs) because variances
+    are multiplicative and often exhibit log-linear trends over development periods. This preserves the
+    positive-only constraint of sigma values. Boundary: Only applies to missing sigma entries; requires
+    at least two non-missing values for interpolation; Macack covariance requires complete sigma triangle.'
+  evidence: chainladder/development/development.py:24(sigma_interpolation)
+  stage: development_pattern_estimation
+  alternative_considered: Linear interpolation could produce negative sigma values at boundaries
+  _evidence_issues:
+  - 'FN_NOT_FOUND: sigma_interpolation in chainladder/development/development.py'
+  vague_rationale: true
+- id: BD-010
+  type: B/BA
+  content: projection_period=12 months default for extending LDFs beyond last development age
+  rationale: 'The 12-month projection period aligns with annual financial reporting cycles, ensuring tail
+    factors extend to year-end valuations. This creates consistency between development period LDFs and
+    annual tail extensions. Boundary: Only affects tail extrapolation beyond last observed development
+    age; applies to both TailCurve and TailBondy methods.'
+  evidence: chainladder/tails/base.py:9(TailBase)
+  stage: tail_estimation
+  alternative_considered: Shorter periods (6 months) would require more extrapolation iterations
+- id: BD-011
+  type: B/BA
+  content: Benktander n_iters=1 for Bornhuetter-Ferguson, allowing iteration for Benktander method
+  rationale: 'n_iters=1 makes Bornhuetter-Ferguson a single-pass method, consistent with its standard
+    actuarial definition. Benktander iterates multiple times to converge on consistent ultimates. The
+    single-iteration default maintains the distinction between these methods. Boundary: n_iters=0 gives
+    ExpectedLoss (pure apriori); n_iters>1 enables Benktander convergence.'
+  evidence: chainladder/methods/bornferg.py:7(BornhuetterFerguson)
+  stage: reserving_methods
+  alternative_considered: Default iteration >1 would blur distinction between BF and Benktander methods
+- id: BD-012
+  type: B/BA
+  content: apriori=1.0 default multiplier for sample_weight in Bornhuetter-Ferguson/Benktander
+  rationale: 'apriori=1.0 applies the sample_weight directly as expected losses without adjustment, providing
+    a neutral starting point. Users scale apriori based on loss exposure modifications or actuarial judgment
+    about expected loss ratios. Boundary: apriori multiplies sample_weight before division by CDF; different
+    values shift the balance between reported and expected losses.'
+  evidence: chainladder/methods/benktander.py:39(apriori)
+  stage: reserving_methods
+  alternative_considered: Different apriori assumptions reflect different prior beliefs about expected
+    loss ratios
+  _evidence_issues:
+  - 'FN_NOT_FOUND: apriori in chainladder/methods/benktander.py'
+- id: BD-013
+  type: B/BA
+  content: apriori_sigma=0.0 for deterministic mode; non-zero enables lognormal sampling in bootstrap
+  rationale: 'apriori_sigma=0.0 produces deterministic outputs without uncertainty from apriori specification,
+    suitable for point estimates. Non-zero values enable simulation of apriori uncertainty using lognormal
+    distribution, providing confidence intervals that account for prior assumption variability. Boundary:
+    sigma affects only stochastic simulation mode; has no effect on deterministic calculations.'
+  evidence: chainladder/methods/benktander.py:8(Benktander)
+  stage: reserving_methods
+  alternative_considered: Zero sigma provides cleaner point estimates but understates total uncertainty
+- id: BD-014
+  type: B
+  content: n_sims=1000 bootstrap simulations with hat_adj=True (hat matrix adjustment for residuals)
+  rationale: 'n_sims=1000 provides adequate convergence for bootstrap distributions while maintaining
+    reasonable computation time. hat_adj=True applies the hat matrix correction to residuals, which improves
+    statistical properties of the bootstrap by accounting for parameter estimation uncertainty. Boundary:
+    hat_adj affects residual scaling; n_sims affects distribution smoothness; both impact confidence interval
+    precision.'
+  evidence: chainladder/adjustments/bootstrap.py:20(BootstrapChainladder)
+  stage: bootstrap
+  alternative_considered: Fewer simulations (100-500) would be faster but potentially less stable
+  _evidence_issues:
+  - 'FN_NOT_FOUND: BootstrapChainladder in chainladder/adjustments/bootstrap.py'
+- id: BD-015
+  type: B/BA
+  content: CapeCod decay=1 means no decay weighting; decay<1 weights recent origins more heavily
+  rationale: 'decay=1 gives equal weight to each origin periods, which is the standard Cape Cod assumption
+    that each years contribute equally to the development pattern. decay<1 downweights older origins,
+    useful when development patterns have shifted over time. Boundary: decay parameter applies to the
+    development pattern weights, not the exposure weights; decay<0 is invalid.'
+  evidence: chainladder/methods/capecod.py:10(CapeCod)
+  stage: reserving_methods
+  alternative_considered: decay<1 with high recency may overreact to recent volatile periods
+- id: BD-016
+  type: B
+  content: Ultimate = latest_diagonal * CDF where CDF aligns to valuation_date using nan_triangle
+  rationale: 'The chainladder method computes ultimates by projecting current reserves (latest diagonal)
+    through remaining development factors (CDF). The nan_triangle ensures proper alignment of development
+    periods to valuation dates, handling missing values appropriately. Boundary: Only applicable to reported
+    claims on the latest diagonal; future claims require separate Bornhuetter-Ferguson treatment.'
+  evidence: chainladder/methods/chainladder.py:70(_get_ultimate)
+  stage: reserving_methods
+  alternative_considered: Different alignment methods could produce materially different results for sparse
+    triangles
+  vague_rationale: true
+- id: BD-017
+  type: B/BA
+  content: Developed LDFs forced through origin (thru_orig=True) in WeightedRegression for link ratios
+  rationale: 'Forcing regression through the origin (0,1) reflects the actuarial assumption that at age
+    zero, LDF must equal 1 (no development has occurred yet). This constraint improves extrapolation reliability
+    and aligns with theoretical expectations. Boundary: thru_orig=True forces intercept=0; affects only
+    regression-based LDFs; simple averages are unaffected.'
+  evidence: chainladder/utils/weighted_regression.py:10(WeightedRegression)
+  stage: development_pattern_estimation
+  alternative_considered: Free regression (thru_orig=False) could produce implausible extrapolations near
+    origin
+- id: BD-018
+  type: B/BA
+  content: Development lags calculated as (valuation-origin) / (365.25/12) = months difference
+  rationale: 'Using 365.25/12 (average days per month) provides accurate month-based development lag calculations
+    that account for leap years. This ensures consistency across different calendar periods and aligns
+    with actuarial convention. Boundary: Results in fractional months for non-monthly grain; used for
+    LDF indexing and interpolation.'
+  evidence: chainladder/core/base.py:391(Triangle.development_lag)
+  stage: core
+  alternative_considered: Simple 365/12 would introduce small systematic errors accumulating over many
+    periods
+  _evidence_issues:
+  - 'FN_NOT_FOUND: Triangle.development_lag in chainladder/core/base.py'
+- id: BD-019
+  type: B/BA
+  content: origin_date represents period START; development_date represents period END
+  rationale: 'This convention aligns with insurance accounting where origin periods define when losses
+    occurred (accident year) and development dates represent when they are observed (valuation year).
+    The start-to-end semantics ensure consistent triangle construction and LDF calculation. Boundary:
+    Every triangle operations assume origin=start and development=end; violating this produces incorrect
+    LDFs.'
+  evidence: chainladder/core/triangle.py:32(Triangle)
+  stage: core
+  alternative_considered: Alternative conventions exist in some actuarial systems but would be inconsistent
+    with insurance industry standards
+- id: BD-020
+  type: B
+  content: ULT_VAL='2261-12-31' sentinel date represents infinite/ultimate maturity
+  rationale: 'The far-future date 2261-12-31 serves as a practical sentinel for ''ultimate maturity''
+    (no further development). Using a distant future date avoids conflicts with real calendar dates while
+    clearly signaling the theoretical endpoint. Boundary: Applies only as valuation date for ultimate
+    periods; tail factors for this date should equal 1.0.'
+  evidence: chainladder/__init__.py:7(ULT_VAL)
+  stage: core
+  alternative_considered: None/NaN would be ambiguous; explicit infinite date would require special handling
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ULT_VAL in chainladder/__init__.py'
+- id: BD-021
+  type: B
+  content: drop_valuation removes specific calendar periods from LDF calculation (not rank-based)
+  rationale: 'drop_valuation operates on calendar periods rather than rank positions, allowing exclusion
+    of specific quarters or years that may be affected by unusual events (catastrophes, law changes).
+    This provides more targeted exclusion than drop_high/drop_low. Boundary: Applies to calendar date
+    ranges, not development periods; operates independently from rank-based exclusions.'
+  evidence: chainladder/development/base.py:313(_drop_valuation)
+  stage: development_pattern_estimation
+  alternative_considered: Rank-based exclusions cannot target specific calendar periods
+- id: BD-022
+  type: B
+  content: fillna=None - zero/NAN values in triangle are excluded from LDF calculation
+  rationale: 'Excluding NaN and zero values ensures LDFs are calculated only from valid, non-trivial link
+    ratios. This prevents division artifacts and focuses on meaningful development observations. fillna=0
+    would incorrectly weight missing data as zero development. Boundary: fillna=None excludes; fillna=''mean''
+    would substitute average values; fillna=0 would create false zero ratios.'
+  evidence: chainladder/development/development.py:74(__init__)
+  stage: development_pattern_estimation
+  alternative_considered: fillna='mean' could mask data gaps with artificial values
+- id: BD-023
+  type: B/BA
+  content: ARRAY_BACKEND defaults to 'numpy'; AUTO_SPARSE=True enables automatic sparse conversion
+  rationale: 'Numpy provides the standard dense array operations expected in Python scientific computing.
+    AUTO_SPARSE=True automatically converts to sparse matrices when triangles are sparse (many NaN), optimizing
+    memory and computation. Boundary: Different backends (jax, torch) may have different numerical properties;
+    sparse conversion threshold is backend-dependent.'
+  evidence: chainladder/__init__.py:4(ARRAY_BACKEND)
+  stage: core
+  alternative_considered: Dense-only mode would be slower for sparse triangles but potentially more consistent
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ARRAY_BACKEND in chainladder/__init__.py'
+- id: BD-024
+  type: B/BA
+  content: ExpectedLoss n_iters=0 bypasses CDF weighting - apriori alone determines ultimate
+  rationale: 'n_iters=0 makes ExpectedLoss purely a priori based, ignoring any reported loss development.
+    This represents the most conservative approach where only expected loss ratios determine ultimates.
+    This is the logical boundary case between BF (n_iters=1) and pure a priori methods. Boundary: n_iters=0
+    ignores reported losses entirely; n_iters>0 would iteratively incorporate actual development.'
+  evidence: chainladder/methods/expectedloss.py:7(ExpectedLoss)
+  stage: reserving_methods
+  alternative_considered: Any iteration would blend in actual reported development, moving toward BF/Benktander
+- id: BD-025
+  type: B/BA
+  content: 'TailBase decay formula: ldf = 1 + initial * (decay^period) where initial from quadratic expansion'
+  rationale: 'The exponential decay formula ensures LDFs smoothly approach 1.0 as periods increase, consistent
+    with theoretical development patterns. The initial LDF from quadratic expansion provides appropriate
+    starting values for the decay curve. Boundary: decay^period → 0 as period → ∞, so ldf → 1+initial;
+    decay<1 required for convergence.'
+  evidence: chainladder/tails/base.py:78(_get_initial_ldf)
+  stage: tail_estimation
+  alternative_considered: Alternative decay functions (linear, hyperbolic) would produce different tail
+    factor shapes
+  vague_rationale: true
+- id: BD-026
+  type: B/BA
+  content: Mack std err = sqrt(parameter_risk^2 + process_risk^2) in quadrature
+  rationale: 'The Mack model separates parameter uncertainty (estimation error in LDFs) from process variance
+    (random fluctuation in claims). Adding in quadrature (square root of sum of squares) is the standard
+    approach for combining independent uncertainty sources. Boundary: Assumes independence between parameter
+    and process risk; covariance terms are neglected; results are approximate for skewed distributions.'
+  evidence: chainladder/methods/mack.py:9(MackChainladder)
+  stage: reserving_methods
+  alternative_considered: Simpler additive approach would overstate uncertainty by ignoring independence
+- id: BD-027
+  type: B/RC
+  content: 'Development grain auto-inferred: Y (12mo), S (6mo), Q (3mo), M (1mo) from data spacing'
+  rationale: 'Auto-inference of development grain from data periodicity ensures correct LDF indexing without
+    manual specification. The hierarchy Y>S>Q>M captures the most natural granularity consistent with
+    the data. Boundary: Infers from spacing alone; manual override required for mixed-grain triangles;
+    semiannual mapped to 2 quarters, not ''S''.'
+  evidence: chainladder/core/base.py:394(_get_grain)
+  stage: core
+  alternative_considered: Default to monthly grain would cause incorrect indexing for annual data
+- id: BD-028
+  type: B/BA
+  content: reg_threshold=(1.00001, None) lower bound for tail curve fitting excludes LDFs near 1.0
+  rationale: 'Excluding LDFs very close to 1.0 prevents fitting to periods where development has essentially
+    ceased, which would distort tail extrapolation. The 1.00001 threshold is slightly above 1.0 to capture
+    the transition point while excluding fully mature periods. Boundary: Only affects TailCurve regression;
+    other methods unaffected; threshold must be <2 for valid fitting.'
+  evidence: chainladder/tails/curve.py:11(TailCurve)
+  stage: tail_estimation
+  alternative_considered: Including each LDFs would weight mature periods equally with developing periods
+- id: BD-029
+  type: B/BA
+  content: Tail stats extrapolation uses log-linear regression on sigma over time periods
+  rationale: 'Log-linear regression on sigma ensures positive sigma values and typically exhibits linear
+    trends, consistent with stochastic models of development variance. This provides stable extrapolation
+    of uncertainty measures into the tail. Boundary: Requires monotonic sigma pattern; applies only to
+    tail periods beyond last observed development.'
+  evidence: chainladder/tails/base.py:119(_get_sigma_tail)
+  stage: tail_estimation
+  alternative_considered: Linear extrapolation could produce negative sigma values at tail extrapolation
+    boundaries
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _get_sigma_tail in chainladder/tails/base.py'
+- id: BD-030
+  type: B/RC
+  content: 'Validation: origin <= development is required; observations violating this are removed with
+    warning'
+  rationale: 'The origin<=development constraint reflects causality: development cannot precede the origin
+    period in which losses occurred. Violating this produces meaningless or negative development lags.
+    Warning removal ensures data integrity while preventing catastrophic failures. Boundary: Applies at
+    triangle construction; removed observations excluded from each calculations; future claims handled
+    separately.'
+  evidence: chainladder/core/base.py:156(Triangle.validate)
+  stage: core
+  alternative_considered: Strict error on violation would prevent loading any invalid data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: Triangle.validate in chainladder/core/base.py'
+- id: BD-031
+  type: B
+  content: Groupby parameter allows pooling multiple triangles for joint LDF/apriori estimation
+  rationale: 'Groupby enables credibility pooling where similar triangles share development information,
+    improving estimates for small or volatile individual segments. This is fundamental to actuarial practice
+    of using industry or portfolio benchmarks. Boundary: Applies only when specified; pooled estimates
+    replace individual estimates for small groups; groupby must match triangle structure.'
+  evidence: chainladder/development/development.py:74(__init__)
+  stage: development_pattern_estimation
+  alternative_considered: Separate estimation for each triangle would ignore valuable pooled information
+- id: BD-032
+  type: B
+  content: Bootstrap uses ODP (Overdispersed Poisson) process with Pearson residuals and resampling with
+    replacement
+  rationale: 'The ODP bootstrap is the actuarial standard for reserve simulation, treating claims as overdispersed
+    Poisson with Pearson residuals that preserve mean-variance relationships. Resampling with replacement
+    generates the bootstrap distribution. Boundary: k_value=1 specifies ODP; applies to individual triangle
+    cells; residuals centered before resampling.'
+  evidence: chainladder/adjustments/bootstrap.py:13(bootstrapodpsample)
+  stage: bootstrap
+  alternative_considered: Parametric bootstrap would assume specific distributions; residual bootstrap
+    preserves empirical properties
+  _evidence_issues:
+  - 'FN_NOT_FOUND: bootstrapodpsample in chainladder/adjustments/bootstrap.py'
+- id: BD-033
+  type: B
+  content: CapeCod reported_exposure = sample_weight / CDF (exposure trended to ultimate basis)
+  rationale: 'Dividing exposure by CDF converts current premium to an ultimate-equivalent basis, allowing
+    direct comparison with ultimate losses. This trending-to-ultimate approach is the theoretical foundation
+    of Cape Cod method. Boundary: Applies only to CapeCod; requires valid CDFs; sample_weight should be
+    current period exposure.'
+  evidence: chainladder/methods/capecod.py:102(CapeCod.reported_exposure)
+  stage: reserving_methods
+  alternative_considered: Using current (untrended) exposure would create inconsistency with ultimate
+    losses
+  _evidence_issues:
+  - 'FN_NOT_FOUND: CapeCod.reported_exposure in chainladder/methods/capecod.py'
+- id: BD-034
+  type: B/BA
+  content: Patsy formula 'C(development) + C(origin)' default for TweedieGLM design matrix
+  rationale: 'The categorical (C()) formula specification treats development and origin as discrete factors
+    rather than continuous variables, which is appropriate for actuarial data where development age effects
+    are not necessarily linear. This is the standard GLM specification for actuarial regression. Boundary:
+    Only applies when formula=None; custom formulas override default; formula parsing depends on patsy.'
+  evidence: chainladder/development/glm.py:13(TweedieGLM)
+  stage: development_pattern_estimation
+  alternative_considered: Continuous variables would assume linear relationships; may not fit actuarial
+    data well
+  vague_rationale: true
+- id: BD-035
+  type: B/BA
+  content: Tweedie power=1.0 default gives compound Poisson-Gamma (typical insurance loss) distribution
+  rationale: 'Power=1.0 represents the compound Poisson-Gamma distribution, which models insurance losses
+    with both frequency and severity components (point mass at zero + continuous positive distribution).
+    This is appropriate for most property-casualty loss data. Boundary: power=1.0 is Tweedie compound
+    Poisson-Gamma; power=2.0 is gamma; power=0 is normal; must be between 1 and 2 for Tweedie.'
+  evidence: chainladder/development/glm.py:13(TweedieGLM)
+  stage: development_pattern_estimation
+  alternative_considered: Different power values suit different loss distribution characteristics; gamma
+    (p=2) for pure severity
+  vague_rationale: true
+- id: BD-036
+  type: B
+  content: MackChainladder uses recursive variance estimation combining parameter_risk and process_risk
+    quadratically via sqrt(t1^2 + t2^2) formula
+  rationale: Recursive variance estimation using quadratic combination of parameter_risk and process_risk
+    via sqrt(t1^2 + t2^2) captures both estimation uncertainty and process randomness inherent in Mack's
+    method, with boundary at fully developed periods where process risk vanishes and only parameter_risk
+    remains. This decomposition aligns with actuarial practice of separating reserve variability sources
+    for risk management.
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.methods.mack
+- id: BD-037
+  type: B
+  content: Standard error weighting uses regression (0), volume (1), or simple (2) averaging exponents
+    applied to sqrt(full_values^(2-val))
+  rationale: Regression (0), volume (1), and simple (2) averaging exponents applied to standard error
+    calculation via sqrt(full_values^(2-val)) represent three distinct weighting philosophies in Mack
+    model variance estimation, with boundary at exponent extremes where volume weighting dominates for
+    high-exposure cells versus simple averaging for equal-weight treatment. This flexibility allows actuaries
+    to emphasize credible data points while maintaining statistical rigor.
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.methods.mack
+- id: BD-038
+  type: B
+  content: ClarkLDF uses scipy.optimize.minimize with bounded parameters to fit growth curve theta/omega
+    via MLE on incremental losses
+  rationale: Using scipy.optimize.minimize with bounded parameters to fit Clark growth curve theta/omega
+    via MLE on incremental losses ensures numerical stability and parameter validity (theta greater than
+    0, omega greater than 0), with boundary at boundary-constrained parameters where optimization terminates.
+    This bounded optimization approach prevents unrealistic parameter estimates while leveraging scipy's
+    robust L-BFGS-B algorithm for efficient convergence in actuarial applications.
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.development.clark
+- id: BD-039
+  type: B/BA
+  content: Scale parameter estimated as sum((observed-expected)^2/expected)/df with df = n_obs - n_params
+    for LDF method
+  rationale: Scale parameter estimated as sum((observed-expected)^2/expected)/df with df = n_obs - n_params
+    for LDF method provides chi-square based dispersion estimation, with boundary at df approaching zero
+    where scale becomes unstable. This approach follows Mack's original specification and ensures proper
+    scaling of LDF distributions for reserve variability measurement in actuarial practice.
+  evidence: chainladder/development/clark.py:259(scale_)
+  stage: chainladder.development.clark
+- id: BD-040
+  type: B
+  content: TweedieGLM uses sklearn TweedieRegressor with power=1.0 (Poisson), link='log', alpha=1.0 regularization
+  rationale: TweedieGLM uses sklearn TweedieRegressor with power=1.0 (Poisson), link='log', alpha=1.0
+    regularization for compound Poisson-Gamma model fitting, with boundary at power=0 (Normal) and power=2
+    (Gamma). This configuration enables mean-variance relationship modeling appropriate for insurance
+    loss data with point masses at zero and positive continuous support, ensuring computational efficiency
+    through sklearn's optimized implementation.
+  evidence: chainladder/development/glm.py:13(tweedieglm)
+  stage: chainladder.development.glm
+  _evidence_issues:
+  - 'FN_NOT_FOUND: tweedieglm in chainladder/development/glm.py'
+  vague_rationale: true
+- id: BD-041
+  type: B
+  content: TailBondy fits Bondy exponent b using scipy.optimize.least_squares on log(ldf) with exponential
+    decay model tail = f0^(b/(1-b))
+  rationale: TailBondy fits Bondy exponent b using scipy.optimize.least_squares on log(ldf) with exponential
+    decay model tail = f0^(b/(1-b)) for tail extrapolation, with boundary at b approaching 1 where tail
+    factor becomes unstable. This method leverages observed LDFs to estimate the power-law decay parameter,
+    providing a theoretically grounded approach to extending development patterns beyond observed periods
+    in actuarial tail estimation.
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.tails.bondy
+- id: BD-042
+  type: B
+  content: CapeCod computes apriori as weighted average of trended ultimate using decay^|i-j| weighting
+    matrix
+  rationale: CapeCod computes apriori as weighted average of trended ultimate using decay^|i-j| weighting
+    matrix for cross-product smoothing, with boundary at decay=0 (independent) and decay=1 (uniform).
+    This decay-based weighting reflects the intuition that nearby origin years provide more relevant information
+    for estimating current apriori, creating a smooth transition across the portfolio in Cape Cod methodology.
+  evidence: chainladder/methods/capecod.py:98(_get_capecod_aprioris)
+  stage: chainladder.methods.capecod
+- id: BD-043
+  type: B
+  content: 'WeightedRegression uses closed-form OLS: slope = (sum(wxy) - sum(wx)*mean(y)) / (sum(wxx)
+    - mean(x)*sum(wx))'
+  rationale: 'WeightedRegression uses closed-form OLS: slope = (sum(wxy) - sum(wx)*mean(y)) / (sum(wxx)
+    - mean(x)*sum(wx)) for efficient estimation without iterative optimization, with boundary at zero
+    variance in x where slope becomes undefined. This formula enables weighted least squares fitting where
+    observation reliability determines influence, critical for handling heteroscedastic insurance data
+    in actuarial regression applications.'
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.utils.weighted_regression
+- id: BD-044
+  type: B/BA
+  content: 'Sigma interpolation uses log-linear extrapolation: sigma_filled = exp(slope*x + intercept)
+    for missing periods'
+  rationale: 'Sigma interpolation uses log-linear extrapolation: sigma_filled = exp(slope*x + intercept)
+    for missing periods to maintain variance pattern continuity, with boundary at extrapolation beyond
+    observed age range where model assumptions may not hold. This method fills gaps in the development
+    variance schedule using log-transformed linear regression, ensuring positive sigma values and smooth
+    progression across development ages.'
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.utils.weighted_regression
+- id: BD-045
+  type: B/BA
+  content: BarnettZehnwirth fits PTF formula using LinearRegression with fit_intercept=False on log-incrementals
+  rationale: BarnettZehnwirth fits PTF formula using LinearRegression with fit_intercept=False on log-incrementals
+    for Bornhuetter-Ferguson parameter estimation, with boundary at intercept constraint where fitted
+    model must pass through origin. This zero-intercept constraint enforces the actuarial principle that
+    expected incremental losses approach zero at infinite development, improving parameter stability and
+    interpretation in PTF methodology.
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.development.barnzehn
+- id: BD-046
+  type: B
+  content: BootstrapODPSample uses ODP Poisson bootstrap with standardized Pearson residuals and hat matrix
+    adjustment (k_value=1)
+  rationale: BootstrapODPSample uses ODP Poisson bootstrap with standardized Pearson residuals and hat
+    matrix adjustment (k_value=1) for over-dispersed Poisson resampling, with boundary at k_value=0 (no
+    adjustment) and k_value=2 (higher adjustment). This approach accounts for over-dispersion common in
+    insurance data while maintaining the mean-variance relationship appropriate for Poisson-based bootstrap
+    uncertainty quantification in reserve estimation.
+  evidence: chainladder/adjustments/bootstrap.py:127(_get_simulation)
+  stage: chainladder.adjustments.bootstrap
+  vague_rationale: true
+- id: BD-047
+  type: B/BA
+  content: Scale parameter computed as Pearson chi-square / degrees_of_freedom with deg_free = n_obs -
+    n_origin_params - n_dev_params
+  rationale: Scale parameter computed as Pearson chi-square / degrees_of_freedom with deg_free = n_obs
+    - n_origin_params - n_dev_params for proper statistical scaling, with boundary at small degrees of
+    freedom where chi-square scaling becomes unstable. This parameterization ensures unbiased dispersion
+    estimation across different triangle dimensions, accounting for both origin and development parameter
+    complexity in the bootstrap model.
+  evidence: chainladder/adjustments/bootstrap.py:51(__init__)
+  stage: chainladder.adjustments.bootstrap
+- id: BD-048
+  type: B
+  content: DevelopmentCorrelation uses Spearman rank correlation T_k = 1 - 6*sum((m1-m2)^2)/(I^3-I) with
+    weighted average Big T
+  rationale: DevelopmentCorrelation uses Spearman rank correlation T_k = 1 - 6*sum((m1-m2)^2)/(I^3-I)
+    with weighted average Big T for development pattern consistency, with boundary at small sample sizes
+    where rank-based statistics lose efficiency. This non-parametric approach provides robustness to outliers
+    and non-normal distributions while detecting systematic relationships across development periods in
+    actuarial correlation analysis.
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.core.correlation
+- id: BD-049
+  type: B/BA
+  content: ValuationCorrelation uses binomial test Z for calendar effects with expected value EZ = n/2
+    - c*n/2^n
+  rationale: ValuationCorrelation uses binomial test Z for calendar effects with expected value EZ = n/2
+    - c*n/2^n to identify anomalous calendar periods, with boundary at n=0 where binomial test undefined.
+    This statistical test detects calendar year artifacts such as processing delays or legislative changes
+    by comparing observed valuation patterns against expected binomial distributions, enabling data quality
+    assessment in actuarial triangle analysis.
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.core.correlation
+- id: BD-050
+  type: B
+  content: Development computes LDF averages using volume-weighted regression with exponent {regression:0,
+    volume:1, simple:2}
+  rationale: 'Development computes LDF averages using volume-weighted regression with exponent {regression:0,
+    volume:1, simple:2} for flexible factor estimation, with boundary at exponent values outside {0,1,2}
+    where weighting scheme undefined. These three exponent values represent distinct weighting philosophies:
+    regression-based for statistical efficiency, volume-weighted for exposure-based credibility, and simple
+    averaging for uniform treatment, allowing actuaries to select appropriate methodology based on'
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.development.development
+  vague_rationale: true
+- id: BD-051
+  type: B/BA
+  content: Drop mechanisms use rank-based exclusion (drop_high/low) and value-based exclusion (drop_above/below)
+    with preserve=1 minimum
+  rationale: Drop mechanisms use rank-based exclusion (drop_high/low) and value-based exclusion (drop_above/below)
+    with preserve=1 minimum to prevent outlier distortion, with boundary at preserve=0 where no observations
+    guaranteed. This dual exclusion strategy handles both distributional outliers (rank-based) and absolute
+    threshold violations (value-based) while ensuring minimum statistical validity through the preserve
+    parameter in development factor adjustments.
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.development.base
+- id: BD-052
+  type: B
+  content: MunichAdjustment computes lambda dependency coefficient using weighted regression of residuals
+    on q_residuals
+  rationale: MunichAdjustment computes lambda dependency coefficient using weighted regression of residuals
+    on q_residuals to capture Munich chain-ladder correlation, with boundary at lambda=0 (independent)
+    and lambda=1 (full correlation). This weighted regression approach specifically models the dependency
+    between claim counts and amounts in the Munich methodology, enabling coherent joint estimation of
+    IBNR across frequency and severity dimensions.
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.development.munich
+- id: BD-053
+  type: B
+  content: TailCurve fits exponential, inverse_power, or weibull curves using weighted regression on log(LDF-1)
+  rationale: 'TailCurve fits exponential, inverse_power, or weibull curves using weighted regression on
+    log(LDF-1) for parametric tail extrapolation, with boundary at LDF approaching 1 where log transformation
+    undefined. These three curve families offer flexibility in modeling tail decay patterns: exponential
+    for constant hazard, inverse power for heavy-tailed behavior, and Weibull for intermediate cases,
+    enabling data-driven tail factor estimation beyond observed development periods.'
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.tails.curve
+- id: BD-054
+  type: B
+  content: 'TailConstant applies constant tail factor with exponential decay across development periods:
+    ldf_decay = decay^(1+2+...+n)'
+  rationale: 'TailConstant applies constant tail factor with exponential decay across development periods:
+    ldf_decay = decay^(1+2+...+n) for simple tail extension, with boundary at decay=1 (no decay) and decay=0
+    (immediate termination). This approach provides a straightforward parametric tail using single decay
+    parameter, creating smooth tail factors by applying geometric decay to successive development periods
+    in actuarial loss reserving.'
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.tails.constant
+- id: BD-055
+  type: B/BA
+  content: 'Benktander uses iterative Bornhuetter-Ferguson with n_iters iterations: ultimate = (1-cdf^iter)*latest_diagonal
+    + cdf^iter*apriori'
+  rationale: 'Benktander uses iterative Bornhuetter-Ferguson with n_iters iterations: ultimate = (1-cdf^iter)*latest_diagonal
+    + cdf^iter*apriori for iterative credibility adjustment, with boundary at n_iters=1 (single BF) and
+    n_iters=infinity (chainladder convergence). This iterative approach progressively shifts weight from
+    initial apriori to experience-based chainladder estimate, providing intermediate credibility levels
+    between Bornhuetter-Ferguson and chainladder methodologies.'
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.methods.benktander
+- id: BD-056
+  type: B
+  content: 'BerquistSherman fits two-period exponential regression: log(paid) = a + b*closed with coefficients
+    via OLS'
+  rationale: 'BerquistSherman fits two-period exponential regression: log(paid) = a + b*closed with coefficients
+    via OLS for on-level adjustment, with boundary at b=0 (no trend) and b negative (inverse relationship).
+    This log-linear model captures the non-linear relationship between closed counts and paid amounts
+    across two periods, enabling trend-based on-leveling that accounts for development pace in actuarial
+    loss analysis.'
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.adjustments.berqsherm
+- id: BD-057
+  type: B/DK
+  content: Parallelogram OLF uses rolling mean of 12 months (or 365 days) for on-leveling with cumulative
+    rate changes
+  rationale: Parallelogram OLF uses rolling mean of 12 months (or 365 days) for on-leveling with cumulative
+    rate changes for premium trend smoothing, with boundary at window=1 (no smoothing) and window=infinity
+    (single average). This rolling window approach stabilizes on-level factors by averaging across sufficient
+    periods to smooth seasonal variations while maintaining responsiveness to genuine rate level changes
+    in insurance pricing.
+  evidence: chainladder/utils/utility_functions.py:379(parallelogram_olf)
+  stage: chainladder.utils.utility_functions
+- id: BD-058
+  type: B
+  content: 'VotingChainladder combines estimator ultimates using weighted average: ultimate = sum(weight_i
+    * ultimate_i) / sum(weights)'
+  rationale: 'VotingChainladder combines estimator ultimates using weighted average: ultimate = sum(weight_i
+    * ultimate_i) / sum(weights) for ensemble prediction, with boundary at equal weights (simple average)
+    and extreme weights (single estimator dominance). This ensemble approach reduces prediction variance
+    by combining multiple estimation methods, leveraging the wisdom of crowds principle in actuarial reserving
+    to improve overall forecast accuracy.'
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.workflow.voting
+- id: BD-059
+  type: B
+  content: Chainladder ultimate = latest_diagonal * CDF alignment with origin-matched development factors
+  rationale: Chainladder ultimate = latest_diagonal * CDF alignment with origin-matched development factors
+    for classic chainladder projection, with boundary at latest diagonal = 0 (zero claims) and CDF = 1
+    (fully developed). This fundamental chainladder formula projects ultimate losses by multiplying current
+    incurred amounts by cumulative development factors specific to each accident year, forming the foundation
+    of actuarial loss reserving methodology.
+  evidence: chainladder/methods/chainladder.py:70(_get_ultimate)
+  stage: chainladder.methods.chainladder
+- id: BD-060
+  type: B/BA
+  content: DevelopmentML transforms triangle to ML-ready DataFrame using origin/valuation encoders and
+    autoregressive lagged features
+  rationale: DevelopmentML transforms triangle to ML-ready DataFrame using origin/valuation encoders and
+    autoregressive lagged features for machine learning-based reserving, with boundary at insufficient
+    lag periods where autoregressive features undefined. This transformation enables modern ML algorithms
+    to learn development patterns from triangular insurance data by creating tabular format with temporal
+    lag features that capture development dynamics for predictive modeling.
+  evidence: N/A:0(see_rationale)
+  stage: chainladder.development.learning
+- id: BD-061
+  type: B/RC
+  content: MethodBase.validate_X auto-applies Development().fit_transform() and TailConstant().fit_transform()
+    if ldf_ missing
+  rationale: MethodBase implements a lazy evaluation pattern where ldf_ computation is deferred unless
+    already present on the triangle. This ensures estimators can operate on triangles with pre-computed
+    link ratios while automatically computing them when absent. The boundary is that if neither ldf_ nor
+    tail factors exist, these transformers fail - callers must ensure at least one pathway produces the
+    required attribute.
+  evidence: chainladder/methods/base.py:18-24(validate_X)
+  stage: ordering_contract
+  alternative_considered: Requiring explicit ldf_ computation before method fitting was rejected to avoid
+    forcing callers to know estimator internals
+- id: BD-062
+  type: B/RC
+  content: TailBase extends DevelopmentBase, making each tail estimators also development transformers
+    with fit/transform
+  rationale: TailBase inherits from DevelopmentBase to reuse the fit_transform pipeline for computing
+    development patterns before applying tail factors. This composition ensures tails are computed on
+    the same LDF basis as the development estimator. The boundary is that TailBase.fit must be called
+    before transform - calling transform alone raises an error since ldf_ computation is required first.
+  evidence: chainladder/tails/base.py:9(class TailBase)
+  stage: inheritance
+  alternative_considered: Composition over inheritance was rejected to maintain consistent API with other
+    development transformers
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: class TailBase in chainladder/tails/base.py'
+- id: BD-063
+  type: B/BA
+  content: Common mixin provides has_ldf, cdf_, ibnr_, full_expectation_, full_triangle_ to both DevelopmentBase
+    and MethodBase
+  rationale: The Common mixin centralizes IBNR calculation logic shared across each estimators and triangle
+    types. This DRY principle ensures consistent ultimate and IBNR computation across the library. The
+    boundary is that these properties require both ldf_ and ultimate_ attributes to be present - missing
+    either raises AttributeError.
+  evidence: chainladder/core/common.py:62-130(class Common)
+  stage: invariant
+  alternative_considered: Per-estimator implementation was rejected due to maintenance burden and inconsistency
+    risk
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: class Common in chainladder/core/common.py'
+- id: BD-064
+  type: B/BA
+  content: Benktander is base class for BornhuetterFerguson, CapeCod, ExpectedLoss - each iterative methods
+    share _get_ultimate logic
+  rationale: Benktander provides the iterative ultimate calculation pattern reused by BornhuetterFerguson,
+    CapeCod, and ExpectedLoss methods. This inheritance structure captures the common iterative convergence
+    logic while allowing method-specific weighting schemes. The boundary is that subclasses must implement
+    their specific weight and expectation calculations - the base class provides the iteration framework
+    only.
+  evidence: chainladder/methods/bornferg.py:7(bornhuetterferguson)
+  stage: development_pattern_estimation
+  alternative_considered: Standalone implementations were rejected to maintain shared iteration logic
+    and ensure consistent convergence behavior
+  _evidence_issues:
+  - 'FN_NOT_FOUND: bornhuetterferguson in chainladder/methods/bornferg.py'
+- id: BD-065
+  type: T
+  content: MackChainladder.fit requires sigma_ attribute on triangle - raises ValueError if missing
+  rationale: The Mack Chainladder method requires the sigma_ (process variance) attribute for its stochastic
+    error calculation. This is a hard requirement because without process variance estimates, the Mack
+    method cannot compute confidence intervals. The boundary is that users must either compute sigma_
+    via DevelopmentBase or set it manually before fitting MackChainladder - the estimator does not compute
+    it internally.
+  evidence: chainladder/methods/mack.py:44(fit)
+  stage: ordering_contract
+  alternative_considered: Auto-computing sigma_ was rejected as it would hide parameter sensitivity from
+    users
+- id: BD-066
+  type: BA
+  content: DevelopmentBase preserve=1 default ensures at least 1 link ratio kept when dropping outliers
+  rationale: The preserve=1 default ensures that even aggressive outlier removal (like volume-weighted
+    averaging) never produces an empty link ratio array. This is a safety constraint preventing numerical
+    instability. The boundary is that preserve=1 is the minimum; higher values provide more conservatism
+    against data sparsity.
+  evidence: chainladder/development/base.py:14(developmentbase)
+  stage: default_value
+  alternative_considered: Dynamic preserve based on sample size was considered but rejected for API simplicity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: developmentbase in chainladder/development/base.py'
+- id: BD-067
+  type: B
+  content: ldf_ attribute is cross-module contract - Development, Tail, Methods each require/set ldf_
+    on triangles
+  rationale: The ldf_ attribute serves as a universal interface contract across the chainladder ecosystem.
+    Development computes it, Tail extends it, and Methods consume it - each working with the same attribute
+    name. The boundary is that ldf_ must be a Triangle-like object with consistent dimensions - passing
+    incompatible types raises ValueError.
+  evidence: chainladder/methods/base.py:58(ldf_)
+  stage: invariant
+  alternative_considered: Method-specific ldf_ prefixes were rejected to maintain uniform API across estimators
+- id: BD-068
+  type: B
+  content: MackChainladder extends Chainladder (not MethodBase directly) - inherits deterministic predict
+    then adds stochastic layers
+  rationale: MackChainladder inherits from Chainladder rather than MethodBase to reuse the standard chainladder
+    prediction logic before applying Mack-specific stochastic adjustments. This two-layer architecture
+    separates deterministic ultimi from statistical uncertainty. The boundary is that MackChainladder
+    cannot be used with arbitrary X values like MethodBase.predict - it always applies the Mack error
+    model.
+  evidence: chainladder/methods/mack.py:9(module)
+  stage: development_pattern_estimation
+  alternative_considered: Direct MethodBase extension was rejected as it would duplicate Chainladder logic
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in chainladder/methods/mack.py'
+- id: BD-069
+  type: B/BA
+  content: Common.set_backend provides numpy/sparse/cupy/dask abstraction used by each Triangle and estimator
+    objects
+  rationale: set_backend enables transparent switching between numpy, scipy sparse, cupy (GPU), and dask
+    (distributed) backends without changing calling code. This abstraction allows users to scale from
+    small单机 to large distributed datasets. The boundary is that not each operations support each backends
+    - unsupported combinations raise ValueError.
+  evidence: chainladder/core/common.py:135-202(set_backend)
+  stage: invariant
+  alternative_considered: Backend-specific subclasses were rejected due to API proliferation and maintenance
+    burden
+- id: BD-070
+  type: B/BA
+  content: TailBase.fit auto-applies Development().fit_transform() if ldf_ missing before calculating
+    tail
+  rationale: TailBase implements the same lazy evaluation pattern as MethodBase, automatically computing
+    development patterns before tail extension. This ensures tails extend from the same LDF basis as the
+    preceding development estimator. The boundary is that the auto-applied Development() uses defaults
+    - users needing custom development must compute ldf_ explicitly before tail fitting.
+  evidence: chainladder/tails/base.py:15-16(fit)
+  stage: ordering_contract
+  alternative_considered: Requiring explicit ldf_ was rejected to maintain consistent lazy-loading behavior
+    with MethodBase
+- id: BD-071
+  type: B/RC
+  content: VotingChainladder inherits from both _BaseChainladderVoting and MethodBase - ensemble methods
+    are full estimators
+  rationale: VotingChainladder uses multiple inheritance to combine sklearn-style voting ensemble logic
+    with MethodBase estimator behavior. This enables ensemble chaining where the output of multiple chainladder
+    estimators feeds into a voting mechanism. The boundary is that each base estimators must be compatible
+    MethodBase subclasses - mixing with other estimator types raises errors.
+  evidence: chainladder/workflow/voting.py:173(module)
+  stage: development_pattern_estimation
+  alternative_considered: Wrapper composition was rejected to maintain consistent fit/predict API with
+    single estimators
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in chainladder/workflow/voting.py'
+- id: BD-072
+  type: B
+  content: Pipeline.fit_predict exists for chaining transformers+estimators in single call
+  rationale: Pipeline.fit_predict enables one-call fitting of transformer-estimator chains, avoiding the
+    need for separate fit and predict calls when transformers don't need transform-time customization.
+    The boundary is that fit_predict only works for pipelines ending in an estimator - transformer-only
+    pipelines raise NotFittedError.
+  evidence: chainladder/workflow/gridsearch.py:157(fit_predict)
+  stage: ordering_contract
+  alternative_considered: Separate fit/transform/predict calls were maintained as the primary API for
+    complex workflows
+- id: BD-073
+  type: RC
+  content: ultimate_ attribute required for ibnr_, full_expectation_, full_triangle_ properties in Common
+  rationale: The ultimate_ attribute is a hard requirement for IBNR calculation properties because these
+    properties compute the reserve as (ultimate - current). Without ultimate values, IBNR cannot be calculated.
+    The boundary is that estimators must produce ultimate_ before ibnr_ properties can be accessed - missing
+    ultimate_ raises AttributeError.
+  evidence: chainladder/core/common.py:94-130(ibnr_, full_expectation_, full_triangle_)
+  stage: invariant
+  alternative_considered: Returning NaN for missing ultimate was rejected to fail fast on incomplete workflows
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: ibnr_, full_expectation_, full_triangle_ in chainladder/core/common.py'
+- id: BD-074
+  type: BA
+  content: DevelopmentBase average='volume' default uses volume-weighted LDFs (exponent=1), not simple
+    average
+  rationale: The volume-weighted average is the actuarial standard for link ratio calculation, giving
+    more influence to larger (more credible) accident years. This default aligns with industry practice.
+    The boundary is that volume weighting assumes monotonic exposure patterns - non-monotonic exposures
+    may produce counterintuitive results.
+  evidence: chainladder/development/base.py:18-22(fit - exponent mapping)
+  stage: default_value
+  alternative_considered: Simple average as default was rejected as less aligned with actuarial standards
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: fit - exponent mapping in chainladder/development/base.py'
+- id: BD-075
+  type: B
+  content: TriangleBase inherits from multiple mixins - massive mixin composition pattern for core triangle
+    functionality
+  rationale: TriangleBase uses multiple inheritance to compose I/O, display, slicing, dunder operators,
+    pandas integration, and common utilities into a single coherent class. This mixin pattern separates
+    concerns while providing a unified API. The boundary is that each mixins must be compatible with the
+    same Triangle data structure - incompatible mixins would cause MRO conflicts.
+  evidence: chainladder/core/base.py:41(trianglebase)
+  stage: invariant
+  alternative_considered: Single monolithic class was rejected due to maintainability and testability
+    concerns
+  _evidence_issues:
+  - 'FN_NOT_FOUND: trianglebase in chainladder/core/base.py'
+- id: BD-076
+  type: T
+  content: MethodBase.predict requires X ages not exceed model ldf_.ddims.max() - raises ValueError otherwise
+  rationale: MethodBase enforces that prediction ages cannot extend beyond the development periods used
+    to fit the model. This is a fundamental statistical constraint - extrapolation beyond fitted development
+    is not supported. The boundary is that users must either extend ldf_ via tails or truncate predictions
+    to fit development periods.
+  evidence: chainladder/methods/base.py:93(predict)
+  stage: ordering_contract
+  alternative_considered: Silent truncation was rejected as it could hide prediction scope issues from
+    users
+- id: BD-077
+  type: B
+  content: BootstrapODPSample extends DevelopmentBase - bootstrap is a development transformer producing
+    simulated triangles
+  rationale: BootstrapODPSample extends DevelopmentBase to use its fit/transform infrastructure while
+    implementing the Overdispersed Poisson resampling methodology. This inheritance reuses LDF computation
+    and averaging logic specific to the bootstrap method. The boundary is that BootstrapODPSample produces
+    multiple simulated triangles in ldf_ rather than single point estimates.
+  evidence: chainladder/adjustments/bootstrap.py:13(bootstrapodpsample)
+  stage: development_pattern_estimation
+  alternative_considered: Standalone bootstrap implementation was rejected to maintain API consistency
+    with other development transformers
+  _evidence_issues:
+  - 'FN_NOT_FOUND: bootstrapodpsample in chainladder/adjustments/bootstrap.py'
+- id: BD-078
+  type: B/RC
+  content: options.ULT_VAL constant used across modules for ultimate valuation date (2262-04-11)
+  rationale: The ULT_VAL constant (2262-04-11, the max timestamp) serves as a sentinel value representing
+    the 'ultimate' future in actuarial calculations. Centralizing this magic number prevents inconsistencies.
+    The boundary is that this date is far enough in the future that it effectively means 'ultimate' across
+    each practical planning horizons.
+  evidence: chainladder/methods/base.py:49(options.ULT_VAL), chainladder/core/common.py:42(options.ULT_VAL),
+    chainladder/core/triangle.py:344(options.ULT_VAL)
+  stage: invariant
+  alternative_considered: Dynamic computation of ultimate date was rejected in favor of a known sentinel
+    value
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: options.ULT_VAL), chainladder/core/common.py:42(options.ULT_VAL), chainladder/core/triangle.py:344(options.ULT_VAL
+    in chainladder/methods/base.py'
+- id: BD-079
+  type: B
+  content: MethodBase._align_cdf vertically aligns CDF to origin period latest diagonal before ultimate
+    calculation
+  rationale: The _align_cdf method ensures CDFs are properly aligned with the triangle's origin periods
+    by selecting the latest available diagonal as the starting point for ultimate projection. This handles
+    triangles with irregular development patterns. The boundary is that triangles with no valid diagonal
+    (each NaN) will produce all-NaN ultimates.
+  evidence: chainladder/methods/base.py:26-40(_align_cdf)
+  stage: ordering_contract
+  alternative_considered: Simple cumulative multiplication was rejected as it doesn't handle irregular
+    triangles correctly
+- id: BD-080
+  type: BA
+  content: TailBase projection_period=12 default determines how many years tail extends beyond data
+  rationale: The projection_period=12 default (12 years) represents a reasonable actuarial assumption
+    for how far development extends beyond the latest diagonal in typical long-tail lines. This balance
+    ensures adequate tail coverage without excessive extrapolation. The boundary is that 12 years may
+    be excessive for short-tail lines or insufficient for very long-tail business.
+  evidence: chainladder/tails/base.py:9(tailbase)
+  stage: default_value
+  alternative_considered: Dynamic estimation of projection period was considered but adds complexity and
+    potential instability
+  _evidence_issues:
+  - 'FN_NOT_FOUND: tailbase in chainladder/tails/base.py'
+- id: BD-081
+  type: BA
+  content: 'INTERACTION: [BD-061] × [BD-070] → Auto-compute cascade where MethodBase and TailBase both
+    auto-apply Development().fit_transform() when ldf_ missing, potentially computing LDFs twice with
+    different parameters'
+  rationale: Both MethodBase.validate_X and TailBase.fit independently trigger Development().fit_transform()
+    when ldf_ is absent. If a pipeline uses both tail and method estimators, the LDF computation may run
+    twice with potentially different default parameters (n_periods, drop settings, averaging). This creates
+    silent inconsistency where tail extension may use different LDFs than method ultimates. Occurs in
+    workflows where users chain TailCurve.fit_transform() then MethodBase.fit() without explicit ldf_
+    pre-computation.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Single auto-compute entry point would prevent duplicate computation
+- id: BD-082
+  type: B/BA
+  content: 'INTERACTION: [BD-006] × [BD-025] → Conservative tail=1.0 with exponential decay creates non-intuitive
+    tail behavior: default decay=0.5 produces substantial tail factors only if tail extension explicitly
+    enabled'
+  rationale: BD-006 sets tail=1.0 (no tail by default) while BD-025 defines decay=0.5 as the decay rate
+    for TailConstant when tail IS enabled. The default conservative setting means decay is never applied
+    unless users explicitly request tail extension. This creates a gap where the 50% decay per period
+    parameter (designed for tail modeling) has no effect in default workflows. Users expecting TailConstant
+    to apply conservative tail factors by default will get none.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Non-unity tail default would make decay parameter immediately relevant
+- id: BD-083
+  type: BA
+  content: 'INTERACTION: [BD-004] × [BD-005] → No threshold exclusion + rank-based outlier removal: drop_high/low
+    operate on absolute ranks regardless of whether values are truly extreme, potentially excluding valid
+    data'
+  rationale: 'BD-004 disables threshold-based exclusion (drop_above=inf, drop_below=0) by default, while
+    BD-005 enables rank-based exclusion. This combination means outliers are removed by count (e.g., highest
+    1 value) without any check on whether that value is actually extreme. A 2.0 LDF gets dropped as aggressively
+    as a 10.0 LDF simply because it''s the highest. This creates tension: threshold exclusion would be
+    more targeted but is disabled by default, forcing users to understand both exclusion mechanisms.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Finite default drop_above/drop_below thresholds would complement rank exclusion
+- id: BD-084
+  type: T
+  content: 'INTERACTION: [BD-065] × [BD-009] → Mack requires sigma_ but sigma_interpolation is log-linear:
+    users with sparse data may get Mack errors based on interpolated sigma values they never explicitly
+    chose'
+  rationale: 'BD-065 mandates sigma_ attribute for MackChainladder fitting, while BD-009 defaults to log-linear
+    sigma_interpolation for missing values. This creates a hidden dependency: Mack confidence intervals
+    depend on sigma values that may be synthetic (interpolated) rather than observed. Users who don''t
+    realize sigma_interpolation is active may believe their Mack standard errors reflect actual data volatility
+    when they''re partially model-based. The interaction is particularly problematic for sparse triangles
+    where interpolation drives most sigma values.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Explicit sigma_interpolation flag in MackChainladder would make interpolation
+    dependency visible
+- id: BD-085
+  type: BA/M
+  content: 'INTERACTION: [BD-017] × [BD-043] → thru_orig=True forces regression through (0,1) but OLS
+    formula may produce negative slopes for downward-trending LDFs, creating contradiction in theoretical
+    constraint application'
+  rationale: BD-017 enforces that LDF regressions pass through origin (intercept=0, LDF=1 at age 0), reflecting
+    the actuarial assumption that development hasn't started at time zero. However, BD-043's OLS formula
+    may produce slopes that, when forced through origin, result in fitted LDFs that decrease below 1.0
+    for early development periods - which is theoretically impossible (LDFs cannot go below 1.0). The
+    constraint applied at origin conflicts with the downward LDF pattern typical in mature development
+    ages.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Constrained optimization with LDF>=1 boundary would prevent invalid fits
+- id: BD-086
+  type: B
+  content: 'INTERACTION: [BD-032] × [BD-046] → ODP bootstrap with hat_adj=True: Pearson residuals combined
+    with hat matrix adjustment may understate uncertainty for highly-leveraged observations'
+  rationale: 'BD-032 defines the ODP bootstrap using Pearson residuals and resampling with replacement,
+    while BD-046 specifies hat matrix adjustment (k_value=1) for residual standardization. The hat adjustment
+    corrects for parameter estimation uncertainty but can increase variance estimates for high-leverage
+    points (sparse triangles with influential observations). This creates a cascade: triangles with sparse
+    data (few observations) get larger hat adjustments, which can paradoxically widen uncertainty intervals
+    more than warranted for genuinely credible large cells.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Fixed k_value scaling regardless of leverage was rejected to maintain statistical
+    properties
+- id: BD-087
+  type: T
+  content: 'RISK CASCADE: [BD-009] → [BD-029] → [BD-026] → [BD-065]: sigma_interpolation default log-linear
+    fills missing sigma values, which propagate to tail sigma extrapolation (BD-029), affecting Mack standard
+    error calculation (BD-026), which MackChainladder requires (BD-065)'
+  rationale: This is a four-stage risk cascade where each decision depends on the previous. BD-009 defaults
+    to log-linear sigma_interpolation, filling gaps in sigma triangle. BD-029 then extrapolates these
+    (potentially interpolated) sigma values into the tail using the same log-linear approach. BD-026 computes
+    Mack standard errors using these extrapolated tail sigma values. BD-065 mandates sigma_ existence
+    before Mack fitting. The cascade means that any error or assumption violation in sigma_interpolation
+    (e.g., sigma values not following log-linear pattern) propagates through to final reserve confidence
+    intervals without user awareness.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Explicit sigma extrapolation independence from interpolation would break the
+    cascade
+- id: BD-088
+  type: BA
+  content: 'RISK CASCADE: [BD-016] × [BD-079] × [BD-067]: Ultimate calculation uses CDF alignment (BD-079)
+    with ldf_ contract (BD-067), where tail extension modifies ldf_ to include projections beyond observed
+    data, creating potential for tail-dominated ultimate estimates'
+  rationale: This cascade occurs when tail estimators (TailCurve, TailBondy) extend ldf_ by adding projected
+    development periods beyond observed data. BD-079's _align_cdf then applies these extended CDFs to
+    the latest diagonal. For triangles with short observed development periods, the tail factor can dominate
+    the CDF (e.g., tail factor of 1.5 applied to 12-month data). The ldf_ contract (BD-067) allows seamless
+    chaining but hides whether ultimates are driven by observed or extrapolated data. Users cannot distinguish
+    between observed-based and tail-dominated estimates without inspecting ldf_ content.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Separate observed vs tail ultimate components would enable transparency
+- id: BD-089
+  type: B/BA
+  content: 'INTERACTION: [BD-012] × [BD-024] → apriori=1.0 default with ExpectedLoss n_iters=0 creates
+    pure a priori method: sample_weight used directly as expected losses, ignoring ALL reported development'
+  rationale: BD-012 sets apriori=1.0 as the default multiplier for sample_weight in Bornhuetter-Ferguson
+    methods. BD-024 sets n_iters=0 for ExpectedLoss, bypassing CDF weighting entirely. Together, these
+    create a workflow where sample_weight becomes the sole determinant of ultimate (no development adjustment).
+    While individually reasonable (apriori neutral, n_iters=0 for pure expected method), the combination
+    means users getting ExpectedLoss estimates have no development-based adjustment whatsoever - purely
+    exposure-based reserving.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Non-unity apriori default would introduce implicit development weighting
+- id: BD-090
+  type: BA/DK
+  content: 'INTERACTION: [BD-001] × [BD-037] × [BD-050] → Volume-weighted averaging exponents specified
+    three times at different code locations: development.py:139 (exponent mapping), mack.py:105-108 (std_err
+    weighting), development.py:138-160 (LDF averaging). Potential inconsistency if different exponent
+    values used across modules.'
+  rationale: 'The exponent mapping {volume:1, simple:2, regression:0} appears in multiple locations for
+    different purposes: BD-001 for LDF averaging default, BD-050 for Development LDF computation, and
+    BD-037 for Mack standard error weighting. While each currently reference the same exponent scheme,
+    the three-location specification creates maintenance risk where a change to one location might not
+    propagate to others. This hidden redundancy means developers must remember to update each three locations
+    when modifying the weighting scheme.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Centralized constant definition would eliminate redundancy
+- id: BD-091
+  type: B/BA
+  content: 'INTERACTION: [BD-022] × [BD-031] → fillna=None excludes NaN/zero values but groupby pooling
+    may combine triangles with different NaN patterns, creating inconsistent LDF sample sizes across pooled
+    groups'
+  rationale: 'BD-022 specifies that NaN and zero values are excluded from LDF calculation (fillna=None).
+    BD-031 enables pooling multiple triangles via groupby for joint LDF estimation. When pooling triangles
+    with different data availability patterns, the exclusion behavior creates asymmetric sample sizes:
+    one triangle might contribute 20 link ratios while another contributes only 5 due to different NaN
+    distributions. This can bias pooled LDFs toward the triangle with more complete data, contradicting
+    the equal-treatment assumption of pooling.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Per-triangle fillna handling before pooling would maintain consistency
+- id: BD-GAP-001
+  type: DK
+  content: 'Missing: Stale data detection and expiry'
+  rationale: 'Audit finding: missing: stale data detection and expiry. 9 | PnL conservation | ❌ N/A |
+    This is loss reserving library, not a trading/PnL system. This gap affects production reliability
+    and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: triangle_data_structure
+  status: missing
+  known_gap: true
+  severity: high
+  impact: 9 | PnL conservation | ❌ N/A | This is loss reserving library, not a trading/PnL system
+- id: BD-GAP-002
+  type: B
+  content: 'Missing: Train/test time split integrity'
+  rationale: 'Audit finding: missing: train/test time split integrity. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: triangle_data_structure
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-003
+  type: B
+  content: 'Missing: Currency/unit explicit annotation'
+  rationale: 'Audit finding: missing: currency/unit explicit annotation. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: triangle_data_structure
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-004
+  type: RC
+  content: 'Missing: Settlement and delivery time'
+  rationale: 'Audit finding: missing: settlement and delivery time. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: triangle_data_structure
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-005
+  type: RC
+  content: 'Missing: Price/quantity precision (tick/lot)'
+  rationale: 'Audit finding: missing: price/quantity precision (tick/lot). Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: triangle_data_structure
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-006
+  type: B
+  content: 'Missing: Provider 优先级与凭证隔离'
+  rationale: 'Audit finding: missing: provider 优先级与凭证隔离. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: triangle_data_structure
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-007
+  type: B
+  content: 'Missing: 最优估计假设 (Best Estimate)'
+  rationale: 'Audit finding: missing: 最优估计假设 (best estimate). Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: triangle_data_structure
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-008
+  type: B
+  content: 'Missing: Solvency II SCR/internal model'
+  rationale: 'Audit finding: missing: solvency ii scr/internal model. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: triangle_data_structure
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-009
+  type: B
+  content: 'Missing: ** "Add currency and unit explicit annotation: Allow users to specify currency codes
+    and units for triangle values'
+  rationale: 'Audit finding: missing: ** "add currency and unit explicit annotation: allow users to specify
+    currency codes and units for triangle values. ** Mixed currency/unit data may produce erroneous calculations
+    in multi-currency portfolios. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: triangle_data_structure
+  status: missing
+  known_gap: true
+  severity: high
+  impact: '** Mixed currency/unit data may produce erroneous calculations in multi-currency portfolios'
+- id: BD-GAP-010
+  type: B
+  content: 'Missing: ** "Implement parameter version tracking: Add effective_date and valid_from fields
+    to track when reserving assumptions were changed'
+  rationale: 'Audit finding: missing: ** "implement parameter version tracking: add effective_date and
+    valid_from fields to track when reserving assumptions were changed. ** Auditors and regulators require
+    audit trail of assumption changes over time. This gap affects production reliability and should be
+    addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: triangle_data_structure
+  status: missing
+  known_gap: true
+  severity: high
+  impact: '** Auditors and regulators require audit trail of assumption changes over time'
+- id: BD-GAP-011
+  type: M
+  content: 'Missing: ** "Add matrix ill-conditioning checks: Implement condition number monitoring and
+    regularization for inverse problems'
+  rationale: 'Audit finding: missing: ** "add matrix ill-conditioning checks: implement condition number
+    monitoring and regularization for inverse problems. ** Numerical instability may go undetected in
+    certain development patterns. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: triangle_data_structure
+  status: missing
+  known_gap: true
+  severity: high
+  impact: '** Numerical instability may go undetected in certain development patterns'
+- id: BD-GAP-012
+  type: DK
+  content: 'Missing: ** "Add random seed documentation: Ensure each stochastic methods document reproducibility
+    requirements and minimum seed coverage'
+  rationale: 'Audit finding: missing: ** "add random seed documentation: ensure each stochastic methods
+    document reproducibility requirements and minimum seed coverage. ** Reproducibility of stochastic
+    reserving results may be compromised. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: triangle_data_structure
+  status: missing
+  known_gap: true
+  severity: high
+  impact: '** Reproducibility of stochastic reserving results may be compromised'
+known_use_cases: []
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 35
+  evidence_invalid: 27
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.5645161290322581
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 4
+    warn: 7
+    fail: 9
+  subdomain_totals:
+    pass: 3
+    warn: 2
+    fail: 6
+  coverage: 31/31 (100%)
+  pass_rate: 7/31 (22%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: serialization_format
+  description: Use dill for full Python object persistence; JSON for interoperability; CSV for tabular
+    data export
+  used_in_stages: []
+  options:
+  - name: dill_pickle
+    traits:
+    - complete object
+    - lambda support
+    - custom classes
+    fit_for:
+    - Full object persistence including closures and custom estimators
+    not_fit_for:
+    - Sharing across different Python versions, security-untrusted environments
+  - name: json
+    traits:
+    - human-readable
+    - interoperable
+    - schema-defined
+    fit_for:
+    - Web APIs, sharing across languages, debugging
+    not_fit_for:
+    - Large objects, binary data, lambda functions
+  - name: csv
+    traits:
+    - universal
+    - spreadsheet-compatible
+    - tabular
+    fit_for:
+    - Data export, Excel users, simple interchange
+    not_fit_for:
+    - Preserving object structure, complex nested data
+  default: dill_pickle
+  _source: worker_resource
+- id: slot-002
+  name: parallelization
+  description: Use joblib for simple parallelization; dask.distributed for cluster computing
+  used_in_stages: []
+  options:
+  - name: joblib_threads
+    traits:
+    - threading
+    - in-process
+    - low-overhead
+    fit_for:
+    - I/O-bound tasks, shared memory, simple setup
+    not_fit_for:
+    - CPU-bound GIL-bound operations (use n_jobs=1)
+  - name: joblib_processes
+    traits:
+    - multiprocessing
+    - bypass-GIL
+    fit_for:
+    - CPU-bound tasks on multi-core machines
+    not_fit_for:
+    - I/O-bound tasks, memory-constrained environments
+  - name: dask_distributed
+    traits:
+    - cluster
+    - out-of-core
+    - lazy-evaluation
+    fit_for:
+    - HPC clusters, cloud distributed computing, large datasets
+    not_fit_for:
+    - Single machine, small datasets, quick prototyping
+  default: joblib_threads
+  _source: worker_resource
+resources:
+- id: res-001
+  type: python_package
+  name: pandas >=2.0, <3.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-002
+  type: python_package
+  name: scikit-learn >1.4.2
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-003
+  type: python_package
+  name: sparse >=0.9
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-004
+  type: python_package
+  name: matplotlib
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-005
+  type: python_package
+  name: dill
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-006
+  type: python_package
+  name: patsy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-007
+  type: python_package
+  name: numba >0.54
+  description: ''
+  used_in_stages: []
+  _source: worker_resource

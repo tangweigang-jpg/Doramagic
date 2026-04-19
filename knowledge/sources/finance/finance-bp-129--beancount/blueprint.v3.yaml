@@ -1,0 +1,2237 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-129
+name: beancount
+sop_version: '3.6'
+source:
+  projects:
+  - beancount
+  commit_hash: daa3ee24a0e5a93a8cad9af71b5752c1f1b38369
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: double-entry bookkeeping from text files
+  description: A double-entry bookkeeping computer language that lets you define financial transaction
+    records in a text file, read them in memory, generate a variety of reports from them, and provides
+    a web interface.
+  prerequisites: Users need to understand double-entry accounting principles and the Beancount syntax
+    for defining transactions, accounts, and directives
+  not_suitable_for: Real-time financial transactions, multi-user ledger systems, complex derivatives pricing,
+    or users who prefer GUI-based accounting interfaces
+stages:
+- id: parsing
+  name: Parsing
+  order: 1
+  responsibility: Tokenize and parse Beancount DSL files into directive data structures. Provides the
+    foundation for each downstream processing.
+  interface:
+    inputs:
+    - Beancount source text files (*.beancount)
+    - Include directives
+    - Plugin directives
+    outputs:
+    - List of Directive NamedTuples (Transaction, Open, Close, etc.)
+    - Parser errors
+    - Options map
+  required_methods:
+  - name: Builder.build
+    description: Accumulates parsed directives via grammar callbacks
+    evidence: beancount/parser/grammar.py:145(Builder)
+  - name: OptDesc.convert
+    description: Option descriptor with converter and defaults for parsing option values
+    evidence: beancount/parser/options.py:151(OptDesc)
+  key_behaviors:
+  - behavior: Lexer/Parser split using PLY
+    description: Standard parser generator with grammar written in .y file; enables precise error reporting
+      with source locations
+    evidence: beancount/parser/lexer.l:1(LexBuilder)
+  - behavior: Directives as immutable NamedTuples
+    description: Immutability ensures entries can be safely shared/cached; NamedTuples provide structural
+      typing without overhead
+    evidence: beancount/core/data.py:93(Open)
+  - behavior: Date-primary sorting with line number as secondary key
+    description: Beancount is date-oriented; line number resolves ordering within same date
+    evidence: beancount/core/data.py:82(comment)
+  replaceable_points:
+  - name: booking_method
+    description: Strategy for matching inventory lots on reduction
+    options:
+    - name: STRICT
+      traits:
+      - exact match only
+      - no size tolerance
+      fit_for:
+      - simple portfolios
+      - precise lot tracking
+      not_fit_for:
+      - rounding errors
+      - partial lot sales
+    - name: STRICT_WITH_SIZE
+      traits:
+      - exact size match
+      - size tolerance fallback
+      fit_for:
+      - size-exact matches
+      - reduced ambiguity errors
+      not_fit_for:
+      - approximate lots
+    - name: FIFO
+      traits:
+      - first-in-first-out
+      - chronological matching
+      fit_for:
+      - tax reporting
+      - simple cost basis
+      not_fit_for:
+      - specific lot identification
+    - name: LIFO
+      traits:
+      - last-in-first-out
+      - reverse chronological
+      fit_for:
+      - tax minimization scenarios
+      not_fit_for:
+      - IFO preference
+      - simple reporting
+    - name: HIFO
+      traits:
+      - highest-in-first-out
+      - cost optimization
+      fit_for:
+      - tax minimization
+      - high-cost lot first
+      not_fit_for:
+      - specific identification requirements
+    - name: NONE
+      traits:
+      - no lot matching
+      - no cost tracking
+      fit_for:
+      - simple currencies
+      - no cost basis needed
+      not_fit_for:
+      - investments with cost basis
+    - name: AVERAGE
+      traits:
+      - average cost calculation
+      - currently disabled
+      fit_for:
+      - not implemented
+      not_fit_for:
+      - currently returns error
+    default: STRICT
+  - name: plugin
+    description: Transform entries via custom module with __plugins__ tuple
+    options:
+    - name: any module with __plugins__
+      traits:
+      - custom transformation
+      - function tuple signature
+      fit_for:
+      - custom entry synthesis
+      - balance adjustments
+      - validations
+      not_fit_for:
+      - core parsing
+      - non-Python environments
+    default: PLUGINS_PRE + user_plugins + PLUGINS_AUTO + PLUGINS_POST
+  design_decisions:
+  - Lexer/Parser split using PLY (Python Lex-Yacc) enables precise error reporting with source locations
+    (beancount/parser/lexer.l:1)
+  - Directives are immutable NamedTuples for safe sharing/caching without overhead (beancount/core/data.py:93)
+  - Every directives require date; lineno is secondary sort key for date-oriented processing (beancount/core/data.py:82)
+  - Options parsed per-file with aggregation for includes allows include files to extend operating_currency
+    (beancount/loader.py:527)
+  acceptance_hints:
+  - All .beancount files parse without syntax errors
+  - Directive NamedTuples are created with correct field types
+  - Options map is populated with user-defined values
+  - Include files are processed and merged correctly
+- id: booking
+  name: Booking (Lot Matching)
+  order: 2
+  responsibility: Match inventory reductions to existing lots using configurable methods; infer missing
+    posting amounts via interpolation
+  interface:
+    inputs:
+    - Sorted list of directives with incomplete postings
+    - Options map with booking method
+    outputs:
+    - Directives with cost specs converted to costs
+    - Balance errors from failed interpolations
+  required_methods:
+  - name: Inventory.reduce
+    description: Aggregates positions using convert functions for units, cost, weight, or value
+    evidence: beancount/core/inventory.py:336(reduce)
+  - name: booking_method_STRICT
+    description: Default lot matching algorithm requiring exact match
+    evidence: beancount/parser/booking_method.py:376(_BOOKING_METHODS)
+  key_behaviors:
+  - behavior: Two-pass booking
+    description: Reductions first, then augmentations; booking affects only reductions while augmentations
+      remain incomplete for interpolation
+    evidence: beancount/parser/booking_full.py:54(step1)
+  - behavior: CostSpec separates incomplete from resolved costs
+    description: User-provided cost spec may be incomplete; resolved to Cost with date/label after booking
+    evidence: beancount/core/position.py:45(CostSpec)
+  - behavior: MISSING sentinel for unfilled numbers
+    description: MISSING propagates through computations and surfaces in errors; None would be ambiguous
+    evidence: beancount/core/number.py:31(MISSING)
+  - behavior: Strategy pattern for booking methods
+    description: New methods can be added without modifying handle_ambiguous_matches via _BOOKING_METHODS
+      dict dispatch
+    evidence: beancount/parser/booking_method.py:376(_BOOKING_METHODS)
+  replaceable_points:
+  - name: booking_method_fn
+    description: Lot matching algorithm
+    options:
+    - name: booking_method_STRICT
+      traits:
+      - exact match
+      - no tolerance
+      fit_for:
+      - simple portfolios
+      - precise tracking
+      not_fit_for:
+      - rounding issues
+      - partial lots
+    - name: booking_method_FIFO
+      traits:
+      - first-in-first-out
+      - chronological
+      fit_for:
+      - tax reporting
+      - simple basis
+      not_fit_for:
+      - specific lots
+    - name: booking_method_LIFO
+      traits:
+      - last-in-first-out
+      - reverse chronological
+      fit_for:
+      - tax scenarios
+      not_fit_for:
+      - FIFO preference
+    - name: booking_method_HIFO
+      traits:
+      - highest-in-first-out
+      fit_for:
+      - cost optimization
+      not_fit_for:
+      - specific identification
+    - name: booking_method_NONE
+      traits:
+      - no matching
+      - no cost tracking
+      fit_for:
+      - simple currencies
+      not_fit_for:
+      - investments
+    default: booking_method_STRICT
+  design_decisions:
+  - 'Two-pass booking: reductions first, then augmentations allows interpolation to fill missing amounts
+    (beancount/parser/booking_full.py:54)'
+  - CostSpec separates incomplete from resolved costs enabling user-friendly input (beancount/core/position.py:45)
+  - Booking method dispatch via _BOOKING_METHODS dict for extensibility (beancount/parser/booking_method.py:376)
+  - STRICT_WITH_SIZE fallback for size-exact matches reduces false ambiguity errors (beancount/parser/booking_method.py:144)
+  - MISSING sentinel for unfilled numbers (not None) propagates and surfaces in errors (beancount/core/number.py:31)
+  acceptance_hints:
+  - Every postings have complete amounts after booking
+  - Inventory balances to zero for matched lots
+  - Balance errors are reported for failed interpolations
+  - CostSpec objects are resolved to Cost objects
+- id: transformation
+  name: Transformation (Plugins)
+  order: 3
+  responsibility: Apply user plugins and built-in transformations to synthesized entries, pad balances,
+    check assertions
+  interface:
+    inputs:
+    - Fully booked directives
+    - Plugin configuration
+    outputs:
+    - Transformed directives
+    - Plugin errors
+  required_methods:
+  - name: DocumentError.check
+    description: Validates document directives during processing
+    evidence: beancount/ops/documents.py:21(DocumentError)
+  - name: PadError.check
+    description: Validates pad entry synthesis
+    evidence: beancount/ops/pad.py:21(PadError)
+  key_behaviors:
+  - behavior: Plugin processing modes
+    description: Raw mode skips built-in plugins for custom workflows; default runs full pipeline
+    evidence: beancount/loader.py:662(plugin_processing_mode)
+  - behavior: Documents plugin always prepended
+    description: Document directives may be needed by other plugins
+    evidence: beancount/loader.py:54(PLUGINS_PRE)
+  - behavior: pad and balance always appended as post plugins
+    description: These synthesize entries that should exist before validation
+    evidence: beancount/loader.py:65(PLUGINS_POST)
+  - behavior: Plugin architecture via __plugins__ tuple
+    description: Each function is (entries, options_map) -> (entries, errors); errors accumulated in pipeline
+    evidence: beancount/loader.py:689(hasattr(module, __plugins__))
+  replaceable_points:
+  - name: plugin_module
+    description: Any Python module with __plugins__ tuple of function names
+    options:
+    - name: custom modules
+      traits:
+      - user-defined
+      - __plugins__ tuple
+      fit_for:
+      - custom transformations
+      - business logic
+      not_fit_for:
+      - non-Python workflows
+    - name: beancount.ops.documents
+      traits:
+      - pre-plugin
+      - document directive processing
+      fit_for:
+      - receipt management
+      not_fit_for:
+      - no document requirements
+    - name: beancount.ops.pad
+      traits:
+      - post-plugin
+      - balance padding synthesis
+      fit_for:
+      - ensuring minimum balances
+      not_fit_for:
+      - fixed balance accounts
+    - name: beancount.ops.balance
+      traits:
+      - post-plugin
+      - assertion checking
+      fit_for:
+      - balance validation
+      not_fit_for:
+      - disabled validation
+    default: auto + pad + balance
+  design_decisions:
+  - 'Plugin processing mode: raw vs default for custom workflows (beancount/loader.py:662)'
+  - Documents plugin is always prepended for dependency ordering (beancount/loader.py:54)
+  - pad and balance are always appended as post plugins for proper synthesis timing (beancount/loader.py:65)
+  - Plugin architecture via __plugins__ tuple allows users to add transformations without modifying loader
+    (beancount/loader.py:689)
+  acceptance_hints:
+  - Every plugins execute without errors
+  - Transformed directives maintain sorting invariant
+  - Errors from plugins are accumulated and reported
+  - Pre and post plugin ordering is preserved
+- id: realization
+  name: Realization
+  order: 4
+  responsibility: Convert chronological list of directives into account tree with running balances for
+    reporting
+  interface:
+    inputs:
+    - Date-filtered list of directives
+    outputs:
+    - RealAccount tree with txn_postings and balance Inventory per node
+  required_methods:
+  - name: RealAccount.txn_postings
+    description: Contains postings for transactions affecting this account
+    evidence: beancount/core/realization.py:45(RealAccount)
+  - name: Amount.__slots__
+    description: Prevents dynamic attributes to enforce immutability beyond NamedTuple
+    evidence: beancount/core/amount.py:47(__slots__)
+  key_behaviors:
+  - behavior: RealAccount extends dict with account component keys
+    description: Natural tree representation; Assets:Brokerage keyed by 'Brokerage' under 'Assets'
+    evidence: beancount/core/realization.py:45(class RealAccount)
+  - behavior: Balance stored as Inventory per RealAccount
+    description: Computed incrementally; supports cost-basis and currency segregation
+    evidence: beancount/core/realization.py:67(self.balance)
+  - behavior: Balances computed via Inventory.reduce with convert functions
+    description: 'Separation of concerns: Inventory holds positions, convert module defines aggregation
+      semantics'
+    evidence: beancount/core/inventory.py:336(reduce)
+  - behavior: Amount uses __slots__ = () to prevent dynamic attributes
+    description: Enforces immutability beyond NamedTuple; prevents accidental attribute assignment
+    evidence: beancount/core/amount.py:47(__slots__)
+  replaceable_points:
+  - name: balance_reducer
+    description: Function to aggregate positions (units, cost, weight, value)
+    options:
+    - name: convert.get_units
+      traits:
+      - total units
+      - no cost basis
+      fit_for:
+      - simple balance reporting
+      not_fit_for:
+      - cost basis tracking
+    - name: convert.get_cost
+      traits:
+      - cost basis
+      - unrealized P&L
+      fit_for:
+      - investment reporting
+      not_fit_for:
+      - currency-only accounts
+    - name: convert.get_weight
+      traits:
+      - weighted cost basis
+      fit_for:
+      - portfolio analysis
+      not_fit_for:
+      - simple ledger
+    - name: convert.get_value
+      traits:
+      - market value
+      - requires price database
+      fit_for:
+      - portfolio valuation
+      not_fit_for:
+      - accounts without prices
+    default: convert.get_units
+  design_decisions:
+  - RealAccount extends dict with account component keys for natural tree representation (beancount/core/realization.py:45)
+  - Balance stored as Inventory per RealAccount for incremental computation (beancount/core/realization.py:67)
+  - Balances computed via Inventory.reduce with convert functions for separation of concerns (beancount/core/inventory.py:336)
+  - Amount uses __slots__ = () to prevent dynamic attributes and enforce immutability (beancount/core/amount.py:47)
+  acceptance_hints:
+  - Account tree structure matches hierarchical account naming
+  - Running balances are computed correctly per account
+  - Postings are associated with correct account nodes
+  - Balance type (units, cost, value) matches reducer function
+- id: summarization
+  name: Summarization
+  order: 5
+  responsibility: Fold historical entries into balance sheet opening transactions; support period reporting
+  interface:
+    inputs:
+    - Every directives
+    - Period boundaries (begin/end dates)
+    outputs:
+    - Summarized entries replacing historical with net transactions
+  required_methods:
+  - name: AccountTypes.equity
+    description: NamedTuple of root account type names including equity for retained earnings
+    evidence: beancount/core/account_types.py:26(AccountTypes)
+  - name: summarize.open
+    description: Rolls income/expenses to equity at period boundaries
+    evidence: beancount/ops/summarize.py:44(open)
+  key_behaviors:
+  - behavior: Income/expenses rolled to equity at period boundaries
+    description: 'Standard accounting: P&L closes to retained earnings; enables balance sheet for any
+      period'
+    evidence: beancount/ops/summarize.py:44(open)
+  - behavior: Conversion entries at open date for zero-priced items
+    description: Ensures accounts with no price history can be converted
+    evidence: beancount/ops/summarize.py:99(conversions)
+  - behavior: GetAccounts class uses getattr dispatch on entry class name
+    description: 'Extensible: new directive types automatically handled by adding method with class name'
+    evidence: beancount/core/getters.py:52(getattr)
+  replaceable_points:
+  - name: conversion_currency
+    description: Target currency for balance conversions
+    options:
+    - name: any currency
+      traits:
+      - user-specified
+      - any valid currency code
+      fit_for:
+      - multi-currency reporting
+      not_fit_for:
+      - no conversion needed
+    - name: operating_currency
+      traits:
+      - from options map
+      - primary ledger currency
+      fit_for:
+      - single currency reporting
+      not_fit_for:
+      - multi-currency requirements
+    default: USD
+  design_decisions:
+  - Income/expenses rolled to equity at period boundaries for standard accounting compliance (beancount/ops/summarize.py:44)
+  - Conversion entries at open date for zero-priced items ensures conversion capability (beancount/ops/summarize.py:99)
+  - GetAccounts class uses getattr dispatch on entry class name for extensibility (beancount/core/getters.py:52)
+  acceptance_hints:
+  - Period boundaries create correct opening/closing transactions
+  - Income/expense accounts are closed to equity
+  - Conversion entries are generated for zero-priced items
+  - Summarized entries maintain accounting identity
+- id: validation
+  name: Validation
+  order: 6
+  responsibility: Verify invariants hold after each transformations; ensure accounting rules are not violated
+  interface:
+    inputs:
+    - Final directives
+    - Options map
+    outputs:
+    - List of ValidationError if constraints violated
+  required_methods:
+  - name: ValidationError.check
+    description: Error type for constraint violations during validation
+    evidence: beancount/ops/validation.py:29(ValidationError)
+  - name: validate_open_close
+    description: Ensures accounts are opened before use and closed appropriately
+    evidence: beancount/ops/validation.py:50(validate_open_close)
+  key_behaviors:
+  - behavior: Open/close account lifecycle validation
+    description: Ensures accounts are opened before use and closed appropriately
+    evidence: beancount/ops/validation.py:50(validate_open_close)
+  - behavior: Currency constraints from Open declaration
+    description: Accounts restrict which currencies they hold; prevents mixing
+    evidence: beancount/ops/validation.py:250(validate_currency_constraints)
+  - behavior: Extra validations injected at load time
+    description: Allows custom validation rules without modifying core
+    evidence: beancount/loader.py:357(extra_validations)
+  replaceable_points:
+  - name: extra_validations
+    description: Additional validation functions to run
+    options:
+    - name: list of (fn, options_map) -> errors
+      traits:
+      - user-defined
+      - pipeline-injected
+      fit_for:
+      - custom business rules
+      - domain-specific checks
+      not_fit_for:
+      - core accounting rules
+    default: None
+  design_decisions:
+  - Open/close account lifecycle validation ensures accounting integrity (beancount/ops/validation.py:50)
+  - Currency constraints from Open declaration prevent mixing of currencies (beancount/ops/validation.py:250)
+  - Extra validations injected at load time for custom validation rules (beancount/loader.py:357)
+  acceptance_hints:
+  - Every validation errors are collected and reported
+  - Accounts are opened before first transaction
+  - Accounts are closed after last transaction
+  - Currency constraints are enforced per Open directive
+data_flow:
+- from_stage: parsing
+  to_stage: booking
+  data: Directives with CostSpec (incomplete costs), Booking enum in options
+- from_stage: booking
+  to_stage: transformation
+  data: Directives with Cost (resolved costs), BalanceError list
+- from_stage: transformation
+  to_stage: transformation
+  data: Directives flow through PLUGINS_PRE → user plugins → PLUGINS_AUTO → PLUGINS_POST
+- from_stage: transformation
+  to_stage: validation
+  data: Fully transformed directives, accumulated errors
+- from_stage: parsing
+  to_stage: validation
+  data: Options map (for account types, tolerance, etc.)
+- from_stage: validation
+  to_stage: realization
+  data: Validated directives for report generation
+global_contracts:
+- contract: Every directives are sorted by (date, lineno) via data.entry_sortkey
+  evidence: beancount/core/data.py:708(entry_sortkey)
+- contract: Entries are immutable NamedTuples; metadata (meta) is dict[str, Any]
+  evidence: beancount/core/data.py:93(Open)
+- contract: 'Inventory positions keyed by (currency: str, cost: Cost|None)'
+  evidence: beancount/core/inventory.py:81(Inventory)
+- contract: EMPTY_SET used for tags/links instead of None
+  evidence: beancount/core/data.py:49(EMPTY_SET)
+- contract: Decimal used for each monetary numbers (no float)
+  evidence: beancount/core/number.py:1(Decimal)
+- contract: MISSING sentinel used for incomplete numbers to be interpolated
+  evidence: beancount/core/number.py:31(MISSING)
+- contract: D() function handles commas as thousands separators
+  evidence: beancount/core/number.py:41(D)
+- contract: CURRENCY_RE regex defines valid currency symbols (uppercase + special chars including slash
+    for currency pairs)
+  evidence: beancount/core/amount.py:32(CURRENCY_RE)
+business_decisions:
+- id: BD-001
+  type: B/DK
+  content: Lexer/Parser split using PLY (Python Lex-Yacc)
+  rationale: 'PLY provides a battle-tested parser generator with source location tracking. Grammar written
+    in .y file enables precise error reporting with line/column information for debugging malformed entries.
+    This is foundational: without accurate source mapping, each downstream error messages would be unhelpful.'
+  evidence: beancount/parser/lexer.l:1(LexBuilder)
+  stage: parsing
+  alternative_considered: Hand-written recursive descent parser was considered but rejected due to grammar
+    complexity and error reporting effort
+- id: BD-002
+  type: B
+  content: Directives are immutable NamedTuples
+  rationale: Immutability ensures entries can be safely shared, cached, and reused across transformations
+    without defensive copying. NamedTuples provide structural typing via _fields without memory overhead
+    of full class instances. This design allows entries to flow through plugin pipeline without risk of
+    accidental mutation corrupting upstream state.
+  evidence: beancount/core/data.py:93(Open)
+  stage: parsing
+  alternative_considered: Mutable dicts were rejected due to shared-state risks; frozen dataclasses rejected
+    due to memory overhead
+- id: BD-003
+  type: B/RC
+  content: Every directives require date; lineno is secondary sort key
+  rationale: Beancount is fundamentally date-oriented for financial reporting. The line number secondary
+    key resolves ordering conflicts when multiple directives share the same date. This ordering guarantee
+    ensures deterministic balance calculations regardless of file reorganization or include ordering.
+  evidence: beancount/core/data.py:82(comment)
+  stage: parsing
+  alternative_considered: Fully date-based ordering was rejected because users legitimately need same-day
+    ordering control
+  _evidence_issues:
+  - 'FN_NOT_FOUND: comment in beancount/core/data.py'
+- id: BD-004
+  type: BA
+  content: Options parsed per-file with aggregation for includes
+  rationale: Allows include files to extend operating_currency and display_context without global modification.
+    Top-level options dominate after aggregation, providing predictable override behavior. This enables
+    modular ledger organization where shared settings live in included files while main file maintains
+    control.
+  evidence: beancount/loader.py:527(aggregate_options_map)
+  stage: parsing
+  alternative_considered: Global-only options were rejected; would require duplication across included
+    files
+- id: BD-005
+  type: BA
+  content: 'Two-pass booking: reductions first, then augmentations'
+  rationale: Booking affects only reductions (debits). Leaving augmentations (credits) incomplete allows
+    interpolation to fill missing lot amounts from available inventory. This sequencing ensures each potential
+    matching candidates are known before finalizing which lots are consumed, preventing premature lot
+    closure.
+  evidence: beancount/parser/booking_full.py:556(book_reductions)
+  stage: booking
+  alternative_considered: Single-pass with backtracking was rejected due to complexity; two-pass is simpler
+    and correct
+- id: BD-006
+  type: B
+  content: CostSpec separates incomplete from resolved costs
+  rationale: User-provided cost spec may be incomplete (missing date, label, or number). The CostSpec/_cost
+    tuple distinguishes pending resolution from fully-specified Cost objects. After booking, incomplete
+    specs resolve to Cost with assigned date/label. This separation prevents conflating user intent with
+    computed values.
+  evidence: beancount/core/position.py:45(CostSpec)
+  stage: booking
+  alternative_considered: Nullable fields on Cost were rejected; mixing incomplete/complete states in
+    same type creates ambiguity
+- id: BD-007
+  type: BA
+  content: Booking method dispatch via _BOOKING_METHODS dict
+  rationale: Strategy pattern implementation enables adding new booking methods (FIFO, LIFO, MOST_RECENT,
+    STRICT, etc.) without modifying handle_ambiguous_matches. Dictionary dispatch is O(1) and new methods
+    register themselves via decorator pattern. This separation of strategy selection from ambiguity resolution
+    enables clean extensibility.
+  evidence: beancount/parser/booking_method.py:376(_BOOKING_METHODS)
+  stage: booking
+  alternative_considered: Class hierarchy for booking methods was rejected due to verbosity; dict dispatch
+    is simpler
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _BOOKING_METHODS in beancount/parser/booking_method.py'
+- id: BD-008
+  type: M/DK
+  content: STRICT_WITH_SIZE fallback for size-exact matches
+  rationale: When lot size exactly matches the posting amount, STRICT_WITH_SIZE prevents false ambiguity
+    errors. Without this, size-exact matches would incorrectly trigger ambiguity handling that requires
+    additional user specification. This fallback reduces user friction while maintaining strict matching
+    semantics.
+  evidence: beancount/parser/booking_method.py:124(booking_method_strict_with_size)
+  stage: booking
+  alternative_considered: Always strict matching was rejected; would require explicit resolution for every
+    size-exact match
+  _evidence_issues:
+  - 'FN_NOT_FOUND: booking_method_strict_with_size in beancount/parser/booking_method.py'
+- id: BD-009
+  type: B
+  content: MISSING sentinel for unfilled numbers (not None)
+  rationale: 'MISSING sentinel propagates through computations and surfaces in error messages with meaningful
+    context. Using None would be ambiguous: None could be a legitimate missing value OR an error in null-checking
+    logic. MISSING makes absence explicit, ensuring bugs surface immediately rather than silent incorrect
+    results.'
+  evidence: beancount/core/number.py:31(MISSING)
+  stage: booking
+  alternative_considered: Using None was rejected due to ambiguity; Optional[T] wrapper was rejected due
+    to verbosity
+- id: BD-010
+  type: BA
+  content: 'Plugin processing mode: raw vs default'
+  rationale: Raw mode skips built-in plugins (documents, pad, balance, tags, links) for custom workflows
+    requiring full control over entry transformation. Default mode runs the complete standard pipeline.
+    This dual-mode design supports both standard workflows and advanced use cases without compromising
+    either.
+  evidence: beancount/loader.py:662(plugin_processing_mode)
+  stage: transformation
+  alternative_considered: Conditional plugin skipping via options was rejected; dual mode is cleaner and
+    explicit
+  _evidence_issues:
+  - 'FN_NOT_FOUND: plugin_processing_mode in beancount/loader.py'
+- id: BD-011
+  type: B/DK
+  content: Documents plugin is always prepended
+  rationale: Document directives may be needed by other plugins for validation or reference purposes.
+    Prepending ensures Document entries exist before subsequent plugins run, enabling downstream consumers
+    to access document metadata during their processing phase.
+  evidence: beancount/loader.py:54(PLUGINS_PRE)
+  stage: transformation
+  alternative_considered: User-specified ordering was rejected; fixed prepended position ensures predictable
+    behavior
+  _evidence_issues:
+  - 'FN_NOT_FOUND: PLUGINS_PRE in beancount/loader.py'
+- id: BD-012
+  type: B
+  content: pad and balance are always appended as post plugins
+  rationale: Pad and balance synthesize missing entries that should exist before final validation. Appending
+    ensures these plugins run after each user transformations, guaranteeing that synthesized entries are
+    present when validation checks run. This ordering prevents false-negative validation on intentionally
+    padded accounts.
+  evidence: beancount/loader.py:65(PLUGINS_POST)
+  stage: transformation
+  alternative_considered: User-specified ordering was rejected; fixed post position ensures validation
+    works correctly
+  _evidence_issues:
+  - 'FN_NOT_FOUND: PLUGINS_POST in beancount/loader.py'
+- id: BD-013
+  type: B
+  content: RealAccount extends dict with account component keys
+  rationale: Natural tree representation where account hierarchy maps directly to nested dict structure.
+    Assets:Brokerage is keyed by 'Brokerage' under the 'Assets' subdict. This enables O(1) account component
+    lookup and natural iteration over account trees. The design mirrors how humans think about account
+    hierarchies.
+  evidence: beancount/core/realization.py:45(RealAccount)
+  stage: realization
+  alternative_considered: Separate node class hierarchy was rejected; dict-based approach is simpler and
+    sufficient
+- id: BD-014
+  type: B
+  content: Balance stored as Inventory per RealAccount
+  rationale: Computed incrementally during traversal, the Inventory per account supports cost-basis segregation
+    and multi-currency positions. This design allows querying 'what lots do I hold in USD' without additional
+    filtering. Supports both simple balance reporting and detailed position analysis from same data structure.
+  evidence: beancount/core/realization.py:67(self.balance)
+  stage: realization
+  alternative_considered: Simple currency-amount map was rejected; cannot represent multi-lot positions
+    with different cost basis
+  _evidence_issues:
+  - 'FN_NOT_FOUND: self.balance in beancount/core/realization.py'
+- id: BD-015
+  type: B
+  content: Balances computed via Inventory.reduce with convert functions
+  rationale: 'Separation of concerns: Inventory holds positions (lots with quantities and costs), while
+    the convert module defines aggregation semantics (how to combine positions, convert currencies, handle
+    costing). The reduce function accepts arbitrary conversion functions, enabling flexible balance computation
+    without modifying Inventory itself.'
+  evidence: beancount/core/inventory.py:336(reduce)
+  stage: realization
+  alternative_considered: Hardcoding conversion logic in Inventory was rejected; reduces flexibility and
+    testability
+- id: BD-016
+  type: B
+  content: Amount uses __slots__ = () to prevent dynamic attributes
+  rationale: 'Enforces immutability beyond NamedTuple guarantees. Prevents accidental attribute assignment
+    that could corrupt Amount values during processing. Combined with frozen NamedTuple, this creates
+    defense-in-depth: even if someone bypasses immutability guards, __slots__ prevents new attribute creation.'
+  evidence: beancount/core/amount.py:47(__slots__)
+  stage: realization
+  alternative_considered: Standard __slots__ with defined fields was rejected; empty slots provide maximum
+    restriction
+  _evidence_issues:
+  - 'FN_NOT_FOUND: __slots__ in beancount/core/amount.py'
+- id: BD-017
+  type: BA
+  content: Income/expenses rolled to equity at period boundaries
+  rationale: 'Standard accounting practice: Profit & Loss closes to retained earnings at period boundaries.
+    This enables balance sheet generation for any arbitrary period, not just account inception to present.
+    Without this rollforward, period-relative balance sheets would show incorrect retained earnings balances.'
+  evidence: beancount/ops/summarize.py:44(open)
+  stage: summarization
+  alternative_considered: Cumulative P&L approach was rejected; standard accounting requires closure for
+    accurate period reports
+- id: BD-018
+  type: B
+  content: Conversion entries at open date for zero-priced items
+  rationale: Ensures accounts with no price history can still be converted to a base currency. By generating
+    conversion entries at the account open date using zero price, any-position balance can be expressed
+    in reporting currency. Without this, assets lacking price history would fail conversion entirely.
+  evidence: beancount/ops/summarize.py:522(conversions)
+  stage: summarization
+  alternative_considered: Skipping conversion was rejected; would cause incomplete balance sheet in multi-currency
+    reports
+- id: BD-019
+  type: M
+  content: GetAccounts class uses getattr dispatch on entry class name
+  rationale: 'Extensible pattern: new directive types automatically handled by adding a method with the
+    class name (e.g., def get_DirectiveClass(self, entry):). This eliminates need to modify dispatch logic
+    when adding new entry types. getattr with fallback provides clean extension point.'
+  evidence: beancount/core/getters.py:52(getattr)
+  stage: summarization
+  alternative_considered: Explicit dispatch dict was rejected; getattr is more Pythonic and auto-discovers
+    new methods
+  _evidence_issues:
+  - 'FN_NOT_FOUND: getattr in beancount/core/getters.py'
+- id: BD-020
+  type: B
+  content: Open/close account lifecycle validation
+  rationale: Ensures accounts are opened before their first posting and closed appropriately after final
+    transaction. This prevents using undefined accounts (typos) and catches forgotten Open directives.
+    Validation runs after each transformations, catching lifecycle issues in final output.
+  evidence: beancount/ops/validation.py:50(validate_open_close)
+  stage: validation
+  alternative_considered: Lazy account creation was rejected; explicit lifecycle is clearer and catches
+    errors earlier
+  vague_rationale: true
+- id: BD-021
+  type: B
+  content: Currency constraints from Open declaration
+  rationale: Accounts restrict which currencies they hold via Open declaration. This prevents accidental
+    currency mixing that would complicate reconciliation. Constraints are validated after each transformations,
+    ensuring final state respects declared currency policy.
+  evidence: beancount/ops/validation.py:250(validate_currency_constraints)
+  stage: validation
+  alternative_considered: Lazy currency creation was rejected; explicit constraints catch configuration
+    errors
+- id: BD-022
+  type: BA/DK
+  content: Extra validations injected at load time
+  rationale: Allows custom validation rules without modifying core validation module. Users register validation
+    functions that run after standard validation. This extensibility point enables domain-specific checks
+    (regulatory compliance, personal rules) while keeping core validation generic.
+  evidence: beancount/loader.py:357(extra_validations)
+  stage: validation
+  alternative_considered: Plugin-based validation was rejected; function injection is simpler for single-file
+    ledgers
+  _evidence_issues:
+  - 'FN_NOT_FOUND: extra_validations in beancount/loader.py'
+- id: BD-023
+  type: B
+  content: 'Double-entry accounting: every transaction must have balanced postings (sum to zero)'
+  rationale: This is the fundamental invariant of double-entry bookkeeping - without balanced postings,
+    the accounting equation (Assets = Liabilities + Equity) would not hold, breaking financial integrity.
+    The boundary is that any unbalanced transaction raises an assertion error at parse time, preventing
+    invalid ledgers from being processed.
+  evidence: beancount/core/data.py:156(__post_init__)
+  stage: validation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: __post_init__ in beancount/core/data.py'
+- id: BD-024
+  type: B/RC
+  content: Lots are identified by (account, currency, cost_spec) triple including number, currency, date,
+    and label
+  rationale: Lot identification enables precise cost basis tracking for tax reporting and gain/loss calculation.
+    The boundary is that two positions with identical cost_specs (same number, currency, date, label)
+    will be treated as the same lot for merging purposes, while any difference in these fields keeps them
+    separate.
+  evidence: beancount/core/position.py:206(__eq__)
+  stage: position_tracking
+- id: BD-025
+  type: B/BA
+  content: 'Booking method defaults to ''NONE'' (strict mode: no currency mixing without explicit cost)'
+  rationale: Defaulting to strict booking prevents silent currency mixing that could cause incorrect lot
+    matching. The boundary is that when booking=NONE, any ambiguous currency situation (e.g., same ticker
+    different currencies) will raise an error, requiring explicit cost specification to disambiguate.
+  evidence: beancount/parser/options.py:59(Booking)
+  stage: booking
+  alternative_considered: FIFO or LIFO as default would silently choose lot ordering without user intent
+  _evidence_issues:
+  - 'FN_NOT_FOUND: Booking in beancount/parser/options.py'
+- id: BD-026
+  type: B/BA
+  content: Interpolation tolerance is 0.005 (0.5% of balance) for balance assertions
+  rationale: A 0.5% tolerance allows for rounding errors in balance calculations while still catching
+    significant discrepancies. The boundary is that any balance assertion passing within ±0.5% of the
+    actual balance will be marked valid, with larger deviations triggering a failure.
+  evidence: beancount/core/interpolate.py:33(TOLERANCE)
+  stage: balance_checking
+  alternative_considered: Zero tolerance was rejected as impractical given floating-point arithmetic
+  _evidence_issues:
+  - 'FN_NOT_FOUND: TOLERANCE in beancount/core/interpolate.py'
+- id: BD-027
+  type: B
+  content: Balance assertions use date-ordered preceding postings for interpolation
+  rationale: Ordering preceding postings by date ensures deterministic interpolation behavior. The boundary
+    is that the most recent posting strictly before the balance assertion date is used as the basis for
+    interpolation, ignoring each postings on or after the assertion date.
+  evidence: beancount/core/interpolate.py:275(compute_entries_balance)
+  stage: balance_checking
+- id: BD-028
+  type: B
+  content: Accounts use hierarchical colon-separated naming with 4 standard types (Assets, Liabilities,
+    Equity, Income, Expenses)
+  rationale: Hierarchical naming enables account grouping and rollup reporting. The boundary is that accounts
+    must begin with one of the 4 standard type prefixes (Assets, Liabilities, Equity, Income, Expenses)
+    to be valid for account type classification and proper balance sheet organization.
+  evidence: beancount/core/account_types.py:26(AccountTypes)
+  stage: account_structure
+- id: BD-029
+  type: B/BA
+  content: Equity contains 'Opening-Balances' and 'Current-Earnings' standard sub-accounts
+  rationale: Standard equity sub-accounts provide the mechanism for initial balances and retained earnings.
+    The boundary is that 'Equity:Opening-Balances' holds initial account balances while 'Equity:Current-Earnings'
+    accumulates period income/expenses for retained earnings calculation.
+  evidence: beancount/core/account_types.py:24(get_account_types)
+  stage: account_structure
+  _evidence_issues:
+  - 'FN_NOT_FOUND: get_account_types in beancount/core/account_types.py'
+- id: BD-030
+  type: B/DK
+  content: Realization creates complete tree from root 'Root' down through 4 account levels
+  rationale: The complete account tree enables hierarchical balance aggregation from leaf accounts to
+    root. The boundary is that the tree is built from the literal 'Root' account through each 4 standard
+    account type levels (Type:Name:Subname:Detail), enabling rollup calculations for financial statements.
+  evidence: beancount/core/realization.py:211(realize)
+  stage: report_generation
+- id: BD-031
+  type: B
+  content: Inventory holds multiple lots per (account, currency) with set-based equality
+  rationale: Multi-lot inventory enables accurate tracking of multiple purchases at different cost bases.
+    The boundary is that inventories are equal only when they contain identical lot sets (sorted position
+    comparison), meaning order of acquisition does not affect equality.
+  evidence: beancount/core/inventory.py:81(inventory)
+  stage: position_tracking
+  _evidence_issues:
+  - 'FN_NOT_FOUND: inventory in beancount/core/inventory.py'
+- id: BD-032
+  type: B
+  content: 'Plugin pipeline runs in order: check_closing first, then other plugins, then close_tree last'
+  rationale: Fixed plugin ordering ensures predictable processing and allows validation before cleanup.
+    The boundary is that check_closing must run first to validate closing balances before other plugins
+    potentially modify entries, and close_tree runs last to clean up empty branches after each processing.
+  evidence: beancount/plugins/close_tree.py:37(close_tree)
+  stage: plugin_pipeline
+- id: BD-033
+  type: B
+  content: sellgains plugin moves realized gains to income when cost basis exceeds proceeds
+  rationale: Moving losses to income ensures proper P&L classification per accounting standards. The boundary
+    is that gains (proceeds > cost) are NOT moved by this plugin; only losses (cost > proceeds) are reclassified
+    from expenses to income.
+  evidence: beancount/plugins/sellgains.py:52(__call__)
+  stage: plugin_processing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: __call__ in beancount/plugins/sellgains.py'
+- id: BD-034
+  type: B
+  content: Summarization uses previous-day dates to maintain chronological ordering in reports
+  rationale: Using date-1 ensures summarized periods don't overlap with source entries. The boundary is
+    that the summarized period ends at (end_date - 1 day), ensuring entries dated on end_date appear after
+    the summary in chronological output.
+  evidence: beancount/ops/summarize.py:463(summarize)
+  stage: report_generation
+- id: BD-035
+  type: B
+  content: Transfer entries use date minus 1 day to precede cutoff date for account transfers
+  rationale: Using date-1 ensures transferred balances appear before the transfer cutoff point. The boundary
+    is that transfer entries are dated exactly 1 day before the transfer date, guaranteeing they are included
+    when filtering entries up to but not including the transfer date.
+  evidence: beancount/ops/summarize.py:393(transfer_balances)
+  stage: report_generation
+- id: BD-036
+  type: B/BA
+  content: Cost currency defaults to the same currency as the lot's units when no explicit cost currency
+    specified
+  rationale: Inferring cost currency from units avoids requiring redundant currency specification. The
+    boundary is that when a cost spec omits currency, the currency is implicitly set to match the position's
+    units currency, simplifying commodity costing.
+  evidence: beancount/core/convert.py:109(get_value)
+  stage: position_tracking
+- id: BD-037
+  type: B
+  content: Price lookup uses (base, quote) currency tuple as key for rate retrieval
+  rationale: Tuple-based price lookup enables unambiguous currency pair identification. The boundary is
+    that price lookups are directional (USD/CAD ≠ CAD/USD), requiring explicit (base, quote) ordering
+    for correct rate selection.
+  evidence: beancount/core/convert.py:190(convert_amount)
+  stage: price_resolution
+- id: BD-038
+  type: B
+  content: Implied price conversion via intermediate currency hops when direct rate unavailable
+  rationale: Multi-hop conversion enables currency pairs without direct rates to still be valued. The
+    boundary is that conversion attempts each currency as an intermediate step, returning the first valid
+    path found through the price graph.
+  evidence: beancount/core/convert.py:190(convert_amount)
+  stage: price_resolution
+- id: BD-039
+  type: B
+  content: Weight calculation uses cost for lots, units for non-cost postings, explicit price overrides
+  rationale: Weight determines how positions contribute to average price calculations. The boundary is
+    that lots with cost spec use cost as weight (meaningful for averaging), while uncosted positions use
+    units as weight, with explicit prices taking precedence when provided.
+  evidence: beancount/core/convert.py:63(get_weight)
+  stage: balance_calculation
+- id: BD-040
+  type: B
+  content: 'Clamp operation: income/expenses to equity at begin_date, summarize period, truncate after
+    end_date, convert at end'
+  rationale: The clamp operation creates period-bound financial snapshots with proper equity treatment.
+    The boundary is that clamp (1) moves income/expenses to Equity:Current-Earnings at begin_date, (2)
+    summarizes the period, (3) removes entries after end_date, and (4) applies currency conversion at
+    end_date.
+  evidence: beancount/ops/summarize.py:229(clamp)
+  stage: report_generation
+- id: BD-041
+  type: B
+  content: Balance assertions following transferred accounts are removed from the new account
+  rationale: Removing balance assertions prevents duplicate validation after account transfer. The boundary
+    is that any Balance directive on the destination (receiving) account is filtered out, as the transfer
+    entry itself establishes the correct balance.
+  evidence: beancount/ops/summarize.py:393(transfer_balances)
+  stage: report_generation
+- id: BD-042
+  type: B/RC
+  content: Cost label (optional) allows distinguishing lots with same date/currency/amount
+  rationale: Cost labels enable differentiation of lots that would otherwise be identical. The boundary
+    is that when each cost fields match (number, currency, date) except the label, the positions are considered
+    different lots, allowing separate tracking for tax lot accounting.
+  evidence: beancount/core/position.py:25(Cost)
+  stage: position_tracking
+  vague_rationale: true
+- id: BD-043
+  type: B
+  content: 'Vesting example: 4-year vesting with 1-year cliff, monthly vesting thereafter'
+  rationale: This vesting schedule demonstrates standard equity compensation structure. The boundary is
+    that no shares vest before the 1-year cliff, then 1/48th vests monthly for months 13-48, totaling
+    100% at 4 years.
+  evidence: N/A:0(see_rationale)
+  stage: business_logic
+- id: BD-044
+  type: B
+  content: 'Trading simulation: sell biggest winner or biggest loser based on random 50/50 selection'
+  rationale: Random selection of gain extreme provides varied trading scenarios for testing. The boundary
+    is that on each sell decision, the algorithm randomly chooses between selling the position with highest
+    gain or highest loss, creating diverse outcome patterns.
+  evidence: beancount/scripts/example.py:882(biggest)
+  stage: business_logic
+  _evidence_issues:
+  - 'FN_NOT_FOUND: biggest in beancount/scripts/example.py'
+- id: BD-045
+  type: B
+  content: 'Trading simulation: skip selling on days when buying (avoid same-day round-trip)'
+  rationale: Preventing same-day buy/sell round-trips reflects realistic trading constraints. The boundary
+    is that on any day with a buy transaction, the algorithm skips sell evaluation entirely, avoiding
+    artificial wash sales.
+  evidence: beancount/scripts/example.py:862(module)
+  stage: business_logic
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/scripts/example.py'
+- id: BD-046
+  type: B
+  content: 'Trading simulation: skip lots without price movement when selecting sell candidates'
+  rationale: Filtering out unchanged positions focuses selling on positions with realized gains/losses.
+    The boundary is that any lot where current price equals cost basis is skipped, ensuring only positions
+    with actual price movement are considered for selling.
+  evidence: beancount/scripts/example.py:872(module)
+  stage: business_logic
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/scripts/example.py'
+  vague_rationale: true
+- id: BD-047
+  type: B
+  content: Inventory reduce uses (amount, currency) key for aggregation across lots
+  rationale: Aggregating by (amount, currency) enables net position calculation across multiple lots.
+    The boundary is that during reduce operations, each lots with identical (amount, currency) are combined,
+    regardless of their individual cost basis.
+  evidence: beancount/core/inventory.py:459(add_position)
+  stage: position_tracking
+- id: BD-048
+  type: B
+  content: check_closing plugin verifies closing entries match computed balances
+  rationale: Closing validation ensures ledger integrity at period boundaries. The boundary is that any
+    discrepancy between a Close directive's stated balance and the computed balance (from preceding entries)
+    triggers an error.
+  evidence: beancount/plugins/check_closing.py:35(__call__)
+  stage: plugin_processing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: __call__ in beancount/plugins/check_closing.py'
+- id: BD-049
+  type: B
+  content: close_tree plugin removes empty account subtrees after each processing
+  rationale: Removing empty branches keeps the account tree clean and reduces report clutter. The boundary
+    is that only accounts with zero balance AND no subaccounts are removed, preserving any account with
+    meaningful balance or children.
+  evidence: beancount/plugins/close_tree.py:37(close_tree)
+  stage: plugin_processing
+- id: BD-050
+  type: B
+  content: Open entries mark accounts as active with optional currencies and booking method
+  rationale: Open directive defines account scope and constraints from its date forward. The boundary
+    is that currencies field limits which currencies can post to the account, and booking field specifies
+    lot merging strategy, both enforced from the Open date onward.
+  evidence: beancount/core/data.py:93(Open)
+  stage: account_structure
+- id: BD-051
+  type: B
+  content: Close entries mark accounts as inactive after the specified date
+  rationale: Close directive prevents future postings to an account. The boundary is that any transaction
+    dated on or after the Close date for an account triggers an error, preventing posthumous entries.
+  evidence: beancount/core/data.py:118(Close)
+  stage: account_structure
+- id: BD-052
+  type: B
+  content: Document directives provide optional source file references for entries
+  rationale: Document linkage provides audit trail and source verification for transactions. The boundary
+    is that the Document directive is purely informational - it associates a filename with a specific
+    entry date but does not affect balance calculations.
+  evidence: beancount/core/data.py:397(Document)
+  stage: metadata
+- id: BD-053
+  type: B/BA
+  content: Pad entries create balance between two dates using interpolation from preceding entries
+  rationale: Pad provides balance scaffolding when source data is temporarily unavailable. The boundary
+    is that the pad amount equals the expected balance minus the computed balance from preceding entries,
+    with TOLERANCE applied to determine if padding is needed.
+  evidence: beancount/core/interpolate.py:38(balanceerror)
+  stage: balance_checking
+  _evidence_issues:
+  - 'FN_NOT_FOUND: balanceerror in beancount/core/interpolate.py'
+- id: BD-054
+  type: B
+  content: Date range filtering in exports uses half-open interval [begin, end)
+  rationale: Half-open intervals provide unambiguous boundary handling for period exports. The boundary
+    is that entries on the begin date are included while entries on the end date are excluded, matching
+    standard Python slice semantics.
+  evidence: beancount/projects/export.py:56(module)
+  stage: report_generation
+  alternative_considered: Closed intervals [begin, end] would cause double-counting in sequential period
+    exports
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/projects/export.py'
+- id: BD-055
+  type: B
+  content: Treeify expands flat account lists into nested dict structure for hierarchical reporting
+  rationale: Tree representation enables hierarchical aggregation and nested reporting. The boundary is
+    that the input flat list of (account, balance) tuples is converted to a nested dict where each level
+    corresponds to an account segment separated by colons.
+  evidence: beancount/tools/treeify.py:35(treeify)
+  stage: report_generation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: treeify in beancount/tools/treeify.py'
+- id: BD-056
+  type: B
+  content: Commission tracked as separate expense line (Expenses:Financial:Commissions) in trading
+  rationale: Separate commission tracking enables accurate cost basis and expense reporting. The boundary
+    is that commissions are posted to a dedicated expense account rather than deducted from proceeds,
+    preserving accurate gain/loss calculations.
+  evidence: beancount/scripts/example.py:853(module)
+  stage: business_logic
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/scripts/example.py'
+- id: BD-057
+  type: B
+  content: Vesting calculation uses EXACT decimal arithmetic (Decimal type) for precision
+  rationale: Decimal arithmetic prevents floating-point rounding errors in financial calculations. The
+    boundary is that each monetary amounts use Decimal type with sufficient precision, avoiding binary
+    floating-point errors that could cause off-by-cent discrepancies.
+  evidence: beancount/core/number.py:41(D)
+  stage: calculation
+- id: BD-058
+  type: B/RC
+  content: Position lot merging requires identical cost basis (number, currency, date, label)
+  rationale: Strict lot equality ensures only truly identical positions are merged. The boundary is that
+    each four cost basis components (number, currency, date, label) must match exactly for lots to be
+    merged, preserving distinct tax lots.
+  evidence: beancount/parser/booking.py:92(merge_positions)
+  stage: booking
+  _evidence_issues:
+  - 'FN_NOT_FOUND: merge_positions in beancount/parser/booking.py'
+- id: BD-059
+  type: B
+  content: 'Inventory addition: same-lot positions combine, different lots coexist in inventory'
+  rationale: Lot-aware accumulation preserves distinct cost basis tracking. The boundary is that when
+    adding a position matching an existing lot (identical cost spec), amounts are combined; otherwise,
+    the new lot is added alongside existing lots.
+  evidence: beancount/core/inventory.py:459(add_position)
+  stage: booking
+- id: BD-060
+  type: B
+  content: Realization tree contains both aggregated balances and per-node lot lists
+  rationale: Dual representation enables both rollup reporting and detailed lot inspection. The boundary
+    is that each RealAccount node stores (1) aggregate balances dict for rollup and (2) subaccounts dict
+    for hierarchical traversal, allowing queries at any level.
+  evidence: beancount/core/realization.py:45(RealAccount)
+  stage: report_generation
+- id: BD-061
+  type: B
+  content: 'Invariant checking: verify_balance_interpolation called after every entry modification'
+  rationale: Post-modification verification catches balance assertion violations immediately. The boundary
+    is that after any entry insertion, modification, or deletion, each balance interpolations are re-verified
+    to ensure the ledger remains internally consistent.
+  evidence: beancount/utils/invariants.py:45(module)
+  stage: validation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/utils/invariants.py'
+- id: BD-062
+  type: B
+  content: 'Position scaling: negate position units to create selling lot from buying position'
+  rationale: Negation converts a long position to a short lot for sell transactions. The boundary is that
+    the negated position creates a new lot with negative units while the original lot remains unchanged
+    until the positions are netted by the booking method.
+  evidence: beancount/scripts/example.py:887(module)
+  stage: trading
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/scripts/example.py'
+- id: BD-063
+  type: B
+  content: Use date + 1 day offset for balance check placement
+  rationale: The balance check occurs on the day after the closing entry date to ensure each closing postings
+    have been applied before verification. This boundary prevents premature balance checks that could
+    miss pending transactions in the same-day closing batch.
+  evidence: beancount/plugins/check_closing.py:68(module)
+  stage: accounting.check_closing
+  alternative_considered: Same-day check would require additional transaction sequencing logic
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/check_closing.py'
+- id: BD-064
+  type: B/BA
+  content: Zero balance assertion for position verification
+  rationale: The system verifies that each position balances are exactly zero after closing, using a strict
+    ZERO constant rather than a tolerance. This boundary ensures complete position liquidation or transfer
+    and prevents residual balances from accumulating in closed accounts.
+  evidence: beancount/plugins/check_closing.py:73(module)
+  stage: accounting.check_closing
+  alternative_considered: Tolerance-based check was rejected to ensure complete closure
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/check_closing.py'
+- id: BD-065
+  type: B/BA
+  content: 'Metadata boolean ''closing: TRUE'' as trigger'
+  rationale: Closing verification is triggered by an explicit metadata flag on postings rather than implicit
+    rules. This boundary ensures only intentional postings trigger the closing check process, avoiding
+    false positives from regular transactions that happen to close a position naturally.
+  evidence: beancount/plugins/check_closing.py:60(module)
+  stage: accounting.check_closing
+  alternative_considered: Implicit detection via balance analysis was considered but rejected for explicitness
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/check_closing.py'
+- id: BD-066
+  type: B
+  content: Balance check date verification equals original + 1 day
+  rationale: Test case verifies that the date offset of exactly +1 day is applied correctly, confirming
+    the boundary condition that one calendar day separates the original entry date from the balance verification
+    date.
+  evidence: beancount/plugins/check_closing_test.py:46(module)
+  stage: accounting.check_closing
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/check_closing_test.py'
+- id: BD-067
+  type: B/BA
+  content: Extra tolerance multiplier for dual constraint satisfaction
+  rationale: A tolerance multiplier of 2 is applied when both cost-basis and proceeds constraints must
+    be satisfied simultaneously. This boundary prevents false rejection when independent rounding errors
+    in price and quantity calculations compound, ensuring legitimate transactions pass validation.
+  evidence: beancount/plugins/sellgains.py:82(module)
+  stage: accounting.sellgains
+  alternative_considered: Single tolerance was insufficient for dual-constraint validation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/sellgains.py'
+- id: BD-068
+  type: B/BA
+  content: Expected proceeds = price * (-units) for short/long positions
+  rationale: 'Proceeds calculation negates the units sign to produce a positive cash flow regardless of
+    whether the position is long or short. This boundary ensures consistent proceeds representation: buying
+    reduces cash (negative) while selling generates proceeds (positive) across both long and short position
+    directions.'
+  evidence: beancount/plugins/sellgains.py:122(module)
+  stage: accounting.sellgains
+  alternative_considered: Separate long/short calculation paths were rejected for complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/sellgains.py'
+- id: BD-069
+  type: B
+  content: Proceeds accumulation for non-income accounts
+  rationale: Proceeds are tracked only for specific account types designated in proceed_types. This boundary
+    excludes income accounts and other non-proceeds categories from the inventory validation, ensuring
+    only cash-equivalent accounts participate in the proceeds reconciliation.
+  evidence: beancount/plugins/sellgains.py:126(module)
+  stage: accounting.sellgains
+  alternative_considered: Tracking each accounts was rejected to reduce false validation errors
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/sellgains.py'
+- id: BD-070
+  type: B/DK
+  content: Currency-by-currency inventory comparison
+  rationale: Proceeds validation iterates currency-by-currency rather than aggregating across currencies.
+    This boundary ensures each currency's proceeds are validated independently, preventing false positives
+    from cross-currency rounding and ensuring regulatory compliance for multi-currency positions.
+  evidence: beancount/plugins/sellgains.py:135(module)
+  stage: accounting.sellgains
+  alternative_considered: Aggregated validation was rejected due to currency-specific tax implications
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/sellgains.py'
+- id: BD-071
+  type: B/BA
+  content: Absolute difference tolerance check
+  rationale: The validation uses absolute difference with tolerance rather than exact equality. This boundary
+    accommodates floating-point rounding errors and minor pricing discrepancies in real-world transactions
+    while still catching significant imbalances that indicate calculation errors.
+  evidence: beancount/plugins/sellgains.py:142-143(module)
+  stage: accounting.sellgains
+  alternative_considered: Exact equality was rejected as too strict for financial calculations
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/sellgains.py'
+- id: BD-072
+  type: B/BA
+  content: Tolerance inference per currency from postings
+  rationale: Tolerance values are inferred from existing postings rather than hardcoded, allowing currency-specific
+    tolerance adjustments. This boundary enables the system to adapt tolerance based on actual transaction
+    patterns while maintaining consistency within each currency.
+  evidence: beancount/plugins/sellgains.py:133(module)
+  stage: accounting.sellgains
+  alternative_considered: Hardcoded tolerances were rejected for lack of flexibility
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/sellgains.py'
+- id: BD-073
+  type: B
+  content: Proceeds inventory accumulation using weight
+  rationale: Proceeds are accumulated using a weighted conversion that accounts for position size. This
+    boundary ensures larger positions contribute proportionally more to the inventory total, enabling
+    accurate FIFO/LIFO matching for cost-basis calculations.
+  evidence: beancount/plugins/sellgains.py:127(module)
+  stage: accounting.sellgains
+  alternative_considered: Simple sum was rejected as it would not support partial sales correctly
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/sellgains.py'
+- id: BD-074
+  type: B/RC
+  content: Require each cost postings to have prices for validation
+  rationale: Every cost postings must have explicit price values before gain/loss validation proceeds.
+    This boundary prevents undefined valuations from causing validation failures and ensures each lot
+    has a traceable cost basis for tax reporting.
+  evidence: beancount/plugins/sellgains.py:108-109(module)
+  stage: accounting.sellgains
+  alternative_considered: Default pricing fallback was rejected to maintain data integrity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/sellgains.py'
+- id: BD-075
+  type: B
+  content: Error when proceeds inventory has unmatched currencies
+  rationale: Validation fails if any proceeds currencies cannot be matched to cost currencies. This boundary
+    ensures complete currency matching for accurate multi-currency gain/loss reporting and prevents orphaned
+    proceeds that would create accounting inconsistencies.
+  evidence: beancount/plugins/sellgains.py:147(module)
+  stage: accounting.sellgains
+  alternative_considered: Partial matching was rejected for regulatory compliance
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/sellgains.py'
+- id: BD-076
+  type: B
+  content: Proceeds types include equity (for stock vesting)
+  rationale: Equity accounts are included in the proceeds types for tracking stock vesting and other equity
+    transactions. This boundary ensures that equity compensation events like RSU vesting and stock option
+    exercises are properly captured in proceeds calculations.
+  evidence: beancount/plugins/sellgains.py:97(module)
+  stage: accounting.sellgains
+  alternative_considered: Excluding equity was rejected as it would miss compensation-related gains
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/sellgains.py'
+- id: BD-077
+  type: B/BA
+  content: No errors expected for balanced multi-leg sale
+  rationale: A balanced multi-leg sale transaction where cash proceeds equal cost basis should produce
+    zero validation errors. This test establishes the boundary that correctly structured transactions
+    pass validation, confirming the system accepts valid economic outcomes.
+  evidence: beancount/plugins/sellgains_test.py:26(module)
+  stage: accounting.sellgains
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/sellgains_test.py'
+- id: BD-078
+  type: B/BA
+  content: SellGainsError on unbalanced cash vs cost
+  rationale: Transactions with cash proceeds that do not match cost basis within tolerance trigger SellGainsError.
+    This test confirms the boundary that mismatched cash flows are rejected, preventing accounting errors
+    from propagating through the system.
+  evidence: beancount/plugins/sellgains_test.py:40(module)
+  stage: accounting.sellgains
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/sellgains_test.py'
+- id: BD-079
+  type: B
+  content: Dual error type on imbalance with missing expense
+  rationale: When a transaction has both proceeds imbalance and missing expense category, the system produces
+    multiple error types. This boundary ensures comprehensive error reporting captures each validation
+    failures, enabling complete correction rather than sequential fixes.
+  evidence: beancount/plugins/sellgains_test.py:54(module)
+  stage: accounting.sellgains
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/sellgains_test.py'
+- id: BD-080
+  type: B
+  content: Other currency (CAD) proceeds accepted as valid
+  rationale: Non-USD currencies are accepted as valid proceeds when properly structured. This boundary
+    confirms multi-currency support where CAD or other foreign currency proceeds are validated against
+    matching cost currencies, supporting international brokerage accounts.
+  evidence: beancount/plugins/sellgains_test.py:66(module)
+  stage: accounting.sellgains
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/sellgains_test.py'
+- id: BD-081
+  type: B
+  content: Zero price sale accepted as valid
+  rationale: Zero-priced transactions are accepted when properly structured, as some corporate actions
+    (like stock splits or certain distributions) can result in zero-value sales. This boundary prevents
+    false rejections of legitimate zero-proceeds events that affect cost-basis calculations.
+  evidence: beancount/plugins/sellgains_test.py:78(module)
+  stage: accounting.sellgains
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in beancount/plugins/sellgains_test.py'
+- id: BD-082
+  type: B/BA
+  content: 'INTERACTION: BD-001 × BD-003 → Parser line tracking enables secondary sort key for same-day
+    ordering'
+  rationale: 'PLY''s source location tracking is the enabling mechanism for BD-003''s lineno secondary
+    sort key. Without accurate line numbers from the parser, same-day directive ordering would be non-deterministic.
+    This is a hidden dependency: BD-003 silently assumes BD-001 provides reliable line number tracking.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-083
+  type: BA
+  content: 'INTERACTION: BD-023 × BD-026 → Balanced postings invariant vs tolerance creates tolerance
+    boundary ambiguity'
+  rationale: 'BD-023 asserts balanced postings (sum to zero) as the fundamental double-entry invariant,
+    yet BD-026 allows 0.5% tolerance on balance assertions. This creates a contradiction: assertions can
+    pass even when postings don''t literally sum to zero. The tension is resolved by scope - BD-023 applies
+    at transaction creation, BD-026 applies during balance checking interpolation.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-084
+  type: B/BA
+  content: 'INTERACTION: BD-025 × BD-008 → Strict booking default vs STRICT_WITH_SIZE fallback creates
+    behavioral inconsistency'
+  rationale: BD-025 defaults to strict booking (NONE) requiring explicit cost specification for currency
+    disambiguation, but BD-008 provides an automatic STRICT_WITH_SIZE fallback for exact-size matches.
+    This contradiction means 'strict' mode is not truly strict - size-exact matches bypass the explicit
+    specification requirement. Users relying on strict enforcement may get unexpected matches.
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-085
+  type: BA
+  content: 'INTERACTION: BD-057 × BD-026 → Decimal precision vs tolerance existence reveals incomplete
+    Decimal coverage'
+  rationale: 'BD-057 mandates Decimal arithmetic for financial precision, yet BD-026''s tolerance suggests
+    floating-point rounding concerns. This reveals a hidden dependency problem: if each calculations use
+    Decimal, tolerance for rounding errors should be unnecessary. The tolerance likely exists for edge
+    cases like price lookups or external data ingestion that may not use Decimal, creating an implicit
+    assumption about coverage gaps.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-086
+  type: B/RC
+  content: 'INTERACTION: BD-006 × BD-005 × BD-031 → CostSpec incompleteness flows through two-pass booking
+    to multi-lot inventory'
+  rationale: 'BD-006''s CostSpec for incomplete costs is the input to BD-005''s two-pass booking algorithm.
+    The first pass collects reductions, the second pass resolves incomplete specs against known augmentations.
+    BD-031''s multi-lot inventory then stores the resolved lots. This is an amplification chain: each
+    stage depends on the previous, and errors compound. An incomplete cost spec that doesn''t resolve
+    correctly corrupts lot tracking.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-087
+  type: B
+  content: 'INTERACTION: BD-017 × BD-029 × BD-040 → Equity rollforward requires standard accounts and
+    consistent date ordering'
+  rationale: 'BD-017 rolls income/expenses to equity at period boundaries using BD-029''s standard equity
+    accounts (Opening-Balances, Current-Earnings). BD-040''s clamp operation enforces the correct ordering
+    of this rollforward. These three decisions form an amplification cluster: equity rollforward only
+    works if standard accounts exist and date ordering is correct. Violate one and the entire period-bound
+    reporting breaks.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-088
+  type: BA
+  content: 'INTERACTION: BD-037 × BD-038 × BD-036 × BD-021 → Currency conversion chain creates systemic
+    conversion dependency'
+  rationale: 'BD-037 provides tuple-based price lookup, BD-038 enables multi-hop conversion via intermediate
+    currencies, BD-036 defaults cost currency to units currency, and BD-021 validates currency constraints.
+    These form a risk cascade: if any single currency in the conversion graph lacks a price, BD-038''s
+    hop mechanism attempts alternatives, but BD-021''s constraints may reject the result. Missing prices
+    create silent failures or constraint violations.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-089
+  type: B/BA
+  content: 'INTERACTION: BD-010 × BD-011 × BD-012 × BD-032 → Plugin pipeline ordering creates invariant
+    check dependencies'
+  rationale: BD-010 defines raw vs default processing modes. BD-011 preprends Documents, BD-012 appends
+    pad/balance, and BD-032 mandates check_closing first and close_tree last. BD-061's invariant checking
+    runs after entry modifications throughout this pipeline. The fixed ordering ensures invariants are
+    checked at predictable points; changing ordering would cause invariant violations to be detected at
+    unexpected stages or missed entirely.
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-090
+  type: B/BA
+  content: 'INTERACTION: BD-068 × BD-073 × BD-070 × BD-075 → Proceeds validation cascade from negation
+    through currency matching'
+  rationale: 'BD-068 negates units to produce positive proceeds, BD-073 accumulates proceeds using weighted
+    conversion, BD-070 validates currency-by-currency, and BD-075 errors on unmatched currencies. This
+    forms a risk cascade: if BD-068''s negation is incorrect, BD-073''s weighted accumulation produces
+    wrong proceeds, BD-070''s per-currency validation may still pass due to tolerance, and BD-075 only
+    catches complete currency mismatches. Subtle errors can slip through.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-091
+  type: B/BA
+  content: 'INTERACTION: BD-013 × BD-014 × BD-030 → Realization tree structure assumptions enable hierarchical
+    aggregation'
+  rationale: 'BD-013 structures RealAccount as nested dict, BD-014 stores Inventory per account for cost-basis
+    segregation, and BD-030 builds the complete tree from Root through 4 account levels. This amplifies
+    hierarchical reporting: dict structure enables O(1) component lookup, Inventory enables per-currency
+    queries, and complete tree enables rollup from leaf to root. Missing any level breaks the aggregation
+    chain.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-092
+  type: B
+  content: 'INTERACTION: BD-002 × BD-061 → Immutable directives enable safe post-modification invariant
+    checking'
+  rationale: 'BD-002 makes directives immutable NamedTuples, enabling safe sharing across the pipeline.
+    BD-061''s invariant checking runs after every entry modification. Immutability is the hidden enabler:
+    without it, modifications could corrupt the entries being checked, making invariant verification unreliable.
+    This is an amplification: immutability guarantees the entries passed to invariant checking are the
+    same as those that entered the pipeline.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-093
+  type: BA
+  content: 'RISK CASCADE: Price lookup failure → multi-hop failure → constraint violation → validation
+    error'
+  rationale: Starting with BD-037's tuple-based price lookup, if a direct rate is unavailable, BD-038
+    attempts multi-hop conversion. If no valid path exists through the price graph, BD-036's cost currency
+    default may produce unexpected results. Finally, BD-021's currency constraint validation may reject
+    the conversion. This cascade means incomplete price data in one currency can cause validation failures
+    for unrelated transactions.
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-094
+  type: BA
+  content: 'RISK CASCADE: Incomplete CostSpec → booking resolution failure → incorrect lot assignment
+    → wrong cost basis'
+  rationale: 'BD-006 allows incomplete CostSpecs (missing date, label, or number). BD-005''s two-pass
+    booking attempts to resolve these against known augmentations. If resolution fails, BD-058''s strict
+    lot merging and BD-059''s inventory addition may create incorrect lot boundaries. This cascades into
+    wrong cost basis for tax reporting: lots that should be merged are kept separate or vice versa.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-095
+  type: BA
+  content: 'RISK CASCADE: Plugin mode change → fixed ordering bypass → invariant check miss → silent corruption'
+  rationale: BD-010 allows raw mode to skip built-in plugins. BD-011 and BD-012's fixed ordering (Documents
+    prepended, pad/balance appended) may be bypassed in raw mode. BD-061's invariant checking depends
+    on predictable plugin ordering to catch corruption at known stages. In raw mode, invariants may run
+    on incompletely-transformed entries, missing corruption that standard mode would catch.
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-096
+  type: BA
+  content: 'RISK CASCADE: Proceeds negation error → weighted accumulation wrong → per-currency pass →
+    false validation pass'
+  rationale: BD-068 negates units for proceeds calculation. If the negation is wrong (especially for short
+    positions with negative units), BD-073's weighted accumulation produces incorrect proceeds totals.
+    BD-070's per-currency validation may still pass due to BD-026's tolerance and BD-071's absolute difference
+    check, allowing incorrect gain/loss to be recorded. This cascade hides calculation errors behind tolerance
+    mechanisms.
+  evidence: N/A:0(see_rationale)
+  stage: global
+- id: BD-GAP-001
+  type: BA
+  content: Google Drive API with service account authentication is used instead of OAuth user flow for
+    document downloads
+  rationale: 'Service accounts enable unattended/scripted access to Google Drive without user interaction
+    or token refresh complexity. BOUNDARY: Fails when the service account lacks domain-wide delegation
+    authority in GSuite environments.'
+  evidence: experiments/docs_rst/download_docs.py:88(get_auth_via_service_account)
+  stage: Infrastructure
+  alternative_considered: OAuth2 user flow was considered but requires browser interaction and token refresh
+    handling
+- id: BD-GAP-002
+  type: B/DK
+  content: MIME type parameter controls which document formats are downloaded from Google Drive
+  rationale: 'Filtering by MIME type allows selective downloading of specific formats (DOCX, PDF, etc.)
+    rather than fetching each available formats. BOUNDARY: Breaks if Google changes MIME type identifiers
+    or adds new format variants.'
+  evidence: experiments/docs_rst/download_docs.py:32(download_doc)
+  stage: Data Filtering
+  alternative_considered: Downloading each formats and filtering locally was rejected to reduce bandwidth
+    and storage
+- id: BD-GAP-003
+  type: T
+  content: reStructuredText (RST) is the target format for documentation conversion, not Markdown
+  rationale: 'RST is chosen for Sphinx documentation compatibility and finer-grained control over formatting
+    directives. BOUNDARY: Breaks for users who prefer Markdown or need HTML output directly.'
+  evidence: experiments/docs_rst/convert_docs.py:46(ConvertToRst)
+  stage: Format Selection
+  alternative_considered: Markdown was considered but offers less control for Sphinx-specific directives
+- id: BD-GAP-004
+  type: B
+  content: Block-based document processing preserves blockquotes during DOCX-to-RST conversion
+  rationale: 'Separating blocks as distinct processing units allows blockquotes to be identified and preserved
+    with their semantic meaning. BOUNDARY: Short blocks that aren''t actually blockquotes may still be
+    captured.'
+  evidence: experiments/docs_rst/convert_docs.py:55(GetDocxBlocks)
+  stage: Document Processing
+  alternative_considered: Line-by-line processing was rejected as it loses block structure information
+- id: BD-GAP-005
+  type: B
+  content: threading.local storage is used to save function call returns during regexp matching
+  rationale: 'Thread-local storage allows saving intermediate results without polluting global state,
+    important for multi-threaded document processing. BOUNDARY: Breaks in async/greenlet contexts where
+    threading.local doesn''t isolate state.'
+  evidence: experiments/docs_rst/convert_docs.py:20(_Save)
+  stage: Concurrency
+  alternative_considered: Passing state through function parameters was rejected as it would require signature
+    changes
+- id: BD-GAP-006
+  type: B/DK
+  content: File-based caching is used for Google Drive API responses to avoid repeated downloads
+  rationale: 'Caching remote API responses locally reduces API quota usage and network latency for repeated
+    accesses. BOUNDARY: Cache invalidation is manual/never, so stale data persists until cache deletion.'
+  evidence: experiments/docs_rst/old/docs.py:28(Cache.__init__)
+  stage: Caching
+  alternative_considered: In-memory caching with TTL was rejected for persistence across script invocations
+- id: BD-GAP-007
+  type: T
+  content: Index document discovery pattern uses a known index document to find each linked documentation
+  rationale: 'Centralized index document serves as the single source of truth for what documents exist
+    and their locations. BOUNDARY: Fails if the index document is deleted, moved, or has permission changes.'
+  evidence: experiments/docs_rst/old/docs.py:71(find_index_document)
+  stage: Architecture
+  alternative_considered: Recursive folder scanning was rejected for simplicity and control over what
+    gets included
+- id: BD-GAP-008
+  type: B
+  content: Dual VCS support (Git AND Mercurial) for extracting file modification years in copyright update
+  rationale: 'Supporting both Git and Mercurial accommodates projects using either VCS, likely due to
+    historical migration. BOUNDARY: Both functions exist but only one is called based on environment.'
+  evidence: tools/update_copyright.py:69(get_change_years_hg)
+  stage: Compatibility
+  alternative_considered: Only supporting Git was rejected for backward compatibility with existing Mercurial
+    users
+- id: BD-GAP-009
+  type: T
+  content: Year compression transforms sequential years into interval notation (2018-2020) in copyright
+    notices
+  rationale: 'Compressed format is standard convention for copyright notices and reduces line length.
+    BOUNDARY: Breaks for non-contiguous year ranges that should remain uncompressed.'
+  evidence: tools/update_copyright.py:104(compress_years)
+  stage: Formatting
+  alternative_considered: Uncompressed year lists were rejected as they violate copyright notice conventions
+- id: BD-GAP-010
+  type: T
+  content: Google Docs is used as the storage mechanism for configuration options
+  rationale: 'Storing options in Google Docs enables non-technical users to edit configuration through
+    a familiar interface with version history. BOUNDARY: Fails when Google API is unavailable or quota
+    is exceeded.'
+  evidence: tools/update_options.py:27(replace_gdocs_document)
+  stage: Configuration
+  alternative_considered: YAML/JSON config files were rejected for lack of collaborative editing features
+- id: BD-GAP-011
+  type: B
+  content: Redirect file pattern is used to lookup Google Doc IDs dynamically
+  rationale: 'Indirection through a redirect file allows doc IDs to change without updating each references.
+    BOUNDARY: Breaks if the redirect file is missing, corrupted, or points to a deleted doc.'
+  evidence: tools/update_options.py:47(get_options_docid)
+  stage: Configuration
+  alternative_considered: Hardcoded doc IDs were rejected for lack of flexibility
+- id: BD-GAP-012
+  type: B
+  content: Benchmark execution is prevented when uncommitted local changes exist
+  rationale: 'Dirty working trees produce non-reproducible benchmark results, so changes must be committed
+    first. BOUNDARY: Untracked files don''t prevent execution, potentially allowing data files to affect
+    results.'
+  evidence: tools/benchmark.py:13(prevent_run_with_changes)
+  stage: Quality Assurance
+  alternative_considered: Stashing changes automatically was rejected to preserve user context
+- id: BD-GAP-013
+  type: B
+  content: Batch update API is used for transforming links in Google Docs
+  rationale: 'Batch updates reduce API calls and allow atomic operations vs individual requests. BOUNDARY:
+    Batch size limits may apply, requiring chunking for large document sets.'
+  evidence: tools/transform_links_in_docs.py:71(process_links)
+  stage: API Usage
+  alternative_considered: Individual API calls were rejected for efficiency
+- id: BD-GAP-014
+  type: B
+  content: Dry-run mode is supported for link transformations to preview changes before applying
+  rationale: 'Dry-run allows verification of transformation logic without side effects, preventing accidental
+    widespread changes. BOUNDARY: No rollback mechanism exists if dry-run passes but actual run fails
+    midway.'
+  evidence: tools/transform_links_in_docs.py:101(transform_links)
+  stage: Safety
+  alternative_considered: Transaction semantics were rejected as Google Docs API doesn't support them
+- id: BD-GAP-015
+  type: DK
+  content: Test completeness is determined by file existence rather than code coverage analysis
+  rationale: 'Simple file existence check is a lightweight heuristic that catches missing test files.
+    BOUNDARY: Existence doesn''t guarantee quality or coverage - empty test files pass.'
+  evidence: tools/find_missing_tests.py:45(is_complete)
+  stage: Quality
+  alternative_considered: Coverage analysis was rejected for complexity and runtime overhead
+- id: BD-GAP-016
+  type: B
+  content: Regexp-based file selection with ignore directories for copyright update operations
+  rationale: 'Regexp provides fine-grained control over which files are processed while ignore_dirs prevents
+    scanning unwanted directories. BOUNDARY: Regexp complexity can make patterns hard to maintain.'
+  evidence: tools/update_copyright.py:24(find_files)
+  stage: Filtering
+  alternative_considered: Hardcoded file lists were rejected for maintainability
+- id: BD-GAP-017
+  type: T
+  content: Pandoc is used as the DOCX-to-RST conversion engine
+  rationale: 'Pandoc is a mature, widely-used document converter that handles format translation. BOUNDARY:
+    Pandoc output requires post-processing to match project style conventions.'
+  evidence: experiments/docs_rst/convert_docs.py:172(PandocDocxToRst)
+  stage: Tooling
+  alternative_considered: Custom DOCX parser was rejected for development complexity
+- id: BD-GAP-018
+  type: DK
+  content: 'Missing: Timezone explicit annotation + UTC normalization'
+  rationale: 'Audit finding: missing: timezone explicit annotation + utc normalization. Identified by
+    audit checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: parsing
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-019
+  type: B
+  content: 'Missing: Provider Priority & Credential Isolation'
+  rationale: 'Audit finding: missing: provider priority & credential isolation. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: parsing
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-020
+  type: RC
+  content: 'Missing: Delinquency Definition (DPD 30/60/90)'
+  rationale: 'Audit finding: missing: delinquency definition (dpd 30/60/90). 4 | Collection Priority &
+    Compliance | N/A | Personal finance tool; not a collection system. This gap affects production reliability
+    and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: parsing
+  status: missing
+  known_gap: true
+  severity: high
+  impact: 4 | Collection Priority & Compliance | N/A | Personal finance tool; not a collection system
+known_use_cases:
+- id: UC-101
+  name: Beancount Test Utilities Framework
+  source: beancount/utils/test_utils.py
+  type: builtin_factor
+  business_problem: Provides reusable testing utilities for beancount test scripts including temporary
+    directory management and test file creation for integration testing.
+  intent_keywords:
+  - testing utilities
+  - tempdir
+  - test files
+  - mock repository
+  - integration testing
+  stage: testing
+  negative_keywords:
+  - trading strategy
+  - screening
+  - live trading
+  - data pipeline
+  - monitoring
+  - reporting
+  disambiguation: Are you looking for reusable testing utilities for your beancount project, or are you
+    looking for a specific trading, screening, or data processing use case?
+  data_domain: internal
+- id: UC-102
+  name: Test Utils Validation Suite
+  source: beancount/utils/test_utils_test.py
+  type: builtin_factor
+  business_problem: Unit tests that validate the correctness of test utility functions including temporary
+    directory cleanup and test file generation for beancount test scripts.
+  intent_keywords:
+  - unit test
+  - validation
+  - test utilities
+  - tempdir cleanup
+  - test file generation
+  stage: testing
+  negative_keywords:
+  - trading signals
+  - portfolio screening
+  - data ingestion
+  - live execution
+  - performance reporting
+  disambiguation: Are you looking for test coverage of beancount utilities, or do you need a specific
+    trading, screening, or analytical use case?
+  data_domain: internal
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 51
+  evidence_invalid: 46
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.5257731958762887
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 4
+    warn: 8
+    fail: 4
+  subdomain_totals:
+    pass: 3
+    warn: 7
+    fail: 3
+  coverage: 29/29 (100%)
+  pass_rate: 7/29 (24%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: price_data_source
+  description: Choose based on frequency of price updates needed and whether you require automated data
+    fetching
+  used_in_stages: []
+  options:
+  - name: Manual Price Directives
+    traits:
+    - static
+    - self-contained
+    - version-controlled
+    fit_for:
+    - Small portfolios, rare transactions, non-tradeable assets
+    not_fit_for:
+    - Large portfolios with frequent trades requiring automated price updates
+  - name: Beanprice (external price fetcher)
+    traits:
+    - automated
+    - real-time
+    - plugin-based
+    fit_for:
+    - Users who need automated price fetching from external sources
+    not_fit_for:
+    - Offline environments, custom price sources not supported by beanprice
+  - name: beancount-prices (plugin)
+    traits:
+    - automated
+    - historical
+    - plugin-based
+    fit_for:
+    - Users migrating from v2 who need existing price fetching plugins
+    not_fit_for:
+    - New v3 users (v3 removed built-in price fetching)
+  default: Manual Price Directives
+  _source: worker_resource
+- id: slot-002
+  name: ledger_storage_format
+  description: Choose based on security requirements and analysis needs
+  used_in_stages: []
+  options:
+  - name: Beancount Syntax (Plain Text)
+    traits:
+    - human-readable
+    - version-controlled
+    - diff-friendly
+    fit_for:
+    - Users who value transparency, version control, and manual editing
+    not_fit_for:
+    - Users who prefer GUI interfaces or encrypted storage
+  - name: Encrypted Beancount Files
+    traits:
+    - encrypted
+    - GPG-based
+    - secure
+    fit_for:
+    - Users with sensitive financial data who need encryption at rest
+    not_fit_for:
+    - Users who need multi-user access or cloud sync with encryption
+  - name: SQLite Database Export
+    traits:
+    - relational
+    - queryable
+    - analytical
+    fit_for:
+    - Users who need SQL-based analysis, complex queries, or integration with BI tools
+    not_fit_for:
+    - Daily transaction entry, version control scenarios
+  default: Beancount Syntax (Plain Text)
+  _source: worker_resource
+- id: slot-003
+  name: cli_framework
+  description: Choose based on interface preference (CLI vs web)
+  used_in_stages: []
+  options:
+  - name: Built-in Click CLI
+    traits:
+    - included
+    - simple
+    - sufficient
+    fit_for:
+    - Most users; provides bean-check, bean-doctor, bean-example, bean-format
+    not_fit_for:
+    - Users who need extensive customization or additional commands
+  - name: Third-party CLI Tools
+    traits:
+    - web-based
+    - visualization
+    - extended features
+    fit_for:
+    - Users who prefer web interfaces over command-line
+    not_fit_for:
+    - Terminal-only environments, minimal installation preferences
+  default: Built-in Click CLI
+  _source: worker_resource
+- id: slot-004
+  name: documentation_source
+  description: Choose based on need for authoritative source vs. accessibility
+  used_in_stages: []
+  options:
+  - name: Google Docs (Official Source)
+    traits:
+    - official
+    - authoritative
+    - requires access
+    fit_for:
+    - Contributors and users who need the latest official documentation
+    not_fit_for:
+    - Offline use, reproducible builds
+  - name: Repository-hosted Markdown
+    traits:
+    - offline-capable
+    - version-controlled
+    - reproducible
+    fit_for:
+    - Users who prefer local documentation, reproducible builds
+    not_fit_for:
+    - Users who want the absolute latest updates from authors
+  - name: beancount.github.io (Published Site)
+    traits:
+    - published
+    - stable
+    - accessible
+    fit_for:
+    - End users seeking documentation
+    not_fit_for:
+    - Contributors or those needing source references
+  default: beancount.github.io (Published Site)
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: Beancount Input Files (.beancount)
+  description: 'Text-based double-entry accounting ledger (custom Beancount syntax). Coverage: N/A. Auth:
+    None (local filesystem)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: Include Directives
+  description: 'Modular ledger files that are recursively included. Coverage: N/A. Auth: None'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: Price Directives
+  description: 'Historical exchange rates and commodity prices. Coverage: N/A. Auth: None'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: Document Files (External)
+  description: 'Supporting documents (PDFs, images) associated with transactions. Coverage: N/A. Auth:
+    None'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: Plugin Configuration
+  description: 'External Python modules for extended functionality. Coverage: N/A. Auth: None (local modules
+    or pip packages)'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: Pickle Cache Files
+  description: 'Cached parsed ledger data for faster reloading. Coverage: N/A. Auth: None'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: Google Drive API
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-008
+  type: external_service
+  name: Google Docs API
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-009
+  type: external_service
+  name: SQLite Database
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-010
+  type: external_service
+  name: Beancount Cache Directory
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: python_package
+  name: click >=7.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: python_package
+  name: python-dateutil >=2.6.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: python_package
+  name: regex >=2022.9.13
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-014
+  type: python_package
+  name: flex / winflexbison-bin >=2.6.4
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-015
+  type: python_package
+  name: bison-bin / winflexbison-bin >=3.8.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: python_package
+  name: meson >=1.2.1
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-017
+  type: python_package
+  name: meson-python >=0.14.0
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-018
+  type: python_package
+  name: pytest
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-019
+  type: python_package
+  name: mypy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-020
+  type: python_package
+  name: types-python-dateutil
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-021
+  type: code_example
+  name: Beancount Test Utilities Framework
+  path: beancount/utils/test_utils.py
+  description: Provides reusable testing utilities for beancount test scripts including temporary directory
+    management and test file creation for integration testing.
+  used_in_stages:
+  - testing
+  _source: uc_list
+- id: res-022
+  type: code_example
+  name: Test Utils Validation Suite
+  path: beancount/utils/test_utils_test.py
+  description: Unit tests that validate the correctness of test utility functions including temporary
+    directory cleanup and test file generation for beancount test scripts.
+  used_in_stages:
+  - testing
+  _source: uc_list

@@ -1,0 +1,3265 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-095
+name: rotki
+sop_version: '3.6'
+source:
+  projects:
+  - rotki
+  commit_hash: 2af250d51b1ee555744d9a23bc48b60e85144179
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: Portfolio tracking, PnL accounting, and tax reporting for cryptocurrency assets
+  description: Privacy-focused, self-hosted portfolio manager that tracks crypto assets across exchanges
+    and blockchain networks, computes tax liabilities using configurable cost basis methods, and stores
+    each data encrypted locally.
+  prerequisites: Users should understand cryptocurrency basics (wallets, addresses, exchanges), have exchange
+    API credentials ready, and be comfortable with self-hosting software for data privacy.
+  not_suitable_for: Real-time trading execution, non-cryptocurrency asset tracking, users unwilling to
+    self-host, organizations requiring multi-user access control with audit trails
+  activation:
+    triggers:
+    - Starting new feature development in frontend or backend
+    - Adding new exchange or blockchain integration
+    - Adding new EVM protocol decoder
+    - Creating new frontend settings
+    - Reviewing pull requests
+    - Running development environment with pnpm dev
+    emphasis:
+    - 'Use ESPECIALLY when implementing new exchanges: must implement ExchangeInterface with authentication,
+      balance fetching, and trade/deposit retrieval (CLAUDE.md:§Exchange Addition)'
+    - 'Use ESPECIALLY when adding EVM decoders: prefer addresses_to_decoders() over generic decoding_rules()
+      for performance (AGENTS.md:§Decoder scope policy)'
+    - 'Use ESPECIALLY when handling EVM addresses: ALWAYS checksum using to_checksum_address() (CLAUDE.md:§Memories)'
+    - 'Use ESPECIALLY when reviewing code: follow systematic review process to avoid false positives (CLAUDE.md:§Code
+      Review Guidelines)'
+    anti_skip:
+    - Don't skip type checking even for simple changes - explicit TypeScript typing is mandatory (CLAUDE.md:§Explicit
+      TypeScript Typing Requirements)
+    - Don't skip gevent wrapper for backend tests - always use pytestgeventwrapper.py (CLAUDE.md:§Common
+      Issues)
+    - Don't skip lint fixes when touching files - leave code cleaner than found (CLAUDE.md:§Lint & Warning
+      Hygiene)
+    - Don't use string_to_evm_address() for checksummed addresses - it won't checksum the literal (CLAUDE.md:§Memories)
+stages:
+- id: api_layer
+  name: REST API Layer
+  order: 1
+  responsibility: Entry point for each frontend/client requests. Routes calls to appropriate services
+    and handles async task management via gevent greenlets. Acts as facade to core rotkehlchen functionality.
+  interface:
+    inputs:
+    - HTTP requests with JSON payloads
+    - WebSocket subscriptions
+    outputs:
+    - JSON responses
+    - WebSocket notifications
+    - CSV exports
+  required_methods:
+  - name: Rotkehlchen.query_async
+    description: Dispatches async queries to appropriate subsystem based on query type, returns task ID
+      for tracking
+    evidence: rotkehlchen/api/rest.py:399(_do_query_async)
+  - name: APIServer.start
+    description: Initializes Flask server with WebSocket support and begins listening for connections
+    evidence: rotkehlchen/api/server.py:27(APIServer)
+  - name: HistoryService.process_history
+    description: Triggers history processing for specified time range across each exchanges and chains
+    evidence: rotkehlchen/api/services/history.py:102(HistoryService)
+  key_behaviors:
+  - behavior: Greenlet-based async handling
+    description: Non-blocking I/O for exchange queries and blockchain calls without threading complexity;
+      gevent greenlets handle concurrent requests within single process
+    evidence: rotkehlchen/api/rest.py:399(_do_query_async)
+  - behavior: Decorator-based task tracking
+    description: Async operations tracked via _new_task_id decorator; frontend can poll for task completion
+      status
+    evidence: rotkehlchen/api/rest.py:354(_new_task_id)
+  - behavior: Service layer pattern
+    description: Business logic isolated in domain services (HistoryService, StatisticsService, etc.)
+      separate from HTTP handling
+    evidence: rotkehlchen/api/services/history.py:102(HistoryService)
+  replaceable_points:
+  - name: Exchange connectors
+    description: Plug in additional CEX adapters via ExchangeManager
+    options:
+    - name: kraken
+      traits:
+      - API key auth
+      - margin support
+      fit_for:
+      - General crypto trading
+      not_fit_for:
+      - High-frequency trading
+    - name: coinbase
+      traits:
+      - OAuth/API key
+      - coinbase pro
+      fit_for:
+      - US-based users
+      not_fit_for:
+      - Non-Coinbase exchanges
+    - name: binance
+      traits:
+      - API key auth
+      - spot/margin/futures
+      fit_for:
+      - Global users
+      - DeFi tracking
+      not_fit_for:
+      - US-regulated users
+    - name: bybit
+      traits:
+      - API key auth
+      - derivatives
+      fit_for:
+      - Derivatives traders
+      not_fit_for:
+      - Spot-only users
+    default: kraken
+  - name: Price oracles
+    description: Swap oracle implementations for price feeds
+    options:
+    - name: coingecko
+      traits:
+      - Free tier
+      - wide coverage
+      fit_for:
+      - Most users
+      not_fit_for:
+      - High-frequency queries
+    - name: cryptocompare
+      traits:
+      - Historical data
+      - API key
+      fit_for:
+      - Historical pricing
+      not_fit_for:
+      - Real-time accuracy
+    - name: uniswapv2
+      traits:
+      - DEX prices
+      - on-chain
+      fit_for:
+      - DeFi tokens
+      not_fit_for:
+      - CEX-only portfolios
+    - name: uniswapv3
+      traits:
+      - DEX prices
+      - concentrated liquidity
+      fit_for:
+      - Active DeFi users
+      not_fit_for:
+      - Token list filtering
+    default: coingecko
+  design_decisions:
+  - Greenlet-based async via gevent for concurrent API handling (rotkehlchen/api/rest.py:399) - Non-blocking
+    I/O for exchange queries and blockchain calls without threading complexity
+  - Service layer pattern separating API from business logic (rotkehlchen/api/services/history.py:102)
+    - Enables testability and single responsibility; each service handles one domain
+  - Decorator-based async task tracking via _new_task_id (rotkehlchen/api/rest.py:354) - Transparent async
+    operation tracking for long-running queries
+  acceptance_hints:
+  - API endpoints return JSON with 'result' and 'message' wrapper structure
+  - Async tasks return task IDs that can be polled for completion
+  - WebSocket connections receive progress updates during long-running operations
+- id: blockchain_data_collection
+  name: Blockchain Data Collection
+  order: 2
+  responsibility: Queries EVM chains and Solana for transactions, balances, and protocol-specific data.
+    Manages RPC node selection, retry logic, and rate limiting across multiple chains.
+  interface:
+    inputs:
+    - Tracked blockchain addresses
+    - Time ranges for queries
+    outputs:
+    - Raw transaction data
+    - Balance snapshots
+    - Decoded events
+  required_methods:
+  - name: ChainsAggregator.get_history
+    description: Fetches transaction history across each configured chains for given addresses and time
+      range
+    evidence: rotkehlchen/chain/aggregator.py:249(ChainsAggregator)
+  - name: EvmNodeInquirer.query
+    description: Low-level RPC query with automatic node failover and weighted selection
+    evidence: rotkehlchen/chain/evm/node_inquirer.py:469(_query)
+  - name: TaskManager._maybe_schedule
+    description: Schedules periodic blockchain data refresh based on configured intervals
+    evidence: rotkehlchen/tasks/manager.py:929(_schedule)
+  key_behaviors:
+  - behavior: Indexers-first strategy
+    description: Etherscan/Blockscout queried before RPC for historical transactions; RPC used for recent
+      data and contract calls. More reliable for historical data retrieval.
+    evidence: rotkehlchen/chain/evm/node_inquirer.py:1676(_get_indexers_in_order)
+  - behavior: Multicall batching
+    description: Multiple balance lookups aggregated into single RPC call via multicall contract; essential
+      for wallets with many tokens
+    evidence: rotkehlchen/chain/evm/node_inquirer.py:1032(multicall)
+  - behavior: Weighted RPC node selection
+    description: User-configurable node priorities with automatic failover; reduces single-point-of-failure
+    evidence: rotkehlchen/chain/evm/node_inquirer.py:469(_query)
+  replaceable_points:
+  - name: Chain-specific inquirers
+    description: Subclasses of EvmNodeInquirer for each EVM chain
+    options:
+    - name: EthereumInquirer
+      traits:
+      - Mainnet
+      - largest TVL
+      fit_for:
+      - ETH holders
+      not_fit_for:
+      - Layer 2 users
+    - name: OptimismInquirer
+      traits:
+      - Layer 2
+      - low fees
+      fit_for:
+      - L2 DeFi users
+      not_fit_for:
+      - Mainnet-only
+    - name: ArbitrumInquirer
+      traits:
+      - Layer 2
+      - Ethereum bridge
+      fit_for:
+      - Arbitrum DeFi
+      not_fit_for:
+      - Solana tokens
+    - name: PolygonInquirer
+      traits:
+      - POS chain
+      - EVM compatible
+      fit_for:
+      - Polygon ecosystem
+      not_fit_for:
+      - ZK rollup users
+    default: EthereumInquirer
+  - name: Indexer providers
+    description: Replaceable indexer implementations for transaction lookup
+    options:
+    - name: etherscan
+      traits:
+      - Free API
+      - widely used
+      fit_for:
+      - Basic users
+      not_fit_for:
+      - High volume
+    - name: blockscout
+      traits:
+      - Open source
+      - self-hostable
+      fit_for:
+      - Privacy users
+      not_fit_for:
+      - Every chains
+    - name: routescan
+      traits:
+      - Optimism/Base
+      fit_for:
+      - L2 users
+      not_fit_for:
+      - Ethereum mainnet
+    default: etherscan
+  design_decisions:
+  - Indexers-first strategy with RPC fallback for transaction queries (rotkehlchen/chain/evm/node_inquirer.py:1676)
+    - Etherscan/Blockscout are more reliable than direct RPC for historical txs; RPC used for recent data
+    and calls
+  - Multicall batching for balance queries to reduce RPC overhead (rotkehlchen/chain/evm/node_inquirer.py:1032)
+    - Single RPC call aggregates multiple balance lookups; essential for wallets with many tokens
+  - Weighted RPC node selection with automatic failover (rotkehlchen/chain/evm/node_inquirer.py:469) -
+    User-configurable node priorities ensure reliability and reduce single-point-of-failure
+  acceptance_hints:
+  - Transactions appear within configured chains after query completes
+  - Balance snapshots include each tracked tokens for addresses
+  - RPC errors trigger automatic failover to next configured node
+- id: transaction_decoding
+  name: Transaction Decoding
+  order: 3
+  responsibility: Transforms raw blockchain transactions into structured history events. Applies protocol-specific
+    decoders to interpret contract calls, swaps, transfers, and DeFi interactions.
+  interface:
+    inputs:
+    - Raw EVM transactions and logs
+    - Contract ABIs
+    outputs:
+    - Decoded HistoryBaseEntry events
+    - Event groupings (swaps, transfers, fees)
+  required_methods:
+  - name: EVMTransactionDecoder.decode_transactions
+    description: Main decoder orchestrator that decodes raw transactions into structured events using
+      protocol-specific decoders
+    evidence: rotkehlchen/chain/evm/decoding/decoder.py:177(EVMTransactionDecoder)
+  - name: EvmDecoderInterface.decode_event
+    description: Protocol-specific decoder that interprets contract calls for a particular DeFi protocol
+    evidence: rotkehlchen/chain/evm/decoding/interfaces.py:80(EvmDecoderInterface)
+  key_behaviors:
+  - behavior: Plug-and-play decoder architecture
+    description: Each DeFi protocol gets isolated decoder subclass; new protocols added without modifying
+      core decoder. EvmDecoderInterface provides abstract base.
+    evidence: rotkehlchen/chain/evm/decoding/interfaces.py:80(EvmDecoderInterface)
+  - behavior: Topic-based rule matching
+    description: Decoder rules triggered by log topics, not transaction hashes. Handles internal contract
+      calls and nested interactions.
+    evidence: rotkehlchen/chain/evm/decoding/decoder.py:417(try_all_rules)
+  - behavior: Reloadable decoder mixin
+    description: Protocols with dynamic data (pools, gauges) auto-invalidate cache when underlying data
+      changes. Applied to Curve, Balancer decoders.
+    evidence: rotkehlchen/chain/evm/decoding/interfaces.py:504(ReloadablePoolsAndGaugesDecoderMixin)
+  replaceable_points:
+  - name: Protocol decoders
+    description: Per-protocol event interpretation logic
+    options:
+    - name: uniswap
+      traits:
+      - DEX
+      - V2/V3
+      fit_for:
+      - Uniswap traders
+      not_fit_for:
+      - Balancer users
+    - name: curve
+      traits:
+      - StableSwap
+      - pool tracking
+      fit_for:
+      - Curve LP users
+      not_fit_for:
+      - Uniswap traders
+    - name: aave
+      traits:
+      - Lending
+      - borrow/lend
+      fit_for:
+      - Aave users
+      not_fit_for:
+      - DEX traders
+    - name: balancer
+      traits:
+      - Weighted pools
+      fit_for:
+      - Balancer LP
+      not_fit_for:
+      - Curve users
+    - name: 1inch
+      traits:
+      - Aggregator
+      fit_for:
+      - 1inch users
+      not_fit_for:
+      - Direct DEX
+    - name: yearn
+      traits:
+      - Vaults
+      - strategy tracking
+      fit_for:
+      - Yearn vault users
+      not_fit_for:
+      - Uniswap only
+    default: uniswap
+  - name: Decoding rule priority
+    description: Order in which decoders attempt matching
+    options:
+    - name: generic_transfer
+      traits:
+      - First
+      - ERC20 handling
+      fit_for:
+      - Standard transfers
+      not_fit_for:
+      - Protocol-specific
+    - name: erc20_transfer
+      traits:
+      - Token standard
+      fit_for:
+      - Token movement
+      not_fit_for:
+      - Native assets
+    - name: protocol_specific
+      traits:
+      - Last
+      - special handling
+      fit_for:
+      - Complex DeFi
+      not_fit_for:
+      - Simple transfers
+    default: generic_transfer
+  design_decisions:
+  - Plug-and-play decoder architecture via protocol-specific subclasses (rotkehlchen/chain/evm/decoding/interfaces.py:80)
+    - Each DeFi protocol gets isolated decoder; new protocols added without modifying core decoder
+  - Event rules triggered by log topics, not transaction hashes (rotkehlchen/chain/evm/decoding/decoder.py:417)
+    - Topic-based matching handles internal contract calls; hash-based would miss nested interactions
+  - Reloadable decoder mixin for protocols with dynamic data (rotkehlchen/chain/evm/decoding/interfaces.py:504)
+    - Curve, Balancer pools change over time; cache invalidation handled automatically
+  acceptance_hints:
+  - Raw transactions become grouped events with recognized protocol labels
+  - Unknown contract calls marked as 'UNKNOWN' with raw hex data preserved
+  - Swaps decoded as paired events (SPEND + RECEIVE) with fees identified
+- id: exchange_integration
+  name: Exchange Integration
+  order: 4
+  responsibility: Connects to centralized exchanges (CEX) to fetch trades, deposits, withdrawals, and
+    balances. Normalizes heterogeneous exchange APIs into unified HistoryBaseEntry events.
+  interface:
+    inputs:
+    - Exchange API credentials
+    - Query time ranges
+    outputs:
+    - Normalized HistoryEvent records
+    - AssetBalance snapshots
+  required_methods:
+  - name: ExchangeManager.get_exchange
+    description: Factory method that creates and returns exchange instance based on Location enum
+    evidence: rotkehlchen/exchanges/manager.py:58(get_exchange)
+  - name: ExchangeInterface.query_trades
+    description: Fetches trade history from exchange API and normalizes to HistoryBaseEntry format
+    evidence: rotkehlchen/exchanges/exchange.py:509(ExchangeInterface)
+  key_behaviors:
+  - behavior: Location-based exchange identification
+    description: Same exchange name can exist on different instances (Binance vs BinanceUS). Location
+      enum ensures uniqueness.
+    evidence: rotkehlchen/exchanges/manager.py:58(get_exchange)
+  - behavior: Recovering session wrapper
+    description: RecoveringExchangeSession handles keep-alive disconnects with automatic retry; reduces
+      false failures from temporary network issues
+    evidence: rotkehlchen/exchanges/exchange.py:53(RecoveringExchangeSession)
+  - behavior: ExchangeWithExtras pattern
+    description: Exchanges with optional settings (Kraken margin, Binance markets) use separate class
+      to avoid optional parameter bloat
+    evidence: rotkehlchen/exchanges/exchange.py:155(ExchangeWithExtras)
+  replaceable_points:
+  - name: Exchange implementations
+    description: Per-exchange API adapters
+    options:
+    - name: kraken
+      traits:
+      - OAuth
+      - margin accounts
+      fit_for:
+      - General traders
+      not_fit_for:
+      - High-frequency
+    - name: coinbase
+      traits:
+      - REST + advanced
+      fit_for:
+      - US users
+      not_fit_for:
+      - Non-USD pairs
+    - name: binance
+      traits:
+      - Spot/margin/futures
+      fit_for:
+      - Global DeFi
+      not_fit_for:
+      - US users
+    - name: bitstamp
+      traits:
+      - EU regulated
+      fit_for:
+      - European users
+      not_fit_for:
+      - US users
+    - name: bybit
+      traits:
+      - Derivatives focus
+      fit_for:
+      - Perpetual traders
+      not_fit_for:
+      - Spot-only
+    - name: okx
+      traits:
+      - Global exchange
+      fit_for:
+      - Asian markets
+      not_fit_for:
+      - US regulated
+    - name: kucoin
+      traits:
+      - Wide altcoin list
+      fit_for:
+      - Altcoin traders
+      not_fit_for:
+      - Binance users
+    default: kraken
+  design_decisions:
+  - Location-based exchange identification (name + Location enum) (rotkehlchen/exchanges/manager.py:58)
+    - Same exchange name can exist on different instances (e.g., Binance vs BinanceUS)
+  - Recovering session wrapper for flaky exchange connections (rotkehlchen/exchanges/exchange.py:53) -
+    Keep-alive disconnects are common; single retry before raising error reduces false failures
+  - Separation of ExchangeWithExtras for exchanges with extra settings (rotkehlchen/exchanges/exchange.py:155)
+    - Kraken's margin accounts, Binance's markets are optional; cleaner interface than optional params
+  acceptance_hints:
+  - Trade events match exchange order IDs when compared manually
+  - Deposits and withdrawals have matching on-chain transactions
+  - Balance snapshots reconcile with sum of trades plus deposits minus withdrawals
+- id: history_event_management
+  name: History Event Management
+  order: 5
+  responsibility: Stores, retrieves, and groups history events from each sources (on-chain, exchange,
+    manual). Provides filtering, aggregation, and deduplication for event queries.
+  interface:
+    inputs:
+    - HistoryBaseEntry events
+    - Filter queries
+    outputs:
+    - Paginated event lists
+    - Event groupings
+    - CSV exports
+  required_methods:
+  - name: DBHistoryEvents.get_history_events
+    description: Retrieves history events from database with filtering, pagination, and grouping support
+    evidence: rotkehlchen/db/history_events.py:185(DBHistoryEvents)
+  - name: HistoryBaseEntry.get_event_direction
+    description: Classifies event as IN/OUT/NEUTRAL for accounting treatment determination
+    evidence: rotkehlchen/history/events/structures/base.py:46(get_event_direction)
+  key_behaviors:
+  - behavior: Group identifier + sequence index pairing
+    description: Swaps are 2 events (spend+receive), transfers have multiple legs; grouping enables correct
+      pairing and event association
+    evidence: rotkehlchen/history/events/structures/base.py:181(__init__)
+  - behavior: Event direction classification
+    description: IN events are acquisitions, OUT events are disposals, NEUTRAL for internal movements.
+      Determines accounting treatment.
+    evidence: rotkehlchen/history/events/structures/base.py:46(get_event_direction)
+  - behavior: Event modification tracking
+    description: User edits preserved with backup/restore capability; redecode can restore original decoded
+      state
+    evidence: rotkehlchen/db/history_events.py:406(save_history_event_backup)
+  replaceable_points:
+  - name: Event type mappings
+    description: Maps raw exchange/blockchain events to HistoryEventType
+    options:
+    - name: exchange_trade
+      traits:
+      - CEX trades
+      fit_for:
+      - Centralized exchanges
+      not_fit_for:
+      - DEX swaps
+    - name: evm_event
+      traits:
+      - On-chain events
+      fit_for:
+      - Blockchain transactions
+      not_fit_for:
+      - Manual entries
+    - name: solana_event
+      traits:
+      - Solana chain
+      fit_for:
+      - Solana DeFi
+      not_fit_for:
+      - Ethereum
+    default: exchange_trade
+  design_decisions:
+  - Group identifier + sequence index for event pairing (rotkehlchen/history/events/structures/base.py:181)
+    - Swaps are 2 events (spend+receive), transfers have multiple legs; grouping enables correct pairing
+  - 'Event direction classification (IN/OUT/NEUTRAL) (rotkehlchen/history/events/structures/base.py:46)
+    - Determines accounting treatment: IN events are acquisitions, OUT events are disposals'
+  - Event modification tracking with backup/restore (rotkehlchen/db/history_events.py:406) - User edits
+    preserved; redecode operations can restore original decoded state
+  acceptance_hints:
+  - Events can be filtered by asset, time range, location, and event type
+  - Event groupings reflect natural transaction relationships (swap = spend + receive)
+  - User modifications do not get overwritten by automatic re-decode without explicit action
+- id: accounting_pnl
+  name: Accounting & PnL Calculation
+  order: 6
+  responsibility: Computes profit and loss for tax reporting by processing history events in chronological
+    order. Applies cost basis methods, taxable/free区分, and generates CSV reports.
+  interface:
+    inputs:
+    - Sequence of HistoryBaseEntry events
+    - DBSettings (cost basis method, tax rules)
+    outputs:
+    - ProcessedAccountingEvent records
+    - PNL totals by asset and category
+    - CSV report files
+  required_methods:
+  - name: Accountant.process_history
+    description: Main accounting orchestrator that drives event processing and PnL calculation across
+      each events
+    evidence: rotkehlchen/accounting/accountant.py:41(Accountant)
+  - name: CostBasisCalculator.get_cost_basis
+    description: Calculates cost basis for given spend using selected method (FIFO/LIFO/HIFO/ACB) with
+      acquisition matching
+    evidence: rotkehlchen/accounting/cost_basis/base.py:577(CostBasisCalculator)
+  - name: AccountingPot.reset
+    description: Resets internal state (pnls, cost_basis, events_accountant) in correct cascade order
+      for fresh calculations
+    evidence: rotkehlchen/accounting/pot.py:134(reset)
+  key_behaviors:
+  - behavior: Heap-based acquisition tracking
+    description: Heapq maintains sorted order for FIFO/LIFO/HIFO without full re-sort. O(log n) insertion
+      and O(1) min/max access.
+    evidence: rotkehlchen/accounting/cost_basis/base.py:130(_acquisitions_heap)
+  - behavior: SWAP OUT must precede IN ordering
+    description: out_event always processed before in_event per _process_swap contract. Cost basis transfer
+      happens between paired events.
+    evidence: rotkehlchen/accounting/history_base_entries.py:199-204(_process_swap)
+  - behavior: Taxable/free区分 via cost_basis_pnl flag
+    description: Events can be fully taxable, partially free, or fully free based on holding period rules
+      (DEFAULT_TAXFREE_AFTER_PERIOD=1 year)
+    evidence: rotkehlchen/accounting/pot.py:219(add_out_event)
+  - behavior: Average cost basis running totals
+    description: ACB maintains current_amount and current_total_acb instead of per-lot heap; avoids repeated
+      division but loses lot granularity
+    evidence: rotkehlchen/accounting/cost_basis/base.py:356(__init__)
+  replaceable_points:
+  - name: Cost basis calculation method
+    description: Strategy for matching acquisitions to disposals
+    options:
+    - name: FIFO
+      traits:
+      - First-in-first-out
+      - default
+      fit_for:
+      - Most jurisdictions
+      not_fit_for:
+      - High-turnover portfolios
+    - name: LIFO
+      traits:
+      - Last-in-first-out
+      fit_for:
+      - Bear markets
+      not_fit_for:
+      - US tax (disallowed)
+    - name: HIFO
+      traits:
+      - Highest-in-first-out
+      fit_for:
+      - Tax minimization
+      not_fit_for:
+      - Some jurisdictions
+    - name: ACB
+      traits:
+      - Adjusted cost basis
+      - lot tracking
+      fit_for:
+      - Canadian/UK users
+      not_fit_for:
+      - Simple averaging
+    default: FIFO
+  - name: Accounting rules engine
+    description: Customizable event processing rules
+    options:
+    - name: default_rules
+      traits:
+      - Built-in rules
+      fit_for:
+      - Standard users
+      not_fit_for:
+      - Custom scenarios
+    - name: custom_rules
+      traits:
+      - User-defined
+      fit_for:
+      - Complex situations
+      not_fit_for:
+      - Simple accounting
+    default: default_rules
+  design_decisions:
+  - Heap-based acquisition tracking for efficient FIFO/LIFO/HIFO matching (rotkehlchen/accounting/cost_basis/base.py:130)
+    - Heapq maintains sorted order without full re-sort; O(log n) insertion and O(1) min/max access
+  - Separate cost basis methods via class inheritance strategy pattern (rotkehlchen/accounting/cost_basis/base.py:299-356)
+    - FIFO/LIFO/HIFO/Average have distinct algorithms; subclassing enables clean separation with shared
+    base
+  - Average cost basis maintains running totals instead of heap (rotkehlchen/accounting/cost_basis/base.py:356)
+    - ACB requires global average, not per-lot tracking; running totals avoid repeated division
+  - Taxable/free区分 via cost_basis_pnl flag on spend events (rotkehlchen/accounting/pot.py:219) - Events
+    can be fully taxable, partially free, or fully free based on holding period rules
+  - EventsAccountant handles SWAP and BASIS_TRANSFER pairing (rotkehlchen/accounting/history_base_entries.py:128)
+    - Swaps need paired events; ACB must transfer between assets preserving original cost basis
+  acceptance_hints:
+  - PnL totals sum to expected values when verified manually for simple trade scenarios
+  - Tax-free events are correctly identified based on holding period
+  - Swap acquisitions have taxable=False invariant maintained
+  - CSV export contains each expected columns with correct calculations
+- id: database_layer
+  name: Database Layer
+  order: 7
+  responsibility: Persistent storage for user data, settings, and cached information. SQLite with SQLCipher
+    encryption. Handles migrations, upgrades, and query optimization.
+  interface:
+    inputs:
+    - Write transactions
+    - Query filter objects
+    outputs:
+    - Typed result sets
+    - Cursor objects for iteration
+  required_methods:
+  - name: DBHandler.write
+    description: Executes write transaction with encryption; each mutations go through this interface
+    evidence: rotkehlchen/db/dbhandler.py:197(DBHandler)
+  - name: DBHandler.transient_write
+    description: Executes write in transient database that can be cleared independently of main user database
+    evidence: rotkehlchen/db/dbhandler.py:646(transient_write)
+  key_behaviors:
+  - behavior: SQLCipher encryption
+    description: Sensitive financial data requires at-rest encryption; key derived from user password.
+      Every data encrypted before writing.
+    evidence: rotkehlchen/db/dbhandler.py:198(__init__)
+  - behavior: Modification timestamp tracking
+    description: _mark_events_modified tracks when events change; enables selective cache invalidation
+      for history event queries
+    evidence: rotkehlchen/db/history_events.py:190(_mark_events_modified)
+  - behavior: Explicit cursor management
+    description: Database cursors must be closed or used in context manager; prevents resource leaks in
+      long-running server process
+    evidence: rotkehlchen/db/dbhandler.py:480(_connect)
+  replaceable_points:
+  - name: Database driver
+    description: SQLCipher with password-based encryption
+    options:
+    - name: sqlcipher3
+      traits:
+      - AES-256 encryption
+      - SQLite compatible
+      fit_for:
+      - Every users
+      not_fit_for:
+      - No encryption needed
+    default: sqlcipher3
+  design_decisions:
+  - SQLCipher encryption for user database (rotkehlchen/db/dbhandler.py:198) - Sensitive financial data
+    requires at-rest encryption; key derived from user password
+  - Modification timestamp tracking for cache invalidation (rotkehlchen/db/history_events.py:190) - Events
+    query cache can be selectively invalidated when underlying data changes
+  - Separate transient DB for temporary calculations (rotkehlchen/db/dbhandler.py:646) - Report calculations
+    don't pollute main user database; can be cleared independently
+  acceptance_hints:
+  - Database file is encrypted and unreadable without user password
+  - Migrations apply correctly when upgrading between versions
+  - Query results are consistent with written data
+- id: asset_registry
+  name: Asset Registry & Resolution
+  order: 8
+  responsibility: Central registry for each recognized assets (crypto, fiat, NFTs, custom). Handles resolution,
+    identification, and oracle mappings for price lookups.
+  interface:
+    inputs:
+    - Asset identifiers
+    - Resolution queries
+    outputs:
+    - Resolved Asset instances
+    - Oracle mappings
+    - Token metadata
+  required_methods:
+  - name: Asset.resolve
+    description: Resolves asset through potential chain of renames, merges, and wrapped token mappings
+      to canonical form
+    evidence: rotkehlchen/assets/asset.py:173(resolve)
+  - name: Asset.__init__
+    description: Creates immutable frozen Asset instance; hashable for use as dict keys
+    evidence: rotkehlchen/assets/asset.py:100(Asset)
+  key_behaviors:
+  - behavior: Frozen dataclass pattern
+    description: Asset instances are immutable and hashable after creation; enables use as dict keys and
+      prevents accidental mutation
+    evidence: rotkehlchen/assets/asset.py:100(Asset)
+  - behavior: Chain-specific token classes
+    description: EvmToken vs SolanaToken distinguish identical addresses on different chains. chain_id
+      field ensures uniqueness.
+    evidence: rotkehlchen/assets/asset.py:549(EvmToken)
+  - behavior: Wrapped token resolution
+    description: WETH resolves to ETH bucket for cost basis tracking. Asset resolution chains through
+      swapped_for for wrapped tokens.
+    evidence: rotkehlchen/assets/asset.py:233(resolve_swapped_for)
+  replaceable_points:
+  - name: Oracle mappings
+    description: Asset to price feed symbol mappings
+    options:
+    - name: coingecko_id
+      traits:
+      - Primary oracle
+      fit_for:
+      - Most tokens
+      not_fit_for:
+      - Small caps
+    - name: cryptocompare_symbol
+      traits:
+      - Alternative oracle
+      fit_for:
+      - Historical data
+      not_fit_for:
+      - New tokens
+    default: coingecko_id
+  design_decisions:
+  - Frozen dataclass pattern for immutable Asset instances (rotkehlchen/assets/asset.py:100) - Hashable
+    assets as dict keys; prevents accidental mutation after creation
+  - Chain-specific token classes (EvmToken, SolanaToken) (rotkehlchen/assets/asset.py:549) - Different
+    chains have different token standards; chain_id distinguishes identical addresses
+  - Asset resolution chain (identifier -> resolved_asset) (rotkehlchen/assets/asset.py:173) - Handles
+    renames, merges, wrapped tokens transparently; callers get canonical form
+  acceptance_hints:
+  - Same asset identifier resolves to identical Asset instance regardless of entry point
+  - Wrapped tokens (WETH) correctly map to base token (ETH) for cost basis
+  - Unknown tokens flagged as custom/spam with manual identification required
+data_flow:
+- from_stage: api_layer
+  to_stage: blockchain_data_collection
+  data: Address lists, time ranges, RPC node configs
+- from_stage: api_layer
+  to_stage: exchange_integration
+  data: Exchange credentials, query parameters
+- from_stage: blockchain_data_collection
+  to_stage: transaction_decoding
+  data: Raw transaction receipts and logs
+- from_stage: transaction_decoding
+  to_stage: history_event_management
+  data: Decoded HistoryBaseEntry events
+- from_stage: exchange_integration
+  to_stage: history_event_management
+  data: Normalized HistoryEvent records
+- from_stage: history_event_management
+  to_stage: accounting_pnl
+  data: Sequenced HistoryBaseEntry events
+- from_stage: accounting_pnl
+  to_stage: database_layer
+  data: ProcessedAccountingEvent records, PNL reports
+- from_stage: database_layer
+  to_stage: api_layer
+  data: Query results, cached data
+- from_stage: asset_registry
+  to_stage: accounting_pnl
+  data: Resolved Asset instances for cost basis tracking
+- from_stage: asset_registry
+  to_stage: blockchain_data_collection
+  data: Token metadata for balance queries
+global_contracts:
+- contract: Every history events use group_identifier + sequence_index for pairing (rotkehlchen/history/events/structures/base.py:181)
+  evidence: ''
+- contract: Timestamps stored as seconds in accounting, milliseconds in history events (rotkehlchen/history/events/structures/base.py:499)
+  evidence: ''
+- contract: Assets resolved through Asset.resolve() before use in calculations (rotkehlchen/assets/asset.py:173)
+  evidence: ''
+- contract: Event direction (IN/OUT/NEUTRAL) determines accounting treatment (rotkehlchen/history/events/structures/base.py:46)
+  evidence: ''
+- contract: Database cursors must be explicitly closed or used in context manager (rotkehlchen/db/dbhandler.py:480)
+  evidence: ''
+- contract: EVM events reference source transaction via tx_ref (bytes serialization) (rotkehlchen/history/events/structures/evm_event.py:37)
+  evidence: ''
+- contract: Swap OUT events always processed before IN events in accounting (rotkehlchen/accounting/history_base_entries.py:199)
+  evidence: ''
+- contract: 'Swap events sequence_index convention: SPEND=0, RECEIVE=1, FEE>=2 (rotkehlchen/history/events/structures/swap.py:86)'
+  evidence: ''
+- contract: 'AccountingPot.reset() must cascade: pnls→cost_basis→events_accountant (rotkehlchen/accounting/pot.py:134)'
+  evidence: ''
+- contract: WETH resolves to ETH bucket for cost basis (rotkehlchen/accounting/cost_basis/base.py:595)
+  evidence: ''
+- contract: DEFAULT_TAXFREE_AFTER_PERIOD=1 year for tax-free gains determination (rotkehlchen/db/settings.py:50)
+  evidence: ''
+- contract: DEFAULT_COST_BASIS_METHOD=FIFO; DEFAULT_INCLUDE_CRYPTO2CRYPTO=True (rotkehlchen/db/settings.py:69)
+  evidence: ''
+business_decisions:
+- id: BD-001
+  type: B/DK
+  content: Greenlet-based async via gevent for concurrent API handling
+  rationale: Greenlet-based concurrency enables non-blocking I/O for exchange queries and blockchain calls
+    without threading complexity. This approach avoids GIL contention while maintaining simple async semantics
+    within a single process, allowing thousands of concurrent requests with minimal memory overhead compared
+    to thread-per-request models.
+  evidence: rotkehlchen/api/rest.py:399(_do_query_async)
+  stage: api_layer
+  alternative_considered: Threading would add context-switch overhead; asyncio alone lacks true parallelism
+    for CPU-bound tasks in sync libraries
+- id: BD-002
+  type: B
+  content: Service layer pattern separating API from business logic
+  rationale: Service layer architecture isolates API endpoints from business logic, enabling independent
+    testability of each domain. Each service handles one bounded context (e.g., HistoryService), making
+    the codebase modular and allowing parallel development of different features without tight coupling.
+  evidence: rotkehlchen/api/services/history.py:102(HistoryService)
+  stage: api_layer
+  alternative_considered: Monolithic API handlers would create tight coupling between HTTP handling and
+    business logic
+- id: BD-003
+  type: BA
+  content: Decorator-based async task tracking via _new_task_id
+  rationale: Async task tracking via decorator enables transparent monitoring of long-running queries
+    without polluting business logic with instrumentation code. The _new_task_id mechanism provides a
+    clean abstraction for tracking task lifecycle, enabling features like progress reporting and cancellation.
+  evidence: rotkehlchen/api/rest.py:354(_new_task_id)
+  stage: api_layer
+  alternative_considered: Manual task tracking would require boilerplate in every async handler
+- id: BD-004
+  type: B
+  content: Indexers-first strategy with RPC fallback for transaction queries
+  rationale: Indexers-first approach prioritizes Etherscan/Blockscout APIs for historical transaction
+    queries because they provide more reliable and complete data than direct RPC calls, which may miss
+    internal transactions. RPC is used as fallback for recent data and contract calls where indexer latency
+    would be problematic.
+  evidence: rotkehlchen/chain/evm/node_inquirer.py:1676(_get_indexers_in_order)
+  stage: blockchain_data_collection
+  alternative_considered: RPC-only would miss internal transactions; pure indexer would lack real-time
+    data
+- id: BD-005
+  type: B
+  content: Multicall batching for balance queries to reduce RPC overhead
+  rationale: Multicall batching aggregates multiple balance lookups into a single RPC call, dramatically
+    reducing network overhead. For wallets with hundreds of tokens, this reduces RPC calls from hundreds
+    to one, enabling acceptable performance even with rate-limited public RPC endpoints.
+  evidence: rotkehlchen/chain/evm/node_inquirer.py:1032(multicall)
+  stage: blockchain_data_collection
+  alternative_considered: Individual calls would exhaust rate limits on wallets with many tokens
+- id: BD-006
+  type: B
+  content: Weighted RPC node selection with automatic failover
+  rationale: User-configurable node priorities ensure blockchain query reliability by distributing load
+    across multiple providers and automatically failing over when nodes become unavailable. This reduces
+    single-point-of-failure risk and improves query success rates for critical operations.
+  evidence: rotkehlchen/chain/evm/node_inquirer.py:469(_query)
+  stage: blockchain_data_collection
+  alternative_considered: Single RPC endpoint would create outage risk; random selection lacks user preference
+- id: BD-007
+  type: B
+  content: Plug-and-play decoder architecture via protocol-specific subclasses
+  rationale: Decoder interface architecture enables adding support for new DeFi protocols without modifying
+    core decoder logic. Each protocol gets an isolated decoder subclass, allowing independent versioning
+    and reducing regression risk when adding new protocol support.
+  evidence: rotkehlchen/chain/evm/decoding/interfaces.py:80(EvmDecoderInterface)
+  stage: transaction_decoding
+  alternative_considered: Monolithic decoder would require coordinated releases for protocol additions
+- id: BD-008
+  type: B
+  content: Event rules triggered by log topics, not transaction hashes
+  rationale: Topic-based event matching correctly captures internal contract calls that never appear in
+    transaction-level data. Hash-based matching would miss nested interactions like DEX swaps executed
+    via router contracts, leading to incomplete transaction history.
+  evidence: rotkehlchen/chain/evm/decoding/decoder.py:417(try_all_rules)
+  stage: transaction_decoding
+  alternative_considered: Hash-based matching would miss internal transactions from router contracts
+- id: BD-009
+  type: BA
+  content: Reloadable decoder mixin for protocols with dynamic data (pools, gauges)
+  rationale: Reloadable decoder mixin handles dynamic protocol data where pool/gauge addresses change
+    over time (e.g., Curve, Balancer). Automatic cache invalidation ensures decoders use current addresses,
+    preventing misattribution of transactions involving deprecated pools.
+  evidence: rotkehlchen/chain/evm/decoding/interfaces.py:504(ReloadablePoolsAndGaugesDecoderMixin)
+  stage: transaction_decoding
+  alternative_considered: Static decoding would fail on protocol upgrades and governance changes
+- id: BD-010
+  type: B/DK
+  content: Location-based exchange identification (name + Location enum)
+  rationale: Location enum disambiguates exchanges with identical names but different instances, such
+    as Binance vs BinanceUS or Coinbase vs CoinbasePro. Without this distinction, users with accounts
+    on multiple variants would have ambiguous balance queries and incorrect transaction matching.
+  evidence: rotkehlchen/exchanges/manager.py:58(get_exchange)
+  stage: exchange_integration
+  alternative_considered: Name-only matching would cause collisions for users with accounts on exchange
+    variants
+- id: BD-011
+  type: B/DK
+  content: Recovering session wrapper for flaky exchange connections
+  rationale: Recovering session wrapper handles keep-alive disconnections common in exchange APIs by performing
+    a single automatic retry before raising errors. This reduces false failure reports from transient
+    network issues while preventing infinite retry loops.
+  evidence: rotkehlchen/exchanges/exchange.py:53(RecoveringExchangeSession)
+  stage: exchange_integration
+  alternative_considered: No retry would cause unnecessary failures; infinite retry would hang
+- id: BD-012
+  type: BA/DK
+  content: Separation of ExchangeWithExtras for exchanges with extra settings
+  rationale: ExchangeWithExtras pattern cleanly handles optional exchange-specific features like Kraken
+    margin accounts or Binance markets without polluting the base interface with optional parameters.
+    This provides a clear separation between common exchange functionality and per-exchange extensions.
+  evidence: rotkehlchen/exchanges/exchange.py:155(ExchangeWithExtras)
+  stage: exchange_integration
+  alternative_considered: Optional parameters would require null checks throughout the codebase
+- id: BD-013
+  type: B
+  content: Group identifier + sequence index for event pairing
+  rationale: Group/sequence indexing enables correct pairing of multi-event transactions such as DEX swaps
+    (spend + receive events) and complex transfers with multiple legs. The grouping ensures events are
+    processed together and prevents misattribution between unrelated transactions.
+  evidence: rotkehlchen/history/events/structures/base.py:526(__init__)
+  stage: history_event_management
+  alternative_considered: Flat event list would lose transaction context and cause incorrect pairing
+- id: BD-014
+  type: B/RC
+  content: Event direction classification (IN/OUT/NEUTRAL)
+  rationale: 'Event direction classification determines accounting treatment: IN events represent acquisitions
+    (additions to holdings), OUT events represent disposals (potential taxable events), and NEUTRAL events
+    (like approvals) have no accounting impact. This distinction is fundamental to correct PnL calculation.'
+  evidence: rotkehlchen/history/events/structures/base.py:46(get_event_direction)
+  stage: history_event_management
+  alternative_considered: No direction classification would prevent distinguishing acquisitions from disposals
+- id: BD-015
+  type: BA
+  content: Event modification tracking with backup/restore
+  rationale: Event backup/restore mechanism preserves user modifications to decoded events while allowing
+    redecode operations to restore original state when needed. This supports the workflow where users
+    correct misdecoded events without losing the ability to regenerate from source data.
+  evidence: rotkehlchen/db/history_events.py:406(save_history_event_backup)
+  stage: history_event_management
+  alternative_considered: No backup would lose user corrections on redecode; immutable storage would prevent
+    corrections
+- id: BD-016
+  type: B
+  content: Heap-based acquisition tracking for efficient FIFO/LIFO/HIFO matching
+  rationale: Heapq-based acquisition tracking provides O(log n) insertion and O(1) min/max access for
+    cost basis matching. For portfolios with thousands of transactions, this enables performant FIFO/LIFO/HIFO
+    calculations without full re-sorting on each disposal event.
+  evidence: rotkehlchen/accounting/cost_basis/base.py:130(_acquisitions_heap)
+  stage: accounting_pnl
+  alternative_considered: List-based tracking would require O(n) sorting on each disposal
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _acquisitions_heap in rotkehlchen/accounting/cost_basis/base.py'
+- id: BD-017
+  type: B/BA
+  content: Separate cost basis methods via class inheritance strategy pattern
+  rationale: Strategy pattern via class inheritance cleanly separates FIFO, LIFO, HIFO, and Average cost
+    basis algorithms while sharing common logic in the base class. This enables user-selected calculation
+    methods without conditional branching and simplifies adding new methods.
+  evidence: rotkehlchen/accounting/cost_basis/base.py:299(_acquisitions_heap)
+  stage: accounting_pnl
+  alternative_considered: Conditional branching would create tangled logic; interface-based would lose
+    code reuse
+  _evidence_issues:
+  - 'FN_NOT_FOUND: _acquisitions_heap in rotkehlchen/accounting/cost_basis/base.py'
+- id: BD-018
+  type: B
+  content: Average cost basis maintains running totals instead of heap
+  rationale: Average Cost Basis (ACB) requires calculating global weighted average rather than per-lot
+    tracking. Running totals (total cost, total quantity) avoid repeated division operations and floating-point
+    accumulation errors inherent in maintaining a full lot history.
+  evidence: rotkehlchen/accounting/cost_basis/base.py:579(__init__)
+  stage: accounting_pnl
+  alternative_considered: Lot-level ACB tracking would require continuous averaging; heap is unnecessary
+- id: BD-019
+  type: BA/DK
+  content: Taxable/free区分 via cost_basis_pnl flag on spend events
+  rationale: cost_basis_pnl flag on spend events enables granular taxable event classification based on
+    holding period rules. Events can be fully taxable (short-term), partially tax-free (long-term portion),
+    or fully tax-free, supporting jurisdiction-specific tax treatment requirements.
+  evidence: rotkehlchen/accounting/pot.py:219(add_out_event)
+  stage: accounting_pnl
+  alternative_considered: Binary taxable flag would not support partial exemptions from holding periods
+- id: BD-020
+  type: B
+  content: EventsAccountant handles SWAP and BASIS_TRANSFER pairing
+  rationale: EventsAccountant pairing logic ensures SWAP events are correctly matched (spend to receive)
+    and BASIS_TRANSFER events preserve cost basis between assets during conversions. Without proper pairing,
+    swaps would show zero PnL incorrectly or double-count gains.
+  evidence: rotkehlchen/accounting/history_base_entries.py:51(process)
+  stage: accounting_pnl
+  alternative_considered: Unpaired processing would cause incorrect cost basis and PnL reporting
+- id: BD-021
+  type: B
+  content: SQLCipher encryption for user database
+  rationale: SQLCipher provides at-rest encryption for sensitive financial data including transaction
+    history, balances, and API keys. The encryption key is derived from the user's password, ensuring
+    that database files stolen from disk are unreadable without the user's credentials.
+  evidence: rotkehlchen/db/dbhandler.py:198(__init__)
+  stage: database_layer
+  alternative_considered: Unencrypted storage would expose each data if database file is accessed
+- id: BD-022
+  type: BA
+  content: Modification timestamp tracking for cache invalidation
+  rationale: Modification timestamps enable selective cache invalidation when events are edited, preventing
+    stale data while avoiding full cache rebuilds. This is essential for maintaining consistency between
+    cached query results and underlying event modifications.
+  evidence: rotkehlchen/db/history_events.py:190(_mark_events_modified)
+  stage: database_layer
+  alternative_considered: TTL-based invalidation would cause staleness; full rebuild would be expensive
+- id: BD-023
+  type: BA
+  content: Separate transient DB for temporary calculations
+  rationale: Transient database isolation keeps temporary calculation data (report intermediates, tax
+    calculations) separate from the main user database. This enables independent cleanup of calculation
+    artifacts and prevents bloat in the primary data store.
+  evidence: rotkehlchen/db/dbhandler.py:646(transient_write)
+  stage: database_layer
+  alternative_considered: Mixed storage would require complex cleanup; clearing would risk user data
+- id: BD-024
+  type: B
+  content: Frozen dataclass pattern for immutable Asset instances
+  rationale: Frozen dataclass pattern ensures Asset instances are immutable after creation, enabling safe
+    use as dictionary keys and set members. This prevents accidental mutation bugs where asset properties
+    could change after being added to collections.
+  evidence: rotkehlchen/assets/asset.py:100(Asset)
+  stage: asset_registry
+  alternative_considered: Mutable assets would break hash-based collections; manual copying would be error-prone
+- id: BD-025
+  type: B
+  content: Chain-specific token classes (EvmToken, SolanaToken)
+  rationale: Chain-specific token classes with chain_id discrimination handle the reality that token addresses
+    are not globally unique across blockchains. An ERC-20 token and a Solana SPL token may share the same
+    numeric address, requiring chain context for correct identification.
+  evidence: rotkehlchen/assets/asset.py:549(EvmToken)
+  stage: asset_registry
+  alternative_considered: Address-only identification would cause cross-chain token collisions
+- id: BD-026
+  type: BA
+  content: Asset resolution chain (identifier -> resolved_asset)
+  rationale: Multi-stage asset resolution handles token renames, mergers, and wrapped token migrations
+    transparently. Callers can use any recognized identifier while receiving the canonical asset form,
+    ensuring consistent treatment regardless of which identifier was originally used.
+  evidence: rotkehlchen/assets/asset.py:173(resolve)
+  stage: asset_registry
+  alternative_considered: Strict identifier matching would fail on deprecated names; ad-hoc resolution
+    would be inconsistent
+- id: BD-027
+  type: B/BA
+  content: Default cost basis method is FIFO (First-In-First-Out)
+  rationale: FIFO selected as standard cost basis calculation method per DEFAULT_COST_BASIS_METHOD constant.
+    This establishes predictable and consistent ordering for determining which acquisition lots are consumed
+    when assets are disposed, ensuring clear and auditable tax calculations. FIFO is the default assumption
+    for capital gains in most jurisdictions, particularly the US, simplifying compliance.
+  evidence: rotkehlchen/db/settings.py:69(DEFAULT_COST_BASIS_METHOD)
+  stage: accounting_pnl
+  alternative_considered: LIFO (Last-In-First-Out) which can inflate gains in rising markets; HIFO (Highest-In-First-Out)
+    which minimizes tax liability
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_COST_BASIS_METHOD in rotkehlchen/db/settings.py'
+- id: BD-028
+  type: B/RC
+  content: HOUR_IN_SECONDS = 3600 for caching/query intervals
+  rationale: Standardized hour constant at 3600 seconds used for caching intervals and query rate-limiting.
+    This boundary ensures consistent timing behavior across the application for data freshness and API
+    compliance.
+  evidence: rotkehlchen/constants/timing.py:12(HOUR_IN_SECONDS)
+  stage: accounting_pnl
+  alternative_considered: Variable or hardcoded values scattered throughout codebase
+  _evidence_issues:
+  - 'FN_NOT_FOUND: HOUR_IN_SECONDS in rotkehlchen/constants/timing.py'
+- id: BD-029
+  type: B/BA
+  content: YEAR_IN_SECONDS = 31536000 for tax-free holding period
+  rationale: Standardized year constant used to calculate tax-free holding periods per settings.taxfree_after_period.
+    This boundary determines when long-term capital gains rates apply versus short-term rates, impacting
+    tax calculation accuracy.
+  evidence: rotkehlchen/constants/timing.py:19(YEAR_IN_SECONDS)
+  stage: accounting_pnl
+  alternative_considered: Locale-specific year calculations or variable holding periods
+  _evidence_issues:
+  - 'FN_NOT_FOUND: YEAR_IN_SECONDS in rotkehlchen/constants/timing.py'
+- id: BD-030
+  type: B
+  content: FREE_PNL_EVENTS_LIMIT = 1000 events for free tier
+  rationale: Free tier capped at 1000 PnL events to create clear differentiation between free and premium
+    users. This boundary protects premium revenue model while allowing meaningful usage for casual users.
+  evidence: rotkehlchen/accounting/constants.py:12(FREE_PNL_EVENTS_LIMIT)
+  stage: accounting_pnl
+  alternative_considered: No limit (would eliminate premium differentiation); higher limit (would reduce
+    premium value)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: FREE_PNL_EVENTS_LIMIT in rotkehlchen/accounting/constants.py'
+- id: BD-031
+  type: B/BA
+  content: include_crypto2crypto defaults to True
+  rationale: Default setting treats crypto-to-crypto trades as taxable events. This conservative boundary
+    ensures tax compliance by default, requiring users to explicitly opt-out if their jurisdiction exempts
+    such trades.
+  evidence: rotkehlchen/db/settings.py:51(DEFAULT_INCLUDE_CRYPTO2CRYPTO)
+  stage: accounting_pnl
+  alternative_considered: Default False (safer but would require users to knowingly include taxable events)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_INCLUDE_CRYPTO2CRYPTO in rotkehlchen/db/settings.py'
+- id: BD-032
+  type: B/BA
+  content: calculate_past_cost_basis defaults to True
+  rationale: Past cost basis recalculation enabled by default to ensure accurate historical tax calculations.
+    This boundary handles retroactive acquisition tracking which is critical for tax accuracy when importing
+    historical data.
+  evidence: rotkehlchen/db/settings.py:61(DEFAULT_CALCULATE_PAST_COST_BASIS)
+  stage: accounting_pnl
+  alternative_considered: Default False (simpler but less accurate for users with historical trades)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_CALCULATE_PAST_COST_BASIS in rotkehlchen/db/settings.py'
+- id: BD-033
+  type: B/DK
+  content: Swaps are only taxable when receiving asset is fiat OR include_crypto2crypto is True
+  rationale: Taxability logic defines that swaps generate taxable events only when receiving fiat currency
+    or when user explicitly includes crypto2crypto trades. This boundary respects jurisdictional differences
+    in crypto swap taxation.
+  evidence: rotkehlchen/accounting/history_base_entries.py:233(module)
+  stage: accounting_pnl
+  alternative_considered: Every swaps always taxable; each swaps never taxable
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/history_base_entries.py'
+- id: BD-034
+  type: B/BA
+  content: Fee events can be optionally included in cost basis (include_fees_in_cost_basis default True)
+  rationale: Transaction fees included in cost basis by default, treating fees as part of acquisition
+    cost. This conservative boundary maximizes deductible amounts but may differ from some jurisdictional
+    requirements.
+  evidence: rotkehlchen/db/settings.py:72(DEFAULT_INCLUDE_FEES_IN_COST_BASIS)
+  stage: accounting_pnl
+  alternative_considered: Fees always separate deduction; fees never deductible
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_INCLUDE_FEES_IN_COST_BASIS in rotkehlchen/db/settings.py'
+- id: BD-035
+  type: B/DK
+  content: Fiat trades are never taxable (taxable=False for fiat)
+  rationale: Fiat currency exchanges explicitly excluded from taxable events regardless of other settings.
+    This boundary reflects that fiat trades are outside crypto tax jurisdiction and prevents double-taxation
+    concerns.
+  evidence: rotkehlchen/accounting/pot.py:259(module)
+  stage: accounting_pnl
+  alternative_considered: Treating fiat trades as taxable crypto events (incorrect)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/pot.py'
+- id: BD-036
+  type: B/RC
+  content: WETH mapped to ETH for cost basis tracking (same bucket)
+  rationale: WETH and ETH treated as the same asset for cost basis calculations. This boundary acknowledges
+    that Wrapped ETH is functionally identical to ETH and should share acquisition history for tax lot
+    tracking.
+  evidence: rotkehlchen/accounting/cost_basis/base.py:606-607(module)
+  stage: accounting_pnl
+  alternative_considered: Separate cost basis for WETH and ETH (would enable tax avoidance)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/cost_basis/base.py'
+- id: BD-037
+  type: B/BA
+  content: Asset collections can share cost basis (use_asset_collections_in_cost_basis default True)
+  rationale: Asset collections enabled by default, allowing functionally equivalent assets to share cost
+    basis pools. This boundary simplifies tracking for assets with 1:1 mappings while providing an opt-out
+    for users needing separate tracking.
+  evidence: rotkehlchen/db/settings.py:87(DEFAULT_USE_ASSET_COLLECTIONS_IN_COST_BASIS)
+  stage: accounting_pnl
+  alternative_considered: No asset collections (more granular but complex); force each mappings
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_USE_ASSET_COLLECTIONS_IN_COST_BASIS in rotkehlchen/db/settings.py'
+- id: BD-038
+  type: B/RC
+  content: 'Tax-free period calculated as: acquisition.timestamp + taxfree_after_period < spend.timestamp'
+  rationale: 'Tax-free holding period uses strict less-than comparison for boundary detection. This ensures
+    precise timing: an asset acquired at time T becomes tax-free only after full holding period elapses,
+    preventing edge-case disputes.'
+  evidence: rotkehlchen/accounting/cost_basis/base.py:201(module)
+  stage: accounting_pnl
+  alternative_considered: <= comparison (less conservative); rounding to day boundaries
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/cost_basis/base.py'
+- id: BD-039
+  type: B
+  content: Prefork assets (ETC, BCH, BSV) automatically created on ETH/BTC/BCH acquisitions
+  rationale: Fork assets automatically generated when parent chain acquisitions occur, reflecting that
+    holders received fork coins at fork time. This boundary ensures complete acquisition history matching
+    user holdings for accurate cost basis.
+  evidence: rotkehlchen/accounting/cost_basis/prefork.py:35-46(module)
+  stage: accounting_pnl
+  alternative_considered: Manual fork tracking only; automatic creation for each forks
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/cost_basis/prefork.py'
+- id: BD-040
+  type: B/RC
+  content: ETH_DAO_FORK_TS = 1469020840 (2016-07-20) triggers ETC prefork acquisition
+  rationale: Historical fork timestamp at block 1920000 marks Ethereum Classic creation. This specific
+    boundary ensures ETC acquisitions are credited to ETH holders at the correct historical moment for
+    cost basis tracking.
+  evidence: rotkehlchen/constants/timing.py:3(ETH_DAO_FORK_TS)
+  stage: accounting_pnl
+  alternative_considered: Approximate dates; user-defined fork times
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ETH_DAO_FORK_TS in rotkehlchen/constants/timing.py'
+- id: BD-041
+  type: B
+  content: BTC_BCH_FORK_TS = 1501593374 (2017-08-01) triggers BCH and BSV prefork
+  rationale: August 2017 fork at block 478558 marks Bitcoin Cash creation. This boundary also includes
+    BSV mapping since BSV later forked from BCH, ensuring both fork assets are properly attributed to
+    BTC holders.
+  evidence: rotkehlchen/constants/timing.py:4(BTC_BCH_FORK_TS)
+  stage: accounting_pnl
+  alternative_considered: Separate timestamps for BCH and BSV forks
+  _evidence_issues:
+  - 'FN_NOT_FOUND: BTC_BCH_FORK_TS in rotkehlchen/constants/timing.py'
+- id: BD-042
+  type: B
+  content: BCH_BSV_FORK_TS = 1542304352 (2018-11-15) triggers BSV prefork
+  rationale: November 2018 fork at block 556766 marks BSV creation from BCH chain. This boundary ensures
+    BSV acquisitions are credited to BCH holders at fork height for accurate cost basis attribution.
+  evidence: rotkehlchen/constants/timing.py:5(BCH_BSV_FORK_TS)
+  stage: accounting_pnl
+  alternative_considered: BSV considered separate from BCH fork tracking
+  _evidence_issues:
+  - 'FN_NOT_FOUND: BCH_BSV_FORK_TS in rotkehlchen/constants/timing.py'
+- id: BD-043
+  type: B/RC
+  content: Cost basis events require event_settings to determine accounting treatment
+  rationale: Each cost basis event must reference event_settings for proper accounting classification.
+    This boundary ensures no events are processed without explicit per-event tax treatment configuration.
+  evidence: rotkehlchen/accounting/history_base_entries.py:70-76(module)
+  stage: accounting_pnl
+  alternative_considered: Global defaults only; per-asset settings
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/history_base_entries.py'
+- id: BD-044
+  type: B
+  content: BASIS_TRANSFER treatment pairs OUT event with paired IN event for same transaction
+  rationale: Internal transfers use paired treatment linking out/in events of same transfer. This boundary
+    prevents double-counting and ensures cost basis moves with assets during internal account movements.
+  evidence: rotkehlchen/accounting/history_base_entries.py:90-126(module)
+  stage: accounting_pnl
+  alternative_considered: Treating as disposal/reacquisition (would create taxable events)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/history_base_entries.py'
+- id: BD-045
+  type: B/RC
+  content: SWAP treatment processes out_event, fee_events, then in_event in sequence
+  rationale: 'Sequential swap processing ensures proper ordering: first resolve outgoing asset, then fees,
+    finally incoming asset. This boundary prevents calculation order bugs affecting tax amounts.'
+  evidence: rotkehlchen/accounting/history_base_entries.py:200-204(module)
+  stage: accounting_pnl
+  alternative_considered: Parallel processing; reverse ordering
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/history_base_entries.py'
+- id: BD-046
+  type: B/RC
+  content: Fee taxability determined by taxable_amount_ratio = trade_taxable_amount / out_event.amount
+  rationale: Fee taxability proportionally calculated based on taxable portion of trade. This boundary
+    ensures fees on tax-free portions of trades don't create artificial taxable events.
+  evidence: rotkehlchen/accounting/history_base_entries.py:268-269(module)
+  stage: accounting_pnl
+  alternative_considered: Fees always fully taxable; fees never taxable
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/history_base_entries.py'
+- id: BD-047
+  type: B/BA
+  content: Ignored assets skip accounting processing entirely
+  rationale: Assets marked as ignored are completely excluded from each accounting calculations. This
+    boundary allows users to exclude assets they don't want tracked without deletion, providing privacy
+    and simplified reports.
+  evidence: rotkehlchen/accounting/accountant.py:298-304(module)
+  stage: accounting_pnl
+  alternative_considered: Process but hide; require deletion
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/accountant.py'
+- id: BD-048
+  type: B
+  content: Missing acquisitions tracked when spending more than available acquisitions
+  rationale: Spending events without matching acquisition records flagged for user review. This boundary
+    ensures users are notified of potentially incorrect cost basis rather than silently assuming zero
+    cost.
+  evidence: rotkehlchen/accounting/cost_basis/base.py:271-285(module)
+  stage: accounting_pnl
+  alternative_considered: Assume zero cost basis; block spending without acquisitions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/cost_basis/base.py'
+- id: BD-049
+  type: B
+  content: Missing prices tracked with rate_limited flag for user notification
+  rationale: Events lacking price data flagged with rate_limited status for user notification. This boundary
+    ensures users know when historical prices couldn't be retrieved, preventing silent calculation errors.
+  evidence: rotkehlchen/accounting/types.py:127-139(module)
+  stage: accounting_pnl
+  alternative_considered: Use zero price; use last available price
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/types.py'
+- id: BD-050
+  type: B/BA
+  content: PROCESSABLE_EVENTS_CACHE_SIZE = 1500 for LRU cache of event accounting rules
+  rationale: LRU cache bounded at 1500 entries for accounting rule lookups. This boundary balances memory
+    usage against repeated computation, ensuring performance for typical portfolios without excessive
+    memory consumption.
+  evidence: rotkehlchen/accounting/accountant.py:38(PROCESSABLE_EVENTS_CACHE_SIZE)
+  stage: accounting_pnl
+  alternative_considered: No caching (slower); unlimited cache (higher memory)
+  _evidence_issues:
+  - 'FN_NOT_FOUND: PROCESSABLE_EVENTS_CACHE_SIZE in rotkehlchen/accounting/accountant.py'
+- id: BD-051
+  type: B
+  content: Geen gevent.sleep(0.5) every 500 events to yield to other greenlets
+  rationale: Periodic yielding every 500 events prevents greenlet starvation in the async framework. This
+    boundary ensures accounting processing doesn't monopolize the event loop, maintaining application
+    responsiveness.
+  evidence: rotkehlchen/accounting/accountant.py:213-217(module)
+  stage: accounting_pnl
+  alternative_considered: No yielding (would block other tasks); more frequent yielding
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/accountant.py'
+- id: BD-052
+  type: B
+  content: AccountingPot allows is_dummy_pot=True for rule checking without persistence
+  rationale: Dummy pot mode enables testing accounting rules without database persistence. This boundary
+    allows dry-run scenarios and rule validation without side effects, critical for preview functionality.
+  evidence: rotkehlchen/accounting/pot.py:51-66(module)
+  stage: accounting_pnl
+  alternative_considered: Always persist; no testing mode
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/pot.py'
+- id: BD-053
+  type: B/BA
+  content: Profit currency defaults to USD (A_USD)
+  rationale: USD set as default profit reporting currency, leveraging its status as primary cryptocurrency
+    pair. This boundary provides immediate useful reports for majority of users while allowing multi-currency
+    selection.
+  evidence: rotkehlchen/db/settings.py:56(DEFAULT_MAIN_CURRENCY)
+  stage: accounting_pnl
+  alternative_considered: EUR default (less universal); no default requiring explicit selection
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_MAIN_CURRENCY in rotkehlchen/db/settings.py'
+- id: BD-054
+  type: B
+  content: CSV export uses SUMIF formulas when pnl_csv_with_formulas=True
+  rationale: Excel SUMIF formulas generated in CSV export for dynamic recalculation. This boundary enables
+    users to modify source data in spreadsheets while preserving automatic totals, improving auditability.
+  evidence: rotkehlchen/accounting/export/csv.py:139-142(module)
+  stage: accounting_pnl
+  alternative_considered: Static values only; no formulas
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/export/csv.py'
+- id: BD-055
+  type: B/BA
+  content: CSV_INDEX_OFFSET = 2 accounts for title row and 1-based counting in Excel
+  rationale: Offset of 2 accounts for CSV row 1 as title and Excel's 1-based row numbering in formulas.
+    This boundary ensures SUMIF formulas correctly reference data ranges accounting for header and Excel
+    conventions.
+  evidence: rotkehlchen/accounting/export/csv.py:46(CSV_INDEX_OFFSET)
+  stage: accounting_pnl
+  alternative_considered: No offset; 0-based counting
+  _evidence_issues:
+  - 'FN_NOT_FOUND: CSV_INDEX_OFFSET in rotkehlchen/accounting/export/csv.py'
+- id: BD-056
+  type: B
+  content: CostBasisInfo.is_complete=False when spend amount exceeds found acquisitions
+  rationale: Incomplete flag set when disposal amount exceeds available acquisition lots. This boundary
+    signals missing acquisition data rather than silently proceeding with partial cost basis.
+  evidence: rotkehlchen/accounting/cost_basis/base.py:270-285(module)
+  stage: accounting_pnl
+  alternative_considered: Proceed with partial basis; require complete acquisitions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/cost_basis/base.py'
+- id: BD-057
+  type: B
+  content: AssetAcquisitionEvent uses heap with priority for FIFO/LIFO/HIFO ordering
+  rationale: Heap data structure with priority queue implements each cost basis methods efficiently. This
+    boundary enables O(log n) insertion and extraction while supporting multiple ordering strategies.
+  evidence: rotkehlchen/accounting/cost_basis/base.py:105-124(module)
+  stage: accounting_pnl
+  alternative_considered: List-based (O(n) operations); sorted container
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/cost_basis/base.py'
+- id: BD-058
+  type: B
+  content: FIFO uses counter as priority (ascending); LIFO uses negated counter
+  rationale: FIFO orders oldest acquisitions first via ascending counter; LIFO reverses with negation.
+    This boundary provides mathematically consistent ordering for both methods using the same heap structure.
+  evidence: rotkehlchen/accounting/cost_basis/base.py:310,325(module)
+  stage: accounting_pnl
+  alternative_considered: Separate data structures per method; timestamp-based comparison
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/cost_basis/base.py'
+- id: BD-059
+  type: B/RC
+  content: HIFO uses negated acquisition rate as priority (highest rate first)
+  rationale: HIFO prioritizes highest-cost acquisitions first, minimizing taxable gains. This boundary
+    implements the tax-optimization strategy using rate-based heap priority.
+  evidence: rotkehlchen/accounting/cost_basis/base.py:339(module)
+  stage: accounting_pnl
+  alternative_considered: Lowest-in-first-out; random ordering
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/cost_basis/base.py'
+- id: BD-060
+  type: B
+  content: Average Cost Basis tracks current_amount and current_total_acb separately
+  rationale: Average method maintains running amount and adjusted cost basis (ACB) as separate fields.
+    This boundary enables precise per-disposal ACB calculation without recomputing from scratch.
+  evidence: rotkehlchen/accounting/cost_basis/base.py:358-363(module)
+  stage: accounting_pnl
+  alternative_considered: Recalculate ACB from transaction history each time
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/cost_basis/base.py'
+- id: BD-061
+  type: B
+  content: Average cost basis calculated BEFORE calling consume_result
+  rationale: ACB calculated prior to consume_result to ensure proper state updates after calculation.
+    This boundary prevents stale calculations from being committed to the consume operation.
+  evidence: rotkehlchen/accounting/cost_basis/base.py:442-446(module)
+  stage: accounting_pnl
+  alternative_considered: Calculate after; calculate in consume_result
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/cost_basis/base.py'
+- id: BD-062
+  type: B
+  content: Premium subscription enables unlimited PnL events (events_limit = -1)
+  rationale: Premium users receive unlimited event processing by setting limit to -1. This boundary creates
+    clear premium differentiation and removes free tier constraints for paying users.
+  evidence: rotkehlchen/accounting/accountant.py:136(module)
+  stage: accounting_pnl
+  alternative_considered: Higher but finite limit for premium; same limits for all
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/accountant.py'
+- id: BD-063
+  type: B
+  content: KFEE asset (MakerDAO fee token) exempt from cost basis PnL calculation
+  rationale: KFEE token excluded from PnL calculations as it's a fee payment mechanism rather than an
+    investment asset. This boundary prevents meaningless PnL tracking for non-speculative utility tokens.
+  evidence: rotkehlchen/accounting/pot.py:277-279(module)
+  stage: accounting_pnl
+  alternative_considered: Standard asset treatment; always zero value
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/pot.py'
+- id: BD-064
+  type: B/DK
+  content: Swap price calculation prefers out_price over in_price when both available
+  rationale: Outgoing asset price prioritized when both sides have price data. This boundary provides
+    consistent swap valuation and prevents ambiguity when prices slightly differ between exchange sides.
+  evidence: rotkehlchen/accounting/pot.py:428(module)
+  stage: accounting_pnl
+  alternative_considered: in_price preference; average of both; require exact match
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/accounting/pot.py'
+- id: BD-065
+  type: B/DK
+  content: Same-asset trades filtered out (spend == receive)
+  rationale: Trades where spend and receive assets are identical are filtered as meaningless. This boundary
+    prevents accounting for non-events and handles edge cases from exchange data quirks.
+  evidence: rotkehlchen/exchanges/coinbase.py:96(module)
+  stage: accounting_pnl
+  alternative_considered: Process as zero-PnL trades; require manual review
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/exchanges/coinbase.py'
+- id: BD-066
+  type: B/RC
+  content: Coinbase uses created_at, not payout_at for trade timestamps
+  rationale: Trade timing based on created_at timestamp rather than payout_at for Coinbase data. This
+    boundary ensures consistent timing aligned with when trades are recorded, not when funds arrive.
+  evidence: rotkehlchen/exchanges/coinbase.py:744-749(module)
+  stage: accounting_pnl
+  alternative_considered: payout_at (fund arrival); average of both
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/exchanges/coinbase.py'
+- id: BD-067
+  type: B/BA
+  content: Key Derivation Function iteration count set to 64000 for database encryption
+  rationale: KDF_ITER=64000 balances security against performance - too high degrades user experience
+    during unlock, too low weakens encryption against brute-force attacks. This value was chosen as minimum
+    viable security for SQLite local database encryption while maintaining acceptable unlock times on
+    typical hardware.
+  evidence: rotkehlchen/db/constants.py:7(KDF_ITER)
+  stage: rotkehlchen.db
+  alternative_considered: Higher values (100000+) would provide stronger security but unacceptable unlock
+    latency; lower values were rejected for insufficient protection
+  _evidence_issues:
+  - 'FN_NOT_FOUND: KDF_ITER in rotkehlchen/db/constants.py'
+- id: BD-068
+  type: B
+  content: SQLite variable chunk size set to 10000 for batch SQL operations
+  rationale: SQL_VARIABLE_CHUNK_SIZE=10000 limits variables per query to prevent SQLite parameter limits
+    being exceeded while maximizing batch efficiency. This prevents SQL too many variables errors during
+    large portfolio history queries while maintaining optimal transaction batching performance.
+  evidence: rotkehlchen/db/constants.py:56(SQL_VARIABLE_CHUNK_SIZE)
+  stage: rotkehlchen.db
+  alternative_considered: Lower values (1000-5000) would be safer but reduce batch efficiency; higher
+    values risk SQLite limits
+  _evidence_issues:
+  - 'FN_NOT_FOUND: SQL_VARIABLE_CHUNK_SIZE in rotkehlchen/db/constants.py'
+- id: BD-069
+  type: BA/DK
+  content: Default cost basis calculation method set to FIFO for taxable events
+  rationale: DEFAULT_COST_BASIS_METHOD=FIFO determines how taxable gains are calculated when matching
+    asset purchases to sales. FIFO (First-In-First-Out) is the default because it is accepted by most
+    tax jurisdictions globally and represents the most conservative interpretation. Users can override
+    this setting based on their local tax requirements.
+  evidence: rotkehlchen/db/settings.py:69(DEFAULT_COST_BASIS_METHOD)
+  stage: rotkehlchen.db.settings
+  alternative_considered: LIFO and HIFO methods available but require user configuration; tax authority
+    acceptance varies by jurisdiction
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_COST_BASIS_METHOD in rotkehlchen/db/settings.py'
+- id: BD-070
+  type: B/BA
+  content: Default tax-free holding period using YEAR_IN_SECONDS before gains become taxable
+  rationale: DEFAULT_TAXFREE_AFTER_PERIOD=YEAR_IN_SECONDS defines the holding duration after which assets
+    qualify for long-term capital gains treatment. This one-year threshold aligns with US tax rules but
+    may not match each jurisdictions. Setting a default ensures users receive reasonable tax advice until
+    they configure country-specific settings.
+  evidence: rotkehlchen/db/settings.py:50(DEFAULT_TAXFREE_AFTER_PERIOD)
+  stage: rotkehlchen.db.settings
+  alternative_considered: Shorter periods (e.g., 6 months) exist in some jurisdictions but would under-report
+    taxes in US; 1 year is conservative default
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_TAXFREE_AFTER_PERIOD in rotkehlchen/db/settings.py'
+- id: BD-071
+  type: B/BA
+  content: Default decimal places set to 2 for floating point values displayed in UI
+  rationale: DEFAULT_UI_FLOATING_PRECISION=2 balances readability against precision for fiat currency
+    display. Two decimal places match standard currency formatting and reduce visual noise while maintaining
+    sufficient accuracy for typical user actions. High-value assets (e.g., small-cap crypto) may require
+    more precision which users can configure.
+  evidence: rotkehlchen/db/settings.py:54(DEFAULT_UI_FLOATING_PRECISION)
+  stage: rotkehlchen.db.settings
+  alternative_considered: Higher precision (4-8 decimals) available for crypto-native users but creates
+    clutter for fiat; configurable per-asset
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_UI_FLOATING_PRECISION in rotkehlchen/db/settings.py'
+- id: BD-072
+  type: B/BA
+  content: Hours between automatic balance snapshots set to 24
+  rationale: DEFAULT_BALANCE_SAVE_FREQUENCY=24 captures account balances daily, providing sufficient granularity
+    for PnL calculations while minimizing database storage growth. Daily snapshots allow accurate profit/loss
+    reporting without excessive storage overhead from hourly captures.
+  evidence: rotkehlchen/db/settings.py:55(DEFAULT_BALANCE_SAVE_FREQUENCY)
+  stage: rotkehlchen.db.settings
+  alternative_considered: Hourly (1) would improve accuracy but increase storage 24x; weekly (168) would
+    reduce granularity too much
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_BALANCE_SAVE_FREQUENCY in rotkehlchen/db/settings.py'
+- id: BD-073
+  type: B/BA
+  content: HD wallet gap limit set to 20 for Bitcoin address discovery
+  rationale: DEFAULT_BTC_DERIVATION_GAP_LIMIT=20 balances discovery completeness against API calls and
+    response time. BIP44 gap limit of 20 stops address derivation after 20 consecutive unused addresses,
+    which handles most multi-transaction wallet patterns without indefinite scanning.
+  evidence: rotkehlchen/db/settings.py:60(DEFAULT_BTC_DERIVATION_GAP_LIMIT)
+  stage: rotkehlchen.db.settings
+  alternative_considered: Higher limits (50-100) increase completeness but multiply API calls; BIP44 standard
+    recommends 20
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_BTC_DERIVATION_GAP_LIMIT in rotkehlchen/db/settings.py'
+- id: BD-074
+  type: B/BA
+  content: Number of oracle query failures before applying penalty set to 5
+  rationale: DEFAULT_ORACLE_PENALTY_THRESHOLD_COUNT=5 tolerates transient network errors without penalizing
+    healthy oracles. Five failures before degradation balances resilience against preventing continued
+    use of malfunctioning data sources that return incorrect prices.
+  evidence: rotkehlchen/db/settings.py:77(DEFAULT_ORACLE_PENALTY_THRESHOLD_COUNT)
+  stage: rotkehlchen.db.settings
+  alternative_considered: Lower threshold (2-3) would penalize healthy oracles during brief outages; higher
+    threshold delays detection of bad data
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_ORACLE_PENALTY_THRESHOLD_COUNT in rotkehlchen/db/settings.py'
+- id: BD-075
+  type: B/BA
+  content: Seconds before oracle penalty is lifted set to 1800 (30 minutes)
+  rationale: DEFAULT_ORACLE_PENALTY_DURATION=1800 allows oracles a 30-minute recovery window before reactivation.
+    This duration accommodates typical infrastructure maintenance windows while not permanently excluding
+    temporarily degraded data sources from the price feed rotation.
+  evidence: rotkehlchen/db/settings.py:78(DEFAULT_ORACLE_PENALTY_DURATION)
+  stage: rotkehlchen.db.settings
+  alternative_considered: Shorter (5-10 min) risks re-enabling unstable oracles; longer (1+ hour) delays
+    recovery and reduces redundancy
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_ORACLE_PENALTY_DURATION in rotkehlchen/db/settings.py'
+- id: BD-076
+  type: B/BA
+  content: Tolerance for matching asset movements between exchanges set to 0.005
+  rationale: DEFAULT_ASSET_MOVEMENT_AMOUNT_TOLERANCE=0.005 accounts for rounding differences and small
+    fees during cross-exchange reconciliation. This tolerance prevents false positives in matching while
+    allowing legitimate small discrepancies that occur due to exchange-specific precision and fee structures.
+  evidence: rotkehlchen/db/settings.py:84(DEFAULT_ASSET_MOVEMENT_AMOUNT_TOLERANCE)
+  stage: rotkehlchen.db.settings
+  alternative_considered: Tighter tolerance (0.001) would cause mismatches for small transfers; looser
+    (0.01+) risks false positive matches
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_ASSET_MOVEMENT_AMOUNT_TOLERANCE in rotkehlchen/db/settings.py'
+- id: BD-077
+  type: B/BA
+  content: Time range for matching asset movements set to 20 hours
+  rationale: DEFAULT_ASSET_MOVEMENT_TIME_RANGE=20_HOURS accommodates timezone differences and processing
+    delays between exchange data sources. Manual transfers and certain exchange processing backlogs can
+    cause significant timing gaps that this window accommodates without excessive false positives.
+  evidence: rotkehlchen/db/settings.py:85(DEFAULT_ASSET_MOVEMENT_TIME_RANGE)
+  stage: rotkehlchen.db.settings
+  alternative_considered: Shorter window (1-6 hours) misses delayed exchanges; longer (24-48h) increases
+    false match risk
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_ASSET_MOVEMENT_TIME_RANGE in rotkehlchen/db/settings.py'
+- id: BD-078
+  type: B/BA
+  content: Maximum internal transactions to repull per cycle set to 100
+  rationale: DEFAULT_INTERNAL_TXS_TO_REPULL=100 limits per-cycle blockchain queries to prevent rate limiting
+    while ensuring eventual consistency. This batch size balances API efficiency against timely conflict
+    resolution for Ethereum internal transactions.
+  evidence: rotkehlchen/db/settings.py:88(DEFAULT_INTERNAL_TXS_TO_REPULL)
+  stage: rotkehlchen.db.settings
+  alternative_considered: Larger batches reduce round-trips but risk rate limits; smaller batches increase
+    overhead
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_INTERNAL_TXS_TO_REPULL in rotkehlchen/db/settings.py'
+- id: BD-079
+  type: B/BA
+  content: Seconds between repulling conflicting internal transactions set to 900 (15 minutes)
+  rationale: DEFAULT_INTERNAL_TX_CONFLICT_REPULL_FREQUENCY=900 provides a 15-minute retry window for blockchain
+    data conflicts. This accommodates block reorganizations and mempool timing issues that cause temporary
+    inconsistencies without hammering RPC endpoints.
+  evidence: rotkehlchen/db/settings.py:89(DEFAULT_INTERNAL_TX_CONFLICT_REPULL_FREQUENCY)
+  stage: rotkehlchen.db.settings
+  alternative_considered: Shorter (1-5 min) risks re-pulling before block confirmation; longer delays
+    conflict visibility
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_INTERNAL_TX_CONFLICT_REPULL_FREQUENCY in rotkehlchen/db/settings.py'
+- id: BD-080
+  type: B/BA
+  content: Chunk size for database backup uploads set to 10,000,000 bytes
+  rationale: UPLOAD_CHUNK_SIZE=10MB optimizes premium subscription backup uploads for typical broadband
+    connections while maintaining reasonable memory usage. This chunk size balances upload parallelism
+    efficiency against server timeout risks and client memory constraints.
+  evidence: rotkehlchen/premium/premium.py:158(UPLOAD_CHUNK_SIZE)
+  stage: rotkehlchen.premium
+  alternative_considered: Larger chunks (20-50MB) faster for fast connections but risk timeouts; smaller
+    chunks slower but more reliable
+  _evidence_issues:
+  - 'FN_NOT_FOUND: UPLOAD_CHUNK_SIZE in rotkehlchen/premium/premium.py'
+- id: BD-081
+  type: B
+  content: Maximum retry attempts for failed upload chunks set to 1
+  rationale: MAX_UPLOAD_CHUNK_RETRIES=1 prevents indefinite retry loops for permanently failing chunks
+    (e.g., corruption, network path issues). Single retry handles transient failures while preserving
+    user experience by failing fast on persistent problems.
+  evidence: rotkehlchen/premium/premium.py:159(MAX_UPLOAD_CHUNK_RETRIES)
+  stage: rotkehlchen.premium
+  alternative_considered: Zero retries fails too quickly on transient issues; 2-3 retries may annoy users
+    with persistent problems
+  _evidence_issues:
+  - 'FN_NOT_FOUND: MAX_UPLOAD_CHUNK_RETRIES in rotkehlchen/premium/premium.py'
+- id: BD-082
+  type: B
+  content: Free tier limits set for PnL events and history events
+  rationale: get_free_limit establishes the boundary between free and premium tiers, defining how many
+    PnL events and history entries free users can access. These limits directly define the product's freemium
+    monetization boundary and encourage premium upgrades.
+  evidence: rotkehlchen/premium/premium.py:132(get_free_limit)
+  stage: rotkehlchen.premium
+  alternative_considered: Different limits tested historically; current values represent balance between
+    user acquisition and conversion
+- id: BD-083
+  type: B/BA
+  content: Maximum retry attempts for API queries set to 5
+  rationale: DEFAULT_QUERY_RETRY_LIMIT=5 handles transient exchange API errors (rate limits, temporary
+    outages) without indefinite hanging. Five attempts accommodate brief rate limit windows while ensuring
+    user-facing errors appear within reasonable time.
+  evidence: rotkehlchen/db/settings.py:74(DEFAULT_QUERY_RETRY_LIMIT)
+  stage: rotkehlchen.db.settings
+  alternative_considered: Lower (1-2) fails too quickly on rate-limited endpoints; higher (10+) causes
+    user-perceived hang during outages
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_QUERY_RETRY_LIMIT in rotkehlchen/db/settings.py'
+- id: BD-084
+  type: B/BA
+  content: Network connection timeout for API requests set to 30 seconds
+  rationale: DEFAULT_CONNECT_TIMEOUT=DEFAULT_READ_TIMEOUT=30 balances responsiveness against exchange
+    reliability. 30 seconds accommodates slow responses from overloaded exchanges while preventing indefinite
+    hangs that frustrate users waiting for data.
+  evidence: rotkehlchen/db/settings.py:75(DEFAULT_CONNECT_TIMEOUT)
+  stage: rotkehlchen.db.settings
+  alternative_considered: Shorter timeouts (5-10s) improve responsiveness but fail on slow exchanges;
+    longer (60s+) cause frustration
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_CONNECT_TIMEOUT in rotkehlchen/db/settings.py'
+- id: BD-085
+  type: BA/DK
+  content: Conflict resolution strategy for accounting rules (local vs remote)
+  rationale: solve_accounting_rule_conflicts defines how custom accounting rules sync between local database
+    and remote premium backup. The resolution strategy determines which version wins during conflicts,
+    affecting tax calculation accuracy and user expectations around customization persistence.
+  evidence: rotkehlchen/db/unresolved_conflicts.py:119(solve_accounting_rule_conflicts)
+  stage: rotkehlchen.db.unresolved_conflicts
+  alternative_considered: Local-wins preserves user control; remote-wins ensures consistency; timestamp-based
+    allows user override
+- id: BD-086
+  type: T
+  content: Tax-free holding period disabled with -1 value
+  rationale: Setting taxfree_after_period to -1 disables the tax-free holding period feature entirely,
+    treating each gains as taxable immediately. This provides users in jurisdictions without long-term
+    capital gains provisions a way to receive accurate tax calculations.
+  evidence: rotkehlchen/tests/unit/accounting/test_settings.py:67(module)
+  stage: rotkehlchen.accounting
+  alternative_considered: Other sentinel values considered but -1 is unambiguous and unlikely to be a
+    valid period
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in rotkehlchen/tests/unit/accounting/test_settings.py'
+- id: BD-087
+  type: B/BA
+  content: Multiplier for adjusting graph point count set to 0
+  rationale: DEFAULT_SSF_GRAPH_MULTIPLIER=0 determines the scaling factor for tax report graph point density.
+    Zero value disables dynamic point adjustment, using fixed point count for consistent visualization
+    across different portfolio sizes.
+  evidence: rotkehlchen/db/settings.py:67(DEFAULT_SSF_GRAPH_MULTIPLIER)
+  stage: rotkehlchen.db.settings
+  alternative_considered: Non-zero values tested but zero provides simpler, predictable output
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_SSF_GRAPH_MULTIPLIER in rotkehlchen/db/settings.py'
+- id: BD-088
+  type: B/RC
+  content: 'SWAP OUT must precede IN: out_event is always processed before in_event per _process_swap
+    docstring'
+  rationale: 'Swap events must follow strict OUT-before-IN ordering to ensure proper accounting sequence.
+    The _process_swap function enforces this invariant because out_asset is the source and in_asset is
+    the target - processing in wrong order would corrupt cost basis calculations and misattribute asset
+    movements. Boundary: Every swap events within a single _process_swap call must obey this sequence
+    regardless of timestamp ordering.'
+  evidence: rotkehlchen/accounting/history_base_entries.py:190(_process_swap)
+  stage: ordering_contract
+- id: BD-089
+  type: B/BA
+  content: 'Swap events sequence_index convention: SPEND=0, RECEIVE=1, FEE>=2. Every exchanges must follow
+    this.'
+  rationale: 'The sequence_index field encodes swap event semantics using ordinal position. SPEND always
+    gets index 0 as the primary outflow, RECEIVE gets index 1 as the primary inflow, and FEE events occupy
+    indices 2+ to allow multiple fee types. This convention ensures deterministic event ordering and enables
+    proper tax lot matching. Boundary: Violation of this convention breaks swap event parsing and causes
+    fee events to be misclassified as primary trade components.'
+  evidence: rotkehlchen/history/events/structures/swap.py:56(swapevent)
+  stage: ordering_contract
+  _evidence_issues:
+  - 'FN_NOT_FOUND: swapevent in rotkehlchen/history/events/structures/swap.py'
+- id: BD-090
+  type: BA
+  content: 'Fork spend invariant: spending pre-fork ETH reduces ETC; spending pre-fork BTC reduces both
+    BCH and BSV'
+  rationale: 'Pre-fork assets have shared lineage that must be tracked for cost basis allocation. When
+    ETH held before the ETH/ETC fork is spent, the cost basis must reduce across both the original chain
+    (ETH) and the forked chain (ETC) proportionally. Similarly, pre-fork BTC spend affects BCH and BSV
+    cost basis pools simultaneously. This invariant ensures tax compliance across jurisdictions that treat
+    forked assets as distinct. Boundary: This rule only applies to assets held BEFORE the fork date; post-fork
+    a'
+  evidence: rotkehlchen/accounting/cost_basis/prefork.py:71-115(handle_prefork_asset_spends)
+  stage: invariant
+- id: BD-091
+  type: B/BA
+  content: DEFAULT_TAXFREE_AFTER_PERIOD=1 year; determines when asset gains become tax-free (Germany-style)
+  rationale: 'The default tax-free holding period is set to 1 year following German tax law conventions
+    (Haltefrist). Assets held longer than this period qualify for tax-free disposal treatment. This default
+    applies when users do not configure jurisdiction-specific settings. Boundary: Setting differs for
+    other jurisdictions; US has no equivalent long-term capital gains threshold based purely on time.'
+  evidence: rotkehlchen/db/settings.py:50(DEFAULT_TAXFREE_AFTER_PERIOD)
+  stage: default_value
+  alternative_considered: No tax-free period (0) would be simpler but would undercharge taxes for users
+    subject to holding period rules
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_TAXFREE_AFTER_PERIOD in rotkehlchen/db/settings.py'
+- id: BD-092
+  type: B/BA
+  content: DEFAULT_INCLUDE_CRYPTO2CRYPTO=True makes crypto-to-crypto trades taxable by default
+  rationale: 'Crypto-to-crypto trades are treated as taxable events by default, treating each exchange
+    as a disposal for capital gains purposes. This follows conservative tax reporting practices where
+    converting between crypto assets triggers a taxable event. Users in jurisdictions where C2C is non-taxable
+    must explicitly disable this setting. Boundary: Disabling this flag does not affect fiat-crypto or
+    crypto-fiat taxable event determination.'
+  evidence: rotkehlchen/db/settings.py:51(DEFAULT_INCLUDE_CRYPTO2CRYPTO)
+  stage: default_value
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_INCLUDE_CRYPTO2CRYPTO in rotkehlchen/db/settings.py'
+- id: BD-093
+  type: B/BA
+  content: 'CostBasisMethod Strategy pattern: FIFO/LIFO/HIFO/ACB selected at runtime via CostBasisEvents
+    factory'
+  rationale: 'Cost basis calculation strategy is implemented as a Strategy pattern allowing users to select
+    their preferred accounting method. The factory (CostBasisEvents) instantiates the appropriate strategy
+    subclass based on user configuration. Each method has different tax implications: FIFO (First In First
+    Out) is default, LIFO (Last In First Out) may reduce gains in rising markets, HIFO (Highest In First
+    Out) minimizes gains. Boundary: Method selection cannot be changed retroactively for already-proces'
+  evidence: rotkehlchen/accounting/cost_basis/base.py:127(basecostbasismethod)
+  stage: pattern_choice
+  _evidence_issues:
+  - 'FN_NOT_FOUND: basecostbasismethod in rotkehlchen/accounting/cost_basis/base.py'
+  vague_rationale: true
+- id: BD-094
+  type: BA
+  content: WETH resolves to ETH bucket for cost basis; cross-module equivalence enforced in _resolve_bucket_asset
+  rationale: 'Wrapped ETH (WETH) is treated as functionally equivalent to ETH for cost basis calculations.
+    The _resolve_bucket_asset function maps WETH to the ETH bucket, ensuring that WETH acquisitions and
+    disposals share cost basis pools with native ETH. This reflects economic equivalence where 1 WETH
+    = 1 ETH. Boundary: Other ERC20 tokens with ETH equivalents (e.g., stETH) may have different treatment
+    based on their redemption mechanics.'
+  evidence: rotkehlchen/accounting/cost_basis/base.py:595-623(_resolve_bucket_asset)
+  stage: invariant
+  alternative_considered: Treating WETH as separate asset would be more conservative but would require
+    users to manually track economically equivalent positions
+- id: BD-095
+  type: B/BA
+  content: DEFAULT_COST_BASIS_METHOD=FIFO; users not explicitly choosing ACB get FIFO accounting
+  rationale: 'FIFO (First In, First Out) is the default cost basis method when users do not explicitly
+    select an accounting strategy. FIFO is the simplest and most widely accepted method, making it a safe
+    default choice. ACB (Adjusted Cost Basis) is available for users who need more complex tracking. Boundary:
+    This default only applies to new users; existing user preferences are preserved in database settings.'
+  evidence: rotkehlchen/db/settings.py:69(DEFAULT_COST_BASIS_METHOD)
+  stage: default_value
+  alternative_considered: HIFO as default would minimize gains but may raise questions from tax authorities
+    about methodology
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_COST_BASIS_METHOD in rotkehlchen/db/settings.py'
+- id: BD-096
+  type: B
+  content: 'AccountingPot.reset() cascade: pnls→cost_basis→events_accountant must be reset in this order'
+  rationale: 'The reset sequence for AccountingPot follows a dependency chain: PnL calculations depend
+    on cost basis data, which in turn depends on events accounting data. Resetting in reverse order would
+    leave dependent components with stale data. Violating this order causes cascading calculation errors.
+    Boundary: Any new accounting components added to AccountingPot must respect this reset dependency
+    order.'
+  evidence: rotkehlchen/accounting/pot.py:120(reset)
+  stage: ordering_contract
+- id: BD-097
+  type: BA
+  content: AccountingEventMixin.process() must accept peekable iterator and return consumed event count
+  rationale: 'The process() method uses a peekable iterator pattern to allow look-ahead without consuming
+    events. This enables proper event coordination across accounting modules. Returning the consumed count
+    allows the caller to track progress and handle partial processing. Boundary: Subclasses that override
+    process() must maintain this contract or break downstream event coordination.'
+  evidence: rotkehlchen/accounting/mixins/event.py:58-70(process)
+  stage: inheritance
+- id: BD-098
+  type: B/BA
+  content: EVMAccountingAggregator uses plugin architecture to auto-discover accountants from submodules
+  rationale: 'The EVMAccountingAggregator implements a plugin discovery pattern that automatically finds
+    and initializes accounting modules from subdirectories. This enables extensible chain support without
+    hardcoding accountant classes. New chain-specific accountants are automatically picked up through
+    module introspection. Boundary: Accountant modules must follow the naming convention and implement
+    the expected interface to be discovered.'
+  evidence: rotkehlchen/chain/evm/accounting/aggregator.py:44-77(_recursively_initialize_accountants)
+  stage: pattern_choice
+  alternative_considered: Explicit registration would be more reliable but requires manual configuration
+    for each new chain
+- id: BD-099
+  type: B/BA
+  content: DEFAULT_INCLUDE_FEES_IN_COST_BASIS=True; fees add to cost basis by default (UK/CAN style)
+  rationale: 'Transaction fees are included in the cost basis of acquired assets by default, following
+    UK and Canadian tax treatment. This increases the cost basis and reduces the reported gain. Users
+    in US-style jurisdictions where fees are separately deductible must disable this setting. Boundary:
+    This setting only affects acquisition costs; fee treatment for disposals follows different rules.'
+  evidence: rotkehlchen/db/settings.py:72(DEFAULT_INCLUDE_FEES_IN_COST_BASIS)
+  stage: default_value
+  alternative_considered: Setting default to False would understate cost basis for UK/CAN users
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_INCLUDE_FEES_IN_COST_BASIS in rotkehlchen/db/settings.py'
+- id: BD-100
+  type: B/BA
+  content: DEFAULT_TREAT_ETH2_AS_ETH=True; staked ETH treated same as regular ETH for accounting
+  rationale: 'Staked ETH (ETH2) is treated as economically equivalent to regular ETH for accounting purposes
+    when this setting is enabled. This simplifies tracking for users who stake ETH through proof-of-stake
+    mechanisms. The setting reflects that staking does not create a taxable disposal event. Boundary:
+    Users who need to distinguish between liquid and staked ETH for regulatory compliance must disable
+    this setting.'
+  evidence: rotkehlchen/db/settings.py:70(DEFAULT_TREAT_ETH2_AS_ETH)
+  stage: default_value
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_TREAT_ETH2_AS_ETH in rotkehlchen/db/settings.py'
+- id: BD-101
+  type: BA/DK
+  content: DEFAULT_USE_ASSET_COLLECTIONS_IN_COST_BASIS=True; different asset identifiers share cost basis
+    buckets
+  rationale: 'Asset collections allow multiple asset identifiers (e.g., ETH and WETH, or different token
+    standards) to share a unified cost basis pool. When enabled, disposals draw from the combined pool
+    regardless of which specific identifier was used. This reflects economic fungibility. Boundary: When
+    disabled, each asset identifier maintains a separate cost basis history, which may be required for
+    precise tax lot tracking.'
+  evidence: rotkehlchen/db/settings.py:87(DEFAULT_USE_ASSET_COLLECTIONS_IN_COST_BASIS)
+  stage: default_value
+  alternative_considered: Setting to False by default would require users to understand asset collections
+    before consolidating positions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_USE_ASSET_COLLECTIONS_IN_COST_BASIS in rotkehlchen/db/settings.py'
+- id: BD-102
+  type: BA/DK
+  content: 'Cross-module price priority: out_price preferred over in_price for swap price calculations'
+  rationale: 'When calculating swap prices, the out_asset price (the asset being given away) takes precedence
+    over the in_asset price (the asset being received). This reflects the accounting principle that disposals
+    determine realized gains/losses. The in_price is only used as a fallback when out_price is unavailable.
+    Boundary: This priority rule applies specifically to swaps; other trade types may have different price
+    determination logic.'
+  evidence: rotkehlchen/accounting/pot.py:359(get_prices_for_swap)
+  stage: invariant
+  alternative_considered: Using in_price as primary would be simpler but would misattribute gains for
+    asymmetric swaps
+- id: BD-103
+  type: DK
+  content: is_dummy_pot=True bypasses DB writes and ignored asset loading; used for rule checking
+  rationale: 'Dummy AccountingPot instances skip database operations for performance during rule validation
+    and dry-run scenarios. This mode is used when only calculation results are needed without persistence.
+    The flag enables testing and preview functionality without side effects. Boundary: Dummy pots cannot
+    be used for actual accounting records; they only produce transient calculation results.'
+  evidence: rotkehlchen/accounting/pot.py:51-65(__init__)
+  stage: default_value
+- id: BD-104
+  type: BA
+  content: BaseCostBasisMethod uses heapq with priority tuple for acquisition ordering (FIFO uses counter,
+    HIFO uses -rate)
+  rationale: 'Cost basis acquisition tracking uses a heap data structure with priority tuples that encode
+    ordering semantics. FIFO uses an incrementing counter as the secondary sort key after timestamp. HIFO
+    uses negative acquisition rate to prioritize higher-cost acquisitions first. This design enables O(log
+    n) insertion and extraction while maintaining correct ordering semantics for each strategy. Boundary:
+    Custom strategies must implement compatible priority tuple semantics to work with the heap.'
+  evidence: rotkehlchen/accounting/cost_basis/base.py:105-125(AssetAcquisitionHeapElement)
+  stage: pattern_choice
+- id: BD-105
+  type: BA
+  content: Acquisitions in swaps are never taxable (taxable=False hardcoded in _process_swap)
+  rationale: 'Swap acquisition events (receiving assets) are marked as non-taxable because they represent
+    asset exchanges rather than income events. The taxable flag is hardcoded to False to prevent double-counting:
+    the corresponding disposal of the given asset already triggers the taxable event. This prevents gains/losses
+    from being recognized on both sides of a swap. Boundary: This applies only to direct swap acquisitions;
+    converted or earned assets may still be taxable.'
+  evidence: rotkehlchen/accounting/history_base_entries.py:190(_process_swap)
+  stage: invariant
+- id: BD-106
+  type: B/BA
+  content: DEFAULT_MAIN_CURRENCY=USD; profit/loss calculated in USD unless user changes
+  rationale: 'USD is the default reporting currency for profit/loss calculations. Every assets are converted
+    to USD using available exchange rates before calculating gains/losses. Users in other jurisdictions
+    must select their local currency or preferred reporting currency. Boundary: The main currency only
+    affects display and reporting; underlying calculations still track per-asset cost basis in original
+    denominations.'
+  evidence: rotkehlchen/db/settings.py:56(DEFAULT_MAIN_CURRENCY)
+  stage: default_value
+  _evidence_issues:
+  - 'FN_NOT_FOUND: DEFAULT_MAIN_CURRENCY in rotkehlchen/db/settings.py'
+- id: BD-107
+  type: BA
+  content: Fee events processed after SPEND if same asset OR if fee sequence_index < RECEIVE sequence_index
+  rationale: 'Fee event insertion follows conditional logic: fees are processed after SPEND events when
+    the fee asset matches the spent asset, or when the fee''s sequence_index indicates it should precede
+    the RECEIVE event. This ordering ensures fee events are properly attributed to the correct trade leg.
+    Incorrect ordering causes fees to be miscategorized or create artificial price distortions. Boundary:
+    The condition assumes sequence_index ordering is consistent with swap event construction rules.'
+  evidence: rotkehlchen/accounting/history_base_entries.py:29(EventsAccountant)
+  stage: ordering_contract
+- id: BD-108
+  type: BA
+  content: 'INTERACTION: BD-004 (Indexers-first) × BD-006 (Weighted RPC failover) → Hidden data completeness
+    risk when indexers fail'
+  rationale: Indexers-first strategy relies on Etherscan/Blockscout for complete historical data including
+    internal transactions. When indexers are unavailable and the system falls back to weighted RPC nodes
+    via BD-006 failover, RPC endpoints return incomplete data missing internal transactions. The failover
+    mechanism silently degrades data quality without alerting users, creating a hidden gap where BD-006's
+    'reliable' fallback actually provides unreliable data for BD-004's completeness guarantees.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Alert users when falling back to RPC for historical queries; implement indexer
+    health monitoring before query routing
+- id: BD-109
+  type: BA
+  content: 'INTERACTION: BD-017 (FIFO/LIFO/HIFO methods) × BD-101 (Asset collections) → Complex lot consumption
+    ordering across shared pools'
+  rationale: Cost basis methods (FIFO/LIFO/HIFO) determine acquisition lot consumption order within BD-016's
+    heap structure. When asset collections are enabled (BD-101), multiple asset identifiers share cost
+    basis pools, so the selected method's ordering must correctly traverse across the merged pool. The
+    interaction creates complexity where a LIFO user expecting 'most recent first' may get unexpected
+    results when collections combine lots from different asset identifiers acquired at different times.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Document collection behavior per method; per-collection method selection; separate
+    pool tracking despite collection flag
+- id: BD-110
+  type: BA
+  content: 'INTERACTION: BD-036 (WETH→ETH bucket) × BD-034 (Fees in cost basis) → Fee treatment asymmetry
+    on wrap/unwrap'
+  rationale: WETH is resolved to ETH bucket for cost basis (BD-036), treating them as same asset. When
+    include_fees_in_cost_basis is True (BD-034), ETH spent on gas to wrap into WETH gets included in WETH
+    cost basis. But if WETH is unwrapped back to ETH, the original ETH pool doesn't reclaim the fee cost,
+    creating a subtle asymmetry where wrapping has permanent tax cost implications that unwrapping doesn't
+    recover. This interaction between equivalence mapping and fee inclusion creates a hidden tax inefficiency.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Fees on wrap/unwrap excluded from ETH bucket; explicit handling for WETH<->ETH
+    conversion transactions
+- id: BD-111
+  type: BA
+  content: 'INTERACTION: BD-039 (Fork asset creation) × BD-101 (Asset collections) → Fork cost basis attribution
+    complexity with collections'
+  rationale: 'Fork handling creates ETC/BCH/BSV prefork acquisitions when parent assets are held at fork
+    time (BD-039). When asset collections are enabled (BD-101), forked assets may share cost basis with
+    their parents depending on collection mappings. The interaction creates ambiguity: does spending ETH
+    after ETC fork reduce ETH cost basis AND trigger ETC prefork reduction per BD-090, or does the collection
+    flag change this behavior? Users may not realize that ETH prefork spends affect multiple cost basis
+    pools simultaneously.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Disable fork handling when asset collections enabled; explicit fork behavior
+    documentation per collection configuration
+- id: BD-112
+  type: B/RC
+  content: 'INTERACTION: BD-021 (SQLCipher encryption) × BD-067 (KDF_ITER=64000) → Security/performance
+    tradeoff creates unlock latency'
+  rationale: 'SQLCipher encryption (BD-021) protects user financial data at rest using key derivation
+    from user password. BD-067 sets KDF_ITER=64000 which is the minimum viable security iteration count.
+    Higher values would strengthen encryption but increase unlock time proportionally. This creates a
+    visible tradeoff: KDF_ITER=64000 was chosen to balance BD-021''s security benefit against user experience
+    during database unlock. The interaction means security-conscious users cannot easily increase iterations
+    without impacting each users'' startup time.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Higher iterations (100000+) would strengthen encryption but degrade unlock UX;
+    hardware-based key derivation could decouple security from latency
+- id: BD-113
+  type: B
+  content: 'INTERACTION: BD-030 (FREE_PNL_LIMIT=1000) × BD-016 (Heap-based acquisitions) → Heap optimization
+    irrelevant for free tier users'
+  rationale: Heap-based acquisition tracking (BD-016) provides O(log n) efficiency for portfolios with
+    many transactions. Free tier users are capped at 1000 PnL events (BD-030), making the heap optimization
+    unnecessary since 1000 events fit easily in memory with simpler data structures. The optimization
+    was designed for premium users with large portfolios but doesn't benefit the free tier population,
+    creating an interaction where implementation sophistication doesn't match the constrained use case.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Simpler list-based tracking for free tier; heap only for premium users
+- id: BD-114
+  type: BA/DK
+  content: 'INTERACTION: BD-088 (OUT-before-IN swap ordering) × BD-089 (sequence_index convention) × BD-105
+    (acquisitions non-taxable) → Critical invariant chain for swap taxability'
+  rationale: 'Three decisions form a critical invariant chain: BD-088 enforces OUT-before-IN ordering,
+    BD-089 encodes this via sequence_index (SPEND=0, RECEIVE=1), and BD-105 marks swap acquisitions as
+    non-taxable. Violation of any breaks the chain: if IN is processed before OUT, BD-105''s taxable flag
+    assignment becomes incorrect; if sequence_index doesn''t match, fee events (BD-107) get misattributed.
+    This cascade means swap taxability correctness depends on each three decisions maintaining their contracts
+    simultaneously.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Atomic swap processing preventing partial state; validation checks at each boundary;
+    transaction-based event grouping
+- id: BD-115
+  type: B/RC
+  content: 'INTERACTION: BD-028 (HOUR_IN_SECONDS=3600) × BD-029 (YEAR_IN_SECONDS=31536000) → Timing boundary
+    consistency for cache and tax calculations'
+  rationale: Hour and year constants are defined as simple scalar values rather than derived relationships.
+    BD-028 is used for caching/query intervals (BD-006's failover timing, BD-075's oracle penalty duration),
+    while BD-029 defines tax-free holding periods. The constants share no relationship but both represent
+    'time periods', creating potential confusion where changes to one might inadvertently affect the other
+    if code paths overlap. The 8760:1 ratio (365.25*24) must remain consistent for tax calculations to
+    be correct.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Derived constants (YEAR = HOUR * 8760); shared timing module with consistent
+    units
+- id: BD-116
+  type: BA
+  content: 'INTERACTION: BD-100 (ETH2 treated as ETH) × BD-034 (Fees in cost basis) × BD-033 (Swap taxability)
+    → Staking reward tax treatment ambiguity'
+  rationale: 'When ETH2 is treated as ETH (BD-100), staking rewards are economically equivalent to regular
+    ETH. However, BD-034''s fee inclusion in cost basis means validator fees affect ETH cost basis. The
+    interaction creates ambiguity: if staking rewards are considered taxable income in some jurisdictions,
+    treating them as ETH acquisitions via BD-100 would require them to be added to the cost basis pool,
+    but there''s no explicit decision about whether staking rewards should be marked as taxable acquisitions.
+    BD-033''s swap taxability logic may not correctly handle staking-derived ETH.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Staking rewards explicitly marked as taxable events; jurisdiction-specific ETH2
+    treatment; separate staking position tracking
+  vague_rationale: true
+- id: BD-117
+  type: B/BA
+  content: 'INTERACTION: BD-031 (include_crypto2crypto=True) × BD-035 (Fiat trades never taxable) → Taxable
+    event boundary interaction'
+  rationale: 'BD-031 defaults crypto-to-crypto trades as taxable, while BD-035 explicitly exempts fiat
+    trades. The interaction creates clear boundaries: crypto-to-fiat is always taxable (BD-035''s exemption
+    doesn''t apply since it''s crypto-to-fiat), fiat-to-crypto is taxable on the crypto acquisition but
+    fiat is exempt, and crypto-to-crypto is taxable when BD-031 is enabled. Users who disable BD-031 to
+    avoid crypto-to-crypto taxation might incorrectly assume each non-fiat trades are exempt, missing
+    edge cases where ETH→USDC→BTC involves both taxable and non-taxable legs.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: More granular per-asset taxability settings; explicit multi-leg transaction
+    decomposition; clear UI indicators for partial taxability
+- id: BD-118
+  type: BA
+  content: 'RISK CASCADE: BD-008 (Topic-based event matching) → BD-004 (Indexers-first) → BD-006 (RPC
+    failover) → BD-013 (Event grouping) → BD-020 (SWAP pairing) → BD-033 (Swap taxability) → Incorrect
+    tax calculation'
+  rationale: This cascade starts when BD-008's topic-based matching relies on complete event data from
+    BD-004's indexers. When indexers fail and BD-006's RPC fallback returns incomplete data, internal
+    transactions are missed. This propagates through BD-013's grouping, which can't pair events from missed
+    internal transactions, breaking BD-020's SWAP pairing logic. The final impact reaches BD-033's taxability
+    calculations, resulting in incorrect PnL reports where swap transactions appear as isolated events
+    rather than properly paired exchanges. Users receive wrong tax data with no indication of the upstream
+    data quality failure.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Data quality indicators propagating through the cascade; explicit incomplete-swap
+    handling; RPC fallback warning to users
+- id: BD-119
+  type: B/BA
+  content: 'RISK CASCADE: BD-027 (FIFO default) → BD-017 (Strategy pattern) → BD-016 (Heap structure)
+    → BD-057 (Priority encoding) → BD-058 (FIFO counter logic) → BD-027 (Loop closed) → Correctness depends
+    on implementation coherence'
+  rationale: 'The FIFO default (BD-027) selects FIFOCostBasisMethod via the strategy pattern (BD-017),
+    which uses a heap structure (BD-016) with specific priority encoding (BD-057, BD-058). Each decision
+    depends on the previous maintaining correctness: if the counter-based priority encoding has an off-by-one
+    error, the FIFO ordering is wrong despite correct strategy and heap selection. This internal cascade
+    means a bug in BD-058 silently corrupts BD-027''s intended behavior, making FIFO produce non-FIFO
+    results without any obvious failure indication.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Formal verification of priority encoding; separate heap implementations per
+    method; timestamp-based FIFO without counter
+- id: BD-120
+  type: BA
+  content: 'CONTRADICTION: BD-100 (ETH2 treated as ETH) vs Tax authority requirements for staking income
+    recognition'
+  rationale: BD-100 treats staked ETH as economically equivalent to regular ETH, simplifying accounting
+    by treating staking as a non-disposal. However, multiple tax authorities (US IRS, UK HMRC) consider
+    staking rewards as taxable income at receipt, treating them as new acquisitions. BD-100's equivalence
+    mapping would incorrectly classify staking rewards as having no tax impact when they should be marked
+    as taxable acquisitions. This creates a contradiction between the system's default behavior and regulatory
+    requirements in major jurisdictions.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Staking rewards explicitly marked taxable on receipt; jurisdiction-specific
+    ETH2 treatment; user warning when ETH2 staking detected
+  vague_rationale: true
+- id: BD-121
+  type: B/BA
+  content: 'CONTRADICTION: BD-092 (Crypto2crypto taxable by default) vs International tax treatment variations'
+  rationale: BD-092 defaults crypto-to-crypto trades as taxable, following conservative accounting. However,
+    some jurisdictions (Germany, Singapore, Portugal before 2023) explicitly exempt crypto-to-crypto disposals
+    from capital gains tax. Users in these jurisdictions who don't change the default will over-report
+    tax liability. The default creates a contradiction between system behavior and jurisdictional requirements,
+    placing the compliance burden on users who may not know to disable this setting.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Jurisdiction-aware defaults based on user location; warning when default conflicts
+    with detected jurisdiction; explicit opt-in for crypto2crypto taxability
+- id: BD-122
+  type: BA/DK
+  content: 'AMPLIFICATION: BD-037 (Asset collections default True) × BD-036 (WETH→ETH bucket) × BD-101
+    (use_asset_collections=True) → Widespread cost basis pool merging'
+  rationale: 'Three decisions combine to merge cost basis pools across multiple asset variants: BD-101
+    enables asset collections by default, BD-036 specifically maps WETH to ETH bucket, and BD-037 enables
+    use of these collections. Together they create extensive cost basis sharing that may not be obvious
+    to users. A user holding ETH and WETH separately would expect separate cost basis tracking but gets
+    merged pools by default. The amplification means changes in any one of these decisions affects the
+    others'' behavior significantly.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Separate cost basis for ETH/WETH by default; explicit user opt-in for asset
+    collection merging; clear UI indication of collection behavior
+- id: BD-GAP-001
+  type: B/RC
+  content: ProcessedAccountingEvent serializes differently based on export_type enum (CSV/API/DB), omitting
+    EVM explorer links from CSV to avoid exposing internal infrastructure
+  rationale: Separating export formats allows DB storage to be self-contained while API responses include
+    discovery links, and CSV stays portable without external dependencies. Breaks if explorer URLs become
+    required in reports or if CSV export is used programmatically for data imports.
+  evidence: rotkehlchen/accounting/structures/processed_event.py:109(to_exported_dict)
+  stage: architecture
+  alternative_considered: Unified export format with optional fields populated conditionally
+- id: BD-GAP-002
+  type: B/BA
+  content: calculate_pnl has two boolean flags (count_entire_amount_spend, count_cost_basis_pnl) that
+    independently gate spend vs cost-basis accounting, enabling tax scenarios where only one treatment
+    applies
+  rationale: Different tax jurisdictions require different PnL treatments; flagging entire amount vs cost
+    basis separately handles simplified accounting. Breaks when both flags are False (zero PnL) or when
+    cost basis must be calculated differently (e.g., FIFO vs specific identification).
+  evidence: rotkehlchen/accounting/structures/processed_event.py:188(calculate_pnl)
+  stage: accounting_pnl
+  alternative_considered: Single enum parameter (FULL/SPEND_ONLY/COST_BASIS_ONLY/NONE)
+- id: BD-GAP-003
+  type: T
+  content: Balance class implements full arithmetic operators (__add__, __sub__, __mul__, __neg__, __abs__)
+    enabling mathematical operations directly on Balance objects
+  rationale: Enabling inline arithmetic reduces boilerplate in balance calculations; __radd__ supports
+    sum() builtin. Breaks if Balance represents non-commutative operations or if overflow semantics differ
+    from FVal implementation.
+  evidence: rotkehlchen/accounting/structures/balance.py:186(__add__)
+  stage: implementation
+  alternative_considered: 'Static methods: Balance.add(a, b)'
+- id: BD-GAP-004
+  type: B/RC
+  content: AssetBalance separates amount() and value() methods, computing value on-demand from asset prices
+    rather than storing pre-computed values
+  rationale: Separation prevents stale valuations and allows price refreshes without data migration. Breaks
+    when value needs to be frozen at a historical timestamp or when price lookup latency is unacceptable.
+  evidence: rotkehlchen/accounting/structures/balance.py:101(amount)
+  stage: architecture
+  alternative_considered: Pre-computed value field updated on price changes
+- id: BD-GAP-005
+  type: T
+  content: TimestampField accepts configurable ts_multiplier (default 1) to handle seconds vs milliseconds
+    vs other unit conversions per API endpoint
+  rationale: Different data sources use different time precision; multiplier allows uniform internal Timestamp
+    representation. Breaks when non-integer multipliers or timezone conversions are needed.
+  evidence: rotkehlchen/api/v1/fields.py:1180(__init__)
+  stage: api_layer
+  alternative_considered: Separate field classes per unit (TimestampSecondsField, TimestampMsField)
+- id: BD-GAP-006
+  type: B
+  content: DelimitedOrNormalList accepts both comma-delimited strings and list-like objects, handling
+    query params and JSON body inputs uniformly
+  rationale: Web APIs commonly pass lists via ?ids=a,b,c or JSON body; dual acceptance improves ergonomics.
+    Breaks if delimiters appear within values or if nested structures are needed.
+  evidence: rotkehlchen/api/v1/fields.py:1187(_deserialize)
+  stage: api_layer
+  alternative_considered: Only accept JSON arrays, require client to encode properly
+- id: BD-GAP-007
+  type: BA
+  content: EvmChainNameField serializes ChainID enum to human-readable chain name (e.g., 'ethereum') for
+    frontend consumption, with reverse lookup on deserialization
+  rationale: Frontend should not need mapping tables for chain ID to name; embedding discovery in serialization
+    removes coupling. Breaks when chain names change or when internal ChainID differs from canonical chain
+    names.
+  evidence: rotkehlchen/api/v1/fields.py:967(_serialize)
+  stage: api_layer
+  alternative_considered: Frontend maintains ID-to-name mapping
+- id: BD-GAP-008
+  type: B/RC
+  content: ApiSecretField only deserializes (accepts input) but does not serialize (never returns secret
+    in responses), preventing secret leakage via API
+  rationale: Secrets should flow only one direction (client to server); omission of _serialize ensures
+    they never appear in GET responses. Breaks if debugging requires secret retrieval or if re-configuration
+    workflows need current values shown.
+  evidence: rotkehlchen/api/v1/fields.py:921(ApiSecretField)
+  stage: security
+  alternative_considered: Show masked secret (e.g., '****') on GET
+- id: BD-GAP-009
+  type: B/RC
+  content: StakingQuerySchema has treat_eth2_as_eth boolean to collapse ETH2 staking into ETH balance,
+    accommodating users who want unified ETH accounting
+  rationale: ETH2 is technically different from ETH (different withdrawal mechanism) but users often want
+    unified balances. Flag allows opt-in consolidation. Breaks when tax treatment differs and consolidation
+    would be incorrect.
+  evidence: rotkehlchen/api/v1/schemas.py:4943(__init__)
+  stage: accounting_pnl
+  alternative_considered: Always separate, require manual consolidation
+- id: BD-GAP-010
+  type: B
+  content: RotkiNotifier uses Semaphore(1) lock in _ws_send_impl ensuring only one WebSocket message transmits
+    at a time per connection
+  rationale: Sequential sending prevents message interleaving and maintains ordering guarantees for progress
+    updates. Breaks under high-throughput scenarios where parallel sends would improve responsiveness.
+  evidence: rotkehlchen/api/websockets/notifier.py:23(_ws_send_impl)
+  stage: infrastructure
+  alternative_considered: Per-channel locks or async message queues
+- id: BD-GAP-011
+  type: B
+  content: HistoricalBalancesManager detects negative balance events and returns (identifier, group_identifier)
+    tuples to flag data integrity issues in event processing
+  rationale: Negative balances indicate missed events or incorrect transaction decoding; surfacing them
+    prevents silent data corruption. Breaks when legitimate negative balances exist (e.g., over-collateralized
+    positions) or when events span multiple days.
+  evidence: rotkehlchen/balances/historical.py:109(get_assets_amounts)
+  stage: blockchain_data_collection
+  alternative_considered: Null values for negative amounts
+- id: BD-GAP-012
+  type: T
+  content: get_historical_netvalue uses SQL LAG() window function to compute balance deltas, then accumulates
+    with polars for daily snapshot aggregation
+  rationale: Window functions efficiently compute deltas without self-joins; polars handles accumulation
+    aggregation. Breaks with very large datasets where SQL window results exceed memory, or when SQLite
+    is used (LAG not available).
+  evidence: rotkehlchen/balances/historical.py:234(get_historical_netvalue)
+  stage: implementation
+  alternative_considered: Pure Python iteration or pandas
+- id: BD-GAP-013
+  type: B/BA
+  content: account_for_manually_tracked_asset_balances mutates balances dict in-place rather than returning
+    a new dict, optimizing memory for large balance sheets
+  rationale: In-place mutation avoids copying large dictionaries; consistent with method naming convention.
+    Breaks if caller expects immutable inputs or if mutation order matters across multiple calls.
+  evidence: rotkehlchen/balances/manual.py:140(account_for_manually_tracked_asset_balances)
+  stage: implementation
+  alternative_considered: Return new merged dict
+- id: BD-GAP-014
+  type: B
+  content: HyperliquidDecoder processes only USDC transfers, treating each other token deposits as invalid;
+    enforces that Hyperliquid operates exclusively with USDC
+  rationale: Protocol is USDC-only; rejecting other tokens prevents mis-classification. Breaks if Hyperliquid
+    adds support for additional collaterals.
+  evidence: rotkehlchen/chain/arbitrum_one/modules/hyperliquid/decoder.py:34(_process_deposit)
+  stage: protocol
+  alternative_considered: Token-aware routing to protocol-specific handlers
+- id: BD-GAP-015
+  type: B
+  content: GmxBalances._extract_unique_deposits removes duplicate positions after fetching deposit events,
+    reducing RPC queries when users modify collateral multiple times
+  rationale: Deduplication minimizes blockchain reads at the cost of additional in-memory processing;
+    useful when users frequently adjust positions. Breaks if duplicate detection misses positions due
+    to timing.
+  evidence: rotkehlchen/chain/arbitrum_one/modules/gmx/balances.py:47(_extract_unique_deposits)
+  stage: optimization
+  alternative_considered: Fetch each positions without deduplication
+- id: BD-GAP-016
+  type: B
+  content: UmamiDecoder distinguishes deposit/withdraw request events from execution events via balance
+    matching rather than transaction graph analysis
+  rationale: Two-phase transactions (request + execution) require correlation; balance matching is robust
+    to reorgs. Breaks when request and execution amounts differ significantly or when execution fails
+    partially.
+  evidence: rotkehlchen/chain/arbitrum_one/modules/umami/decoder.py:60(_decode_deposit_withdraw_request)
+  stage: transaction_decoding
+  alternative_considered: Track request-execution pairs explicitly
+- id: BD-GAP-017
+  type: B
+  content: get_umami_vault_token_price computes value as vault_price_per_share * underlying_token_usd_price,
+    assuming vault tokens maintain 1:1 with underlying
+  rationale: Price-per-share model is standard for yield-bearing tokens; multiplication gives current
+    USD value. Breaks if vault uses rebasing mechanics or if price_per_share includes accrued rewards.
+  evidence: rotkehlchen/chain/arbitrum_one/modules/umami/utils.py:22(get_umami_vault_token_price)
+  stage: pricing
+  alternative_considered: Query vault.totalAssets() / totalSupply()
+- id: BD-GAP-018
+  type: B
+  content: BaseTransactions extends L2WithL1FeesTransactions to account for Layer 1 fee costs separately,
+    reflecting that Base transactions pay ETH gas on L1
+  rationale: L2s settling to L1 have fee components; separating them provides accurate cost accounting.
+    Breaks when L1 fee calculation changes or when fee estimation becomes inaccurate.
+  evidence: rotkehlchen/chain/base/transactions.py:17(__init__)
+  stage: accounting_pnl
+  alternative_considered: Absorb L1 fees into L2 gas price
+- id: BD-GAP-019
+  type: B
+  content: BasenamesDecoder queries base.org API for labelhash resolution with cache-first lookup, falling
+    back to API call on cache miss
+  rationale: API calls are expensive; caching reduces latency and rate limiting risk. Breaks when API
+    is unavailable or when cached data becomes stale.
+  evidence: rotkehlchen/chain/base/modules/basenames/decoder.py:113(_maybe_get_labelhash_name)
+  stage: exchange_integration
+  alternative_considered: On-chain resolution only
+- id: BD-GAP-020
+  type: B
+  content: EchoDecoder does not track partial refunds as they are rare (3 historical occurrences) and
+    don't emit deregistration events, requiring explicit detection
+  rationale: Rare events不值得完整追踪基础设施；仅记录主要流程。Breaks when partial refunds increase in frequency.
+  evidence: rotkehlchen/chain/base/modules/echo/decoder.py:88(_transform_refund)
+  stage: transaction_decoding
+  alternative_considered: Full event tracking with periodic polling
+- id: BD-GAP-021
+  type: B/BA
+  content: ThegraphDecoder uses subgraph data service address as default verifier for pre-Horizon events
+    where event logs don't include verifier field
+  rationale: Pre-Horizon events lack verifier info; service address is a reasonable proxy for delegated
+    stakes. Breaks if users delegated to contracts other than the data service.
+  evidence: rotkehlchen/chain/arbitrum_one/modules/thegraph/balances.py:50(_get_delegations)
+  stage: transaction_decoding
+  alternative_considered: Historical subgraph queries for each events
+- id: BD-GAP-022
+  type: BA
+  content: Addressbook enrichment in ProcessedAccountingEvent uses regex matching with addressbook lookup
+    at export time, enriching event notes with human-readable labels
+  rationale: Addressbook provides user-defined labels; enriching at export allows labels to change without
+    re-processing events. Breaks if addressbook lookup is slow or if labels contain special characters.
+  evidence: rotkehlchen/accounting/structures/processed_event.py:78(_maybe_add_label_with_address)
+  stage: ui
+  alternative_considered: Enrich at event creation time
+- id: BD-GAP-023
+  type: T
+  content: EvmCounterpartyField allows dynamic population of valid counterparty set via set_counterparties(),
+    enabling protocol-specific counterparty lists per user
+  rationale: Counterparties are user-scoped and can change; dynamic population avoids hardcoding. Breaks
+    when concurrent requests need different sets.
+  evidence: rotkehlchen/api/v1/fields.py:1184(set_counterparties)
+  stage: api_layer
+  alternative_considered: Query counterparty list from database per request
+- id: BD-GAP-024
+  type: B
+  content: IncludeExcludeListField accepts 'values' array and 'behaviour' key, deserializing to either
+    include or exclude filter based on behaviour
+  rationale: Unified field for both filter modes reduces schema duplication; behaviour enum determines
+    processing. Breaks when new filter modes are added.
+  evidence: rotkehlchen/api/v1/fields.py:1187(_deserialize)
+  stage: api_layer
+  alternative_considered: Separate IncludeFilterField and ExcludeFilterField
+- id: BD-GAP-025
+  type: B/DK
+  content: HistoricalPricesPerAssetSchema aligns timestamps to interval boundaries (rounds down from_timestamp,
+    rounds up to_timestamp), ensuring aligned data points
+  rationale: Aligned timestamps produce clean chart data without partial intervals; boundary rounding
+    ensures complete periods. Breaks when non-aligned timestamps are intentionally used.
+  evidence: rotkehlchen/api/v1/schemas.py:4605(transform_data)
+  stage: api_layer
+  alternative_considered: Return partial first/last intervals with flag
+- id: BD-GAP-026
+  type: M
+  content: 'Missing: Matrix ill-conditioning and stability'
+  rationale: 'Audit finding: missing: matrix ill-conditioning and stability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-027
+  type: DK
+  content: 'Missing: Point-in-Time data availability'
+  rationale: 'Audit finding: missing: point-in-time data availability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-028
+  type: B
+  content: 'Missing: Train/test time split integrity'
+  rationale: 'Audit finding: missing: train/test time split integrity. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-029
+  type: DK
+  content: 'Missing: Random seed full coverage'
+  rationale: 'Audit finding: missing: random seed full coverage. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-030
+  type: B
+  content: 'Missing: Signal-Execution Timing'
+  rationale: 'Audit finding: missing: signal-execution timing. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-031
+  type: B
+  content: 'Missing: Funding/Carry Cost Modeling'
+  rationale: 'Audit finding: missing: funding/carry cost modeling. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-032
+  type: B
+  content: 'Missing: Backtest Overfitting Protection'
+  rationale: 'Audit finding: missing: backtest overfitting protection. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-033
+  type: B
+  content: 'Missing: Volatility Model & Distribution'
+  rationale: 'Audit finding: missing: volatility model & distribution. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-034
+  type: B
+  content: 'Missing: GHG Emission Scope Boundaries'
+  rationale: 'Audit finding: missing: ghg emission scope boundaries. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-035
+  type: B
+  content: 'Missing: PCAF Data Quality Scoring'
+  rationale: 'Audit finding: missing: pcaf data quality scoring. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-036
+  type: B
+  content: 'Missing: Best Estimate & Risk Margin'
+  rationale: 'Audit finding: missing: best estimate & risk margin. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-037
+  type: B
+  content: 'Missing: Solvency II SCR'
+  rationale: 'Audit finding: missing: solvency ii scr. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-038
+  type: B
+  content: 'Missing: Reinsurance Contract Mapping'
+  rationale: 'Audit finding: missing: reinsurance contract mapping. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-039
+  type: B
+  content: 'Missing: Catastrophe Model Selection'
+  rationale: 'Audit finding: missing: catastrophe model selection. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-040
+  type: B
+  content: 'Missing: Amortization Schedule (Equal Payment/Principal)'
+  rationale: 'Audit finding: missing: amortization schedule (equal payment/principal). Identified by audit
+    checklist. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-041
+  type: B
+  content: 'Missing: Delinquency Definition (DPD 30/60/90)'
+  rationale: 'Audit finding: missing: delinquency definition (dpd 30/60/90). Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-042
+  type: B
+  content: 'Missing: 7'
+  rationale: 'Audit finding: missing: 7. Total** | **20** | **100%. This gap affects production reliability
+    and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Total** | **20** | **100%
+- id: BD-GAP-043
+  content: 'Missing: Point-in-Time data availability'
+  type: DK
+  rationale: 'Audit finding: missing: point-in-time data availability. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-044
+  content: 'Missing: Signal-Execution Timing'
+  type: B
+  rationale: 'Audit finding: missing: signal-execution timing. Identified by audit checklist. This gap
+    affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-045
+  content: 'Missing: Covariance Estimator Selection'
+  type: B
+  rationale: 'Audit finding: missing: covariance estimator selection. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-046
+  content: 'Missing: LCR & NSFR'
+  type: B
+  rationale: 'Audit finding: missing: lcr & nsfr. Identified by audit checklist. This gap affects production
+    reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-047
+  content: 'Missing: Funds Transfer Pricing (FTP)'
+  type: B
+  rationale: 'Audit finding: missing: funds transfer pricing (ftp). Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-048
+  content: 'Missing: 7'
+  type: B
+  rationale: 'Audit finding: missing: 7. Total** | **20** | **100%. This gap affects production reliability
+    and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: api_layer
+  status: missing
+  severity: high
+  impact: Total** | **20** | **100%
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: Sphinx Documentation Configuration
+  source: docs/conf.py
+  type: extension_example
+  business_problem: Configure Sphinx documentation builder settings for the rotki project including version,
+    author, and extension modules.
+  intent_keywords:
+  - documentation
+  - sphinx
+  - configuration
+  - docs setup
+  - project config
+  stage: data_collection
+  negative_keywords:
+  - trading strategy
+  - backtesting
+  - portfolio analysis
+  - price data
+  - trade execution
+  disambiguation: This is a documentation infrastructure file. Are you looking for trading strategies,
+    financial data analysis, or documentation setup?
+  data_domain: mixed
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 62
+  evidence_invalid: 70
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.4696969696969697
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: AGENTS.md
+  description: AGENTS.md mirrors CLAUDE.md with model-neutral language for any AI assistant
+  evidence: AGENTS.md:§intro
+- type: contains
+  target: rotkehlchen/
+  description: Main Python backend package containing each backend code
+  evidence: CLAUDE.md:§Backend Structure
+- type: contains
+  target: frontend/app/
+  description: Vue.js Electron application containing frontend code
+  evidence: CLAUDE.md:§Frontend Structure
+- type: contains
+  target: colibri/
+  description: Rust service directory for performance-critical components
+  evidence: CLAUDE.md:§Colibri (Rust) Service
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 1
+    warn: 1
+    fail: 1
+  subdomain_totals:
+    pass: 5
+    warn: 30
+    fail: 35
+  coverage: 73/73 (100%)
+  pass_rate: 6/73 (8%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: price_oracle_primary
+  description: CoinGecko is the primary oracle. CryptoCompare is used as fallback and for OHLCV. DeFiLlama
+    supplements TVL data.
+  used_in_stages: []
+  options:
+  - name: CoinGecko
+    traits:
+    - crypto_prices
+    - historical
+    - market_data
+    - free_tier
+    fit_for:
+    - General-purpose cryptocurrency pricing, good coverage of major tokens
+    not_fit_for:
+    - Privacy-sensitive use (requires API key for anonymity; free tier logs IPs); some DeFi tokens may
+      be missing
+  - name: CryptoCompare
+    traits:
+    - crypto_prices
+    - real_time
+    - ohlcv
+    - orderbooks
+    fit_for:
+    - Real-time trading data, OHLCV candles, exchange orderbook data
+    not_fit_for:
+    - Some tokens may have lower coverage than CoinGecko
+  - name: DeFiLlama
+    traits:
+    - defi_tvl
+    - yield_data
+    - no_auth
+    fit_for:
+    - DeFi protocol TVL and yield farming data; no API key required
+    not_fit_for:
+    - General price lookups; not a price oracle
+  default: CoinGecko
+  _source: worker_resource
+- id: slot-002
+  name: price_oracle_fallback
+  description: CryptoCompare is the configured fallback; manual prices always take precedence.
+  used_in_stages: []
+  options:
+  - name: CryptoCompare
+    traits:
+    - crypto_prices
+    - fallback
+    fit_for:
+    - Fallback when CoinGecko fails or rate-limits
+    not_fit_for:
+    - When CoinGecko is unavailable and CryptoCompare is also unavailable
+  - name: Manual prices
+    traits:
+    - manual
+    - override
+    fit_for:
+    - User overrides for any asset; highest priority in price resolution
+    not_fit_for:
+    - Automated price discovery
+  default: CryptoCompare
+  _source: worker_resource
+- id: slot-003
+  name: rpc_node_provider
+  description: Weighted round-robin across multiple nodes per chain; users can add owned nodes (Infura/QuickNode/Alchemy)
+    with higher priority.
+  used_in_stages: []
+  options:
+  - name: Cloudflare Ethereum Gateway
+    traits:
+    - public
+    - free
+    - no_auth
+    - eth_only
+    fit_for:
+    - Ethereum mainnet; no setup required
+    not_fit_for:
+    - L2 chains, privacy-sensitive use (Cloudflare sees all queries)
+  - name: Ankr
+    traits:
+    - public_free
+    - multi_chain
+    - no_auth
+    fit_for:
+    - Multi-chain access; good Ethereum free tier
+    not_fit_for:
+    - Production use without owned tier (rate limits on free)
+  - name: Flashbots RPC
+    traits:
+    - eth_only
+    - privacy
+    - no_auth
+    fit_for:
+    - Ethereum with MEV protection; privacy-preserving transactions
+    not_fit_for:
+    - Non-Ethereum chains; high-throughput needs
+  - name: Infura
+    traits:
+    - owned
+    - multi_chain
+    - reliable
+    - api_key
+    fit_for:
+    - Production deployments requiring reliable, multi-chain RPC access
+    not_fit_for:
+    - Users without Infura accounts; free/cheap alternatives suffice for light use
+  - name: QuickNode
+    traits:
+    - owned
+    - multi_chain
+    - reliable
+    - api_key
+    fit_for:
+    - Production with premium features (traces, enhanced APIs)
+    not_fit_for:
+    - Free-tier users
+  - name: Alchemy
+    traits:
+    - owned
+    - enhanced_apis
+    - nft_data
+    - traces
+    - api_key
+    fit_for:
+    - Enhanced APIs (NFTs, traces, decoded events); recommended by rotki
+    not_fit_for:
+    - Free users; simple RPC-only needs
+  - name: Blockscout (RPC)
+    traits:
+    - public
+    - free
+    - multi_chain
+    - no_auth
+    fit_for:
+    - Optimism, Polygon, Arbitrum, Base, Gnosis, Scroll, Hyperliquid; no key needed
+    not_fit_for:
+    - Ethereum mainnet (limited); privacy-sensitive queries
+  default: Cloudflare + Ankr + Flashbots + MyEtherWallet (ETH); chain-specific public nodes
+  _source: worker_resource
+- id: slot-004
+  name: evm_explorer_api
+  description: Etherscan is primary; Blockscout used as fallback for chains it supports; Routescan used
+    for L2 L1 fee extraction.
+  used_in_stages: []
+  options:
+  - name: Etherscan
+    traits:
+    - primary
+    - eth
+    - bsc
+    - polygon
+    - arbitrum
+    - optimism
+    - api_key
+    fit_for:
+    - Ethereum and most EVM chains; full feature set
+    not_fit_for:
+    - Gnosis, Scroll, Base (dedicated explorers available); rate limits on free tier
+  - name: Blockscout
+    traits:
+    - multi_chain
+    - no_auth
+    - rpc_also
+    fit_for:
+    - Multi-chain; Gnosis, Scroll, Base, Hyperliquid; no API key needed
+    not_fit_for:
+    - Ethereum mainnet (shared PRO API may be rate-limited)
+  - name: Routescan
+    traits:
+    - eth
+    - optimism
+    - l1_fees
+    - api_key
+    fit_for:
+    - Ethereum, Optimism (especially L1 fee extraction); free placeholder key accepted
+    not_fit_for:
+    - Other chains not supported by Routescan
+  default: Etherscan (primary) + Blockscout (fallback per chain) + Routescan (for L1 fees on L2s)
+  _source: worker_resource
+- id: slot-005
+  name: fiat_exchange_rate_provider
+  description: Only fiat exchange rate provider in the codebase; beautifulsoup4 is also used for HTML
+    parsing.
+  used_in_stages: []
+  options:
+  - name: x-rates.com (web scraping)
+    traits:
+    - fiat
+    - historical
+    - current
+    - no_auth
+    fit_for:
+    - Fiat currency exchange rates (EUR, USD, GBP, etc.); both current and historical
+    not_fit_for:
+    - Cryptocurrency rates; scraping may break if website changes
+  default: x-rates.com (web scraping)
+  _source: worker_resource
+- id: slot-006
+  name: solana_rpc_provider
+  description: Helius recommended; user can configure owned RPC; The Graph / Helius used for tx decoding
+    when Helius key provided.
+  used_in_stages: []
+  options:
+  - name: Helius (recommended)
+    traits:
+    - solana
+    - api_key
+    - enhanced_txs
+    - rpc_fallback
+    fit_for:
+    - Enhanced Solana transaction parsing; RPC fallback when API key provided
+    not_fit_for:
+    - Without API key (rate limits apply at 2 req/sec free)
+  - name: Public Solana RPC
+    traits:
+    - public
+    - free
+    - no_auth
+    fit_for:
+    - Basic Solana RPC access
+    not_fit_for:
+    - Enhanced transaction parsing; rate limits
+  default: Public Solana RPC nodes (from nodes.json if any configured)
+  _source: worker_resource
+- id: slot-007
+  name: ethereum_beacon_chain_api
+  description: Only ETH2 staking data provider in codebase; requires API key.
+  used_in_stages: []
+  options:
+  - name: beaconcha.in
+    traits:
+    - eth2
+    - validator_data
+    - api_key
+    fit_for:
+    - ETH validator/staking balance queries, attestations, proposer duties
+    not_fit_for:
+    - Non-validator ETH2 data needs
+  default: beaconcha.in
+  _source: worker_resource
+- id: slot-008
+  name: nft_marketplace_api
+  description: Only NFT marketplace integrated; has backup free API key.
+  used_in_stages: []
+  options:
+  - name: OpenSea API
+    traits:
+    - nft
+    - ownership
+    - floor_prices
+    - ethereum
+    - api_key
+    fit_for:
+    - NFT ownership queries, collection floor prices, NFT metadata
+    not_fit_for:
+    - Non-OpenSea NFTs; other marketplaces (Blur, Rarible, Magic Eden) not directly supported
+  default: OpenSea API
+  _source: worker_resource
+- id: slot-009
+  name: database_encryption
+  description: User database must be encrypted (contains sensitive keys/assets); global DB ships unencrypted
+    in the package and is copied to user dir as read-write copy at first run.
+  used_in_stages: []
+  options:
+  - name: SQLCipher (default)
+    traits:
+    - encrypted
+    - sqlcipher
+    - aes_256
+    - open_source
+    fit_for:
+    - Production use; encrypts user DB at rest with AES-256
+    not_fit_for:
+    - Environments where SQLCipher native libraries are unavailable
+  - name: rsqlite (read-only global DB)
+    traits:
+    - read_only
+    - packaged
+    - unencrypted
+    fit_for:
+    - Read-only access to the bundled global asset database (shipped with app)
+    not_fit_for:
+    - User database (needs writes); any modification
+  default: sqlcipher3 for user DB (encrypted); rsqlite for bundled global DB (read-only)
+  _source: worker_resource
+- id: slot-010
+  name: async_runtime
+  description: gevent is the only async runtime used; required because SQLite is used in an async greenlet
+    context and requires yielding to prevent blocking.
+  used_in_stages: []
+  options:
+  - name: gevent (default & only)
+    traits:
+    - greenlets
+    - non_blocking_io
+    - sqlite_safe
+    fit_for:
+    - All production deployments; allows SQLite to be safely used in async context via cooperative yielding
+    not_fit_for:
+    - Python async/await native code; environments where greenlet patching is problematic
+  default: gevent
+  _source: worker_resource
+resources:
+- id: res-001
+  type: code_example
+  name: Sphinx Documentation Configuration
+  path: docs/conf.py
+  description: Configure Sphinx documentation builder settings for the rotki project including version,
+    author, and extension modules.
+  used_in_stages:
+  - data_collection
+  _source: uc_list

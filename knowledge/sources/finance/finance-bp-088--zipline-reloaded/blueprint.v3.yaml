@@ -1,0 +1,3059 @@
+# Re-enriched by reenrich_blueprint.py (P0-A Bug B/C/D2 fix)
+id: finance-bp-088
+name: Zipline
+sop_version: '3.6'
+source:
+  projects:
+  - zipline-reloaded
+  commit_hash: 943010b9da848e317fc520de87edade2b884d329
+  extraction_methods:
+  - semi_auto
+applicability:
+  domain: finance
+  task_type: algorithmic trading backtesting and live-trading simulation
+  description: Pythonic event-driven system for backtesting trading strategies with realistic slippage,
+    transaction costs, and order delays. Supports cross-sectional factor computation, multi-currency portfolios,
+    and futures continuous contracts.
+  prerequisites: Python programming, basic understanding of financial markets and trading strategies,
+    familiarity with pandas DataFrames
+  not_suitable_for: real-time production trading (requires custom integration), options pricing, portfolio
+    optimization, high-frequency trading strategies requiring tick-level modeling
+  activation:
+    triggers:
+    - User asks about Zipline algorithmic trading library
+    - Working with trading strategies or backtesting
+    - Implementing custom data sources or factors
+    - Modifying order execution or portfolio management logic
+    - Running tests or building documentation
+    emphasis:
+    - Use ESPECIALLY when implementing data bundles or pipeline factors
+    - Use ESPECIALLY when dealing with numpy/pandas API compatibility issues
+    anti_skip:
+    - Don't skip dependency versions as breaking changes occur in pandas >= 2.0 and numpy >= 2.0
+    - Don't skip Cython considerations as performance-critical components require attention
+stages:
+- id: data_ingestion
+  name: Data Ingestion/Bundles
+  order: 1
+  responsibility: Ingest external pricing data (Quandl, CSV, etc.) into proprietary formats and transform
+    raw OHLCV data into bcolz/HDF5 for efficient reading. This stage exists because trading simulations
+    require fast random access to historical pricing data across thousands of securities.
+  interface:
+    inputs:
+    - Raw CSV/HDF5 files
+    - Asset metadata (equities/futures)
+    - Corporate action data (splits, dividends)
+    outputs:
+    - bcolz daily bars
+    - bcolz minute bars
+    - SQLite adjustments DB
+    - Asset SQLite DB
+  required_methods:
+  - name: ingest
+    description: Main entry point for ingesting data into a bundle; invokes the registered ingest function
+      and writes data to bcolz/SQLite storage
+    evidence: src/zipline/data/bundles/core.py:154(BundleData)
+  key_behaviors:
+  - behavior: Versioned bundle directories
+    description: Allows multiple versions of the same bundle; enables backtesting against historical data
+      states by storing each ingest with a timestamp
+    evidence: src/zipline/data/bundles/core.py:91(to_bundle_ingest_dirname)
+  - behavior: Asset/futures separation
+    description: Equities and futures have different metadata schemas; separate tables enable efficient
+      querying per asset type
+    evidence: src/zipline/assets/asset_writer.py:688(write)
+  replaceable_points:
+  - name: bundle_ingest
+    description: Ingestion function for new data sources
+    options:
+    - name: quandl
+      traits:
+      - Remote API
+      - WIKI dataset
+      - Requires API key
+      fit_for:
+      - Free US equity data
+      - Historical backtests with quandl data
+      not_fit_for:
+      - Modern data sources
+      - Non-US markets
+      - Production use (API deprecated)
+    - name: csvdir
+      traits:
+      - Local CSV files
+      - No API required
+      fit_for:
+      - Custom datasets
+      - Private data sources
+      - Testing
+      not_fit_for:
+      - Large datasets
+      - Remote team sharing
+    - name: custom
+      traits:
+      - User-defined ingest function
+      fit_for:
+      - Proprietary data formats
+      - Alternative data sources
+      - Streaming data
+      not_fit_for:
+      - Quick prototyping
+      - Beginners without Python experience
+    default: quandl
+  - name: bar_format
+    description: Backend format for bar storage
+    options:
+    - name: bcolz
+      traits:
+      - Columnar
+      - Chunked out-of-core
+      - Fast column extraction
+      fit_for:
+      - Large equity datasets
+      - Memory-constrained environments
+      not_fit_for:
+      - HPC clusters without bcolz support
+    - name: hdf5
+      traits:
+      - Widely compatible
+      - Hierarchical structure
+      fit_for:
+      - Interoperability with other tools
+      not_fit_for:
+      - Memory-constrained environments
+    default: bcolz
+  design_decisions:
+  - 'bcolz for bar storage (evidence: src/zipline/data/bcolz_daily_bars.py:111(BcolzDailyBarWriter)) —
+    bcolz provides chunked out-of-core storage ideal for large equity datasets; supports column-wise reading
+    (only open/close needed without loading high/low)'
+  - 'SQLite for adjustments (evidence: src/zipline/data/adjustments.py:82(SQLiteAdjustmentReader)) — Adjustments
+    are append-only sparse events; SQLite''s single-file DB with indices handles range queries efficiently'
+  acceptance_hints:
+  - Bundle appears in `zipline bundles` command output
+  - Ingested data covers expected date range for test assets
+  - Asset lookup by symbol returns correct SID after ingestion
+- id: asset_management
+  name: Asset Management
+  order: 2
+  responsibility: Resolve symbols to assets, track asset lifetimes, manage futures continuous contracts
+    and roll schedules. This stage exists because there is a need for authoritative mapping from ticker
+    symbols to unique security identifiers across historical periods.
+  interface:
+    inputs:
+    - Symbol strings
+    - SID integers
+    - Trading dates
+    outputs:
+    - Asset objects (Equity/Future)
+    - ContinuousFuture specs
+    - Asset lifetimes DataFrame
+  required_methods:
+  - name: AssetFinder.lookup_symbol
+    description: Resolves a ticker symbol to an Asset object, handling fuzzy matching for delisted/reused
+      tickers
+    evidence: src/zipline/assets/assets.py:257(AssetFinder)
+  - name: AssetFinder.retrieve_asset
+    description: Retrieves asset by SID with caching for efficient repeated lookups
+    evidence: src/zipline/assets/assets.py:454(retrieve_asset)
+  - name: create_continuous_future
+    description: Creates a synthetic continuous contract spanning multiple expirations for historical
+      backtests
+    evidence: src/zipline/assets/assets.py:1219(create_continuous_future)
+  key_behaviors:
+  - behavior: Fuzzy symbol matching
+    description: Symbol delistings cause ticker reuse; fuzzy matching enables handling of stale references
+      when exact symbol lookup fails
+    evidence: src/zipline/assets/assets.py:357(_fuzzify_symbol_ownership_map)
+  - behavior: Memoized ownership maps
+    description: Asset lookups happen millions of times in backtests; caching ownership maps avoids repeated
+      SQL queries
+    evidence: src/zipline/assets/assets.py:327(symbol_ownership_map)
+  - behavior: Continuous futures abstraction
+    description: Historical backtests need synthetic price series spanning multiple contract expirations;
+      continuous futures provide gap-adjusted price history
+    evidence: src/zipline/assets/assets.py:1219(create_continuous_future)
+  replaceable_points:
+  - name: roll_strategy
+    description: How to determine roll dates for futures continuous contracts
+    options:
+    - name: CalendarRollFinder
+      traits:
+      - Uses contract auto_close_date
+      - Deterministic rolls
+      fit_for:
+      - Calendar-based trading
+      - Standard futures strategies
+      not_fit_for:
+      - Volume-driven roll timing
+    - name: VolumeRollFinder
+      traits:
+      - Based on volume transfer
+      - Dynamic roll dates
+      fit_for:
+      - Liquidity-following strategies
+      - Arbitrage detection
+      not_fit_for:
+      - Pre-trade planning
+      - Deterministic backtests
+    - name: custom
+      traits:
+      - User-defined roll logic
+      fit_for:
+      - Proprietary roll heuristics
+      not_fit_for:
+      - Standard backtests
+    default: CalendarRollFinder
+  design_decisions:
+  - 'Fuzzy symbol matching (evidence: src/zipline/assets/assets.py:357(_fuzzify_symbol_ownership_map))
+    — Symbol delistings cause ticker reuse; fuzzy matching enables handling of stale references'
+  - 'Memoized ownership maps (evidence: src/zipline/assets/assets.py:327(symbol_ownership_map)) — Asset
+    lookups happen millions of times in backtests; caching ownership maps avoids repeated SQL queries'
+  - 'Continuous futures abstraction (evidence: src/zipline/assets/assets.py:1219(create_continuous_future))
+    — Historical backtests need synthetic price series spanning multiple contract expirations'
+  acceptance_hints:
+  - Symbol lookup returns correct Asset with proper start/end dates
+  - Continuous future price series is continuous (no NaN gaps except at rolls)
+  - Asset lookup by SID returns same object for repeated calls (caching)
+- id: pipeline_computation
+  name: Pipeline Computation Engine
+  order: 3
+  responsibility: Execute declarative factor/filter/classifier graphs over asset-date matrices. This stage
+    enables vectorized cross-sectional computations (rankings, z-scores) across thousands of securities
+    efficiently.
+  interface:
+    inputs:
+    - Pipeline object (terms + screen)
+    - start_date, end_date
+    - BoundColumn loaders
+    outputs:
+    - DataFrame with MultiIndex (date, asset)
+    - Narrowed to screened assets
+  required_methods:
+  - name: SimplePipelineEngine.run_pipeline
+    description: Topological execution of Pipeline term graph; computes each factors, filters, and classifiers
+      with chunked processing for memory efficiency
+    evidence: src/zipline/pipeline/engine.py:210(SimplePipelineEngine)
+  - name: Pipeline藤
+    description: Creates pipeline with factors, filters, classifiers and screens
+    evidence: src/zipline/pipeline/pipeline.py
+  - name: USEquityPricing.close
+    description: BoundColumn for daily close prices; class attribute that becomes bound term when accessed
+    evidence: src/zipline/pipeline/data/equity_pricing.py
+  key_behaviors:
+  - behavior: Memoized Term construction
+    description: Pipeline literals (USEquityPricing.close) are class attributes; memoization ensures identical
+      terms share the same object identity for graph equality checks
+    evidence: src/zipline/pipeline/term.py:103(__new__)
+  - behavior: Chunked execution
+    description: Multi-year pipelines on thousands of assets exceed memory; chunking limits peak memory
+      to one chunk at a time
+    evidence: src/zipline/pipeline/engine.py:271(run_chunked_pipeline)
+  - behavior: Sliding window with adjustments
+    description: Windowed computations need pre-adjusted prices; sliding window amortizes adjustment computation
+      across requests
+    evidence: src/zipline/data/history_loader.py:225(SlidingWindow)
+  - behavior: NumExpr for expressions
+    description: Factor arithmetic (close / moving_average) compiles to NumExpr for ~10x speedup vs pure
+      numpy
+    evidence: src/zipline/pipeline/factors/factor.py:1350(NumExprFactor)
+  replaceable_points:
+  - name: pipeline_loader
+    description: How to load external data into pipelines
+    options:
+    - name: EquityPricingLoader
+      traits:
+      - Pre-adjusted prices
+      - bcolz backend
+      fit_for:
+      - Standard equity factors
+      - Historical data
+      not_fit_for:
+      - Real-time data
+      - Custom data sources
+    - name: PrecomputedLoader
+      traits:
+      - User-provided arrays
+      fit_for:
+      - Alternative data
+      - Pre-computed signals
+      not_fit_for:
+      - Standard OHLCV factors
+    - name: custom
+      traits:
+      - Custom loader protocol
+      fit_for:
+      - Proprietary data formats
+      not_fit_for:
+      - Standard pipelines
+    default: EquityPricingLoader
+  - name: execution_engine
+    description: Pipeline computation engine
+    options:
+    - name: SimplePipelineEngine
+      traits:
+      - Standard execution
+      - Memory-managed
+      fit_for:
+      - Production backtests
+      not_fit_for:
+      - Debugging term execution
+    - name: ExplodingPipelineEngine
+      traits:
+      - Every terms computed
+      - No optimization
+      fit_for:
+      - Testing
+      - Debugging
+      not_fit_for:
+      - Large pipelines
+    default: SimplePipelineEngine
+  design_decisions:
+  - 'Memoized Term construction (evidence: src/zipline/pipeline/term.py:103(__new__)) — Pipeline literals
+    (USEquityPricing.close) are class attributes; memoization ensures identical terms share the same object
+    identity for graph equality checks'
+  - 'Chunked execution (evidence: src/zipline/pipeline/engine.py:271(run_chunked_pipeline)) — Multi-year
+    pipelines on thousands of assets exceed memory; chunking limits peak memory to one chunk at a time'
+  - 'Universal mixin pattern (evidence: src/zipline/pipeline/mixins.py:287(UniversalMixin)) — Same mixin
+    (Slice, Downsample) applies across Factor/Filter/Classifier; avoids triplicated code'
+  - 'NumExpr for expressions (evidence: src/zipline/pipeline/factors/factor.py:1350(NumExprFactor)) —
+    Factor arithmetic (close / moving_average) compiles to NumExpr for ~10x speedup vs numpy'
+  - 'Domain abstraction (evidence: src/zipline/pipeline/domain.py:36(IDomain)) — US vs non-US calendars
+    have different session definitions; Domain abstracts calendar choice for multi-market pipelines'
+  acceptance_hints:
+  - Pipeline computation completes without errors for multi-year date ranges
+  - Output DataFrame has MultiIndex (date, asset) structure
+  - Screened assets match filter conditions (no NaN rows from screen)
+  - Windowed factors produce correct trailing window values
+- id: trading_simulation
+  name: Trading Simulation
+  order: 4
+  responsibility: 'Drive the event loop for backtesting: advance clock, emit bars, process orders. This
+    stage exists because Zipline historically simulated minute-by-minute; maintains compatibility while
+    supporting daily frequency.'
+  interface:
+    inputs:
+    - TradingAlgorithm instance
+    - DataPortal
+    - SimulationClock
+    - BenchmarkSource
+    outputs:
+    - Performance DataFrames
+    - Capital change packets
+    - Risk reports
+  required_methods:
+  - name: TradingAlgorithm.run
+    description: Entry point for backtest execution; initializes algorithm, creates clock, and runs simulation
+      loop
+    evidence: src/zipline/algorithm.py:142(TradingAlgorithm)
+  - name: TradingAlgorithm.order
+    description: Place an order for a security with given amount; returns order_id for tracking
+    evidence: src/zipline/algorithm.py
+  - name: TradingAlgorithm.schedule_function
+    description: Schedule a function to run at specific date/time rules (e.g., daily close, weekly)
+    evidence: src/zipline/algorithm.py
+  key_behaviors:
+  - behavior: Generator-based simulation
+    description: Generator allows yielding mid-loop for capital changes; enables incremental result streaming
+      vs batch processing
+    evidence: src/zipline/gens/tradesimulation.py:99(transform)
+  - behavior: Dual emission rates
+    description: Minute frequency tracks intraday metrics; daily frequency for end-of-day risk; emission_rate
+      parameter controls output granularity
+    evidence: src/zipline/gens/tradesimulation.py:305(_get_daily_message)
+  - behavior: Clock abstraction
+    description: Separate clock creation allows same algorithm to run minute or daily without code changes
+    evidence: src/zipline/algorithm.py:481(_create_clock)
+  - behavior: Auto-close expired assets
+    description: Assets delist after end_date; auto-close prevents stale positions from affecting subsequent
+      calculations
+    evidence: src/zipline/gens/tradesimulation.py:258(_cleanup_expired_assets)
+  replaceable_points:
+  - name: simulation_clock
+    description: Time progression mechanism
+    options:
+    - name: MinuteSimulationClock
+      traits:
+      - Minute-by-minute
+      - Intraday metrics
+      fit_for:
+      - Intraday strategies
+      - High-frequency analysis
+      not_fit_for:
+      - Daily strategies
+      - Long backtests
+    - name: DailySimulationClock
+      traits:
+      - Daily bars
+      - Efficient execution
+      fit_for:
+      - Daily strategies
+      - Long historical periods
+      not_fit_for:
+      - Intraday strategies
+      - Minute-level analysis
+    default: MinuteSimulationClock
+  - name: blotter_class
+    description: Order management backend
+    options:
+    - name: SimulationBlotter
+      traits:
+      - Standard order tracking
+      - Built-in slippage
+      fit_for:
+      - Standard backtests
+      not_fit_for:
+      - Custom order handling
+    - name: custom
+      traits:
+      - User-defined blotter
+      fit_for:
+      - Live trading integration
+      - Custom fill models
+      not_fit_for:
+      - Standard backtests
+    default: SimulationBlotter
+  design_decisions:
+  - 'Generator-based simulation (evidence: src/zipline/gens/tradesimulation.py:99(transform)) — Generator
+    allows yielding mid-loop for capital changes; enables incremental result streaming vs batch processing'
+  - 'Dual emission rates (evidence: src/zipline/gens/tradesimulation.py:305(_get_daily_message)) — Minute
+    frequency tracks intraday metrics; daily frequency for end-of-day risk; emission_rate parameter controls
+    output granularity'
+  - 'Clock abstraction (evidence: src/zipline/algorithm.py:481(_create_clock)) — Separate clock creation
+    allows same algorithm to run minute or daily without code changes'
+  acceptance_hints:
+  - Algorithm produces performance DataFrame with expected date range
+  - handle_data or before_trading_start called at correct intervals
+  - Order placement returns valid order_id
+  - Performance metrics (returns, Sharpe) computed without errors
+- id: order_management
+  name: Order Management & Execution
+  order: 5
+  responsibility: Track open orders, apply slippage/commission models, generate transactions. This stage
+    enables realistic backtesting by modeling market impact, fill uncertainty, and trading costs.
+  interface:
+    inputs:
+    - Order requests from algorithm
+    - Bar data (prices/volume)
+    - Execution styles (market/limit/stop)
+    outputs:
+    - Transaction objects
+    - Commission costs
+    - Order status updates
+  required_methods:
+  - name: SimulationBlotter.order
+    description: Place a new order; validates against trading controls, applies slippage model
+    evidence: src/zipline/finance/blotter/simulation_blotter.py:41(SimulationBlotter)
+  - name: Blotter.cancel
+    description: Cancel an existing order by order_id
+    evidence: src/zipline/finance/blotter/blotter.py:21(Blotter)
+  - name: SlippageModel.calculate_fill
+    description: Calculate actual fill price based on volume share and order size
+    evidence: src/zipline/finance/slippage.py:81(SlippageModel)
+  key_behaviors:
+  - behavior: Per-asset slippage models
+    description: Equities and futures have different liquidity characteristics; asset-type dispatch allows
+      different models
+    evidence: src/zipline/finance/blotter/simulation_blotter.py:63(slippage_models)
+  - behavior: Asset-type commission dispatch
+    description: Futures have per-contract pricing with exchange fees; equities have per-share pricing;
+      dispatch ensures correct model selection
+    evidence: src/zipline/finance/blotter/simulation_blotter.py:70(commission_models)
+  - behavior: Cancel policy abstraction
+    description: EODCancel vs NeverCancel affects intraday backtest results; policy abstraction lets users
+      choose realism level
+    evidence: src/zipline/finance/cancel_policy.py:22(CancelPolicy)
+  replaceable_points:
+  - name: slippage_model
+    description: Fill price impact model
+    options:
+    - name: VolumeShareSlippage
+      traits:
+      - Quadratic price impact
+      - Volume-based
+      fit_for:
+      - Large orders
+      - Liquid markets
+      not_fit_for:
+      - Small orders
+      - Illiquid markets
+    - name: FixedBasisPointsSlippage
+      traits:
+      - Fixed spread
+      - 5 bps default
+      fit_for:
+      - Simple backtests
+      - Market orders
+      not_fit_for:
+      - Large orders
+      - Volume-sensitive strategies
+    - name: FixedSlippage
+      traits:
+      - Fixed dollar spread
+      fit_for:
+      - ETF strategies
+      - Predictable spreads
+      not_fit_for:
+      - Percentage-based analysis
+    - name: NoSlippage
+      traits:
+      - No market impact
+      fit_for:
+      - Academic benchmarks
+      - Small order validation
+      not_fit_for:
+      - Realistic backtests
+      - Large orders
+    default: FixedBasisPointsSlippage
+  - name: commission_model
+    description: Trading cost model
+    options:
+    - name: PerShare
+      traits:
+      - $0.001/share default
+      - Equity-focused
+      fit_for:
+      - US equity strategies
+      not_fit_for:
+      - Futures
+      - Large-cap trades
+    - name: PerDollar
+      traits:
+      - Percentage of value
+      fit_for:
+      - Percentage-based cost analysis
+      not_fit_for:
+      - Flat fee structures
+    - name: PerTrade
+      traits:
+      - Flat fee per trade
+      fit_for:
+      - Brokerage-style modeling
+      not_fit_for:
+      - Volume-based analysis
+    - name: PerContract
+      traits:
+      - Per futures contract
+      fit_for:
+      - Futures strategies
+      not_fit_for:
+      - Equity-only backtests
+    default: PerShare
+  - name: cancel_policy
+    description: Order expiration policy
+    options:
+    - name: EODCancel
+      traits:
+      - Day orders only
+      - End-of-day cancellation
+      fit_for:
+      - Realistic intraday simulation
+      not_fit_for:
+      - Multi-day positions
+      - GTC orders
+    - name: NeverCancel
+      traits:
+      - GTC orders
+      - Persistent until filled
+      fit_for:
+      - Simple backtests
+      - Limit orders
+      not_fit_for:
+      - Realistic live trading
+    default: NeverCancel
+  design_decisions:
+  - 'Per-asset slippage models (evidence: src/zipline/finance/blotter/simulation_blotter.py:63(slippage_models))
+    — Equities and futures have different liquidity characteristics; asset-type dispatch allows different
+    models'
+  - 'Default FixedBasisPointsSlippage (evidence: src/zipline/finance/blotter/simulation_blotter.py:64)
+    — 5 basis points is reasonable market impact estimate; avoids requiring users to configure slippage
+    for simple backtests'
+  - 'Default PerShare commission (evidence: src/zipline/finance/blotter/simulation_blotter.py:71) — $0.001/share
+    approximates US equity exchange fees; realistic cost modeling for performance attribution'
+  - 'Asset-type commission dispatch (evidence: src/zipline/finance/blotter/simulation_blotter.py:70(commission_models))
+    — Futures have per-contract pricing with exchange fees; equities have per-share pricing; dispatch
+    ensures correct model selection'
+  - 'Cancel policy abstraction (evidence: src/zipline/finance/cancel_policy.py:22(CancelPolicy)) — EODCancel
+    vs NeverCancel affects intraday backtest results; policy abstraction lets users choose realism level'
+  acceptance_hints:
+  - Orders are filled with prices matching slippage model calculations
+  - Commission costs are correctly applied per model specification
+  - Cancel requests successfully remove orders from open_orders
+  - Position amounts correctly reflect filled orders
+- id: portfolio_accounting
+  name: Portfolio Accounting & Metrics
+  order: 6
+  responsibility: Track positions, calculate portfolio value, compute P&L, update risk metrics. This stage
+    enables accurate performance measurement by modeling cash flows, dividends, and position changes atomically.
+  interface:
+    inputs:
+    - Transactions
+    - Dividend events
+    - Corporate actions
+    - Price updates
+    outputs:
+    - Portfolio state
+    - Account state
+    - Performance DataFrames
+  required_methods:
+  - name: Ledger.process_transaction
+    description: Atomic processing of transaction with cash flow calculation, position update, and P&L
+      tracking
+    evidence: src/zipline/finance/ledger.py:314(Ledger)
+  - name: Ledger.earn_dividends
+    description: Accrue dividend income on ex-date and process payment on pay_date
+    evidence: src/zipline/finance/ledger.py:140(earn_dividends)
+  - name: MetricsTracker.record
+    description: Record daily/minute metrics including returns, positions, and cash
+    evidence: src/zipline/finance/metrics/tracker.py:24(MetricsTracker)
+  key_behaviors:
+  - behavior: Ledger as central coordinator
+    description: Single source of truth for cash/positions; avoids inconsistent state between separate
+      cash and position trackers
+    evidence: src/zipline/finance/ledger.py:314(Ledger)
+  - behavior: Cost basis per position
+    description: Average cost basis matches real-world tax/performance reporting conventions
+    evidence: src/zipline/finance/position.py:47(__init__)
+  - behavior: Immutability via MutableView
+    description: Portfolio/Account exposed to user algorithms as read-only; MutableView allows internal
+      mutation while maintaining external immutability contract
+    evidence: src/zipline/protocol.py:22(MutableView)
+  - behavior: Dividend accrual on ex-date
+    description: 'Standard convention: dividend value captured on ex-date, payment on pay_date; models
+      real-world cash flow timing'
+    evidence: src/zipline/finance/ledger.py:140(earn_dividends)
+  - behavior: MetricsTracker emission
+    description: Daily vs minute emission affects perf DataFrame granularity; emission_rate drives handle_*_close
+      callbacks
+    evidence: src/zipline/finance/metrics/tracker.py:69(__init__)
+  replaceable_points:
+  - name: metrics_set
+    description: Risk/performance calculation set
+    options:
+    - name: default
+      traits:
+      - Full risk metrics
+      - Empyrical calculations
+      fit_for:
+      - Production backtests
+      - Performance analysis
+      not_fit_for:
+      - Memory-constrained environments
+    - name: simplified
+      traits:
+      - Basic metrics only
+      fit_for:
+      - Quick validation
+      - Debugging
+      not_fit_for:
+      - Production reporting
+    - name: custom
+      traits:
+      - User-defined metrics
+      fit_for:
+      - Custom KPI tracking
+      not_fit_for:
+      - Standard analysis
+    default: default
+  design_decisions:
+  - 'Ledger as central coordinator (evidence: src/zipline/finance/ledger.py:314(Ledger)) — Single source
+    of truth for cash/positions; avoids inconsistent state between separate cash and position trackers'
+  - 'Cost basis per position (evidence: src/zipline/finance/position.py:47(__init__)) — Average cost basis
+    matches real-world tax/performance reporting conventions'
+  - 'Immutability via MutableView (evidence: src/zipline/protocol.py:22(MutableView)) — Portfolio/Account
+    exposed to user algorithms as read-only; MutableView allows internal mutation while maintaining external
+    immutability contract'
+  - 'Dividend accrual on ex-date (evidence: src/zipline/finance/ledger.py:140(earn_dividends)) — Standard
+    convention: dividend value captured on ex-date, payment on pay_date; models real-world cash flow timing'
+  acceptance_hints:
+  - Portfolio value matches cash + sum of position values
+  - Dividends correctly accrue and pay on appropriate dates
+  - P&L calculations match expected values for trades
+  - Performance DataFrame contains expected columns (returns, positions, capital_used)
+- id: data_access
+  name: Data Access Layer
+  order: 7
+  responsibility: Serve historical and spot pricing data to algorithms and pipelines with adjustment support.
+    This stage provides unified access to raw/adjusted prices across minute/daily frequencies for both
+    live bars and historical windows.
+  interface:
+    inputs:
+    - Asset, field, datetime
+    - Assets, end_dt, bar_count
+    - Adjustment reader
+    outputs:
+    - Scalar values
+    - RawArrays (OHLCV)
+    - Adjustment lists
+  required_methods:
+  - name: DataPortal.get_spot_value
+    description: Retrieve single value for asset/field at specific datetime; applies adjustments if requested
+    evidence: src/zipline/data/data_portal.py:89(DataPortal)
+  - name: DataPortal.get_history_window
+    description: Retrieve historical bars for multiple assets; applies adjustments and returns RawArrays
+    evidence: src/zipline/data/data_portal.py
+  - name: DataPortal.get_adjustments
+    description: Retrieve corporate action adjustments (splits, dividends, mergers) for date range
+    evidence: src/zipline/data/data_portal.py:553(get_adjustments)
+  key_behaviors:
+  - behavior: Adjustment reader abstraction
+    description: Adjustments needed for both spot values and history windows; reader abstraction enables
+      pluggable adjustment sources
+    evidence: src/zipline/data/data_portal.py:553(get_adjustments)
+  - behavior: Prefetch windows
+    description: minutely=400, daily=200 default prefetch reduces per-bar I/O; tunable for memory-constrained
+      environments
+    evidence: src/zipline/data/data_portal.py:131(__init__)
+  - behavior: Continuous future reader
+    description: Roll-aware reading for continuous contracts; maps gap-adjusted prices across roll dates
+    evidence: src/zipline/data/continuous_future_reader.py:6(ContinuousFutureSessionBarReader)
+  replaceable_points:
+  - name: bar_reader
+    description: Raw bar storage backend
+    options:
+    - name: BcolzMinuteBarReader
+      traits:
+      - Minute bars
+      - bcolz format
+      fit_for:
+      - Intraday backtests
+      - Standard US equity
+      not_fit_for:
+      - Non-bcolz data sources
+    - name: HDF5DailyBarReader
+      traits:
+      - Daily bars
+      - HDF5 format
+      fit_for:
+      - Daily strategies
+      - Alternative data
+      not_fit_for:
+      - Minute-level needs
+    - name: custom
+      traits:
+      - User-defined reader
+      fit_for:
+      - Proprietary formats
+      not_fit_for:
+      - Standard workflows
+    default: BcolzMinuteBarReader
+  - name: adjustment_reader
+    description: Corporate action adjustments
+    options:
+    - name: SQLiteAdjustmentReader
+      traits:
+      - SQLite storage
+      - Efficient range queries
+      fit_for:
+      - Standard bundles
+      not_fit_for:
+      - Custom adjustment sources
+    - name: custom
+      traits:
+      - User-defined adjustments
+      fit_for:
+      - Proprietary adjustment data
+      not_fit_for:
+      - Standard bundles
+    default: SQLiteAdjustmentReader
+  design_decisions:
+  - 'Adjustment reader abstraction (evidence: src/zipline/data/data_portal.py:553(get_adjustments)) —
+    Adjustments needed for both spot values and history windows; reader abstraction enables pluggable
+    adjustment sources'
+  - 'Prefetch windows (evidence: src/zipline/data/data_portal.py:131(__init__)) — minutely=400, daily=200
+    default prefetch reduces per-bar I/O; tunable for memory-constrained environments'
+  - 'Continuous future reader (evidence: src/zipline/data/continuous_future_reader.py:6(ContinuousFutureSessionBarReader))
+    — Roll-aware reading for continuous contracts; maps gap-adjusted prices across roll dates'
+  acceptance_hints:
+  - Spot value queries return correct adjusted prices
+  - History windows return correct bar count and alignment
+  - Adjustment ratios correctly modify prices on ex-dates
+  - Continuous futures show gap-adjusted prices at roll boundaries
+- id: fx_conversion
+  name: FX/Currency Conversion
+  order: 8
+  responsibility: Provide currency conversion rates for multi-currency portfolio valuation. This stage
+    exists because international assets may be quoted in different currencies; normalization is needed
+    for accurate P&L calculation.
+  interface:
+    inputs:
+    - Quote currency, base currency, dates
+    outputs:
+    - Rate arrays for batch conversion
+    - Scalar rates for spot conversion
+  required_methods:
+  - name: FXRateReader.get_rates
+    description: Retrieve FX conversion rates for batch conversion between currencies
+    evidence: src/zipline/data/fx/base.py:13(FXRateReader)
+  key_behaviors:
+  - behavior: HDF5 FX storage
+    description: Consistent with HDF5DailyBar storage; columnar format enables efficient rate lookups
+    evidence: src/zipline/data/fx/hdf5.py:119(HDF5FXRateReader)
+  - behavior: Default FX rate sentinel
+    description: DEFAULT_FX_RATE='close' provides fallback; prevents crashes when FX rates unavailable
+    evidence: src/zipline/data/fx/base.py:13
+  - behavior: Currency-aware columns
+    description: EquityPricing columns mark currency_aware=True; enables automatic conversion pipeline
+    evidence: src/zipline/pipeline/data/equity_pricing.py:17(currency_aware)
+  replaceable_points:
+  - name: fx_reader
+    description: FX rate source
+    options:
+    - name: HDF5FXRateReader
+      traits:
+      - HDF5 storage
+      - Efficient lookups
+      fit_for:
+      - Standard multi-currency backtests
+      not_fit_for:
+      - Real-time FX data
+    - name: InMemoryFXRateReader
+      traits:
+      - Dictionary-based
+      - Testing-friendly
+      fit_for:
+      - Unit tests
+      - Fixed rate scenarios
+      not_fit_for:
+      - Production backtests
+    - name: ExplodingFXRateReader
+      traits:
+      - Error on access
+      fit_for:
+      - Single-currency only
+      not_fit_for:
+      - Multi-currency strategies
+    default: HDF5FXRateReader
+  design_decisions:
+  - 'HDF5 FX storage (evidence: src/zipline/data/fx/hdf5.py:119(HDF5FXRateReader)) — Consistent with HDF5DailyBar
+    storage; columnar format enables efficient rate lookups'
+  - 'Default FX rate sentinel (evidence: src/zipline/data/fx/base.py:13) — DEFAULT_FX_RATE=''close'' provides
+    fallback; prevents crashes when FX rates unavailable'
+  - 'Currency-aware columns (evidence: src/zipline/pipeline/data/equity_pricing.py:17(currency_aware))
+    — EquityPricing columns mark currency_aware=True; enables automatic conversion pipeline'
+  acceptance_hints:
+  - FX rates correctly convert portfolio values to base currency
+  - Multi-currency portfolios aggregate correctly
+  - Fallback behavior prevents crashes for single-currency strategies
+data_flow:
+- from_stage: data_ingestion
+  to_stage: asset_management
+  data: Asset metadata written to SQLite asset DB via AssetDBWriter; symbols, SIDs, lifetimes stored for
+    lookup
+- from_stage: data_ingestion
+  to_stage: data_access
+  data: bcolz/HDF5 daily/minute bars, SQLite adjustments written to disk for later retrieval
+- from_stage: asset_management
+  to_stage: data_access
+  data: AssetFinder instance provided for SID resolution during bar queries; validates asset lifetimes
+- from_stage: asset_management
+  to_stage: pipeline_computation
+  data: AssetFinder for lifetimes; BoundColumns (USEquityPricing) registered for pricing data access
+- from_stage: pipeline_computation
+  to_stage: trading_simulation
+  data: Pipeline outputs (factors, filters, screens) available via TradingAlgorithm.pipeline_output()
+- from_stage: data_access
+  to_stage: trading_simulation
+  data: DataPortal provides get_spot_value and get_history_window to AlgorithmSimulator for bar emission
+- from_stage: trading_simulation
+  to_stage: order_management
+  data: Order objects created via blotter.order() call; execution styles passed with order details
+- from_stage: order_management
+  to_stage: portfolio_accounting
+  data: Transaction objects with prices, commissions, and asset information for position updates
+- from_stage: data_access
+  to_stage: portfolio_accounting
+  data: Dividend data for accrual calculations; price updates for position valuation via Ledger.update_positions
+- from_stage: fx_conversion
+  to_stage: data_access
+  data: FXRateReader injected into DataPortal for currency conversion during spot value queries
+- from_stage: portfolio_accounting
+  to_stage: trading_simulation
+  data: Performance messages (daily/minute perf dicts) yielded by AlgorithmSimulator for results aggregation
+global_contracts:
+- contract: Every portfolio/account metrics use MutableView for external immutability
+  evidence: src/zipline/protocol.py:22(MutableView)
+- contract: Pipeline term caching via memoized __new__ ensures term identity for graph operations
+  evidence: src/zipline/pipeline/term.py:103(__new__)
+- contract: Every asset lookups normalized to integer SIDs; symbol strings are lookup keys only
+  evidence: src/zipline/assets/assets.py:454(retrieve_asset)
+- contract: Bar readers must implement last_available_dt for data availability checks
+  evidence: src/zipline/data/bar_reader.py:75(last_available_dt)
+- contract: Pipeline dates are always trading sessions; non-session dates rejected
+  evidence: src/zipline/pipeline/engine.py:459
+- contract: 'Order amounts: positive=buy, negative=sell; enforced in SimulationBlotter.order()'
+  evidence: src/zipline/finance/blotter/simulation_blotter.py:143(is_buy)
+- contract: Corporate adjustments applied retroactively to historical prices; adjusted price ≤ raw price
+    for splits
+  evidence: src/zipline/data/adjustments.py:458(calc_dividend_ratios)
+- contract: Portfolio value = cash + Σ(position_value × price_multiplier)
+  evidence: src/zipline/protocol.py:163(current_portfolio_weights)
+- contract: Equity price_multiplier=1, Future multiplier from contract specification
+  evidence: src/zipline/assets/assets.py:1253(_make_sids)
+- contract: Continuous futures use adjustment='mul' (default) for ratio-based roll transitions
+  evidence: src/zipline/assets/assets.py:1219(create_continuous_future)
+- contract: 'Pipeline dtype system enforces strict type contracts: Factor→float64, Filter→bool, Classifier→categorical/int64'
+  evidence: src/zipline/pipeline/factors/factor.py:49(ALLOWED_DTYPES)
+- contract: 'Order lifecycle has strict state transitions: CREATED→OPEN→FILLED/CANCELLED'
+  evidence: src/zipline/finance/order.py:39(status)
+- contract: 'Ledger cash flow uses exposure-based calculation: cash_flow = exposure * direction * multiplier'
+  evidence: src/zipline/finance/ledger.py:281-283(process_transaction)
+- contract: Position tracker uses position.amount (positive=long, negative=short) consistently; no separate
+    is_short flag
+  evidence: src/zipline/finance/position.py:47(__init__)
+- contract: SlidingWindow amortizes adjustment computation across monotonically increasing end_dt requests
+  evidence: src/zipline/data/history_loader.py:245(get)
+business_decisions:
+- id: BD-001
+  type: B/BA
+  content: Default capital base is 10 million (10e6) for backtests
+  rationale: Capital base of 10 million (10e6) establishes a sufficient starting equity for backtests
+    to allow meaningful position sizing and margin utilization while avoiding unrealistic fractional positions.
+    This default enables users to run representative simulations immediately without manual configuration
+    while maintaining boundary conditions that prevent overflow in standard financial calculations.
+  evidence: src/zipline/__main__.py:154(capital_base=10e6)
+  stage: order_management
+  alternative_considered: Smaller defaults like 100k were considered but deemed too small for meaningful
+    leverage calculations
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: capital_base=10e6 in src/zipline/__main__.py'
+- id: BD-002
+  type: B/BA
+  content: Default data frequency is daily for backtests
+  rationale: Daily frequency serves as the default data granularity because it reduces computational overhead
+    and data storage requirements while providing sufficient resolution for most algorithmic trading strategies.
+    This boundary ensures backtests complete in reasonable timeframes while accommodating both intraday
+    and daily strategies through explicit frequency specification.
+  evidence: src/zipline/__main__.py:147(default='daily')
+  stage: order_management
+  alternative_considered: Minute data as default was rejected due to higher storage costs and slower backtest
+    speeds
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: default=''daily'' in src/zipline/__main__.py'
+- id: BD-003
+  type: B/BA
+  content: Default bundle is 'quandl' for data ingestion
+  rationale: The 'quandl' bundle serves as the default data source because it provides freely accessible
+    end-of-day US equity data that was historically the primary data source for zipline users. This default
+    establishes a working boundary for immediate data ingestion without requiring users to configure custom
+    bundle paths, while still allowing substitution for alternative data sources.
+  evidence: src/zipline/__main__.py:119(DEFAULT_BUNDLE='quandl')
+  stage: data_ingestion
+  alternative_considered: No default bundle was rejected as it would break beginner workflows requiring
+    explicit configuration
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: DEFAULT_BUNDLE=''quandl'' in src/zipline/__main__.py'
+- id: BD-004
+  type: B/BA
+  content: Default trading calendar is XNYS (NYSE) for backtests
+  rationale: The NYSE (XNYS) calendar is the default trading calendar because it represents the most liquid
+    and widely-traded US equity market, providing comprehensive market coverage. This default establishes
+    market-hours boundaries that align with standard US equity trading while supporting substitution for
+    futures calendars or international markets when needed.
+  evidence: src/zipline/__main__.py:224(default='XNYS')
+  stage: order_management
+  alternative_considered: 24/7 continuous trading was rejected as it would misrepresent actual market
+    microstructure
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: default=''XNYS'' in src/zipline/__main__.py'
+- id: BD-005
+  type: B/BA
+  content: Default commission model is PerShare for equities at $0.001/share
+  rationale: PerShare commission at $0.001 per share approximates typical US equity broker fees while
+    providing realistic transaction cost modeling. This default establishes a boundary for commission
+    calculations that affects portfolio optimization and strategy profitability estimates, ensuring backtests
+    reflect realistic trading costs for standard brokerage arrangements.
+  evidence: src/zipline/finance/commission.py:32(commissionmodel)
+  stage: commission
+  alternative_considered: Zero commission was rejected as it would create unrealistic backtest results
+  _evidence_issues:
+  - 'FN_NOT_FOUND: commissionmodel in src/zipline/finance/commission.py'
+- id: BD-006
+  type: B/BA
+  content: Default slippage model is FixedBasisPointsSlippage for equities (10 bps)
+  rationale: FixedBasisPointsSlippage at 10 basis points provides a simple, predictable market impact
+    model for equity trading that balances realism with computational efficiency. This default establishes
+    a boundary for slippage estimation that moderately affects execution price assumptions, particularly
+    for larger orders where market impact becomes significant.
+  evidence: src/zipline/finance/blotter/simulation_blotter.py:64(module)
+  stage: slippage
+  alternative_considered: Zero slippage was rejected; VolumeShareSlippage was considered but deemed more
+    complex for defaults
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/zipline/finance/blotter/simulation_blotter.py'
+- id: BD-007
+  type: B/BA
+  content: Default slippage model for futures is VolatilityVolumeShare
+  rationale: VolatilityVolumeShare slippage for futures accounts for the higher volatility and contract-specific
+    volume characteristics of futures markets. This default establishes a boundary that differentiates
+    futures execution modeling from equities, recognizing that futures markets exhibit different liquidity
+    profiles and price impact dynamics than equity markets.
+  evidence: src/zipline/finance/blotter/simulation_blotter.py:65-68(module)
+  stage: slippage
+  alternative_considered: Fixed slippage was rejected as it doesn't capture futures-specific volatility
+    scaling
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/zipline/finance/blotter/simulation_blotter.py'
+- id: BD-008
+  type: B/BA
+  content: Max shares limit is 100 billion (1e11) per order
+  rationale: The 100 billion share limit establishes a practical boundary that prevents numeric overflow
+    in position tracking while accommodating extremely large institutional orders. This default ensures
+    the system handles edge cases without crashing while clearly signaling that orders exceeding this
+    threshold should not be submitted, protecting against data entry errors.
+  evidence: src/zipline/finance/blotter/simulation_blotter.py:61(module)
+  stage: order_management
+  alternative_considered: Lower limits were considered but might restrict legitimate institutional order
+    sizes
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/zipline/finance/blotter/simulation_blotter.py'
+- id: BD-009
+  type: B/BA
+  content: Default volume limit for equity slippage is 2.5% of bar volume
+  rationale: The 2.5% volume limit for equity slippage establishes a boundary that prevents order sizes
+    from exceeding realistic market participation rates. This default recognizes that aggressive trading
+    strategies should not assume they can execute more than 2.5% of average bar volume without significant
+    market impact, affecting execution price realism.
+  evidence: src/zipline/finance/slippage.py:118(volume_for_bar)
+  stage: slippage
+  alternative_considered: Higher limits like 5% were considered but deemed too aggressive for realistic
+    market impact
+- id: BD-010
+  type: B/BA
+  content: Default price impact coefficient is 0.1 for VolumeShareSlippage
+  rationale: The 0.1 price impact coefficient provides a moderate market impact curve that scales order
+    execution prices based on order size relative to volume. This default establishes a boundary for how
+    aggressively orders affect their own execution prices, ensuring backtests reflect realistic execution
+    degradation for large institutional orders.
+  evidence: src/zipline/finance/slippage.py:270(price_impact=0.1)
+  stage: slippage
+  alternative_considered: Higher coefficients like 0.2 were rejected as too punitive; lower values underestimate
+    market impact
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: price_impact=0.1 in src/zipline/finance/slippage.py'
+- id: BD-011
+  type: B/BA
+  content: Default future volume limit is 5% of bar volume
+  rationale: The 5% volume limit for futures slippage acknowledges higher market participation rates in
+    futures markets compared to equities. This default establishes a boundary that allows larger relative
+    order sizes in futures while still preventing unrealistic execution assumptions, reflecting the deeper
+    liquidity typical of futures contracts.
+  evidence: src/zipline/finance/slippage.py:41(DEFAULT_FUTURE_VOLUME_SLIPPAGE_BAR_LIMIT=0.05)
+  stage: slippage
+  alternative_considered: Equal to equity limit was rejected as futures markets have different liquidity
+    structures
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: DEFAULT_FUTURE_VOLUME_SLIPPAGE_BAR_LIMIT=0.05 in src/zipline/finance/slippage.py'
+- id: BD-012
+  type: B/BA
+  content: PerShare commission uses minimum trade cost of $1.00 in examples
+  rationale: The $1.00 minimum trade cost ensures that small orders still incur realistic broker fees
+    that exceed the percentage-based commission. This default establishes a floor boundary preventing
+    unrealistic backtest results from tiny orders where percentage commissions would produce negligible
+    costs, reflecting real-world minimum commission practices.
+  evidence: src/zipline/examples/buyapple.py:30(cost=0.0075, min_trade_cost=1.0)
+  stage: commission
+  alternative_considered: Zero minimum was rejected as it doesn't reflect real brokerage fee structures
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: cost=0.0075, min_trade_cost=1.0 in src/zipline/examples/buyapple.py'
+- id: BD-013
+  type: B/BA
+  content: VolumeShareSlippage used in examples for historical accuracy
+  rationale: VolumeShareSlippage in examples demonstrates realistic market impact modeling for educational
+    purposes, showing users how order size affects execution quality. This default establishes that example
+    strategies should reflect realistic execution constraints rather than frictionless trading assumptions,
+    preparing users for production strategy development.
+  evidence: src/zipline/examples/buyapple.py:31(module)
+  stage: slippage
+  alternative_considered: NoSlippage was rejected as it would teach unrealistic trading assumptions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/zipline/examples/buyapple.py'
+- id: BD-014
+  type: B/BA
+  content: Dual moving average uses 100-day short and 300-day long windows
+  rationale: The 100/300 day window combination provides a balanced momentum strategy that captures medium-term
+    trends while filtering noise. This default establishes a boundary for warmup requirements and strategy
+    responsiveness, with the long window ensuring sufficient data history while the short window provides
+    timely signals.
+  evidence: src/zipline/examples/dual_moving_average.py:50-51(module)
+  stage: strategy
+  alternative_considered: Shorter windows like 20/50 were considered but deemed too noisy for demonstration
+    purposes
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/zipline/examples/dual_moving_average.py'
+- id: BD-015
+  type: B/BA
+  content: Dual moving average skips first 300 days for warmup
+  rationale: The 300-day warmup period ensures the long moving average has valid data before generating
+    signals, establishing a data quality boundary. This default prevents premature trading based on incomplete
+    averages while clearly defining the minimum backtest period needed for valid signal generation.
+  evidence: 'src/zipline/examples/dual_moving_average.py:44(if context.i < 300: return)'
+  stage: strategy
+  alternative_considered: Shorter warmup was rejected as it would generate signals from incomplete moving
+    averages
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: if context.i < 300: return in src/zipline/examples/dual_moving_average.py'
+- id: BD-016
+  type: B/BA
+  content: RSI momentum strategy uses top 3 longs and bottom 3 shorts
+  rationale: The top/bottom 3 position count balances diversification benefits against concentration risk
+    in the RSI momentum strategy. This default establishes a boundary for portfolio construction that
+    allows meaningful long-short exposure while maintaining manageable position count, affecting both
+    risk characteristics and transaction costs.
+  evidence: src/zipline/examples/momentum_pipeline.py:23-24(module)
+  stage: strategy
+  alternative_considered: Top/bottom 5 was considered but would increase turnover and reduce per-position
+    conviction
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/zipline/examples/momentum_pipeline.py'
+- id: BD-017
+  type: B/BA
+  content: RSI momentum uses 2x leverage with 1/3 allocation per position
+  rationale: The 2x leverage combined with 1/3 position allocation ensures full capital deployment while
+    maintaining risk boundaries. This default establishes that each position receives equal weight at
+    1/3 of available capital, allowing the strategy to achieve target leverage through position sizing
+    rather than margin calls.
+  evidence: src/zipline/examples/momentum_pipeline.py:42(one_third=1.0/3.0)
+  stage: strategy
+  alternative_considered: 1x leverage with full allocation was rejected as it wouldn't demonstrate leveraged
+    strategy patterns
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: one_third=1.0/3.0 in src/zipline/examples/momentum_pipeline.py'
+- id: BD-018
+  type: B/BA
+  content: RSI default window length is 15 days
+  rationale: The 15-day RSI window provides a balanced oscillator period that captures medium-term momentum
+    without excessive noise or lag. This default establishes a boundary for overbought/oversold detection
+    that aligns with common trading literature while avoiding the extremes of very short (volatile) or
+    very long (laggy) windows.
+  evidence: src/zipline/pipeline/factors/technical.py:42(RSI)
+  stage: strategy
+  alternative_considered: 14-day window (standard) was considered but 15 provides cleaner calendar alignment
+- id: BD-019
+  type: B/BA
+  content: Bollinger Bands default k=2 (2 standard deviations)
+  rationale: The k=2 standard deviation multiplier for Bollinger Bands establishes a boundary that captures
+    approximately 95% of price action under normal distribution assumptions. This default ensures the
+    bands provide meaningful support/resistance levels while avoiding excessive signals that narrower
+    bands would produce.
+  evidence: src/zipline/pipeline/factors/technical.py:86(module)
+  stage: strategy
+  alternative_considered: k=1 (68% coverage) was rejected as too narrow; k=3 too wide for practical use
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/zipline/pipeline/factors/technical.py'
+- id: BD-020
+  type: B/BA
+  content: Order direction uses positive for buy, negative for sell
+  rationale: The sign convention mapping positive amounts to buys and negative to sells establishes a
+    clear directional boundary in the trading system. This default ensures consistent order interpretation
+    across the platform, preventing ambiguity in order direction and enabling straightforward portfolio
+    position calculations through algebraic sign operations.
+  evidence: src/zipline/finance/order.py:44(order:)
+  stage: order_management
+  alternative_considered: Inverse convention was rejected as positive values should represent long exposure
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: order: in src/zipline/finance/order.py'
+- id: BD-021
+  type: B/BA
+  content: 'Limit price asymmetry: round down for buys, up for sells'
+  rationale: The asymmetric rounding convention rounds limit prices against the trader (down for buys,
+    up for sells) ensuring conservative execution assumptions. This default establishes a boundary that
+    prevents optimistic backtest results by assuming the worst-case rounding direction for each order
+    type.
+  evidence: src/zipline/finance/execution.py:171(module)
+  stage: order_management
+  alternative_considered: Symmetric rounding was rejected as it doesn't reflect conservative execution
+    assumptions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/zipline/finance/execution.py'
+- id: BD-022
+  type: B/BA
+  content: Stop order prices rounded opposite to limit orders
+  rationale: Stop orders round opposite to limit orders (up for buys, down for sells) ensuring the stop
+    triggers at or beyond the intended price. This default establishes a boundary that prevents stop orders
+    from inadvertently triggering at worse prices due to rounding, protecting traders from unexpected
+    execution.
+  evidence: src/zipline/finance/execution.py:123-128(module)
+  stage: order_management
+  alternative_considered: Same rounding as limits was rejected as it would create asymmetric execution
+    assumptions
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/zipline/finance/execution.py'
+- id: BD-023
+  type: B/BA
+  content: Default tick size is $0.01 for orders without asset-specific tick
+  rationale: The $0.01 tick size provides a reasonable price granularity for assets without specified
+    tick requirements, aligning with US equity minimum price increments. This default establishes a boundary
+    that prevents infinite precision in price specification while accommodating the vast majority of financial
+    instruments' minimum price movements.
+  evidence: src/zipline/finance/execution.py:24(ExecutionStyle)
+  stage: order_management
+  alternative_considered: Smaller tick sizes were rejected as they would create unrealistic precision
+    in backtests
+- id: BD-024
+  type: B/BA
+  content: CancelPolicy default is NeverCancel (orders never auto-expire)
+  rationale: The NeverCancel policy ensures orders persist until explicitly filled or cancelled, establishing
+    a boundary that prevents unintended order expiration during backtests. This default reflects conservative
+    backtesting assumptions where order validity should not be a limiting factor, though production systems
+    may require explicit expiration policies.
+  evidence: src/zipline/finance/cancel_policy.py:63(class NeverCancel)
+  stage: order_management
+  alternative_considered: Time-based expiration was rejected as it would add complexity without clear
+    benefit in backtests
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: class NeverCancel in src/zipline/finance/cancel_policy.py'
+- id: BD-025
+  type: B/BA
+  content: Default history window prefetch is 1560 minutes (one trading day)
+  rationale: The 1560-minute prefetch window (representing one trading day of minute data) ensures sufficient
+    historical context for pipeline computations. This default establishes a boundary that balances memory
+    usage against computational needs, ensuring strategies requiring daily lookback have immediate data
+    access without excessive prefetching.
+  evidence: src/zipline/data/data_portal.py:830(_get_history_minute_window)
+  stage: data_ingestion
+  alternative_considered: Larger windows were rejected due to memory constraints; smaller windows might
+    cause cache misses
+- id: BD-026
+  type: B/BA
+  content: Default history window prefetch is 40 days for daily frequency
+  rationale: The 40-day daily prefetch window accommodates strategies with lookbacks up to approximately
+    one month plus buffer for trading days. This default establishes a boundary that supports common technical
+    indicators requiring 20-30 days of data while providing margin for non-trading days and holiday gaps.
+  evidence: src/zipline/data/data_portal.py:757(_get_history_daily_window)
+  stage: data_ingestion
+  alternative_considered: Shorter windows like 30 days were rejected as they might miss month-end effects
+- id: BD-027
+  type: B/BA
+  content: NoTrade commission model exists for testing scenarios
+  rationale: The NoTrade commission model provides zero-cost transactions for testing scenarios where
+    commission effects should be isolated or ignored. This default establishes a boundary that enables
+    clean testing of non-commission strategy components, though production use requires explicit commission
+    configuration to reflect realistic costs.
+  evidence: src/zipline/finance/commission.py:75(class NoCommission)
+  stage: commission
+  alternative_considered: Hidden zero commission was rejected; explicit model ensures users consciously
+    choose this option
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: class NoCommission in src/zipline/finance/commission.py'
+- id: BD-028
+  type: B/BA
+  content: NoSlippage model exists for testing without market impact
+  rationale: The NoSlippage model provides frictionless execution for testing scenarios where market impact
+    should be isolated from other strategy components. This default establishes a boundary that enables
+    clean testing of non-slippage strategy behavior, though production use requires realistic slippage
+    modeling to avoid optimistic execution assumptions.
+  evidence: src/zipline/finance/slippage.py:212(class NoSlippage)
+  stage: slippage
+  alternative_considered: Hidden zero slippage was rejected; explicit model ensures users consciously
+    choose this option
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: class NoSlippage in src/zipline/finance/slippage.py'
+- id: BD-029
+  type: B/BA
+  content: Annualization uses 250 trading days per year
+  rationale: The 250 trading days per year standard (accounting for weekends and US market holidays) provides
+    consistent annualization for performance metrics. This default establishes a boundary that enables
+    meaningful year-over-year and annualized comparisons while acknowledging the actual trading calendar
+    differs from calendar days.
+  evidence: src/zipline/finance/constants.py:16(TRADING_DAYS_IN_YEAR=250)
+  stage: portfolio_accounting
+  alternative_considered: 252 (exact trading days) was considered but 250 provides conservative rounding
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: TRADING_DAYS_IN_YEAR=250 in src/zipline/finance/constants.py'
+- id: BD-030
+  type: B/BA
+  content: 6.5 trading hours per day for minute annualization
+  rationale: The 6.5 hours per trading day reflects standard US equity market hours (9:30 AM - 4:00 PM
+    EST) plus slight buffer for analysis. This default establishes a boundary that enables accurate minute-to-annualized
+    performance conversions while acknowledging pre/post-market trading is typically excluded from standard
+    metrics.
+  evidence: src/zipline/finance/constants.py:17(TRADING_HOURS_IN_DAY=6.5)
+  stage: portfolio_accounting
+  alternative_considered: 6 hours exact was rejected as it doesn't account for brief opening/closing periods
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: TRADING_HOURS_IN_DAY=6.5 in src/zipline/finance/constants.py'
+- id: BD-031
+  type: B/BA
+  content: 'Order status enum: OPEN, FILLED, CANCELLED, REJECTED, HELD'
+  rationale: The five-state order lifecycle (OPEN, FILLED, CANCELLED, REJECTED, HELD) captures each meaningful
+    order states while maintaining manageable state complexity. This default establishes a boundary that
+    supports order tracking without excessive granularity, ensuring backtests can distinguish between
+    pending, completed, and failed order outcomes.
+  evidence: src/zipline/finance/order.py:24-34(module)
+  stage: order_management
+  alternative_considered: Additional states like PARTIAL were considered but would increase complexity
+    without clear benefit
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/zipline/finance/order.py'
+- id: BD-032
+  type: B/BA
+  content: Daily history aggregation uses 1m and 1d frequencies only
+  rationale: The 1m and 1d frequency pair provides sufficient granularity for most quantitative strategies
+    while minimizing data infrastructure complexity. This default establishes a boundary that covers intraday
+    (minute) and end-of-day analysis needs without supporting intermediate frequencies that would increase
+    storage and computation requirements.
+  evidence: src/zipline/data/data_portal.py:80(HISTORY_FREQUENCIES={'1m', '1d'})
+  stage: data_ingestion
+  alternative_considered: 5-minute or hourly frequencies were considered but rejected to limit data infrastructure
+    scope
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: HISTORY_FREQUENCIES={''1m'', ''1d''} in src/zipline/data/data_portal.py'
+- id: BD-033
+  type: B/BA
+  content: Order uses UUID hex string as unique identifier
+  rationale: UUID4 hex strings provide globally unique order identifiers without coordination requirements,
+    ensuring no collision across distributed backtest runs. This default establishes a boundary that supports
+    parallel and distributed execution while maintaining human-readable 32-character identifiers for debugging
+    purposes.
+  evidence: src/zipline/finance/order.py:108(module)
+  stage: order_management
+  alternative_considered: Sequential integers were rejected as they require centralized coordination
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/zipline/finance/order.py'
+- id: BD-034
+  type: B/BA
+  content: OLMAR portfolio uses eps=1 and window_length=5
+  rationale: The epsilon=1 parameter bounds portfolio deviation from uniform allocation, while window_length=5
+    provides sufficient recent price history for the online learning algorithm. This default establishes
+    a boundary that balances exploration (portfolio changes) against stability (deviation constraints)
+    in the OLMAR market-making strategy.
+  evidence: src/zipline/examples/olmar.py:24(eps=1, window_length=5)
+  stage: strategy
+  alternative_considered: Higher eps (2+) was rejected as it allows too much portfolio drift from mean
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: eps=1, window_length=5 in src/zipline/examples/olmar.py'
+- id: BD-035
+  type: B/BA
+  content: OLMAR uses simplex projection for weight normalization
+  rationale: Simplex projection ensures portfolio weights remain non-negative and sum to exactly 1.0,
+    a mathematical requirement for valid portfolios. This default establishes a boundary that guarantees
+    numerical stability by projecting any calculated weights back to the feasible simplex space, preventing
+    invalid portfolio allocations.
+  evidence: src/zipline/examples/olmar.py:113(module)
+  stage: strategy
+  alternative_considered: Truncation to non-negative was rejected as it doesn't guarantee sum-to-one constraint
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/zipline/examples/olmar.py'
+- id: BD-036
+  type: B/BA
+  content: Pipeline BaseUSEquityPipelineTestCase uses 2014 as default test period
+  rationale: The 2014 default test period provides post-crisis market data with sufficient history for
+    factor development while avoiding the extreme volatility of 2008-2009. This default establishes a
+    boundary that ensures consistent factor evaluation across the test suite while representing a normalized
+    market environment.
+  evidence: tests/pipeline/base.py:58(module)
+  stage: testing
+  alternative_considered: 2010-2012 was rejected as it includes post-crisis recovery anomalies
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in tests/pipeline/base.py'
+- id: BD-037
+  type: B/BA
+  content: Buy-and-hold uses 100 shares per stock
+  rationale: The 100-share position size provides sufficient market exposure for demonstrating long-only
+    strategies while remaining manageable with typical capital allocations. This default establishes a
+    boundary that enables clear P&L visualization and commission demonstration without requiring complex
+    position sizing calculations.
+  evidence: src/zipline/examples/buy_and_hold.py:37(module)
+  stage: strategy
+  alternative_considered: Dollar-based sizing was rejected as it would complicate the simplest possible
+    strategy example
+  _evidence_issues:
+  - 'FN_NOT_FOUND: module in src/zipline/examples/buy_and_hold.py'
+- id: BD-038
+  type: B/BA
+  content: PerDollar commission model uses $0.0015 per dollar (15 bps)
+  rationale: The 15 basis point PerDollar commission reflects percentage-based brokerage fee structures
+    common in mutual funds and certain brokerage arrangements. This default establishes a boundary that
+    models percentage-of-assets fees rather than per-share fees, affecting strategy cost estimates for
+    different commission structures.
+  evidence: src/zipline/finance/commission.py:32(commissionmodel)
+  stage: commission
+  alternative_considered: 10 bps was considered but 15 better reflects institutional fee structures
+  _evidence_issues:
+  - 'FN_NOT_FOUND: commissionmodel in src/zipline/finance/commission.py'
+- id: BD-039
+  type: B/BA
+  content: PerContract commission uses $0.85 per future contract default
+  rationale: The $0.85 per contract commission approximates typical futures broker fees across major exchanges.
+    This default establishes a boundary that enables realistic futures strategy cost modeling, recognizing
+    that futures trading costs are typically quoted per contract rather than per dollar or per share.
+  evidence: src/zipline/finance/commission.py:98(futurecommissionmodel)
+  stage: commission
+  alternative_considered: Higher fees ($1.50+) were rejected as they would be too punitive for examples
+  _evidence_issues:
+  - 'FN_NOT_FOUND: futurecommissionmodel in src/zipline/finance/commission.py'
+- id: BD-040
+  type: B/BA
+  content: Asymmetric price rounding uses 0.95 threshold for boundary decision
+  rationale: The 0.95 threshold determines when rounding changes direction, establishing a conservative
+    boundary that rounds against the trader when the fractional part exceeds 95% of a tick. This default
+    ensures prices near round numbers favor the market maker rather than the order placer, preventing
+    artificially optimistic execution assumptions.
+  evidence: src/zipline/finance/execution.py:171(diff=0.95)
+  stage: order_management
+  alternative_considered: 0.5 midpoint rounding was rejected as it doesn't provide conservative execution
+    assumptions
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: diff=0.95 in src/zipline/finance/execution.py'
+- id: BD-041
+  type: B/BA
+  content: RSI uses mean of clipped gains/losses over 15-day window
+  rationale: 'Relative Strength Index calculated as 100 - (100/(1+RS)) where RS is the ratio of average
+    gains to average losses over a 15-day window. The clipped mean approach prevents extreme single-day
+    moves from distorting the momentum signal. This 15-period default balances responsiveness to recent
+    price action with noise reduction, aligning with traditional technical analysis conventions used by
+    practitioners since Wilder''s 1978 specification. Boundary: 15-day window size is configurable but
+    defaults to '
+  evidence: src/zipline/pipeline/factors/technical.py:42(RSI)
+  stage: zipline.pipeline.factors.technical
+  alternative_considered: Alternative window sizes could capture different momentum cycles; adaptive RSI
+    was considered but not implemented
+- id: BD-042
+  type: B/BA
+  content: Bollinger Bands use k standard deviations from nanmean
+  rationale: 'Bollinger Bands envelope price by placing bands at k standard deviations above and below
+    a rolling mean. The nanmean ensures NaN values don''t break calculation. Default k=2 captures approximately
+    95% of price distribution under normal conditions, providing statistically meaningful deviation thresholds
+    for mean-reversion strategies. Boundary: k multiplier is configurable; values outside 1.5-3.0 typically
+    indicate non-standard volatility assumptions.'
+  evidence: src/zipline/pipeline/factors/technical.py:67(BollingerBands)
+  stage: zipline.pipeline.factors.technical
+  alternative_considered: ATR-based bands were considered for non-normal return distributions
+- id: BD-043
+  type: B/DK
+  content: Aroon uses nanargmax/nanargmin to measure days since high/low
+  rationale: 'Aroon indicator measures time since highest high and lowest low using nanargmax/nanargmin
+    functions. This approach identifies trend strength by counting periods since price extrema. NaN-handling
+    ensures incomplete windows produce valid signals rather than errors. The method captures both directional
+    bias (Aroon Up vs Down) and trend intensity. Boundary: window size defines the lookback period; extrema
+    detection is purely price-based without volume confirmation.'
+  evidence: src/zipline/pipeline/factors/technical.py:97(Aroon)
+  stage: zipline.pipeline.factors.technical
+  alternative_considered: Percentage-based thresholds or volume-weighted extrema were not implemented
+- id: BD-044
+  type: B/BA
+  content: 'Fast Stochastic Oscillator: (close-low)/(high-low)*100 over 14 days'
+  rationale: 'Fast Stochastic calculates position of close relative to the period''s range: (%K = (C-L)/(H-L)*100).
+    This normalizes price to [0,100] range regardless of absolute price level. The 14-day default reflects
+    Lane''s original specification and balances signal stability with responsiveness. Boundary: The formula
+    measures position within historical range but does not account for gaps or volume; momentum confirmation
+    may require additional filters.'
+  evidence: src/zipline/pipeline/factors/technical.py:137(FastStochasticOscillator)
+  stage: zipline.pipeline.factors.technical
+  alternative_considered: Alternative periods for different cycle lengths; slow stochastic smoothing was
+    considered separately
+- id: BD-045
+  type: B/BA
+  content: Ichimoku Cloud uses fixed window lengths for trend lines
+  rationale: 'Ichimoku Cloud defines five trend lines using fixed windows: Tenkan-sen (9), Kijun-sen (26),
+    Senkou Span A/B (26/52), and Chikou Span (26). These specific periods originate from Goichi Hosoda''s
+    pre-computed telegraph system and remain standard in Japanese technical analysis. Fixed windows ensure
+    consistent cross-instrument comparison. Boundary: Every parameters are fixed integers; the 26-period
+    (one trading month) baseline reflects historical market structure not directly applicable to modern
+    24/7'
+  evidence: src/zipline/pipeline/factors/technical.py:179(ichimokukinkohyo)
+  stage: zipline.pipeline.factors.technical
+  alternative_considered: Adaptive periods based on realized volatility were considered but rejected to
+    maintain standard interpretation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ichimokukinkohyo in src/zipline/pipeline/factors/technical.py'
+- id: BD-046
+  type: B/BA
+  content: MACD uses EWMA with fast=12, slow=26, signal=9 periods
+  rationale: 'MACD implements Gerald Appel''s original specification using 12-day (fast) and 26-day (slow)
+    EWMA for the signal line differential, with 9-day EWMA of MACD for the trigger. The 12/26 split approximates
+    two-week and one-month cycles; 9-period signal smoothing reduces whipsaws. EWMA weighting provides
+    exponential decay sensitivity to recent prices. Boundary: Parameters are non-adaptive; the formula
+    assumes stationary statistical properties over the signal window.'
+  evidence: src/zipline/pipeline/factors/technical.py:352-385(MACD)
+  stage: zipline.pipeline.factors.technical
+  alternative_considered: Variable-span MACD or histogram divergence filters were considered but not implemented
+  _evidence_issues:
+  - 'FN_NOT_FOUND: MACD in src/zipline/pipeline/factors/technical.py'
+- id: BD-047
+  type: B/BA
+  content: RollingPearson uses vectorized pearson correlation over lookback
+  rationale: 'RollingPearson computes time-series Pearson correlation using vectorized operations over
+    configurable lookback windows. Vectorization enables efficient batch computation across large cross-sectional
+    datasets typical in pipeline factors. The linear correlation coefficient measures directional co-movement
+    without scale dependency. Boundary: Pearson assumes linear relationships and normal distributions;
+    non-linear dependencies are not captured; lookback window must exceed minimum observations for v'
+  evidence: src/zipline/pipeline/factors/statistical.py:49(RollingPearson)
+  stage: zipline.pipeline.factors.statistical
+  alternative_considered: Spearman rank correlation handles outliers better but was implemented separately
+- id: BD-048
+  type: B/BA
+  content: RollingSpearman uses scipy.stats.spearmanr for rank correlation
+  rationale: 'RollingSpearman implements rank-based correlation using scipy.stats.spearmanr, which converts
+    values to ranks before correlation. This approach is robust to outliers and non-normal distributions,
+    making it suitable for return series with fat tails. Rank transformation preserves monotonic relationships
+    while eliminating scale dependence. Boundary: Rank correlation cannot detect non-monotonic relationships;
+    computational cost higher than Pearson due to sorting.'
+  evidence: src/zipline/pipeline/factors/statistical.py:95(RollingSpearman)
+  stage: zipline.pipeline.factors.statistical
+  alternative_considered: Kendall's tau was considered for additional robustness but rejected to limit
+    computational overhead
+- id: BD-049
+  type: B/BA
+  content: RollingLinearRegression uses scipy linregress for OLS
+  rationale: 'RollingLinearRegression performs Ordinary Least Squares regression using scipy.stats.linregress
+    over rolling windows. OLS minimizes squared residuals to find optimal slope and intercept. The approach
+    provides interpretable beta coefficients and statistical significance metrics. Boundary: OLS assumes
+    homoscedastic, uncorrelated errors; heteroscedasticity or autocorrelation invalidates standard errors;
+    window size must exceed 2 observations plus any NaN handling.'
+  evidence: src/zipline/pipeline/factors/statistical.py:142(RollingLinearRegression)
+  stage: zipline.pipeline.factors.statistical
+  alternative_considered: Robust regression (Huber) or quantile regression were considered for fat-tailed
+    returns
+- id: BD-050
+  type: B/BA
+  content: SimpleBeta calculates Cov(X,Y)/Var(X) with 25% allowed missing
+  rationale: 'SimpleBeta implements the classic beta coefficient as covariance of returns divided by variance
+    of the factor, allowing up to 25% missing data before returning NaN. The 25% threshold balances data
+    availability against statistical reliability; insufficient observations produce unreliable beta estimates.
+    This traditional beta measures systematic risk relative to a benchmark. Boundary: Assumes linear relationship;
+    does not account for higher moments or regime shifts in beta.'
+  evidence: src/zipline/pipeline/factors/statistical.py:468(SimpleBeta)
+  stage: zipline.pipeline.factors.statistical
+  alternative_considered: Adaptive threshold based on return volatility or market regime was not implemented
+- id: BD-051
+  type: B/RC
+  content: Vectorized beta uses centered residual approach for efficiency
+  rationale: 'Vectorized beta computation centers both factor and regression target by subtracting their
+    means, then calculates slope as dot product of centered vectors divided by centered variance. This
+    approach enables numpy vectorization across the entire cross-section simultaneously, providing order-of-magnitude
+    speedup over row-by-row iteration. The centered residual method is mathematically equivalent to OLS.
+    Boundary: Memory intensive for large datasets; single-precision may introduce rounding error fo'
+  evidence: src/zipline/pipeline/factors/statistical.py:545(vectorized_beta)
+  stage: zipline.pipeline.factors.statistical
+  alternative_considered: Chunked processing for memory-constrained environments was not implemented
+- id: BD-052
+  type: B/DK
+  content: demean subtracts row nanmean with optional groupby
+  rationale: 'The demean operation centers factor values by subtracting the row-wise (cross-sectional)
+    mean, with optional grouping by sector, exchange, or other classification. Removing the market-wide
+    drift isolates relative factor value independent of market direction. Groupby enables sector-neutral
+    positioning. Boundary: Demeaning is a linear transformation; non-linear factor dependencies are not
+    addressed; periodicity of rebalancing affects residual structure.'
+  evidence: src/zipline/pipeline/factors/factor.py:540-662(demean)
+  stage: zipline.pipeline.factors
+  alternative_considered: MAD-based centering or winsorized demeaning were considered for outlier robustness
+- id: BD-053
+  type: B/BA
+  content: zscore normalizes by (row - nanmean)/nanstd
+  rationale: 'Z-score normalization scales factor values to zero mean and unit variance using row-wise
+    nanmean and nanstd. This transformation enables comparison across factors with different absolute
+    scales and ensures equal contribution to combination weights. Standardization assumes approximate
+    normality for statistical validity. Boundary: Outliers inflate standard deviation, compressing the
+    bulk of distribution; mean and std computed on same window as application.'
+  evidence: src/zipline/pipeline/factors/factor.py:669-729(zscore)
+  stage: zipline.pipeline.factors
+  alternative_considered: Robust z-score using MAD or percentile-based normalization were considered but
+    rejected for simplicity
+- id: BD-054
+  type: B/RC
+  content: rank uses scipy.stats.rankdata with 5 method options
+  rationale: 'Rank transformation converts factor values to their cross-sectional percentile using scipy.stats.rankdata.
+    Five tie-handling methods (average, min, max, first, dense) enable different interpretations of tied
+    values. Ranking is robust to outliers and non-normal distributions. Boundary: Rank loses magnitude
+    information; temporal stability of ranks depends on factor autocorrelation; method choice affects
+    percentile values at ties.'
+  evidence: src/zipline/pipeline/factors/factor.py:731-786(rank)
+  stage: zipline.pipeline.factors
+  alternative_considered: Percentile rank vs raw rank; adaptive method selection based on tie frequency
+- id: BD-055
+  type: B/BA
+  content: winsorize clips values at user-specified percentiles
+  rationale: 'Winsorization replaces extreme values at specified percentiles (e.g., 1st and 99th) with
+    boundary values, reducing outlier influence while preserving sample size. Unlike trimming, winsorization
+    retains each observations. This approach is less aggressive than removal and maintains statistical
+    power. Boundary: Percentile thresholds must be chosen based on expected tail distributions; symmetric
+    winsorization may not suit asymmetric factors.'
+  evidence: src/zipline/pipeline/factors/factor.py:997-1100(winsorize)
+  stage: zipline.pipeline.factors
+  alternative_considered: Huber estimator, MAD-based clipping, or adaptive winsorization based on kurtosis
+- id: BD-056
+  type: B/BA
+  content: VolumeShareSlippage models quadratic price impact
+  rationale: 'VolumeShareSlippage implements quadratic price impact where execution cost increases with
+    the square of order size relative to average daily volume. This captures the empirical observation
+    that large orders move prices more than proportionally. The quadratic form ensures diminishing marginal
+    impact for small orders while penalizing block trades. Boundary: Coefficient estimation from historical
+    data required; model assumes stationary volume patterns; does not account for time-of-day liquidity
+    var'
+  evidence: src/zipline/finance/slippage.py:241(VolumeShareSlippage)
+  stage: zipline.finance.slippage
+  alternative_considered: Linear impact model (simpler but less realistic) or Almgren-Chriss optimal execution
+    model
+- id: BD-057
+  type: B/BA
+  content: FixedBasisPointsSlippage uses fixed basis points and volume cap
+  rationale: 'FixedBasisPointsSlippage charges a constant spread proportional to price (in basis points)
+    with an optional volume cap limiting impact for large orders. This model represents institutionalFIXEDcost
+    structures like exchange fees plus a fixed market impact component. The volume cap prevents unrealistic
+    impact for orders exceeding reasonable participation rates. Boundary: Fixed model underestimates impact
+    for block trades; does not capture intraday liquidity variation.'
+  evidence: src/zipline/finance/slippage.py:603(FixedBasisPointsSlippage)
+  stage: zipline.finance.slippage
+  alternative_considered: Variable spread model based on bid-ask spreads was not implemented
+- id: BD-058
+  type: B/BA
+  content: VolatilityVolumeShare models MI = eta * sigma * sqrt(psi) for futures
+  rationale: 'VolatilityVolumeShare computes market impact for futures using the formula: impact = eta
+    * volatility * sqrt(order_size/average_volume). This model captures empirical findings that impact
+    scales with volatility (higher vol = more price uncertainty) and square-root of participation rate.
+    The eta coefficient captures market microstructure effects. Boundary: Calibrated for futures; equity
+    application requires different eta values; assumes liquidity scales proportionally with ADV.'
+  evidence: src/zipline/finance/slippage.py:520(VolatilityVolumeShare)
+  stage: zipline.finance.slippage
+  alternative_considered: Per-asset eta calibration based on bid-ask spreads was considered but not implemented
+- id: BD-059
+  type: B/BA
+  content: MarketImpactBase uses 20-day window for volatility and ADV
+  rationale: 'MarketImpactBase estimates volatility and average daily volume using a 20-trading-day rolling
+    window. This approximates one calendar month of data, providing stable estimates while remaining responsive
+    to structural changes in liquidity. The window balances statistical precision against regime adaptability.
+    Boundary: 20-day window is fixed; does not adapt to volatility regime; assumes stationarity within
+    window; requires 20 days of history before producing estimates.'
+  evidence: src/zipline/finance/slippage.py:368(MarketImpactBase)
+  stage: zipline.finance.slippage
+  alternative_considered: EWMA-based estimation or GARCH volatility model were considered for faster adaptation
+- id: BD-060
+  type: B/DK
+  content: SimpleMovingAverage computes nanmean over window
+  rationale: 'SimpleMovingAverage calculates the arithmetic mean of values within a rolling window, with
+    NaN values excluded from calculation. SMA treats each observations equally, making it interpretable
+    but slower to respond to recent changes than weighted alternatives. The nanmean handling ensures incomplete
+    windows at the start of series produce valid results. Boundary: Equal weighting may underweight recent
+    information; lag equals (window-1)/2 periods.'
+  evidence: src/zipline/pipeline/factors/basic.py:106-121(SimpleMovingAverage)
+  stage: zipline.pipeline.factors.basic
+  alternative_considered: Adaptive windows based on volatility were considered but not implemented
+- id: BD-061
+  type: B/BA
+  content: VWAP computes sum(price*volume)/sum(volume)
+  rationale: 'Volume-Weighted Average Price divides the sum of price-volume products by total volume,
+    weighting each price by its trading volume. VWAP serves as both a benchmark for execution quality
+    and a technical indicator reflecting institutional activity. High price above VWAP suggests strong
+    buying pressure. Boundary: Requires volume data; VWAP computed from past data is an approximation;
+    does not account for intraday volume patterns.'
+  evidence: src/zipline/pipeline/factors/basic.py:137-146(VWAP)
+  stage: zipline.pipeline.factors.basic
+  alternative_considered: Tick-based VWAP or VWAP from open-to-close phases
+- id: BD-062
+  type: B/DK
+  content: MaxDrawdown computes peak-to-trough decline as (peak-trough)/trough
+  rationale: 'Maximum Drawdown measures the largest peak-to-trough percentage decline in cumulative returns.
+    This risk metric captures the worst-case historical loss scenario, complementary to volatility measures.
+    The (peak-trough)/trough formula expresses loss as a percentage of the trough value. Boundary: Only
+    measures historical realized drawdown; does not predict future drawdowns; depends on sampling frequency.'
+  evidence: src/zipline/pipeline/factors/basic.py:149-168(MaxDrawdown)
+  stage: zipline.pipeline.factors.basic
+  alternative_considered: Ulcer index (area under drawdown curve) or conditional drawdown at risk
+- id: BD-063
+  type: B/BA
+  content: AnnualizedVolatility uses std(returns) * sqrt(252)
+  rationale: 'Annualized Volatility scales daily standard deviation by sqrt(252), assuming 252 trading
+    days per year. This annualization enables comparison across different sampling frequencies and investment
+    horizons. The square-root scaling reflects diffusion processes where volatility scales with square
+    root of time. Boundary: Assumes i.i.d. returns and constant volatility; does not account for mean
+    reversion or volatility clustering; sqrt(252) specific to US equity markets.'
+  evidence: src/zipline/pipeline/factors/basic.py:474-494(AnnualizedVolatility)
+  stage: zipline.pipeline.factors.basic
+  alternative_considered: GARCH-based expected volatility or exponentially weighted volatility for recent
+    data emphasis
+- id: BD-064
+  type: B/DK
+  content: EWMA uses exponential weights with decay from span/halflife/CoM
+  rationale: 'Exponential Weighted Moving Average applies exponentially decaying weights to observations,
+    controlled by span, halflife, or center-of-mass parameters. This approach provides smoother estimates
+    than SMA while responding faster to recent data. The decay parameter controls the effective lookback
+    window. Boundary: Unlike SMA, EWMA has infinite theoretical memory; warm-up period required; parameter
+    interpretation requires understanding decay formula.'
+  evidence: src/zipline/pipeline/factors/basic.py:208-399(EWMA)
+  stage: zipline.pipeline.factors.basic
+  alternative_considered: Double exponential smoothing or triple EMA for trend following
+  _evidence_issues:
+  - 'FN_NOT_FOUND: EWMA in src/zipline/pipeline/factors/basic.py'
+- id: BD-065
+  type: B/BA
+  content: 'LinearWeightedMovingAverage weights linearly: n,n-1,...,1'
+  rationale: 'Linear Weighted Moving Average applies weights decreasing linearly from most recent (weight=n)
+    to oldest (weight=1) observation. This provides faster response than SMA while maintaining interpretability
+    of weight structure. The linear weighting is simpler than exponential decay. Boundary: Weights sum
+    to n(n+1)/2; lag approximately (window+1)/3; does not decay to zero at oldest observation.'
+  evidence: src/zipline/pipeline/factors/basic.py:444(linearweightedmovingaverage)
+  stage: zipline.pipeline.factors.basic
+  alternative_considered: Triangular weights or adaptive weights based on trend strength
+  _evidence_issues:
+  - 'FN_NOT_FOUND: linearweightedmovingaverage in src/zipline/pipeline/factors/basic.py'
+- id: BD-066
+  type: B/BA
+  content: Returns computed as (close[-1] - close[0]) / close[0]
+  rationale: 'Simple returns calculate percentage price change as (current price - previous price) / previous
+    price. This discrete return formula is additive across time periods for portfolio returns but not
+    for asset returns. The approach is intuitive and matches accounting conventions. Boundary: Does not
+    account for dividends or distributions; assumes simple price returns only; additive only for very
+    small returns.'
+  evidence: src/zipline/pipeline/factors/basic.py:41-61(Returns)
+  stage: zipline.pipeline.factors.basic
+  alternative_considered: Log returns for additive properties; total return including dividends
+- id: BD-067
+  type: B/BA
+  content: 'Minute-to-session resample: open=first, high=max, low=min, close=last, volume=sum'
+  rationale: 'OHLCV aggregation from minute to daily (or other session) bars uses standard conventions:
+    open is first minute price, high is maximum, low is minimum, close is last minute price, volume is
+    summed. This approach matches exchange data conventions and technical analysis tools. Boundary: First/last
+    tick sensitivity for illiquid assets; volume sum may exceed daily volume for partial sessions; corporate
+    actions not adjusted in resampling.'
+  evidence: src/zipline/data/resample.py:70(minute_to_session)
+  stage: zipline.data.resample
+  alternative_considered: Volume-weighted open/close or midpoint-based aggregation for illiquid assets
+- id: BD-068
+  type: B/DK
+  content: 'Price scaling: multiply by 1000 and store as uint32 for precision'
+  rationale: 'Price scaling multiplies float prices by 1000 and stores as unsigned 32-bit integer to balance
+    precision and storage efficiency. This captures prices to 3 decimal places (sufficient for most assets)
+    while reducing storage by 75% compared to float64. The uint32 range supports prices up to ~4 million.
+    Boundary: Loses sub-millisecond precision; does not handle extremely high-priced assets or cryptocurrencies
+    with many decimals; scaling factor not adjustable per asset.'
+  evidence: src/zipline/data/hdf5_daily_bars.py:148-164(price_scaling)
+  stage: zipline.data.hdf5_daily_bars
+  alternative_considered: Decimal type for arbitrary precision; float64 for accuracy; different scaling
+    per asset class
+  _evidence_issues:
+  - 'FN_NOT_FOUND: price_scaling in src/zipline/data/hdf5_daily_bars.py'
+- id: BD-069
+  type: B/BA
+  content: 'Cumulative returns: cumprod(1 + returns) - 1'
+  rationale: 'Cumulative returns compound period returns using cumprod(1 + r) - 1, assuming reinvestment
+    of profits. This geometric linking accounts for the compound growth effect where gains build on gains.
+    The formula assumes returns are independent and identically distributed. Boundary: Compound assumption
+    may not hold with cash flows; does not account for volatility drag explicitly; path-dependent for
+    asymmetric returns.'
+  evidence: src/zipline/finance/metrics/metric.py:157,175,477-478(cumulative_returns)
+  stage: zipline.finance.metrics
+  alternative_considered: Log returns for continuous compounding; arithmetic linking for non-compounding
+    comparison
+  _evidence_issues:
+  - 'FN_NOT_FOUND: cumulative_returns in src/zipline/finance/metrics/metric.py'
+- id: BD-070
+  type: B/DK
+  content: 'Annual volatility: expanding std * sqrt(252)'
+  rationale: 'Annualized volatility uses expanding window standard deviation (each available history)
+    multiplied by sqrt(252). Expanding windows provide increasingly stable estimates as more data accumulates,
+    avoiding window boundary effects. The annualization enables comparison with target volatility and
+    other annualized metrics. Boundary: Expanding window is sensitive to early observations when regime
+    may differ; does not adapt to regime changes.'
+  evidence: src/zipline/finance/metrics/metric.py:158-160(annual_volatility)
+  stage: zipline.finance.metrics
+  alternative_considered: Rolling volatility or GARCH forecasts for forward-looking estimates
+  _evidence_issues:
+  - 'FN_NOT_FOUND: annual_volatility in src/zipline/finance/metrics/metric.py'
+- id: BD-071
+  type: B/BA
+  content: Alpha/Beta computed via empyrical.alpha_beta_aligned
+  rationale: 'Alpha and beta are calculated using the empyrical library''s aligned computation, which
+    handles missing values and ensures date alignment between portfolio and benchmark returns. Alpha measures
+    risk-adjusted excess return; beta measures systematic risk exposure. The alignment function ensures
+    valid statistical comparison. Boundary: Alpha is CAPM alpha (excess return over benchmark); does not
+    account for factor model residuals; beta assumes linear relationship.'
+  evidence: src/zipline/finance/metrics/metric.py:329-332,480-483(alpha_beta)
+  stage: zipline.finance.metrics
+  alternative_considered: Multi-factor regression (Barra, Axioma) or conditional beta estimation
+  _evidence_issues:
+  - 'FN_NOT_FOUND: alpha_beta in src/zipline/finance/metrics/metric.py'
+- id: BD-072
+  type: B/BA
+  content: Asymmetric price rounding with 0.95 threshold bias
+  rationale: 'Asymmetric price rounding applies a 0.95 threshold bias where prices at exactly 0.5 round
+    up (to ask) for sells and down (to bid) for buys, favoring the market maker. This accounts for exchange
+    rounding conventions and bid-ask spread asymmetry. The 0.95 threshold is calibrated to typical tick
+    sizes. Boundary: Threshold may not suit each exchanges; does not adapt to different tick sizes; favors
+    liquidity providers over takers.'
+  evidence: src/zipline/finance/execution.py:171-205(asymmetric_rounding)
+  stage: zipline.finance.execution
+  alternative_considered: Symmetric rounding (0.5 ties to even); exchange-specific rounding rules
+  _evidence_issues:
+  - 'FN_NOT_FOUND: asymmetric_rounding in src/zipline/finance/execution.py'
+- id: BD-073
+  type: B/BA
+  content: Sharpe ratio uses empyrical.sharpe_ratio with nan-to-zero conversion
+  rationale: 'Sharpe Ratio divides mean excess return by standard deviation of returns, annualized for
+    comparison. The empyrical implementation handles NaN values by converting to zero (treating missing
+    periods as neutral). This approach maintains sample size while avoiding NaN propagation. Boundary:
+    Sharpe assumes normal returns and i.i.d.; does not account for skewness or kurtosis; negative Sharpe
+    is possible.'
+  evidence: src/zipline/finance/metrics/metric.py:486,494-496(sharpe_ratio)
+  stage: zipline.finance.metrics
+  alternative_considered: Sortino ratio (downside deviation); Calmar ratio (return/max drawdown); skewness-adjusted
+    Sharpe
+  _evidence_issues:
+  - 'FN_NOT_FOUND: sharpe_ratio in src/zipline/finance/metrics/metric.py'
+- id: BD-074
+  type: B/BA
+  content: Sortino ratio via empyrical.sortino_ratio with downside risk
+  rationale: 'Sortino Ratio divides excess return by downside deviation (std of negative returns only),
+    penalizing volatility only when it causes losses. This addresses Sharpe ratio''s symmetric penalty
+    by focusing on harmful volatility. The empyrical implementation uses MAR (minimum acceptable return)
+    threshold. Boundary: MAR assumption affects ratio significantly; threshold may not reflect investor
+    preferences; does not account for upside volatility.'
+  evidence: src/zipline/finance/metrics/metric.py:498-500(sortino_ratio)
+  stage: zipline.finance.metrics
+  alternative_considered: Omega ratio (probability-weighted gain/loss ratio); Kappa ratios for higher
+    moments
+  _evidence_issues:
+  - 'FN_NOT_FOUND: sortino_ratio in src/zipline/finance/metrics/metric.py'
+- id: BD-075
+  type: B/BA
+  content: 'Mixin-based composition pattern in Pipeline: LatestMixin adds .latest accessor, PositiveWindowLengthMixin
+    modifies __init__ validation, StandardOutputs provides output methods'
+  rationale: The window_safe flag is a correctness contract that gates windowed computation behavior.
+    When window_safe=True, compute() accepts windowed inputs; otherwise, it expects point-in-time data.
+    This boundary prevents silent data misalignment in factor computations where window lengths must be
+    explicitly declared.
+  evidence: src/zipline/pipeline/term.py:51(term)
+  stage: pipeline.term
+  alternative_considered: Dynamic signature detection was rejected to maintain explicit, debuggable contracts
+  _evidence_issues:
+  - 'FN_NOT_FOUND: term in src/zipline/pipeline/term.py'
+- id: BD-076
+  type: B
+  content: TermGraph.compute_chunk() requires execution_order() and refcounts() to be called first, establishing
+    a strict ordering contract for graph execution
+  rationale: 'Graph computation requires prior computation of execution order and reference counts. This
+    ordering contract ensures proper dependency resolution and memory management before chunk processing
+    begins. Boundary: calling compute_chunk() without prerequisites raises AttributeError or produces
+    incorrect ordering.'
+  evidence: tests/pipeline/base.py:77(run_graph)
+  stage: pipeline.graph
+  alternative_considered: Internal prerequisite initialization was rejected to keep execution explicit
+    and debuggable
+- id: BD-077
+  type: BA
+  content: 'Pipeline dtype system enforces strict type contracts: Factor→float64, Filter→bool, Classifier→categorical/int64'
+  rationale: 'The dtype system enforces type safety across the Pipeline hierarchy. Each term type has
+    a constrained output dtype: Factors produce float64 for numerical precision, Filters produce bool
+    for logical operations, and Classifiers produce categorical/int64 for discrete labels. This boundary
+    prevents type mixing that would break downstream computations and ensures NumPy array compatibility.'
+  evidence: src/zipline/pipeline/factors/factor.py:49(ALLOWED_DTYPES)
+  stage: pipeline.dtypes
+  alternative_considered: Dynamic dtype inference was rejected for explicit type safety and performance
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ALLOWED_DTYPES in src/zipline/pipeline/factors/factor.py'
+- id: BD-078
+  type: BA/M
+  content: 'Mixin-based composition pattern in Pipeline: LatestMixin adds .latest accessor, SingleInputMixin
+    modifies validation, RestrictedDTypeMixin provides dtype constraints, CustomTermMixin enables user-defined
+    terms'
+  rationale: Mixin composition enables orthogonal feature addition without inheritance explosion. LatestMixin
+    provides .latest for point-in-time extraction, SingleInputMixin enforces single input constraints,
+    RestrictedDTypeMixin handles output shape normalization, and CustomTermMixin enables user-defined
+    computations. This pattern boundary allows flexible term customization while maintaining predictable
+    initialization order and method resolution.
+  evidence: src/zipline/pipeline/mixins.py:41(positivewindowlengthmixin), src/zipline/pipeline/mixins.py:52(singleinputmixin),
+    src/zipline/pipeline/mixins.py:86(restricteddtypemixin), src/zipline/pipeline/mixins.py:107(customtermmixin)
+  stage: pipeline.mixins
+  alternative_considered: Multiple inheritance without mixins was rejected for complexity; decorator pattern
+    rejected for verbosity
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: positivewindowlengthmixin), src/zipline/pipeline/mixins.py:52(singleinputmixin),
+    src/zipline/pipeline/mixins.py:86(restricteddtypemixin), src/zipline/pipeline/mixins.py:107(customtermmixin
+    in src/zipline/pipeline/mixins.py'
+- id: BD-079
+  type: B
+  content: 'Order lifecycle has strict state transitions: CREATED→OPEN→FILLED/CANCELLED, and ledger requires
+    filled status before registration'
+  rationale: Order state machine enforces legal trading lifecycle transitions. Orders must transition
+    through CREATED→OPEN before reaching terminal states FILLED or CANCELLED. The ledger additionally
+    requires filled=True before order registration in position tracking. This boundary prevents double-filling
+    and ensures portfolio consistency across trade execution.
+  evidence: src/zipline/finance/order.py:39(status), src/zipline/finance/order.py:40(due_date), src/zipline/finance/order.py:41(filled),
+    src/zipline/finance/ledger.py:294(calculate_registration)
+  stage: finance.order
+  alternative_considered: Flexible state transitions were rejected for audit trail integrity and regulatory
+    requirements
+  _evidence_issues:
+  - 'INVALID_IDENTIFIER: status), src/zipline/finance/order.py:40(due_date), src/zipline/finance/order.py:41(filled),
+    src/zipline/finance/ledger.py:294(calculate_registration in src/zipline/finance/order.py'
+- id: BD-080
+  type: BA/DK
+  content: 'Ledger cash flow uses exposure-based calculation: cash_flow = exposure * direction * multiplier
+    (not simple position * price multiplication)'
+  rationale: Cash flow calculation uses exposure model rather than simple multiplication to handle leverage,
+    short positions, and multi-leg instruments correctly. The formula cash_flow = exposure * direction
+    * multiplier accounts for long/short direction and instrument-specific multipliers. This boundary
+    ensures accurate PnL attribution across complex portfolio structures.
+  evidence: src/zipline/finance/ledger.py:449(process_transaction)
+  stage: finance.ledger
+  alternative_considered: Simple position*price was rejected for inability to handle leverage and short
+    positions correctly
+- id: BD-081
+  type: B/DK
+  content: 'Strategy pattern in slippage.py via order_style parameter: VolumeShareSlippage and KalmanSlippage
+    implement different fill models'
+  rationale: Slippage models use Strategy pattern via order_style parameter to enable pluggable fill algorithms.
+    VolumeShareSlippage models volume-based market impact; KalmanSlippage uses adaptive estimation. This
+    boundary allows runtime selection of slippage models without modifying execution logic.
+  evidence: src/zipline/finance/slippage.py:81(slippagemodel)
+  stage: finance.slippage
+  alternative_considered: Hardcoded slippage was rejected for lack of flexibility; abstract factory rejected
+    for complexity
+  _evidence_issues:
+  - 'FN_NOT_FOUND: slippagemodel in src/zipline/finance/slippage.py'
+- id: BD-082
+  type: BA
+  content: ComputableTerm base class enforces Term → Filter/Factor/Classifier hierarchy with computed
+    outputs, establishing type-safe output types
+  rationale: 'ComputableTerm enforces a type-safe inheritance hierarchy where each Pipeline terms produce
+    typed outputs: Factors produce arrays, Filters produce boolean masks, Classifiers produce integer
+    labels. This boundary prevents invalid term composition and ensures downstream consumers receive correctly-typed
+    data.'
+  evidence: src/zipline/pipeline/term.py:186(ComputableTerm.compute)
+  stage: pipeline.term
+  alternative_considered: Duck typing was rejected for type safety and IDE support requirements
+  _evidence_issues:
+  - 'FN_NOT_FOUND: ComputableTerm.compute in src/zipline/pipeline/term.py'
+- id: BD-083
+  type: BA/DK
+  content: RestrictedDTypeMixin sets dtype validation on subclasses that enforce Factor→float64, Filter→bool,
+    Classifier→categorical/int64, preventing invalid dtype assignment at construction time
+  rationale: RestrictedDTypeMixin provides construction-time dtype enforcement rather than runtime validation.
+    Subclasses are restricted to specific dtype sets during __init__, catching invalid configurations
+    early. This boundary separates dtype validation from compute logic, improving error messages and debugging.
+  evidence: src/zipline/pipeline/mixins.py:86(RestrictedDTypeMixin)
+  stage: pipeline.mixins
+  alternative_considered: Runtime-only dtype checking was rejected for poor error locality; union types
+    rejected for complexity
+- id: BD-084
+  type: BA
+  content: Pipeline loaders/base.py defines specialized loader protocol with column-based data loading
+    (sids, columns, dates) for efficient adjusted array retrieval
+  rationale: The loader protocol uses column-based access pattern for efficient data retrieval, separating
+    data storage concerns from Pipeline computation. load_adjusted_array receives sids, columns, and dates,
+    returning adjusted arrays with corporate action modifications. This boundary enables pluggable data
+    sources while maintaining consistent Pipeline input contracts.
+  evidence: src/zipline/pipeline/loaders/base.py:12(load_adjusted_array)
+  stage: pipeline.loaders
+  alternative_considered: Row-based loading was rejected for memory efficiency; ORM-based loading rejected
+    for performance
+- id: BD-085
+  type: B
+  content: NumExprFilter creates expressions with bound terms (x_0, x_1) that are resolved at compute
+    time, enabling optimized numerical filter evaluation
+  rationale: NumExprFilter uses expression compilation with bound placeholder terms for efficient vectorized
+    evaluation. Terms x_0, x_1 are bound to actual arrays at compute time, enabling NumExpr to optimize
+    the entire expression tree. This boundary separates expression parsing from data binding for performance.
+  evidence: src/zipline/pipeline/filters/filter.py:329(NumExprFilter.create)
+  stage: pipeline.filters
+  alternative_considered: Pure Python evaluation was rejected for performance; SQL-style compilation rejected
+    for complexity
+- id: BD-086
+  type: DK
+  content: Continuous futures (continuous_futures.pyx) has special roll logic using canonical_root_map
+    for chain identification across roll dates
+  rationale: Continuous futures contracts require special handling because underlying futures contracts
+    expire and roll to new contracts. The canonical_root_map identifies which contracts belong to the
+    same logical underlying, and roll logic determines when to switch between front and back contract
+    prices. This domain knowledge is essential for accurate historical backtesting of futures strategies.
+  evidence: src/zipline/assets/continuous_futures.pyx:115(__init__)
+  stage: assets.continuous_futures
+  alternative_considered: Simple front-month series was rejected for data discontinuity at roll dates
+- id: BD-087
+  type: RC
+  content: FX rate resolution uses multiplier=1.0 for AUD,CAD,CHF,CNY,EUR,GBP,HKD,JPY,NZD,SGD,USD but
+    applies different conversion logic for cryptocurrency pairs
+  rationale: Foreign exchange rate handling distinguishes between traditional fiat currencies (with multiplier=1.0
+    and standard quote conventions) and cryptocurrencies (with variable multipliers and 24/7 trading).
+    This boundary ensures correct currency conversion across asset classes while handling the different
+    market structures and settlement conventions.
+  evidence: src/zipline/data/fx/base.py:13(fxratereader)
+  stage: data.fx
+  alternative_considered: Unified FX logic was rejected for cryptocurrency's unique market structure and
+    volatility
+  _evidence_issues:
+  - 'FN_NOT_FOUND: fxratereader in src/zipline/data/fx/base.py'
+- id: BD-088
+  type: B/BA
+  content: Classifier comparisons are explicitly blocked (>,<,>=,<=) except eq/ne - intentional safety
+    design to prevent misuse of ordinal operations on categorical data
+  rationale: Classifier terms represent categorical data without inherent ordering, so comparison operators
+    (> < >= <=) are explicitly blocked to prevent semantic errors. Only equality (eq) and inequality (ne)
+    are allowed. This boundary prevents bugs where traders incorrectly assume ordinal relationships in
+    categorical classifications like sector or country labels.
+  evidence: src/zipline/pipeline/classifiers/classifier.py:125-133(bad_compare)
+  stage: pipeline.classifiers
+  alternative_considered: Allowing each comparisons was rejected for semantic correctness; using Enum
+    was rejected for API compatibility
+- id: BD-089
+  type: B/BA
+  content: Pipeline Term dimensions default requires explicit mask inputs for windowed computations, enforcing
+    data scope declaration at construction time
+  rationale: Term dimensions define the data scope for computations, and windowed factors require explicit
+    mask declaration to define universe boundaries. This design enforces scope declaration at construction
+    rather than compute time, enabling early validation and clear data lineage. The boundary prevents
+    accidental full-universe computations where a mask was intended.
+  evidence: src/zipline/pipeline/term.py:100(dimensions)
+  stage: pipeline.term
+  alternative_considered: Implicit mask inference was rejected for ambiguity; dynamic dimension calculation
+    rejected for performance
+  _evidence_issues:
+  - 'FN_NOT_FOUND: dimensions in src/zipline/pipeline/term.py'
+- id: BD-090
+  type: BA/DK
+  content: 'INTERACTION: [BD-029] × [BD-065] × [BD-072] → Trading day inconsistency creates 0.8% annualization
+    discrepancy (250 vs 252 days)'
+  rationale: BD-029 documents TRADING_DAYS_IN_YEAR=250 as the canonical value, but BD-065 (AnnualizedVolatility)
+    and BD-072 (annual_volatility in metrics) both use 252. This creates a hidden inconsistency where
+    Sharpe ratio, volatility, and other annualized metrics disagree with the documented convention. When
+    comparing BD-029-based returns with BD-065-based risk metrics, Sharpe ratios will be miscalculated
+    by approximately 0.8%.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Using 252 everywhere (standard practitioner convention); using 250 everywhere
+    (conservative calendar approximation)
+- id: BD-091
+  type: B/BA
+  content: 'INTERACTION: [BD-017] × [BD-001] × [BD-006] × [BD-009] → 2x leverage amplifies execution costs
+    disproportionately for large positions'
+  rationale: The momentum example's 2x leverage configuration amplifies slippage costs non-linearly. With
+    2x leverage, each position requires twice the capital deployment, causing orders to hit the 2.5% volume
+    limit (BD-009) faster. Combined with 10 bps FixedBasisPointsSlippage (BD-006), the effective execution
+    cost per dollar of exposure increases substantially, potentially turning profitable signals into losing
+    trades.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: 1x leverage for examples to avoid cost amplification; explicit cost budgeting
+- id: BD-092
+  type: B/DK
+  content: 'INTERACTION: [BD-056] × [BD-059] × [BD-010] → Quadratic slippage with fixed 20-day window
+    creates regime-dependent execution quality'
+  rationale: The quadratic price impact model (BD-056) combined with the fixed 20-day rolling window for
+    ADV estimation (BD-059) creates execution quality that varies dramatically with market regime. During
+    high-volatility periods, ADV contracts while orders remain constant, causing the order-to-volume ratio
+    to spike and impact costs to quadruple (quadratic relationship). The fixed 0.1 price_impact coefficient
+    (BD-010) is calibrated for normal conditions but underestimates costs in volatile markets by 3-5x.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Adaptive price_impact based on VIX regime; GARCH-based ADV forecasting; volatility-normalized
+    volume limits
+- id: BD-093
+  type: B/BA
+  content: 'INTERACTION: [BD-024] × [BD-022] → NeverCancel policy with conservative stop rounding creates
+    stale stop accumulation risk'
+  rationale: The NeverCancel default (BD-024) combined with conservative stop order rounding (BD-022)
+    creates a risk cascade where stale stops accumulate in the order book indefinitely. During volatile
+    markets, stops may round away from optimal trigger points (e.g., up for buy stops), never executing
+    while price continues trending. With NeverCancel, these orders persist across sessions, creating hidden
+    position exposure that contradicts the intended stop-loss protection.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Session-based stop expiration; adaptive rounding based on volatility; explicit
+    stop tracking
+- id: BD-094
+  type: BA/M
+  content: 'INTERACTION: [BD-034] × [BD-035] × [BD-070] → OLMAR simplex projection sensitive to price
+    scaling precision for small portfolios'
+  rationale: 'The OLMAR portfolio optimizer (BD-034) relies on simplex projection (BD-035) to maintain
+    valid weight distributions, but this projection is sensitive to the price scaling precision (BD-070:
+    multiply by 1000, store as uint32). For low-priced assets or small portfolio values, the 3-decimal
+    precision limit can cause weight normalization errors, leading to either negative weights after projection
+    or allocation sums deviating from 1.0.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Higher precision scaling for low-priced assets; explicit weight normalization
+    with tolerance; validation after projection
+- id: BD-095
+  type: BA/M
+  content: 'INTERACTION: [BD-068] × [BD-071] × [BD-065] → Simple returns compound with expanding volatility
+    creates volatility drag inconsistency'
+  rationale: The combination of simple returns (BD-068) with cumulative return calculation (BD-071) and
+    expanding volatility (BD-072/BD-065) creates a volatility drag inconsistency. Simple returns assume
+    no reinvestment within the period, but the expanding volatility window mixes historical and current
+    observations non-uniformly. The sqrt(252) annualization assumes i.i.d. returns, but expanding windows
+    create autocorrelated volatility estimates, potentially overstating risk by 10-20% for trending strategies.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Rolling volatility window for consistency; log returns for additive compounding;
+    GARCH volatility forecast
+- id: BD-096
+  type: B/BA
+  content: 'INTERACTION: [BD-004] × [BD-026] × [BD-025] → NYSE default with 40-day prefetch misses non-NYSE
+    holiday effects'
+  rationale: The NYSE calendar (BD-004) with 40-day daily prefetch (BD-026) and 1560-minute minute prefetch
+    (BD-025) creates a hidden dependency on US equity holiday patterns. Strategies using non-trading day
+    indicators or holiday-adjacent signals may reference stale data due to the prefetch window missing
+    partial trading days around holidays. For international assets or alternative calendars, the NYSE-centric
+    prefetch assumes uniform holiday patterns.
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Calendar-specific prefetch lengths; explicit non-trading day NaN handling; holiday
+    calendar awareness
+- id: BD-097
+  type: BA/DK
+  content: 'INTERACTION: [BD-030] × [BD-032] × [BD-002] → 6.5 hours/day incompatible with 1m/1d frequency
+    assumption for minute annualization'
+  rationale: 'The 6.5 trading hours constant (BD-030) assumes minute bars but the system only supports
+    1-minute and 1-day frequencies (BD-032). This creates a contradiction: 6.5 hours implies 390 minutes
+    per session, but hourly frequency is not available for strategies needing intraday resolution without
+    minute data overhead. The default daily frequency (BD-002) ignores the 6.5-hour specification entirely,
+    making the constant relevant only for explicit minute-based annualization.'
+  evidence: N/A:0(see_rationale)
+  stage: global
+  alternative_considered: Add hourly frequency support; clarify 6.5 hours is for explicit annualization
+    only; deprecate unused constant
+- id: BD-GAP-001
+  type: B/BA
+  content: HTTP retry strategy with configurable retry count for Quandl API calls, defaulting to 3 attempts
+  rationale: Network requests to external APIs are inherently unreliable; configurable retries provide
+    resilience without hardcoding failure thresholds. Breaks under API rate limiting or prolonged outages
+    where exponential backoff would be needed.
+  evidence: src/zipline/data/bundles/quandl.py:69(fetch_data_table)
+  stage: data_ingestion
+  alternative_considered: Infinite retry with exponential backoff would be more robust but adds complexity
+- id: BD-GAP-002
+  type: B/BA
+  content: Conditional progress display for large data downloads, with separate download paths for progress
+    vs silent modes
+  rationale: Large downloads benefit from progress visibility to set user expectations; silent mode avoids
+    terminal clutter in scripted/automated contexts. Breaks when streaming chunk size doesn't align with
+    terminal width or in non-interactive environments.
+  evidence: src/zipline/data/bundles/quandl.py:232(download_with_progress)
+  stage: data_ingestion
+  alternative_considered: Single download function with log-based progress instead of streaming display
+- id: BD-GAP-003
+  type: T
+  content: Environment-based path configuration for bundle storage, enabling dev/prod/test isolation
+  rationale: Separating storage paths by environment prevents accidental data corruption and allows concurrent
+    environments. Breaks when environ parameter is misconfigured or omitted in multi-user systems without
+    proper permission isolation.
+  evidence: src/zipline/data/bundles/core.py:34(asset_db_path)
+  stage: infrastructure
+  alternative_considered: Environment variables alone without explicit parameter override
+- id: BD-GAP-004
+  type: T
+  content: Separated storage paths for different data types (assets, minute bars, daily bars, adjustments,
+    cache) with versioned database paths
+  rationale: Different data types have different access patterns and retention policies; separation enables
+    independent scaling and cleanup. Breaks when db_version drift occurs across components or when migration
+    paths are not maintained.
+  evidence: src/zipline/data/bundles/core.py:85(asset_db_relative)
+  stage: infrastructure
+  alternative_considered: Unified blob storage with type tags would simplify but lose query efficiency
+- id: BD-GAP-005
+  type: B/BA
+  content: Directory-based CSV ingestion with configurable directory path and flexible timeframe support
+    for custom data bundles
+  rationale: Enables user-defined data sources beyond official bundles; directory flexibility supports
+    diverse data formats. Breaks when directory permissions are restrictive or when CSV files have inconsistent
+    schemas.
+  evidence: src/zipline/data/bundles/csvdir.py:22(csvdir_equities)
+  stage: data_ingestion
+  alternative_considered: Schema registry approach would enforce consistency but reduce flexibility
+- id: BD-GAP-006
+  type: T/BA
+  content: AdjustedArray stores adjustments separately from baseline data rather than mutating raw prices
+  rationale: Separation preserves data immutability and enables multiple adjustment views; O(1) as_int_array
+    conversion reflects efficient internal representation. Breaks when memory-constrained since adjustments
+    can exceed raw data size for highly volatile assets.
+  evidence: src/zipline/lib/adjusted_array.py:189(AdjustedArray.__init__)
+  stage: data_ingestion
+  alternative_considered: In-place adjustment would save memory but lose audit trail and multi-view capability
+- id: BD-GAP-007
+  type: T/BA
+  content: Window-based iteration over AdjustedArray with configurable perspective offsets, supporting
+    multiple analytical views without data duplication
+  rationale: Finance calculations need lookback windows at different points; offset parameters enable
+    this without materializing copies. Breaks when window_length exceeds available history or when offsets
+    create gaps in coverage.
+  evidence: src/zipline/lib/adjusted_array.py:259(traverse)
+  stage: data_ingestion
+  alternative_considered: Materialized windows would be simpler but multiply memory usage
+- id: BD-GAP-008
+  type: T/BA
+  content: Pipeline execution hooks use context managers for instrumentation at each computation stage,
+    enabling composable monitoring
+  rationale: Context managers ensure proper setup/teardown of instrumentation; composable design via delegation
+    allows multiple observers. Breaks when hook implementations raise exceptions (no error handling visible)
+    or when hooks have side effects that affect computation.
+  evidence: src/zipline/pipeline/hooks/iface.py:39(running_pipeline)
+  stage: order_management
+  alternative_considered: Callback pattern would be simpler but lose context manager resource guarantees
+- id: BD-GAP-009
+  type: BA
+  content: Progress hooks integrate with IPython/Jupyter for widget-based progress display, with testing
+    support for non-interactive environments
+  rationale: Interactive environments benefit from visual progress; testing publisher enables CI/CD without
+    display dependencies. Breaks in terminal-only environments without IPython kernel.
+  evidence: src/zipline/pipeline/hooks/progress.py:291(IPythonWidgetProgressPublisher)
+  stage: order_management
+  alternative_considered: Logging-based progress would work everywhere but be less visible
+- id: BD-GAP-010
+  type: T/BA
+  content: LabelArray uses integer factorization internally with custom missing_value sentinel for efficient
+    string array operations
+  rationale: Factorization enables O(1) string equality checks and memory efficiency; custom missing value
+    avoids NaN limitations for string data. Breaks when category count approaches int dtype limits or
+    when string-to-code mapping becomes a bottleneck.
+  evidence: src/zipline/lib/labelarray.py:157(LabelArray.__new__)
+  stage: data_ingestion
+  alternative_considered: Dictionary-based mapping would be simpler but slower for repeated lookups
+- id: BD-GAP-011
+  type: B/BA
+  content: Benchmark returns pre-calculated at initialization rather than computed on-demand during simulation
+  rationale: Pre-calculation avoids repeated lookups during tight simulation loops; trades memory for
+    latency. Breaks when benchmark asset changes mid-simulation or when memory pressure is severe.
+  evidence: src/zipline/sources/benchmark_source.py:187(_initialize_precalculated_series)
+  stage: trading_simulation
+  alternative_considered: On-demand computation would save memory but add per-bar latency
+- id: BD-GAP-012
+  type: B/BA
+  content: Symbol uniqueness validation with NaN/0 return when symbol is ambiguous or not found
+  rationale: Ambiguous symbols indicate data quality issues; returning failure indicators prevents silent
+    misattribution. Breaks when symbol history spans multiple companies with legitimate name reuse (common
+    in small-cap stocks).
+  evidence: src/zipline/sources/requests_csv.py:258(_lookup_unconflicted_symbol)
+  stage: data_ingestion
+  alternative_considered: Return each matches would be less safe but preserve data access
+- id: BD-GAP-013
+  type: T/BA
+  content: Daily timestamp normalization to midnight for consistent date alignment across data sources
+  rationale: Eliminates timezone and time-of-day inconsistencies when merging heterogeneous data sources.
+    Breaks when intraday date boundaries matter (e.g., overnight positions crossing exchange close).
+  evidence: src/zipline/sources/requests_csv.py:21(roll_dts_to_midnight)
+  stage: data_ingestion
+  alternative_considered: Preserve original timestamps would be accurate but require timezone-aware merge
+    logic
+- id: BD-GAP-014
+  type: B/RC
+  content: Protocol validation functions assert datasource/trade/unframe event structures at runtime
+  rationale: Runtime validation catches integration errors early with clear failure messages; defensive
+    approach prevents subtle bugs. Breaks when protocol evolves without updating validators, creating
+    false negatives.
+  evidence: src/zipline/gens/utils.py:38(assert_datasource_protocol)
+  stage: data_ingestion
+  alternative_considered: Type annotations alone would be less intrusive but less enforced
+- id: BD-GAP-015
+  type: B/BA
+  content: Expired asset cleanup at simulation day boundaries, clearing orders for delisted securities
+  rationale: Prevents order execution for securities that no longer trade; boundary-based cleanup is efficient.
+    Breaks when asset lifetimes are incorrectly tracked or when corporate actions create apparent 'new'
+    tickers for same entity.
+  evidence: src/zipline/gens/tradesimulation.py:258(_cleanup_expired_assets)
+  stage: trading_simulation
+  alternative_considered: Continuous cleanup would be safer but less efficient
+- id: BD-GAP-016
+  type: B
+  content: 'Missing: PnL conservation'
+  rationale: 'Audit finding: missing: pnl conservation. Identified by audit checklist. This gap affects
+    production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-017
+  type: DK
+  content: 'Missing: Model/data version snapshot'
+  rationale: 'Audit finding: missing: model/data version snapshot. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-018
+  type: B
+  content: 'Missing: Model Calibration Residuals'
+  rationale: 'Audit finding: missing: model calibration residuals. 7 | Finite Difference Grid Stability
+    | ❌ N/A | Not applicable. This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: 7 | Finite Difference Grid Stability | ❌ N/A | Not applicable
+- id: BD-GAP-019
+  type: B
+  content: 'Missing: Default Definition/IFRS9 Stages'
+  rationale: 'Audit finding: missing: default definition/ifrs9 stages. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-020
+  type: M
+  content: 'Missing: Transition Matrix Time-Homogeneity'
+  rationale: 'Audit finding: missing: transition matrix time-homogeneity. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-021
+  type: B
+  content: 'Missing: Repayment Schedule Generation'
+  rationale: 'Audit finding: missing: repayment schedule generation. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-022
+  type: B
+  content: 'Missing: Delinquency Definition (DPD)'
+  rationale: 'Audit finding: missing: delinquency definition (dpd). Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-023
+  type: RC
+  content: 'Missing: Collection Priority/Compliance'
+  rationale: 'Audit finding: missing: collection priority/compliance. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  known_gap: true
+  severity: high
+  impact: Identified by audit checklist
+- id: BD-GAP-024
+  content: 'Missing: Default Definition/IFRS9 Stages'
+  type: B
+  rationale: 'Audit finding: missing: default definition/ifrs9 stages. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-025
+  content: 'Missing: Stress Test Scenario Macro Variables'
+  type: B
+  rationale: 'Audit finding: missing: stress test scenario macro variables. Identified by audit checklist.
+    This gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+- id: BD-GAP-026
+  content: 'Missing: NPL EBA Field Completeness'
+  type: RC
+  rationale: 'Audit finding: missing: npl eba field completeness. Identified by audit checklist. This
+    gap affects production reliability and should be addressed.'
+  evidence: N/A:0(see_rationale)
+  stage: data_ingestion
+  status: missing
+  severity: high
+  impact: Identified by audit checklist
+  known_gap: true
+known_use_cases:
+- id: UC-101
+  name: Zipline Documentation Deployment
+  source: docs/deploy.py
+  type: reporting
+  business_problem: Automates the process of building and deploying Zipline documentation by cleaning
+    old artifacts, moving files to temporary locations, and preparing docs for publication.
+  intent_keywords:
+  - deploy
+  - documentation
+  - docs
+  - build
+  - publish
+  stage: data_collection
+  negative_keywords:
+  - trading
+  - backtest
+  - algorithm
+  - strategy
+  - data ingest
+  disambiguation: Are you looking to deploy documentation, or do you want to create/run a trading algorithm?
+  data_domain: mixed
+- id: UC-102
+  name: Zipline Getting Started Tutorial
+  source: docs/notebooks/tutorial.ipynb
+  type: research_analysis
+  business_problem: Provides an interactive tutorial for new Zipline users to learn the platform's core
+    concepts including data ingestion, algorithm execution via CLI and magic commands, and performance
+    visualization.
+  intent_keywords:
+  - tutorial
+  - getting started
+  - learn
+  - beginner
+  - notebook
+  stage: factor_computation
+  negative_keywords:
+  - production trading
+  - live trading
+  - screening
+  - factor computation
+  disambiguation: Are you learning Zipline basics, or do you need a production-ready trading strategy?
+  data_domain: trading_data
+- id: UC-103
+  name: Basic Buy-and-Hold Tutorial Algorithm
+  source: src/zipline/examples/buyapple.ipynb
+  type: extension_example
+  business_problem: Demonstrates a minimal Zipline algorithm that places consistent buy orders for a single
+    stock and records price data for later analysis, serving as a starter template for custom algorithms.
+  intent_keywords:
+  - example
+  - buy apple
+  - simple order
+  - starter template
+  - record data
+  stage: factor_computation
+  negative_keywords:
+  - screening
+  - factor
+  - machine learning
+  - multi-asset
+  disambiguation: Do you need a simple example to understand Zipline structure, or a complex factor-based
+    screening algorithm?
+  data_domain: trading_data
+_enrich_meta:
+  evidence_coverage_ratio: 1.0
+  evidence_verified: 50
+  evidence_invalid: 54
+  evidence_auto_fixed: 0
+  evidence_verify_ratio: 0.4807692307692308
+relations:
+- type: complementary
+  target: finance-bp-001
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-002
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-003
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-004
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-005
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-006
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-007
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-008
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-009
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-010
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-011
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-012
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-013
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-014
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-015
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-016
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-017
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-018
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-019
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-020
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-021
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-022
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-023
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-024
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-025
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-026
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-027
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-028
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-029
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-030
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-031
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-032
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-033
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-034
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-035
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-036
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-037
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-038
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-039
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-040
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-041
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-042
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-043
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-044
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-045
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-046
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-047
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-048
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-049
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-050
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-051
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-052
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-053
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-054
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-055
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-056
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-057
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-058
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: finance-bp-059
+  description: Different capability, potential data/component synergy
+- type: complementary
+  target: exchange_calendars
+  description: Zipline uses the external exchange_calendars library for trading calendar management rather
+    than implementing calendars internally
+  evidence: CLAUDE.md:§Common-Tasks
+- type: contains
+  target: src/zipline/algorithm.py
+  description: Core algorithm execution is contained in algorithm.py
+  evidence: CLAUDE.md:§Project-Structure
+- type: contains
+  target: src/zipline/api.py
+  description: Public API is exposed through api.py
+  evidence: CLAUDE.md:§Project-Structure
+- type: contains
+  target: src/zipline/data/
+  description: Data handling subsystem contains bundles and ingestion logic
+  evidence: CLAUDE.md:§Project-Structure
+- type: contains
+  target: src/zipline/finance/
+  description: Finance module contains execution and calculations
+  evidence: CLAUDE.md:§Project-Structure
+- type: contains
+  target: src/zipline/pipeline/
+  description: Pipeline module contains factor-based screening
+  evidence: CLAUDE.md:§Project-Structure
+execution_paradigm:
+  live: unknown
+  backtest: unknown
+  note: Auto-detected from source code structure
+audit_checklist_summary:
+  sop_version: '3.6'
+  executed_at: auto
+  subdomain_labels:
+  - TRD
+  finance_universal:
+    pass: 5
+    warn: 12
+    fail: 3
+  subdomain_totals:
+    pass: 4
+    warn: 21
+    fail: 16
+  coverage: 61/61 (100%)
+  pass_rate: 9/61 (14%)
+  note: Parsed from worker_audit.md (universal + subdomain separated)
+replaceable_slots:
+- id: slot-001
+  name: equity_price_data_bundle
+  description: Use quandl_wiki for standard US equities; csvdir_custom for international or proprietary
+    data; yfinance for quick exploration
+  used_in_stages: []
+  options:
+  - name: quandl_wiki
+    traits:
+    - daily_ohlcv
+    - dividends
+    - splits
+    - us_equities
+    - free_api_key
+    fit_for:
+    - Standard US equity backtesting with fundamental data
+    not_fit_for:
+    - Non-US equities, minute data, real-time data
+  - name: quantopian_quandl
+    traits:
+    - daily_ohlcv
+    - pre_built_archive
+    - historical
+    fit_for:
+    - Quick setup with historical Quantopian data
+    not_fit_for:
+    - Current data, custom data sources
+  - name: csvdir_custom
+    traits:
+    - daily_or_minute
+    - custom_symbols
+    - user_provided
+    fit_for:
+    - Custom data, proprietary data sources, international equities
+    not_fit_for:
+    - Data that requires API fetching
+  - name: yfinance
+    traits:
+    - daily_ohlcv
+    - international
+    - free
+    - no_guarantee
+    fit_for:
+    - Current market data for popular tickers
+    not_fit_for:
+    - Historical dividend/split adjustment, production systems
+  default: quandl_wiki
+  _source: worker_resource
+- id: slot-002
+  name: fx_rate_storage
+  description: Use HDF5 for production; in-memory for testing with known FX data; exploding for algorithms
+    that should not use FX
+  used_in_stages: []
+  options:
+  - name: hdf5_fx_rates
+    traits:
+    - persistent
+    - chunked
+    - compressed
+    fit_for:
+    - Production FX workflows with large currency datasets
+    not_fit_for:
+    - Small datasets, testing where speed is critical
+  - name: in_memory_fx_rates
+    traits:
+    - fast
+    - non_persistent
+    - testing
+    fit_for:
+    - Testing, small FX datasets, quick prototyping
+    not_fit_for:
+    - Large datasets, production workloads
+  - name: exploding_fx_rates
+    traits:
+    - error_on_use
+    - testing
+    fit_for:
+    - Testing scenarios where FX is not expected
+    not_fit_for:
+    - Any actual FX conversion needs
+  default: hdf5_fx_rates
+  _source: worker_resource
+- id: slot-003
+  name: price_bar_storage
+  description: Use bcolz for standard zipline workflows; HDF5 for interoperability; in-memory for testing
+  used_in_stages: []
+  options:
+  - name: bcolz_daily_bars
+    traits:
+    - columnar
+    - compressed
+    - persistent
+    - daily
+    fit_for:
+    - Daily bar storage, efficient compression
+    not_fit_for:
+    - Minute bars, random access patterns
+  - name: bcolz_minute_bars
+    traits:
+    - columnar
+    - compressed
+    - persistent
+    - minute
+    fit_for:
+    - Minute bar storage, high-frequency backtesting
+    not_fit_for:
+    - Daily bars, simple use cases
+  - name: hdf5_daily_bars
+    traits:
+    - hdf5
+    - persistent
+    - daily
+    fit_for:
+    - Alternative to bcolz, standard HDF5 compatibility
+    not_fit_for:
+    - Minute bars, performance-critical paths
+  - name: in_memory_daily_bars
+    traits:
+    - fast
+    - non_persistent
+    - testing
+    fit_for:
+    - Testing, small datasets
+    not_fit_for:
+    - Production, large datasets
+  default: bcolz_daily_bars and bcolz_minute_bars
+  _source: worker_resource
+- id: slot-004
+  name: trading_calendar
+  description: Use built-in calendars from exchange_calendars; create custom only if needed
+  used_in_stages: []
+  options:
+  - name: exchange_calendars
+    traits:
+    - 50+_calendars
+    - maintained
+    - comprehensive
+    fit_for:
+    - Standard use with well-known exchanges
+    not_fit_for:
+    - Custom/ proprietary exchange hours
+  - name: custom_calendar
+    traits:
+    - user_defined
+    - flexible_hours
+    fit_for:
+    - Proprietary exchanges, custom trading hours
+    not_fit_for:
+    - Standard exchanges
+  default: exchange_calendars
+  _source: worker_resource
+- id: slot-005
+  name: technical_indicators
+  description: Use built-in factors for simplicity; TA-Lib for comprehensive technical analysis if NumPy
+    < 2.0
+  used_in_stages: []
+  options:
+  - name: builtin_pipeline_factors
+    traits:
+    - integrated
+    - pipeline_aware
+    - documented
+    fit_for:
+    - Standard technical indicators within zipline pipeline
+    not_fit_for:
+    - Indicators not in zipline.factor namespace
+  - name: ta_lib
+    traits:
+    - 200+_indicators
+    - optimized_c
+    - professional
+    fit_for:
+    - Professional trading with comprehensive technical analysis
+    not_fit_for:
+    - NumPy 2.0+ environments (incompatible)
+  default: builtin_pipeline_factors
+  _source: worker_resource
+- id: slot-006
+  name: asset_database
+  description: Use persistent SQLite for production; in-memory for testing
+  used_in_stages: []
+  options:
+  - name: sqlite_assets
+    traits:
+    - persistent
+    - relational
+    - migrations
+    fit_for:
+    - Standard zipline deployment
+    not_fit_for:
+    - Distributed/multi-user scenarios
+  - name: sqlite_in_memory
+    traits:
+    - fast
+    - non_persistent
+    - testing
+    fit_for:
+    - Testing, small asset universes
+    not_fit_for:
+    - Production with many assets
+  default: sqlite_assets
+  _source: worker_resource
+resources:
+- id: res-001
+  type: external_service
+  name: NASDAQ Data Link
+  description: 'US equity daily OHLCV with dividends and splits. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-002
+  type: external_service
+  name: Quantopian (historical archive)
+  description: 'Complete historical zipline bundle data (tar archive). Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-003
+  type: external_service
+  name: User-provided files
+  description: 'Custom equity daily/minute OHLCV data. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-004
+  type: external_service
+  name: exchange_calendars library
+  description: 'Trading session schedules for 50+ exchanges. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-005
+  type: external_service
+  name: User-provided HDF5 files
+  description: 'Currency conversion rates (multiple rate types: bid/ask/mid). Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-006
+  type: external_service
+  name: User-provided CSV or equity asset
+  description: 'Daily returns for benchmark comparison. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-007
+  type: external_service
+  name: Bundled CSV file
+  description: 'US treasury yield curve data. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-008
+  type: external_service
+  name: Bundled CSV file
+  description: 'SPY ETF daily returns for testing. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-009
+  type: external_service
+  name: User-specified HTTP URLs
+  description: 'Custom event data for backtesting. Coverage: N/A. Auth: N/A'
+  used_in_stages:
+  - data_download
+  _source: worker_resource
+- id: res-010
+  type: external_service
+  name: NASDAQ Data Link API
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-011
+  type: external_service
+  name: Quantopian S3 Bucket
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-012
+  type: external_service
+  name: PyPI (Python Package Index)
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-013
+  type: external_service
+  name: TestPyPI
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-014
+  type: external_service
+  name: Conda-Forge
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-015
+  type: external_service
+  name: SQLite Database
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-016
+  type: external_service
+  name: Bcolz Data Store
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-017
+  type: external_service
+  name: HDF5 FX Rate Files
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-018
+  type: python_package
+  name: numpy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-019
+  type: python_package
+  name: pandas
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-020
+  type: python_package
+  name: sqlalchemy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-021
+  type: python_package
+  name: alembic
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-022
+  type: python_package
+  name: bcolz-zipline
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-023
+  type: python_package
+  name: h5py
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-024
+  type: python_package
+  name: tables
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-025
+  type: python_package
+  name: exchange-calendars
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-026
+  type: python_package
+  name: scipy
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-027
+  type: python_package
+  name: statsmodels
+  description: ''
+  used_in_stages: []
+  _source: worker_resource
+- id: res-028
+  type: code_example
+  name: Zipline Documentation Deployment
+  path: docs/deploy.py
+  description: Automates the process of building and deploying Zipline documentation by cleaning old artifacts,
+    moving files to temporary locations, and preparing docs for publication.
+  used_in_stages:
+  - data_collection
+  _source: uc_list
+- id: res-029
+  type: code_example
+  name: Zipline Getting Started Tutorial
+  path: docs/notebooks/tutorial.ipynb
+  description: Provides an interactive tutorial for new Zipline users to learn the platform's core concepts
+    including data ingestion, algorithm execution via CLI and magic commands, and performance visualization.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list
+- id: res-030
+  type: code_example
+  name: Basic Buy-and-Hold Tutorial Algorithm
+  path: src/zipline/examples/buyapple.ipynb
+  description: Demonstrates a minimal Zipline algorithm that places consistent buy orders for a single
+    stock and records price data for later analysis, serving as a starter template for custom algorithms.
+  used_in_stages:
+  - factor_computation
+  _source: uc_list
