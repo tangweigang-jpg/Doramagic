@@ -186,13 +186,16 @@ def build_constraint_phases_v3(
     *,
     fallback_agent: ExtractionAgent | None = None,
     strict_quality_gate: bool = True,
+    knowledge_sources: list[str] | None = None,
 ) -> list[Phase]:
     """Build constraint extraction phases for the v3 pipeline (SOP v2.3).
 
     Extends v2 with:
     - con_extract_doc: Document constraint extraction (Step 2.1-s)
     - con_extract_rationalization: Rationalization guard extraction (Step 2.6)
-    - con_evaluate: Independent Sprint-Contract constraint evaluation
+      — conditionally skipped when *knowledge_sources* is provided and does
+      not contain "document" (saves ~2K tokens / 2-4 iter per blueprint).
+    - con_evaluate: Independent Sprint-Contract constraint evaluation (disabled)
 
     Args:
         blueprint_id: Blueprint identifier, e.g. "finance-bp-009".
@@ -200,6 +203,10 @@ def build_constraint_phases_v3(
         agent: ExtractionAgent for Instructor calls and agentic phases.
         fallback_agent: Optional fallback ExtractionAgent.
         strict_quality_gate: If True, hard gate failures stop the pipeline.
+        knowledge_sources: Detected knowledge source types for this repo
+            (e.g. ["structural", "document"]). When provided and "document"
+            is absent, con_extract_rationalization is omitted from the phase
+            list entirely (the output artifact is not required by con_merge).
 
     Returns:
         Ordered list of Phase objects ready for SOPExecutor.
@@ -216,10 +223,18 @@ def build_constraint_phases_v3(
     # Insert new extract phases before con_merge (last extract group member)
     merge_idx = next(i for i, p in enumerate(v2_phases) if p.name == "con_merge")
 
+    # Decide whether to include con_extract_rationalization.
+    # Condition: only include when knowledge_sources is unknown (None) OR
+    # when "document" is explicitly present — finance bps almost never have
+    # SKILL.md/CLAUDE.md, so skipping saves ~2 K tokens with no quality loss.
+    has_document_sources = knowledge_sources is None or "document" in knowledge_sources
+
     # Build new phases
     new_extract_phases: list[Phase] = []
 
     # --- con_extract_doc (Step 2.1-s) ---
+    # Always included: the phase itself has a graceful-skip fast-path when
+    # no document sources are present (writes empty JSON immediately).
     new_extract_phases.append(
         Phase(
             name="con_extract_doc",
@@ -241,24 +256,33 @@ def build_constraint_phases_v3(
     )
 
     # --- con_extract_rationalization (Step 2.6) ---
-    new_extract_phases.append(
-        Phase(
-            name="con_extract_rationalization",
-            description="Step 2.6: Extract rationalization guard constraints",
-            system_prompt=prompts_v2.CON_RATIONALIZATION_SYSTEM,
-            initial_message_builder=_build_ct_extract_rationalization_message,
-            allowed_tools=[
-                "read_file",
-                "grep_codebase",
-                "write_artifact",
-            ],
-            max_iterations=30,
-            required_artifacts=["ct_rationalization_constraints.json"],
-            depends_on=["con_build_manifest"],
-            blocking=False,
-            parallel_group="extract",
+    # Skipped when we know document sources are absent: the phase would only
+    # run its graceful-skip path anyway, wasting 2-4 iterations.
+    if has_document_sources:
+        new_extract_phases.append(
+            Phase(
+                name="con_extract_rationalization",
+                description="Step 2.6: Extract rationalization guard constraints",
+                system_prompt=prompts_v2.CON_RATIONALIZATION_SYSTEM,
+                initial_message_builder=_build_ct_extract_rationalization_message,
+                allowed_tools=[
+                    "read_file",
+                    "grep_codebase",
+                    "write_artifact",
+                ],
+                max_iterations=30,
+                required_artifacts=["ct_rationalization_constraints.json"],
+                depends_on=["con_build_manifest"],
+                blocking=False,
+                parallel_group="extract",
+            )
         )
-    )
+    else:
+        logger.info(
+            "build_constraint_phases_v3: con_extract_rationalization skipped for %s "
+            "(no document sources detected)",
+            blueprint_id,
+        )
 
     # NOTE: con_evaluate phase is DISABLED in production.
     # The evaluator produces `ct_evaluation_report.json` which is purely
@@ -270,16 +294,19 @@ def build_constraint_phases_v3(
 
     # Assemble final phase list:
     # v2_phases[:merge_idx] = pre-processing + all v2 extract phases
-    # + new extract phases (doc + rationalization)
+    # + new extract phases (doc + [rationalization if applicable])
     # + v2_phases[merge_idx:] = con_merge + synthesis + downstream
     result = v2_phases[:merge_idx] + new_extract_phases + v2_phases[merge_idx:]
 
+    added_names = [p.name for p in new_extract_phases]
     logger.info(
-        "build_constraint_phases_v3: %d phases for %s (v2 base: %d, +2 new: "
-        "doc_extract, rationalization; con_evaluate disabled)",
+        "build_constraint_phases_v3: %d phases for %s (v2 base: %d, +%d new: %s; "
+        "con_evaluate disabled)",
         len(result),
         blueprint_id,
         len(v2_phases),
+        len(new_extract_phases),
+        ", ".join(added_names),
     )
 
     return result

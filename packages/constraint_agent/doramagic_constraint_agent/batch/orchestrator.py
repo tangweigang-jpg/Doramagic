@@ -312,6 +312,7 @@ class ConstraintBatchOrchestrator:
                 blueprint_path,
                 agent,
                 fallback_agent=fb_agent,
+                knowledge_sources=state.extra.get("knowledge_sources"),
             )
         else:
             from ..sop.constraint_phases_v2 import build_constraint_phases_v2
