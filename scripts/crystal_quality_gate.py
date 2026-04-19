@@ -167,27 +167,48 @@ def load_blueprint(path: Path) -> dict:
     }
 
 
-def load_constraints(path: Path) -> dict:
+def load_constraints(path: Path, domain_path: Path | None = None) -> dict:
     all_ids: list[str] = []
     fatal_ids: list[str] = []
     regular_ids: list[str] = []
-    with path.open() as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                c = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            cid = c.get("id")
-            if not cid:
-                continue
-            all_ids.append(cid)
-            if c.get("severity") == "fatal":
-                fatal_ids.append(cid)
-            else:
-                regular_ids.append(cid)
+    seen: set[str] = set()
+    domain_skipped: list[str] = []
+
+    def _consume(p: Path, is_domain: bool = False) -> None:
+        with p.open() as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    c = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cid = c.get("id")
+                if not cid:
+                    continue
+                if cid in seen:
+                    if is_domain:
+                        domain_skipped.append(cid)
+                    continue
+                seen.add(cid)
+                all_ids.append(cid)
+                if c.get("severity") == "fatal":
+                    fatal_ids.append(cid)
+                else:
+                    regular_ids.append(cid)
+
+    _consume(path)
+    if domain_path is not None:
+        _consume(domain_path, is_domain=True)
+        if domain_skipped:
+            print(
+                f"[warn] {len(domain_skipped)} domain constraint(s) skipped in quality gate "
+                f"due to id collision with project constraints: "
+                f"{domain_skipped[:10]}" + ("..." if len(domain_skipped) > 10 else ""),
+                file=sys.stderr,
+            )
+
     return {
         "all_ids": all_ids,
         "fatal_ids": fatal_ids,
@@ -938,6 +959,12 @@ def main() -> int:
     )
     parser.add_argument("--blueprint", type=Path, required=True, help="LATEST.yaml path")
     parser.add_argument("--constraints", type=Path, required=True, help="LATEST.jsonl path")
+    parser.add_argument(
+        "--domain-constraints",
+        type=Path,
+        default=None,
+        help="Optional domain-universal constraints JSONL (merged into all_ids for SA-03)",
+    )
     parser.add_argument("--crystal", type=Path, required=True, help="seed.yaml path (.md rejected)")
     parser.add_argument(
         "--schema",
@@ -959,6 +986,12 @@ def main() -> int:
         if not p.exists():
             print(f"[error] {label} file not found: {p}", file=sys.stderr)
             return 2
+    if args.domain_constraints is not None and not args.domain_constraints.exists():
+        print(
+            f"[error] domain-constraints file not found: {args.domain_constraints}",
+            file=sys.stderr,
+        )
+        return 2
 
     # Reject .md early (load_crystal also checks, but do it here for clarity)
     if args.crystal.suffix.lower() == ".md" or args.crystal.name.lower().endswith(".seed.md"):
@@ -972,7 +1005,7 @@ def main() -> int:
 
     schema = load_schema(args.schema)
     bp = load_blueprint(args.blueprint)
-    cons = load_constraints(args.constraints)
+    cons = load_constraints(args.constraints, args.domain_constraints)
     crystal = load_crystal(args.crystal)
 
     report = run_gate(crystal, schema, bp, cons)

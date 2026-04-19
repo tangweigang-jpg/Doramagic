@@ -38,7 +38,10 @@ except ImportError:
 # ============================================================
 
 
-def load_inputs(blueprint_dir: Path) -> tuple[dict, list[dict], dict]:
+def load_inputs(
+    blueprint_dir: Path,
+    domain_constraints_path: Path | None = None,
+) -> tuple[dict, list[dict], dict]:
     bp_path = blueprint_dir / "LATEST.yaml"
     cons_path = blueprint_dir / "LATEST.jsonl"
     with bp_path.open() as f:
@@ -48,7 +51,32 @@ def load_inputs(blueprint_dir: Path) -> tuple[dict, list[dict], dict]:
         for line in f:
             line = line.strip()
             if line:
-                constraints.append(json.loads(line))
+                c = json.loads(line)
+                c["_source_scope"] = "project"
+                constraints.append(c)
+    if domain_constraints_path is not None:
+        project_ids = {c.get("id") for c in constraints}
+        skipped_collisions: list[str] = []
+        with domain_constraints_path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                c = json.loads(line)
+                cid = c.get("id")
+                if cid and cid in project_ids:
+                    # Project-local takes precedence; skip domain duplicate to preserve SA-03 uniqueness
+                    skipped_collisions.append(cid)
+                    continue
+                c["_source_scope"] = "domain"
+                constraints.append(c)
+        if skipped_collisions:
+            print(
+                f"[warn] {len(skipped_collisions)} domain constraint(s) dropped due to id "
+                f"collision with project constraints (project wins): "
+                f"{skipped_collisions[:10]}" + ("..." if len(skipped_collisions) > 10 else ""),
+                file=sys.stderr,
+            )
     targets_path = blueprint_dir / "crystal_inputs" / "coverage_targets.json"
     targets: dict = {}
     if targets_path.exists():
@@ -73,6 +101,7 @@ def _extract_constraint_fields(c: dict) -> dict:
         "consequence": core.get("consequence"),
         "stage_ids": (c.get("applies_to") or {}).get("stage_ids") or [],
         "derived_from_bd_id": c.get("derived_from"),
+        "source_scope": c.get("_source_scope", "project"),
     }
 
 
@@ -301,13 +330,16 @@ def build_evidence_quality(bp: dict) -> dict:
 # ============================================================
 
 
-def build_traceback(bp: dict) -> dict:
+def build_traceback(bp: dict, domain_constraints_name: str | None = None) -> dict:
     bp_id = bp.get("id", "unknown")
+    source_files: dict = {
+        "blueprint": "LATEST.yaml",
+        "constraints": "LATEST.jsonl",
+    }
+    if domain_constraints_name:
+        source_files["domain_constraints"] = domain_constraints_name
     return {
-        "source_files": {
-            "blueprint": "LATEST.yaml",
-            "constraints": "LATEST.jsonl",
-        },
+        "source_files": source_files,
         "mandatory_lookup_scenarios": [
             {
                 "id": "TB-01",
@@ -891,7 +923,12 @@ def _load_domain_pool(domain: str = "finance") -> dict:
         return {}
 
 
-def build_resources(bp: dict, target_host: str, domain: str = "finance") -> dict:
+def build_resources(
+    bp: dict,
+    target_host: str,
+    domain: str = "finance",
+    domain_resources_path: Path | None = None,
+) -> dict:
     resources_raw = bp.get("resources") or []
     packages = []
     for r in resources_raw:
@@ -919,6 +956,46 @@ def build_resources(bp: dict, target_host: str, domain: str = "finance") -> dict
             and entry.get("name")
         ]
         # If pool also absent or empty, return empty list (no ZVT fallback)
+
+    # Domain resource injection (curated by Stage 2 selection pipeline).
+    # Project-declared packages take precedence; domain additions are appended
+    # with source_scope="domain" tag. Same-name collisions are warned and skipped.
+    if domain_resources_path is not None:
+        try:
+            with domain_resources_path.open() as f:
+                domain_pool = yaml.safe_load(f) or {}
+        except Exception as e:
+            print(
+                f"[error] failed to load --domain-resources {domain_resources_path}: {e}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        domain_entries = domain_pool.get("resources") or []
+        project_names = {p["name"] for p in packages if p.get("name")}
+        skipped_collisions: list[str] = []
+        for entry in domain_entries:
+            if entry.get("kind") != "python_package":
+                continue
+            name = entry.get("name")
+            if not name:
+                continue
+            if name in project_names:
+                skipped_collisions.append(name)
+                continue
+            packages.append(
+                {
+                    "name": name,
+                    "version_pin": entry.get("version_range", "latest"),
+                    "source_scope": "domain",
+                }
+            )
+        if skipped_collisions:
+            print(
+                f"[warn] {len(skipped_collisions)} domain package(s) dropped due to name "
+                f"collision with project packages (project wins): "
+                f"{skipped_collisions[:10]}" + ("..." if len(skipped_collisions) > 10 else ""),
+                file=sys.stderr,
+            )
 
     # Fix 2: entry_point_name derived from blueprint UC architecture signals
     # Priority: stage (architecture action) > type (pipeline shape) > data_domain (domain semantics)
@@ -1059,6 +1136,8 @@ def build_constraints(fatal_constraints: list[dict], non_fatal_constraints: list
             result["stage_ids"] = f["stage_ids"]
         if f["derived_from_bd_id"]:
             result["derived_from_bd_id"] = f["derived_from_bd_id"]
+        if f["source_scope"] != "project":
+            result["source_scope"] = f["source_scope"]
         return result
 
     return {
@@ -1985,6 +2064,8 @@ def build_seed(
     targets: dict,
     target_host: str,
     sop_version: str,
+    domain_constraints_name: str | None = None,
+    domain_resources_path: Path | None = None,
 ) -> dict:
     # Classify BDs by stage
     bd_by_stage: dict = defaultdict(list)
@@ -2006,7 +2087,7 @@ def build_seed(
         "meta": build_meta(bp, target_host, sop_version),
         "locale_contract": build_locale_contract(),
         "evidence_quality": build_evidence_quality(bp),
-        "traceback": build_traceback(bp),
+        "traceback": build_traceback(bp, domain_constraints_name=domain_constraints_name),
         "preconditions": preconditions,
         "intent_router": build_intent_router(ucs),
         "context_state_machine": build_context_state_machine(),
@@ -2019,7 +2100,7 @@ def build_seed(
             preconditions_count=len(preconditions),
         ),
         "architecture": build_architecture(bp, bd_by_stage),
-        "resources": build_resources(bp, target_host),
+        "resources": build_resources(bp, target_host, domain_resources_path=domain_resources_path),
         "constraints": build_constraints(fatal_constraints, non_fatal_constraints),
         "output_validator": build_output_validator(),
         "acceptance": build_acceptance(),
@@ -2080,11 +2161,49 @@ def main() -> int:
         help="Path to output human_summary.md sidecar (English, Doraemon persona)",
     )
     parser.add_argument("--sop-version", default="crystal-compilation-v5.3")
+    parser.add_argument(
+        "--domain-constraints",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSONL path of domain-universal constraints to inject "
+            "(tagged source_scope=domain). When omitted, behavior is identical "
+            "to pre-domain-injection compilation."
+        ),
+    )
+    parser.add_argument(
+        "--domain-resources",
+        type=Path,
+        default=None,
+        help=(
+            "Optional YAML path of domain-pool python_package entries to inject "
+            "(tagged source_scope=domain). Same shape as _shared/resources_full.yaml. "
+            "When omitted, behavior is identical to pre-domain-injection compilation."
+        ),
+    )
     args = parser.parse_args()
 
-    bp, constraints, targets = load_inputs(args.blueprint_dir)
+    # Uniform pre-flight checks for optional domain-injection paths.
+    for label, p in [
+        ("--domain-constraints", args.domain_constraints),
+        ("--domain-resources", args.domain_resources),
+    ]:
+        if p is not None and not p.exists():
+            print(f"[error] {label} file not found: {p}", file=sys.stderr)
+            return 2
 
-    seed = build_seed(bp, constraints, targets, args.target_host, args.sop_version)
+    bp, constraints, targets = load_inputs(args.blueprint_dir, args.domain_constraints)
+
+    domain_name = args.domain_constraints.name if args.domain_constraints else None
+    seed = build_seed(
+        bp,
+        constraints,
+        targets,
+        args.target_host,
+        args.sop_version,
+        domain_constraints_name=domain_name,
+        domain_resources_path=args.domain_resources,
+    )
 
     # Write seed.yaml
     seed_yaml_text = yaml.safe_dump(
