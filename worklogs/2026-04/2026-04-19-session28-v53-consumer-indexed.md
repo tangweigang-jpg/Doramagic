@@ -138,4 +138,61 @@ v5.3 seed 相对 v5.2：
 
 ---
 
+---
+
+## 九、OpenClaw 09:25 v5.3 实测审核（2026-04-19 当日下午补录）
+
+### 9.1 部署状态
+
+| 项 | 值 |
+|---|---|
+| 提交时间 | 2026-04-19 09:25（UTC+7） |
+| 目标路径 | `~/.openclaw/skills/zvt-quant-v5/finance-bp-009-v5.3.seed.yaml` |
+| 字节数 | 142,943（与源文件一致）|
+| meta.compiled_at | `2026-04-19T02:19:59.720650+00:00` |
+| PIN-01 触发 | 09:26:24（安装后约 1 分钟）|
+| 用户追问 | 09:27 "筛选 ROE ≥ 10% 的优质公司" → UC-110 |
+
+### 9.2 v5.3 翻译扩容**行为层**证据
+
+**✅ 已验证落地**：
+
+1. **UC 名称中文化**（`capability_catalog.groups[].ucs[].name`，v5.3 新增翻译字段）
+   - PIN-01 Notice 精选入口渲染为 "MACD 多头因子 / 基本面筛选器 / 龙虎榜数据"
+   - 对比 v5.2 的 23:39/08:46 两次 PIN-01：同一 UC 以英文 name 呈现
+   - 这是 SA-19 守卫保护的核心价值的直接落地
+
+2. **Host 主动宣告翻译契约扩展**
+   - OpenClaw 在 PIN-01 正文中列出："UC 名称翻译 | locale_rendering 增强 | preconditions/constraints/assertions 全翻译"
+   - 说明 host 读到 v5.3 的 `user_facing_fields` 26 条并反映给用户
+
+3. **真执行 UC-110**
+   - 山西汾酒 ROE 20.2% / 茅台 10.6% / 伊利 10.5%，全程中文输出
+
+**⚠️ 未能验证（因本次 happy path 无异常触发）**：
+
+- `preconditions[].on_fail` 翻译
+- `output_validator.assertions[].failure_message` 翻译
+- `constraints.{fatal,regular}[].consequence` 翻译
+- `intent_router.uc_entries[].ambiguity_question` — 子代理观察到 seed 内部该字段仍为英文，但因本次执行无歧义分支，无法判断 host 在歧义场景是否会翻译
+
+### 9.3 结论
+
+v5.3 的**单点核心价值**（UC 名称中文化 + capability_catalog 翻译扩展）在 PIN-01 行为层**明确可见**。这一点本身已经回答了 Session 27 P-06 提出的问题："改字段却行为不变"——v5.3 改的 `user_facing_fields` 扩容**是** NR 消费者接收的字段，所以**行为变了**。与 Session 27 Fix A 改 `skill_file_schema`（SR 消费）无行为变化形成对比，证明字段-消费者映射的有效性。
+
+异常路径翻译（on_fail / failure_message / consequence）的行为层证明需要下次主动构造失败场景验证——本次执行过于顺畅，翻译守卫的完整价值未完全观察到。
+
+### 9.4 版本对照（三次 OpenClaw 实测）
+
+| 时间 | 版本 | commit | PIN-01 UC 命名 | 执行 UC | 是否触发错误路径 |
+|---|---|---|---|---|---|
+| 23:39 (04-18) | v5.2 首版 | 934694c (8.30) | 英文 | 无 | — |
+| 08:46 (04-19) | v5.2 最终 | 7ec70de (8.72) | 英文 | MACD/ROE | 无 |
+| **09:25 (04-19)** | **v5.3** | **80a15da** | **中文 ✅** | **ROE (UC-110)** | **无** |
+
+v5.3 的差异**只在翻译**，执行层与 v5.2 一致。这符合预期——本次改动是翻译契约扩容，不动 executor/verifier/skill_emitter。
+
+---
+
+*v1.1 | 2026-04-19 | §九 补录 OpenClaw 09:25 v5.3 实测审核*
 *v1.0 | 2026-04-19 | Session 28 | 主线程 Opus 4.7 (1M) | 无子代理*
