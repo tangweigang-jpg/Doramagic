@@ -225,6 +225,9 @@ def build_evidence_quality(bp: dict) -> dict:
     audit_fail_total = fu_fail + sub_fail
 
     audit_coverage = audit.get("coverage")
+    audit_pass_rate = audit.get(
+        "pass_rate"
+    )  # CONCERN 4: pass/total ratio — preserved as dual signal
 
     declared = {
         "evidence_coverage_ratio": ev_coverage_ratio,
@@ -233,6 +236,7 @@ def build_evidence_quality(bp: dict) -> dict:
         "evidence_verified": ev_verified,
         "evidence_auto_fixed": ev_auto_fixed,
         "audit_coverage": audit_coverage,
+        "audit_pass_rate": audit_pass_rate,  # CONCERN 4: host sees both coverage (completeness) and pass_rate (quality)
         "audit_fail_total": audit_fail_total,
         "audit_finance_universal": {
             "pass": int(fu.get("pass") or 0),

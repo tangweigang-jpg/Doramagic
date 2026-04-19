@@ -1839,3 +1839,148 @@ class TestPatchAuditChecklistBugD:
         assert "pass_rate" in summary
         total_pass = 3 + 2  # 5
         assert summary["pass_rate"] == f"{total_pass}/{total} ({total_pass * 100 // total}%)"
+
+
+# ---------------------------------------------------------------------------
+# P0-A fix-forward: BLOCKER 1 + CONCERN 1 + CONCERN 6 guard tests
+# ---------------------------------------------------------------------------
+
+
+class TestPatchResourceInjectionP0AGuards:
+    """P0-A fix-forward guards: skill_files dict entries, uc_list.source non-str,
+    and audit coverage 0/0 boundary.
+    """
+
+    def _make_worker_resource_json(self, tmp_path: Path) -> None:
+        """Write a minimal worker_resource.json with no matrix but a placeholder service."""
+        data: dict[str, Any] = {
+            "replaceable_resource_matrix": [],
+            "data_sources": [],
+            "external_services": [{"name": "TestAPI", "description": "test"}],
+            "dependencies": [],
+        }
+        (tmp_path / "worker_resource.json").write_text(json.dumps(data), encoding="utf-8")
+
+    def test_skill_files_with_dict_entries_skipped_gracefully(self, tmp_path: Path) -> None:
+        """BLOCKER fix: repo_index.json skill_files dict entries are skipped by isinstance guard.
+
+        21.6% of real repo_index.json files have skill_files as list[dict].
+        The isinstance guard must let str entries through and skip dicts,
+        so the loop does NOT silently abort — valid str paths still produce technique_document entries.
+        """
+        self._make_worker_resource_json(tmp_path)
+        repo_index = {
+            "files": [],
+            "entry_points": [],
+            "examples": [],
+            "document_sources": {
+                # Mix: one dict (must be skipped), one str (must be injected)
+                "skill_files": [{"path": "SKILL.md", "type": "doc"}, "valid_skill.md"],
+                "claude_md": [],
+                "agent_files": [],
+            },
+            "stats": {},
+        }
+        (tmp_path / "repo_index.json").write_text(json.dumps(repo_index), encoding="utf-8")
+        bp: dict[str, Any] = {"stages": []}
+
+        _patch_resource_injection(bp, tmp_path)
+
+        resources = bp.get("resources", [])
+        tech_docs = [r for r in resources if r.get("type") == "technique_document"]
+        paths = {r["path"] for r in tech_docs}
+
+        # dict entry skipped, str entry injected → exactly 1 technique_document
+        assert len(tech_docs) == 1, (
+            f"BLOCKER: expected 1 technique_document (str entry only), got {len(tech_docs)}: {tech_docs}"
+        )
+        assert "valid_skill.md" in paths, (
+            f"BLOCKER: valid_skill.md must be injected as technique_document, got paths={paths}"
+        )
+
+    def test_uc_source_non_string_skipped_gracefully(self, tmp_path: Path) -> None:
+        """CONCERN 1 fix: uc_list.source of type dict/list/None must be skipped without AttributeError.
+
+        The isinstance(src, str) guard must prevent AttributeError on .endswith() when source
+        is a non-string type (e.g. dict or list from malformed uc_list.json).
+        Only str sources that end with .py or .ipynb should produce code_example entries.
+        """
+        self._make_worker_resource_json(tmp_path)
+        uc_list = [
+            {
+                "id": "UC-001",
+                "name": "Good Example",
+                "source": "good_example.py",
+                "business_problem": "Valid",
+                "stage": "training",
+            },
+            {
+                "id": "UC-002",
+                "name": "Dict Source",
+                "source": {"path": "bad_example.py", "type": "file"},  # dict — must be skipped
+                "business_problem": "Malformed",
+                "stage": "training",
+            },
+            {
+                "id": "UC-003",
+                "name": "List Source",
+                "source": ["list_item.py"],  # list — must be skipped
+                "business_problem": "Also malformed",
+                "stage": "training",
+            },
+            {
+                "id": "UC-004",
+                "name": "None Source",
+                "source": None,  # None — must be skipped
+                "business_problem": "None source",
+                "stage": "training",
+            },
+        ]
+        (tmp_path / "uc_list.json").write_text(json.dumps(uc_list), encoding="utf-8")
+        bp: dict[str, Any] = {"stages": []}
+
+        # Must not raise AttributeError or TypeError
+        _patch_resource_injection(bp, tmp_path)
+
+        resources = bp.get("resources", [])
+        code_examples = [r for r in resources if r.get("type") == "code_example"]
+        assert len(code_examples) == 1, (
+            f"CONCERN 1: expected exactly 1 code_example (good_example.py only), got {len(code_examples)}"
+        )
+        assert code_examples[0]["path"] == "good_example.py"
+
+    def _write_audit_md(self, tmp_path: Path, content: str) -> Path:
+        p = tmp_path / "worker_audit.md"
+        p.write_text(content, encoding="utf-8")
+        return p
+
+    def test_audit_coverage_total_zero_boundary(self, tmp_path: Path) -> None:
+        """CONCERN 6 fix: when total_all == 0, coverage and pass_rate must be '0/0 (0%)'.
+
+        An empty audit file with no status rows must not cause ZeroDivisionError.
+        Both coverage and pass_rate must degrade gracefully to '0/0 (0%)'.
+        """
+        # Write audit with headers but no data rows
+        audit_md = (
+            "## Universal Finance Checklist\n"
+            "| # | Item | Status | Evidence |\n"
+            "|---|------|--------|----------|\n"
+            # No data rows → total = 0
+        )
+        self._write_audit_md(tmp_path, audit_md)
+        bp: dict[str, Any] = {}
+        state = make_state(subdomain_labels=[])
+
+        # Must not raise ZeroDivisionError
+        _patch_audit_checklist(bp, state, tmp_path)
+
+        summary = bp.get("audit_checklist_summary", {})
+        coverage = summary.get("coverage", "")
+        pass_rate = summary.get("pass_rate", "")
+
+        assert coverage == "0/0 (0%)", (
+            f"CONCERN 6: zero-total coverage must be '0/0 (0%)', got: {coverage!r}"
+        )
+        assert pass_rate == "0/0 (0%)", (
+            f"CONCERN 6: zero-total pass_rate must be '0/0 (0%)', got: {pass_rate!r}"
+        )

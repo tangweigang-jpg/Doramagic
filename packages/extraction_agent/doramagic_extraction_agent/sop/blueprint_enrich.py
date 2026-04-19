@@ -1476,6 +1476,8 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
             uc_list: list[dict[str, Any]] = json.loads(uc_list_path.read_text(encoding="utf-8"))
             for uc in uc_list:
                 src = uc.get("source", "")
+                if not isinstance(src, str):  # CONCERN 1: guard against non-str source
+                    continue
                 if not src:
                     continue
                 if not (src.endswith(".py") or src.endswith(".ipynb")):
@@ -1497,7 +1499,9 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
                 )
                 injected += 1
         except (json.JSONDecodeError, OSError, TypeError) as exc:
-            logger.debug("P14 (resource_injection): could not read uc_list.json: %s", exc)
+            logger.warning(  # CONCERN 2: elevated from debug — file parse failure affects Bug B completeness; surface to monitoring
+                "P14 (resource_injection): could not read uc_list.json: %s", exc
+            )
 
     repo_index_path = artifacts_dir / "repo_index.json"
     if repo_index_path.exists():
@@ -1507,6 +1511,10 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
             # skill_files, claude_md, agent_files are document knowledge sources
             for key in ("skill_files", "claude_md", "agent_files"):
                 for doc_path in doc_sources.get(key, []):
+                    if not isinstance(
+                        doc_path, str
+                    ):  # BLOCKER 1: repo_index.json skill_files may be dicts
+                        continue
                     if not doc_path or doc_path in _seen_paths:
                         continue
                     _seen_paths.add(doc_path)
@@ -1524,7 +1532,9 @@ def _patch_resource_injection(bp: dict[str, Any], artifacts_dir: Path) -> int:
                     )
                     injected += 1
         except (json.JSONDecodeError, OSError, TypeError) as exc:
-            logger.debug("P14 (resource_injection): could not read repo_index.json: %s", exc)
+            logger.warning(  # CONCERN 3: elevated from debug — file parse failure affects Bug B completeness; surface to monitoring
+                "P14 (resource_injection): could not read repo_index.json: %s", exc
+            )
 
     if resources:
         bp["resources"] = resources
