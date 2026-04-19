@@ -2763,7 +2763,7 @@ def build_blueprint_phases_v5(
         state: AgentState,
         repo_path: Path,
     ) -> PhaseResult:
-        """SOP v3.4 quality gate — BQ-01..BQ-09 hard gates + warnings.
+        """SOP v3.4 quality gate — BQ-01..BQ-11 hard gates + warnings.
 
         Hard gates (BQ-01~04): block pipeline when strict_quality_gate=True.
         Warnings (BQ-05~09): always logged, never block.
@@ -2817,11 +2817,15 @@ def build_blueprint_phases_v5(
 
         stage_count = len(stages) if isinstance(stages, list) else 0
 
-        # Evidence coverage (from _enrich_meta if available)
+        # Evidence coverage + verify ratio (from _enrich_meta if available)
         evidence_coverage = 0.0
+        evidence_verify_ratio = 0.0
+        evidence_invalid_count = 0
         meta = bp_data.get("_enrich_meta", {}) if isinstance(bp_data, dict) else {}
         if isinstance(meta, dict):
             evidence_coverage = meta.get("evidence_coverage_ratio", 0.0)
+            evidence_verify_ratio = meta.get("evidence_verify_ratio", 0.0) or 0.0
+            evidence_invalid_count = meta.get("evidence_invalid", 0) or 0
 
         # BD type diversity (non-T)
         non_t_types: set[str] = set()
@@ -3024,6 +3028,50 @@ def build_blueprint_phases_v5(
                 warnings.append(f"BQ-10 WARN: evidence_grounded={grounded_ratio:.1%} < 50%")
             else:
                 logger.info("BQ-10 PASS: evidence_grounded=%s", f"{grounded_ratio:.1%}")
+
+        # --- BQ-11: Evidence verify ratio threshold (added 2026-04-19) ---
+        # Blocks extraction output when P5.5 verifier found too many invalid
+        # refs. A BD's evidence passes P5.5 only when file+line exist AND
+        # (.py symbol AST-matches OR non-.py symbol grep-matches ±5 lines).
+        # Low ratio means the LLM hallucinated file:line:symbol triples en
+        # masse; the blueprint is structurally complete but evidentially
+        # worthless. Two thresholds, calibrated against the current 73-bp
+        # distribution so 'healthy but imperfect' blueprints (median 41.5%)
+        # still pass:
+        #   - ratio < 0.30  → hard fail (current bottom tier: 20 bps)
+        #   - invalid > 50  → hard fail (rampant hallucination, e.g.
+        #     bp-098 pre-fix had 62 invalid; keeps this gate independent
+        #     of total BD count)
+        _BQ11_RATIO_MIN = 0.30
+        _BQ11_INVALID_MAX = 50
+        checks["BQ-11_evidence_verify_ratio"] = (
+            evidence_verify_ratio >= _BQ11_RATIO_MIN and evidence_invalid_count <= _BQ11_INVALID_MAX
+        )
+        details["BQ-11_evidence_verify_ratio"] = (
+            f"ratio={evidence_verify_ratio:.1%} "
+            f"(target ≥{_BQ11_RATIO_MIN:.0%}), "
+            f"invalid={evidence_invalid_count} (target ≤{_BQ11_INVALID_MAX})"
+        )
+        if not checks["BQ-11_evidence_verify_ratio"]:
+            reason_parts = []
+            if evidence_verify_ratio < _BQ11_RATIO_MIN:
+                reason_parts.append(
+                    f"verify_ratio={evidence_verify_ratio:.1%} < {_BQ11_RATIO_MIN:.0%}"
+                )
+            if evidence_invalid_count > _BQ11_INVALID_MAX:
+                reason_parts.append(f"invalid={evidence_invalid_count} > {_BQ11_INVALID_MAX}")
+            hard_issues.append(
+                "BQ-11 FAIL: " + " AND ".join(reason_parts) + ". "
+                "Fix: Re-run extraction with stricter prompts that reject "
+                "fabricated evidence, or narrow the scope so the LLM has "
+                "fewer files to cite from (cuts hallucination surface)."
+            )
+        else:
+            logger.info(
+                "BQ-11 PASS: verify_ratio=%.1f%% invalid=%d",
+                evidence_verify_ratio * 100,
+                evidence_invalid_count,
+            )
 
         # ---- Emit warnings ----
         for w in warnings:
