@@ -147,15 +147,70 @@ bp-073: 47/47 verified、0 invalid；bp-098 nautilus: 41 verified、**62 invalid
 ## 8. 未来跟踪（修订后）
 
 - [x] 追溯 bp-073 的 semi_auto 介入点 —— **已结论：无介入，是默认值**
-- [ ] 修 P5.5 verifier：Go/Rust 文件也做 `(symbol)` grep（grep symbol in line ±5 window），避免非 Python 项目免检
-- [ ] 修 bp-062 类丢失：查 `bd_list.json` 构建路径为何丢 evidence。怀疑 `_synthesize_bd_types_*` prompt 或 batching 把 evidence 字段 reset 成 N/A
+- [x] 修 P5.5 verifier：Go/Rust 文件也做 `(symbol)` grep —— **已修复 `88365de`**
+- [x] 修 bp-062 类丢失：查 `bd_list.json` 构建路径 —— **已定位为 L3 recovery 默认 N/A，`4cb61b7`/`28d5e37`/`d211c4e` 三连修**
 - [ ] Gate 阻断上线后，重跑 bottom-5，看 73 个蓝图 verify_ratio 是否能提升
-- [ ] 对比"真 Python 严格检查"下的 bp-050 (0.79) vs "Go 宽松免检"的 bp-073 (1.00) —— 实际质量差距可能被 verify_ratio 夸大
+- [x] 对比"真 Python 严格检查" vs "Go 宽松免检" —— **已验证：bp-073 1.00 → 85.87%（新符号检查抓到 3 个真幻觉），bp-050 保持 78.57%。bp-073 仍排第一但"100% 神话"已破**
+
+---
+
+## 9. Codex adversarial 验证史（2026-04-19 附录）
+
+从 checklist 发现的 5 个行动项出发，到最终修复全部落盘并通过外部 LLM 审查，本附录记录真实迭代：
+
+### 9.1 修复路径（Commit 链）
+
+| # | Commit | 性质 | 关键内容 |
+|---|---|---|---|
+| 1 | `b236423` | 观察 | 本 checklist 初版 —— 提出"evidence 诚实度"假设 |
+| 2 | `3294715` | 纠正 | 澄清 `semi_auto` 是默认值而非人工介入信号；首次发现 P5.5 verifier 对非 Python 的宽松 bug + bp-062 类 step2c.md ↛ bd_list.json 证据丢失 |
+| 3 | `88365de` | 修复 | P5.5 verifier 对非 Python 文件做 `(symbol)` grep（±5 行窗）。bp-073 因此从 100% → 93.62%，抓到 3 个真幻觉：`machine.go:197(opcodes)`、`log_process.go:97(SchemaEnforcementMode)`、`chart.go:109(Pattern)` |
+| 4 | `4cb61b7` | 修复 | 新 P5.3 patch：enrich 阶段从 `step2c_business_decisions.md` 按 content 前缀回填 N/A evidence（后置补丁）|
+| 5 | `28d5e37` | 修复 | 上游根治：在 `bp_synthesis_v5` + `synthesis_v9` 的 5+4 处 L3 recovery 默认化 `N/A` 之前先查 step2c map |
+| 6 | `38b10ef` | 落盘 | 73 蓝图首次 re-enrich。bp-062 **0% → 79.71%**，回填 1046 条 refs，均值 +6pp |
+| 7 | `d211c4e` | 修复 | Codex adversarial 审查 `28d5e37` 给出 3 个 finding，全部封堵 |
+| 8 | `150701c` | 落盘 | 73 蓝图再次 re-enrich，验证 7 号修复无回归 |
+
+### 9.2 Codex 两次审查
+
+**第一次（`/codex:review` 工作树，50s）**
+- 目标：工作树
+- 产出：只检测到本地 `.claude/scheduled_tasks.lock`（housekeeping，与 P2 无关）
+- 结论：不能审已提交 commit —— 暴露 `/codex:review` 对历史修复的盲区
+
+**第二次（`/codex:adversarial-review` 指定 commit，~2min）**
+- 目标：`commit 28d5e37` + 聚焦 (A)(B)(C) 三点
+- Verdict：**needs-attention**
+- 发现 3 个真 bug：
+
+| Finding | 优先级 | 问题 | Codex 建议 |
+|---|---|---|---|
+| #1 | high | v9 pipeline 中 step2c.md 写入 **晚于** local/global synthesis → 新运行 map 永远空 | 改用 worker candidate evidence 或在 synthesis 前写入 |
+| #2 | high | 正则 `_STEP2C_ROW_RE` 不处理 `\|` 转义；`_bd_to_markdown` 会把 `\|` 写进 cell → 公式型 BD 列错位 | 换字符解析器 |
+| #3 | medium | `_recover_bd_evidence` 只在 `not evidence` 时触发 → `"N/A:0(see_rationale)"` 是 truthy，不被重写 | 加 `is_missing_evidence()` helper 集中判 sentinel |
+
+### 9.3 修复验证
+
+`d211c4e` 逐一封堵：
+- **#1**: 新 `load_worker_candidate_evidence_map()` 读 `worker_*.json` 的 `BDCandidate.evidence`（这些文件在 synthesis 前必然存在）。v9 三 handler 用 `{worker, **step2c}` 合并，step2c 优先 worker 兜底
+- **#2**: `_split_md_row()` 字符解析器，honor `\|` 转义并 unescape cell 内容
+- **#3**: `is_missing_evidence()` 认 `empty / "-" / "—" / "N/A*" / "none" / "null"`，所有 L3 recovery 路径统一调用
+- +15 pytest 测试全部通过；`150701c` 再跑 73 蓝图 reenrich，分布完全相同（无回归）
+
+### 9.4 元启示
+
+1. **Codex adversarial review 值回票价**：`/codex:review`（非对抗）只能审工作树且易漏；`/codex:adversarial-review + commit hash + focus text` 能精准打点并抓到非平凡 bug（v9 时序竞态 #1 几乎不可能靠人工发现）
+2. **正则 vs 解析器的界线**：一旦有转义语义，正则立刻失效。`_STEP2C_ROW_RE` 是"看起来对"的典型案例 —— 覆盖 90% 输入但剩下 10% 默默漏数据
+3. **"看起来修好了"≠ 修好了**：P2 提交（`28d5e37`）PR-level 测试全绿（120 passed），但 Codex 发现它在 v9 新运行里**完全无效** —— 提醒我们**必须跑真实 pipeline 端到端**而不是只看 unit test
+4. **Sentinel 语义统一的价值**：`N/A:0(see_rationale)` 在 7 个地方被硬编码，`is_missing_evidence` 把这个"语义缺失"的概念提纯到一个函数，未来所有 L3/backfill/verify 改动都能引用，避免重复犯错
+
+---
 
 **相关文件**:
-- `packages/extraction_agent/doramagic_extraction_agent/sop/blueprint_enrich.py:1116`（P5.5 verifier，L1183 是语义分叉点）
-- `packages/extraction_agent/doramagic_extraction_agent/sop/blueprint_enrich.py:208`（semi_auto 默认值来源）
-- `packages/extraction_agent/doramagic_extraction_agent/sop/blueprint_phases.py:2412`（synthesis 覆盖 md）
+- `packages/extraction_agent/doramagic_extraction_agent/sop/blueprint_enrich.py`（`is_missing_evidence`、`_split_md_row`、`load_step2c_evidence_map`、`load_worker_candidate_evidence_map`、P5.3、P5.5）
+- `packages/extraction_agent/doramagic_extraction_agent/sop/blueprint_phases.py:1567`（`_recover_bd_evidence` + 3 个 v5 L3 call sites）
+- `packages/extraction_agent/doramagic_extraction_agent/sop/synthesis_v9.py`（`_coerce_bd_dict` + 3 个 v9 handler 的 map 加载）
+- `packages/extraction_agent/tests/test_blueprint_enrich.py`（`TestIsMissingEvidence`、`TestSplitMdRow`、`TestLoadWorkerCandidateEvidenceMap`、`TestPatchEvidenceBackfillFromMd`、`TestPatchEvidenceVerifyNonPython`）
 - `knowledge/sources/finance/finance-bp-073--ledger/blueprint.v1.yaml`（对照样本）
 - `_runs/finance-bp-073/artifacts/step2c_business_decisions.md`（LLM 原始 BD 表）
 - `_runs/finance-bp-062/artifacts/step2c_business_decisions.md`（证据丢失现场）
