@@ -82,11 +82,11 @@ def _extract_constraint_fields(c: dict) -> dict:
 
 
 def build_meta(bp: dict, target_host: str, sop_version: str) -> dict:
-    # Derive crystal version from sop_version (e.g. crystal-compilation-v5.2 → v5.2)
+    # Derive crystal version from sop_version (e.g. crystal-compilation-v5.3 → v5.3)
     import re as _re
 
     m = _re.search(r"v(\d+\.\d+)$", sop_version)
-    version_str = f"v{m.group(1)}" if m else "v5.2"
+    version_str = f"v{m.group(1)}" if m else "v5.3"
     bp_id = bp.get("id", "unknown")
     crystal_id = f"{bp_id}-{version_str}"
     return {
@@ -141,21 +141,48 @@ def build_meta(bp: dict, target_host: str, sop_version: str) -> dict:
 
 
 def build_locale_contract() -> dict:
+    # v5.3: user_facing_fields expanded 12→26 per consumer_map.yaml user_facing_fields_expected.
+    # Every NR+TR field in the schema is listed here so translator consumer covers all
+    # user-visible text (previously preconditions.on_fail, OV.failure_message, stages.narrative,
+    # etc. were English-only when user locale != en).
     return {
         "source_language": "en",
         "user_facing_fields": [
+            # human_summary (4)
             "human_summary.what_i_can_do.tagline",
             "human_summary.what_i_can_do.use_cases[]",
             "human_summary.what_i_auto_fetch[]",
             "human_summary.what_i_ask_you[]",
+            # evidence_quality (1)
             "evidence_quality.user_disclosure_template",
+            # post_install_notice (8)
             "post_install_notice.message_template.positioning",
             "post_install_notice.message_template.capability_catalog.groups[].name",
             "post_install_notice.message_template.capability_catalog.groups[].description",
+            "post_install_notice.message_template.capability_catalog.groups[].ucs[].name",
             "post_install_notice.message_template.capability_catalog.groups[].ucs[].short_description",
             "post_install_notice.message_template.call_to_action",
             "post_install_notice.message_template.featured_entries[].beginner_prompt",
             "post_install_notice.message_template.more_info_hint",
+            # preconditions error messages (2) — NEW v5.3
+            "preconditions[].description",
+            "preconditions[].on_fail",
+            # intent_router (2) — NEW v5.3
+            "intent_router.uc_entries[].name",
+            "intent_router.uc_entries[].ambiguity_question",
+            # architecture narrative (4) — NEW v5.3
+            "architecture.pipeline",
+            "architecture.stages[].narrative.does_what",
+            "architecture.stages[].narrative.key_decisions",
+            "architecture.stages[].narrative.common_pitfalls",
+            # constraints violation (2) — NEW v5.3
+            "constraints.fatal[].consequence",
+            "constraints.regular[].consequence",
+            # validator/gate failure (2) — NEW v5.3
+            "output_validator.assertions[].failure_message",
+            "acceptance.hard_gates[].on_fail",
+            # skill emission notification (1) — NEW v5.3
+            "skill_crystallization.action",
         ],
         "locale_detection_order": [
             "explicit_user_declaration",
@@ -1259,7 +1286,7 @@ def build_skill_crystallization(
         "violation_signal": "All hard gates passed but no .skill file exists at expected path",
         "skill_file_schema": {
             "name": f"{bp_id} / {primary_uc_name}",
-            "version": meta.get("version", "v5.2"),
+            "version": meta.get("version", "v5.3"),
             "intent_keywords": primary_uc_keywords,
             "entry_point": entry_point,
             "fatal_guards": fatal_sl_ids,
@@ -1982,7 +2009,7 @@ def main() -> int:
         default=None,
         help="Path to output human_summary.md sidecar (English, Doraemon persona)",
     )
-    parser.add_argument("--sop-version", default="crystal-compilation-v5.2")
+    parser.add_argument("--sop-version", default="crystal-compilation-v5.3")
     args = parser.parse_args()
 
     bp, constraints, targets = load_inputs(args.blueprint_dir)

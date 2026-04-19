@@ -1,10 +1,11 @@
-# 晶体编译 SOP v5.2
+# 晶体编译 SOP v5.3
 
 > **A crystal is a proof obligation, not a prompt.**
 > 一颗晶体声明对宿主 AI 必须成立的契约，而非劝说它做什么。
 
-**SOP 版本**: `crystal-compilation-v5.2`
+**SOP 版本**: `crystal-compilation-v5.3`
 **Schema 版本**: `schemas/crystal_contract.schema.yaml` — **唯一真源**
+**Consumer Map**: `schemas/consumer_map.yaml` — **字段消费者映射**（v5.3 新增，下方 §v5.3 一节详述）
 
 ---
 
@@ -48,6 +49,37 @@ v3.x 是"带 5 个 YAML 控制块的 Markdown 段落合集"。v5.0 是"符合 sc
 - 编译脚本**不硬编码任何领域术语**（不写 backtest / MACD / zvt 这类词）
 - 启发式兜底用通用英文 keyword（data / compute / report / util）匹配 emoji
 - 蓝图声明优先 → 启发式兜底 → 单组 fallback，三级降级
+
+### v5.3 新增（字段消费者显式化 — 根治 Fix-A 作用域错位）
+
+**背景**：Session 27 v5.2 Fix A 动态化了 `skill_crystallization.skill_file_schema` 的 name/keywords/guards，期望 OpenClaw 安装 Notice 改文案。08:46 实测发现 Notice 文案未变——根因是该字段的**真实消费者是 skill_router（SR），不是 notice_render（NR）**。两作用域独立，改错字段。
+
+**v5.3 解决方案**：把每个晶体字段的**主消费者**显式标注，compile/gate/SOP 三者以此为单一真源。
+
+**7 个消费者**（`schemas/consumer_map.yaml` 的正式定义）：
+
+| 缩写 | 消费者 | 触发 | 典型字段 |
+|---|---|---|---|
+| **NR** | notice_render | skill_installation_complete | `post_install_notice.*` / `human_summary.*` |
+| **SR** | skill_router | every_user_message | `intent_router.*` / `skill_crystallization.skill_file_schema` |
+| **TR** | translator | first_user_msg + non-en locale | `locale_contract.user_facing_fields[]` 列出的全部字段 |
+| **EX** | executor | execute_trigger_matched | `preconditions.check_command` / `resources.*` / `traceback.*` |
+| **VF** | verifier | during/post execute | `output_validator.*` / `acceptance.hard_gates.*` / `evidence_quality.enforcement_rules` |
+| **SE** | skill_emitter | all_hard_gates_passed | `skill_crystallization.trigger/output_path_template/captured_fields` |
+| **MA** | meta_archival | compile + audit | `meta.id/version/compiled_at` / `business_decisions` / `soft_gates` |
+
+**v5.3 编译脚本硬约束**：
+- compile_crystal_skeleton.py 按消费者分 build block 组装字段（不再按 I1-I8 不变式分）
+- `locale_contract.user_facing_fields` **自动由 consumer_map 的 user_facing_fields_expected 派生**（26 条），不再手工维护
+- `skill_crystallization.skill_file_schema` schema 注释明确标注 `x-consumer: [SR]`，避免 Fix-A 类错位
+
+**v5.3 质量规则 Q4（翻译完整性）**：
+- 所有 consumer_map 中标注为 NR 或 TR 的字段，必须出现在 `locale_contract.user_facing_fields[]`
+- 缺任何一条 → SA-19 FAIL
+
+**v5.3 废弃字段**（v5.4 移除）：
+- `meta.target_host` — 无运行时消费者
+- `acceptance.soft_gates[].rubric` — 仅审计用，非运行时强制
 
 ### v5.2 质量规则（2026-04-18 量化评审后补，普适性要求）
 
@@ -206,6 +238,7 @@ schema 只保证结构，以下 13 条断言保证意义：
 | SA-16 | post_install_notice 完整 | `post_install_notice.message_template.featured_entries` 恰 3 项；每项 uc_id 在 intent_router 中可查；`enforcement.violation_code == "PIN-01"` |
 | SA-17 | capability_catalog 完整 | `post_install_notice.message_template.capability_catalog.groups` 非空；**所有 intent_router UC 被精确覆盖 1 次**（无丢失、无重复）；每组 `uc_count == len(ucs)`；每条 UC 有非空 `sample_triggers` |
 | SA-18 | short_description 无 mid-cut | 每条 `capability_catalog.groups[].ucs[].short_description` 末尾是**句子终止符**（`. ? ! 。 ？ ！`）或**最后一词 ≥ 3 字符**（避免 "... on a" 这种短单词结尾的截断残留）；允许白名单短词：`US / UK / AI / ML / IT / EU` |
+| **SA-19** | **translation_completeness（v5.3）** | **读 `schemas/consumer_map.yaml` 的 `user_facing_fields_expected[]`，检查每条都出现在 `locale_contract.user_facing_fields[]`。缺失任一条 → FAIL。缺失字段列表进入 `violation_signal`。** |
 
 ### 4c. 退出码
 
@@ -307,9 +340,10 @@ schema 只保证结构，以下 13 条断言保证意义：
 | v5.0 | 2026-04-18 | Schema-driven 重写：crystal = proof obligation；全英文机器文本 + 运行时 locale 翻译；结构化 trigger-action-violation 规则；preconditions / skill_crystallization / trace_schema 纳入契约；两层门禁（schema + 13 条 SA）|
 | v5.1 | 2026-04-18 | 消费者价值优先：`meta.authoritative_artifact`（seed.yaml 真源锁）+ `meta.execution_protocol`（install/execute 边界）+ `post_install_notice`（安装即发能力引导，3 句定位+入门）+ `featured_use_cases` 蓝图策展字段；SA 扩到 16 条；新增 `crystal_skill_readme_emitter.py` 工具 |
 | **v5.2** | **2026-04-18** | **安装即全量引导：`post_install_notice.capability_catalog`（所有 UC 按分组结构化，host 直接渲染）+ `call_to_action` 互动邀请 + `blueprint.capability_groups` 作者策展字段（可选，无声明时脚本启发式兜底）；SA-17 catalog 完整性；普适性要求：编译脚本不硬编码任何领域词。**  **量化评审后补 3 条质量规则（Q1 short_description 不 mid-cut + Q2 cross-cutting 合并单 stage + Q3 locale_contract 全覆盖 9 字段）+ SA-18 mid-cut guard** |
+| **v5.3** | **2026-04-19** | **根治 Fix-A 作用域错位类问题：引入字段消费者显式化（NR/SR/TR/EX/VF/SE/MA 7 类），新增 `schemas/consumer_map.yaml` 为单一真源；compile 脚本按消费者分 build block；`locale_contract.user_facing_fields` 从 12 条扩为 26 条（补 8 处漏翻）；SA-19 translation_completeness 门禁；`meta.target_host` + `soft_gates[].rubric` 标 deprecated；quality_gate 检查可按消费者分层以改善错误信息；参考研究：llamaindex §6.3 合同分层 + meta-harness Algorithm 1 接口验证先行。** |
 
-（跳过 v4.0 — 直接 v3.2 → v5.0 → v5.1 → v5.2）
+（跳过 v4.0 — 直接 v3.2 → v5.0 → v5.1 → v5.2 → v5.3）
 
 ---
 
-*v5.0 | 2026-04-18 | 编写者：Doramagic 主线程 | 真源：`schemas/crystal_contract.schema.yaml`*
+*v5.3 | 2026-04-19 | 编写者：Doramagic 主线程 | 真源：`schemas/crystal_contract.schema.yaml` + `schemas/consumer_map.yaml`*

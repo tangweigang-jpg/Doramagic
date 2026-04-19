@@ -182,7 +182,7 @@ crystal-compile:
 		--output-seed $(CRYSTAL_SEED) \
 		--output-human-summary $(CRYSTAL_HUMAN_SUMMARY) \
 		--output-validate $(CRYSTAL_VALIDATE) \
-		--sop-version $(or $(SOP_VERSION),crystal-compilation-v5.2)
+		--sop-version $(or $(SOP_VERSION),crystal-compilation-v5.3)
 
 crystal-gate:
 	@test -n "$(BP)" || (echo "Usage: make crystal-gate BP=finance-bp-009--zvt VERSION=v3.3" && exit 1)

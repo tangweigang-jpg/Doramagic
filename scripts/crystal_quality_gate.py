@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Crystal Quality Gate v5.2 — Schema Validator + Semantic Gate
+"""Crystal Quality Gate v5.3 — Schema Validator + Semantic Gate
 
-Validates a v5.2 seed.yaml crystal against:
+Validates a v5.3 seed.yaml crystal against:
   Layer 1: JSON Schema (crystal_contract.schema.yaml)
-  Layer 2: 17 semantic assertions (SA-01 … SA-17)
+  Layer 2: 19 semantic assertions (SA-01 … SA-19, incl. SA-19 translation_completeness
+           driven by schemas/consumer_map.yaml)
 
 Usage:
     python3 crystal_quality_gate.py \\
@@ -640,6 +641,49 @@ def sa18_short_description_no_midcut(crystal: dict) -> tuple[bool, str]:
     return True, f"all {checked} short_description(s) end cleanly"
 
 
+def sa19_translation_completeness(crystal: dict) -> tuple[bool, str]:
+    """SA-19 (v5.3): every NR+TR field in consumer_map is listed in user_facing_fields.
+
+    Reads schemas/consumer_map.yaml → user_facing_fields_expected[] and diffs against
+    crystal.locale_contract.user_facing_fields. Any missing path = FAIL with that path
+    in the violation signal. Root-cause guard for translator-scope drift — the class of
+    bug that would leave non-en users seeing untranslated English in error messages,
+    stage narratives, or PIN catalog entries.
+    """
+    from pathlib import Path as _Path
+
+    import yaml as _yaml
+
+    # Locate consumer_map.yaml relative to this script
+    script_dir = _Path(__file__).resolve().parent
+    repo_root = script_dir.parent
+    cmap_path = repo_root / "schemas" / "consumer_map.yaml"
+    if not cmap_path.exists():
+        return False, f"consumer_map.yaml not found at {cmap_path}"
+
+    try:
+        cmap = _yaml.safe_load(cmap_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return False, f"consumer_map.yaml parse error: {e}"
+
+    expected = cmap.get("user_facing_fields_expected") or []
+    if not expected:
+        return False, "consumer_map.yaml user_facing_fields_expected[] empty"
+
+    actual = set((crystal.get("locale_contract") or {}).get("user_facing_fields") or [])
+    missing = [p for p in expected if p not in actual]
+
+    if missing:
+        sample = "; ".join(missing[:5])
+        extra = f" (+{len(missing) - 5} more)" if len(missing) > 5 else ""
+        return (
+            False,
+            f"{len(missing)}/{len(expected)} NR+TR field(s) missing from "
+            f"locale_contract.user_facing_fields: {sample}{extra}",
+        )
+    return True, f"all {len(expected)} NR+TR fields declared as user-facing"
+
+
 def sa16_post_install_notice(crystal: dict) -> tuple[bool, str]:
     """SA-16: post_install_notice completeness + cross-validation against intent_router."""
     pin = crystal.get("post_install_notice")
@@ -718,6 +762,12 @@ _SA_REGISTRY = [
     ("SA-16", "post_install_notice completeness", sa16_post_install_notice, ("crystal",)),
     ("SA-17", "capability_catalog completeness", sa17_capability_catalog, ("crystal",)),
     ("SA-18", "short_description no mid-cut", sa18_short_description_no_midcut, ("crystal",)),
+    (
+        "SA-19",
+        "translation completeness (consumer_map)",
+        sa19_translation_completeness,
+        ("crystal",),
+    ),
 ]
 
 
@@ -806,7 +856,7 @@ def format_summary(report: dict) -> str:
     out: list[str] = []
     W = 70
     out.append("=" * W)
-    out.append("Crystal Quality Gate v5.2 — Report")
+    out.append("Crystal Quality Gate v5.3 — Report")
     out.append("=" * W)
 
     # Layer 1
