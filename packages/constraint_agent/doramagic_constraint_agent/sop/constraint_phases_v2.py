@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -38,6 +39,33 @@ if TYPE_CHECKING:
     from doramagic_agent_core.core.agent_loop import ExtractionAgent
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# QG-10/11/12 content-quality constants
+# ---------------------------------------------------------------------------
+
+# QG-10: unexpanded placeholder patterns (bash-style ${VAR} is excluded)
+_QG10_PLACEHOLDER_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\{(?:file|path|source|filepath)\}", re.IGNORECASE),
+    re.compile(r"<(?:placeholder|path|TODO)>", re.IGNORECASE),
+    # generic {snake_case_var} — but NOT ${VAR} (real shell var)
+    re.compile(r"(?<!\$)\{[a-z][a-z_]*\}"),
+]
+
+# QG-11: consequence "negative" keywords and action "positive" verbs
+_QG11_NEGATIVE_KEYWORDS: re.Pattern[str] = re.compile(
+    r"导致|引起|触发|造成|产生|破坏|违反|泄露|丢失|崩溃|错误|失败"
+)
+_QG11_POSITIVE_VERBS: re.Pattern[str] = re.compile(r"使用|设置|启用|调用|执行|添加")
+_QG11_FORWARD_MODALITIES: frozenset[str] = frozenset({"must", "should"})
+_QG11_REVERSE_MODALITIES: frozenset[str] = frozenset({"must_not", "should_not"})
+
+# QG-12: evidence_refs type vs locator consistency
+_QG12_SOURCE_CODE_PATTERN: re.Pattern[str] = re.compile(
+    r"\.(?:py|cpp|ts|tsx|js|go|rs|java|c|h|rb|swift|kt|cs|scala)\b|:\d+$"
+)
+_QG12_DOCUMENT_PATTERN: re.Pattern[str] = re.compile(r"\.(?:md|rst|txt)\b|§")
 
 
 # ---------------------------------------------------------------------------
@@ -1988,19 +2016,23 @@ async def _con_postprocess_v2_handler(state: AgentState, repo_path: Path) -> Pha
 
 
 async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseResult:
-    """Quality gate: 4 hard checks (QG-01 to QG-04) + 4 warnings (QG-05 to QG-08).
+    """Quality gate: 4 hard checks (QG-01 to QG-04) + warnings (QG-05 to QG-12).
 
     Hard gates (pipeline halts on failure):
       QG-01: total >= 80
       QG-02: kind_coverage >= 5 (all 5 constraint kinds must be present)
       QG-03: claim_boundary >= 5%
       QG-04: domain_rule + architecture_guardrail >= 50%
+      QG-09: fatal+machine_checkable threshold coverage >= 30%
 
     Warnings (logged but non-blocking):
       QG-05: evidence_coverage — % of constraints with file:line in evidence_summary
       QG-06: vt_coverage — % of M-class derived with validation_threshold
       QG-07: derive_count — derived constraints >= expected minimum
       QG-08: needs_threshold_ratio — % of constraints tagged needs_validation_threshold
+      QG-10: placeholder_count — unexpanded {file}/{path}/etc. tokens (threshold > 0)
+      QG-11: logic_reversal_suspects — modality/consequence direction mismatch (threshold > 2%)
+      QG-12: evidence_type_mismatch — type vs locator extension inconsistency (threshold > 5%)
     """
     run_dir_str = getattr(state, "run_dir", None)
     if not run_dir_str:
@@ -2033,6 +2065,12 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
     p4_residual_count = 0
     fatal_checkable_total = 0
     fatal_checkable_with_vt = 0
+    # QG-10: placeholder count
+    qg10_placeholder_count = 0
+    # QG-11: logic-reversal suspect count
+    qg11_reversal_count = 0
+    # QG-12: evidence type/locator mismatch count
+    qg12_mismatch_count = 0
 
     for line in output_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
@@ -2078,6 +2116,54 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
         tags = obj.get("tags", [])
         if isinstance(tags, list) and "needs_validation_threshold" in tags:
             p4_residual_count += 1
+
+        # QG-10: placeholder detection
+        vt = obj.get("validation_threshold") or ""
+        core = obj.get("core") or {}
+        action_text = core.get("action") or "" if isinstance(core, dict) else ""
+        when_text = core.get("when") or "" if isinstance(core, dict) else ""
+        confidence = obj.get("confidence") or {}
+        evidence_refs_list = (
+            confidence.get("evidence_refs") or [] if isinstance(confidence, dict) else []
+        )
+        candidate_texts = [str(vt), str(action_text), str(when_text)]
+        for eref in evidence_refs_list:
+            if isinstance(eref, dict):
+                candidate_texts.append(str(eref.get("locator") or ""))
+                candidate_texts.append(str(eref.get("summary") or ""))
+        for text in candidate_texts:
+            if any(pat.search(text) for pat in _QG10_PLACEHOLDER_PATTERNS):
+                qg10_placeholder_count += 1
+                break  # count per-constraint, not per-field
+
+        # QG-11: modality / consequence logic reversal
+        modality = obj.get("modality") or ""
+        consequence = obj.get("consequence_description") or ""
+        has_negative_consequence = bool(_QG11_NEGATIVE_KEYWORDS.search(str(consequence)))
+        has_positive_action = bool(_QG11_POSITIVE_VERBS.search(str(action_text)))
+        if (
+            modality in _QG11_FORWARD_MODALITIES
+            and has_positive_action
+            and has_negative_consequence
+        ) or (
+            modality in _QG11_REVERSE_MODALITIES
+            and not has_negative_consequence
+            and str(consequence)
+        ):
+            qg11_reversal_count += 1
+
+        # QG-12: evidence_refs type/locator consistency
+        for eref in evidence_refs_list:
+            if not isinstance(eref, dict):
+                continue
+            etype = str(eref.get("type") or "")
+            elocator = str(eref.get("locator") or "")
+            if not elocator:
+                continue
+            if (etype == "source_code" and not _QG12_SOURCE_CODE_PATTERN.search(elocator)) or (
+                etype == "document" and not _QG12_DOCUMENT_PATTERN.search(elocator)
+            ):
+                qg12_mismatch_count += 1
 
     # ----- Hard gates (QG-01 to QG-04) -----
     hard_issues: list[str] = []
@@ -2177,6 +2263,62 @@ async def _con_validate_v2_handler(state: AgentState, repo_path: Path) -> PhaseR
             )
         else:
             logger.debug("QG-08 OK: needs_threshold_ratio=%.1f%%", needs_threshold_pct)
+
+    # QG-10: placeholder detection (unexpanded {file}/{path}/etc.)
+    if qg10_placeholder_count > 0:
+        warnings.append(
+            f"QG-10 WARN: placeholder_count={qg10_placeholder_count} constraints contain "
+            "unexpanded placeholders ({{file}}/{{path}}/{{source}}/{{filepath}}/<placeholder>/<TODO>/{{var}})"
+        )
+        logger.info(
+            "QG-10: %d constraint(s) contain unexpanded placeholder tokens",
+            qg10_placeholder_count,
+        )
+    else:
+        logger.debug("QG-10 OK: no placeholder tokens detected")
+
+    # QG-11: modality/consequence logic reversal heuristic
+    if total > 0:
+        reversal_threshold = max(1, int(total * 0.02))
+        if qg11_reversal_count > reversal_threshold:
+            warnings.append(
+                f"QG-11 WARN: logic_reversal_suspects={qg11_reversal_count} "
+                f"(threshold={reversal_threshold}, >{total * 0.02:.1f}% of {total}) — "
+                "modality and consequence direction appear mismatched"
+            )
+            logger.info(
+                "QG-11: %d constraint(s) have suspect modality/consequence reversal (threshold=%d)",
+                qg11_reversal_count,
+                reversal_threshold,
+            )
+        else:
+            logger.debug(
+                "QG-11 OK: logic_reversal_suspects=%d <= threshold=%d",
+                qg11_reversal_count,
+                reversal_threshold,
+            )
+
+    # QG-12: evidence_refs type/locator consistency
+    if total > 0:
+        mismatch_threshold_pct = total * 0.05
+        if qg12_mismatch_count > mismatch_threshold_pct:
+            mismatch_pct = qg12_mismatch_count / total * 100
+            warnings.append(
+                f"QG-12 WARN: evidence_type_mismatch={qg12_mismatch_count} ({mismatch_pct:.1f}%) > 5% — "
+                "evidence_refs[].type does not match locator extension"
+            )
+            logger.info(
+                "QG-12: %d evidence ref(s) have type/locator mismatch (%.1f%% of %d constraints)",
+                qg12_mismatch_count,
+                mismatch_pct,
+                total,
+            )
+        else:
+            logger.debug(
+                "QG-12 OK: evidence_type_mismatch=%d (%.1f%% <= 5%%)",
+                qg12_mismatch_count,
+                qg12_mismatch_count / total * 100 if total > 0 else 0.0,
+            )
 
     # Log warnings
     for w in warnings:
