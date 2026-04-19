@@ -786,7 +786,20 @@ async def _derive_single_chunk(
         # L3 recovery: MiniMax produced text with constraint data but
         # validation failed (often old grouped format or field mismatches).
         # Try manual extraction from the raw text.
-        recovered = _recover_derive_from_raw(result.text, chunk_index, total_chunks)
+        # Defensive wrapper: any unexpected shape inside recovery (e.g. LLM
+        # emitting ints where lists are expected) should NOT kill the whole
+        # phase — degrade to "recovery failed" and let the retry loop handle.
+        try:
+            recovered = _recover_derive_from_raw(result.text, chunk_index, total_chunks)
+        except Exception as exc:
+            logger.warning(
+                "con_derive chunk %d/%d: L3 recovery raised %s: %s — treating as recovery failed",
+                chunk_index + 1,
+                total_chunks,
+                type(exc).__name__,
+                exc,
+            )
+            recovered = None
         if recovered:
             logger.info(
                 "con_derive chunk %d/%d: L3 recovery extracted %d constraints",
@@ -853,13 +866,17 @@ def _recover_derive_from_raw(
             items = data.get(key, [])
             if isinstance(items, list):
                 all_constraints.extend(items)
-        # Handle missing_gap_pairs
-        for pair in data.get("missing_gap_pairs", []):
-            if isinstance(pair, dict):
-                if "boundary" in pair and isinstance(pair["boundary"], dict):
-                    all_constraints.append(pair["boundary"])
-                if "remedy" in pair and isinstance(pair["remedy"], dict):
-                    all_constraints.append(pair["remedy"])
+        # Handle missing_gap_pairs (defensive: LLM sometimes emits
+        # a non-list value such as an int here — iterating that raises
+        # "'int' object is not iterable" and kills the phase).
+        gap_pairs = data.get("missing_gap_pairs", [])
+        if isinstance(gap_pairs, list):
+            for pair in gap_pairs:
+                if isinstance(pair, dict):
+                    if "boundary" in pair and isinstance(pair["boundary"], dict):
+                        all_constraints.append(pair["boundary"])
+                    if "remedy" in pair and isinstance(pair["remedy"], dict):
+                        all_constraints.append(pair["remedy"])
     elif isinstance(data, list):
         all_constraints = data
 

@@ -164,6 +164,14 @@ def _raw_to_constraint(
         except ValueError:
             constraint_kind = ConstraintKind.DOMAIN_RULE
 
+        # consequence_kind is occasionally omitted by upstream LLM outputs.
+        # Dropping the whole constraint over one missing enum is too harsh —
+        # fall back to "bug" (schema default) and warn at debug level.
+        if "consequence_kind" not in raw:
+            logger.debug(
+                "raw constraint missing consequence_kind; defaulting to 'bug' (id hash=%s)",
+                raw.get("hash", "?"),
+            )
         return Constraint(
             id=constraint_id,
             core=ConstraintCore(
@@ -171,7 +179,7 @@ def _raw_to_constraint(
                 modality=raw["modality"],
                 action=raw["action"],
                 consequence={
-                    "kind": raw["consequence_kind"],
+                    "kind": raw.get("consequence_kind", "bug"),
                     "description": raw.get(
                         "consequence_description",
                         f"Violation of {kind_str} constraint",
