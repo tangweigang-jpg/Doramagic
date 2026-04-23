@@ -370,7 +370,13 @@ def render_skill_md(seed: dict, skill_name: str, bp_id: str) -> str:
     ep = meta.get("execution_protocol", {}) or {}
     hs = seed.get("human_summary", {}) or {}
     what_can = hs.get("what_i_can_do") or {}
-    tagline = what_can.get("tagline", "Doramagic-compiled quant skill").strip()
+    opts = seed.get("_runtime_opts") or {}
+    tagline_raw = (
+        opts.get("tagline_override") or what_can.get("tagline") or "Doramagic-compiled quant skill"
+    )
+    # Collapse multi-line tagline (YAML |- keeps internal newlines) to one line
+    tagline = " ".join(tagline_raw.split())
+    display_name_zh = opts.get("display_name_zh")
     uc_entries = (seed.get("intent_router") or {}).get("uc_entries") or []
     description = _build_description(seed)
 
@@ -431,8 +437,9 @@ def render_skill_md(seed: dict, skill_name: str, bp_id: str) -> str:
     frontmatter = "\n".join(fm_lines)
 
     # ---- Body ----
+    h1 = f"# {display_name_zh} ({skill_name})" if display_name_zh else f"# {skill_name}"
     body = [
-        f"# {skill_name}",
+        h1,
         "",
         f"> {tagline}",
         "",
@@ -793,16 +800,38 @@ def emit_skill_bundle(seed_path: Path, out_dir: Path, _opts: dict | None = None)
     )
     _validate_skill_name(skill_name)
 
-    # Load descriptions override (LLM-generated user-facing Chinese copy)
+    # Load overrides in priority order:
+    #   1. skill_metadata.yaml (CTO-locked bilingual) — highest priority
+    #   2. descriptions_map.py (LLM-generated Chinese copy) — fallback
     desc_override = None
-    try:
-        from descriptions_map import FINAL_DESCRIPTIONS  # type: ignore
+    tagline_override = None
+    display_name_zh = None
 
-        desc_override = FINAL_DESCRIPTIONS.get(skill_name)
-    except ImportError:
-        pass
+    metadata_yaml = Path(__file__).resolve().parent / "skill_metadata.yaml"
+    if metadata_yaml.exists():
+        with metadata_yaml.open(encoding="utf-8") as f:
+            metadata_data = yaml.safe_load(f) or {}
+        entry = (metadata_data.get("skills") or {}).get(skill_name)
+        if entry:
+            desc_override = entry.get("description_zh")
+            tagline_override = entry.get("tagline_zh")
+            display_name_zh = entry.get("name_zh")
+
+    if desc_override is None:
+        try:
+            from descriptions_map import FINAL_DESCRIPTIONS  # type: ignore
+
+            desc_override = FINAL_DESCRIPTIONS.get(skill_name)
+        except ImportError:
+            pass
+
+    opts = seed.setdefault("_runtime_opts", {})
     if desc_override:
-        seed.setdefault("_runtime_opts", {})["description_override"] = desc_override
+        opts["description_override"] = desc_override
+    if tagline_override:
+        opts["tagline_override"] = tagline_override
+    if display_name_zh:
+        opts["display_name_zh"] = display_name_zh
 
     bundle_root = out_dir / f"{skill_name}.skill"
     skill_dir = bundle_root / skill_name
